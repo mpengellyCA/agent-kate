@@ -43,19 +43,42 @@ func headCommit(dir string) (string, bool) {
 	return strings.TrimSpace(out), true
 }
 
-// Create makes an isolated worktree for threadID under
-// <repoRoot>/.agentkate/worktrees/. If repoRoot is not a committed git repo it
-// returns a non-isolated Worktree pointing at repoRoot itself.
-func Create(repoRoot, threadID string) (Worktree, error) {
+// Isolation modes for Create.
+const (
+	ModeAuto      = "auto"      // isolate when the repo has commits, else run direct
+	ModeIsolated  = "isolated"  // require isolation; fail if the repo has no commits
+	ModeWorkspace = "workspace" // always run directly in the workspace
+)
+
+// Create sets up where an agent thread runs, honouring an isolation mode:
+//
+//   - ModeWorkspace      — always run directly in repoRoot, no isolation.
+//   - ModeIsolated       — a dedicated git worktree; an error if repoRoot has
+//     no commit to branch from.
+//   - ModeAuto (default) — a worktree when repoRoot has a commit, otherwise run
+//     directly in repoRoot.
+//
+// An unrecognised mode (including "") is treated as ModeAuto. An isolated
+// worktree lives under <repoRoot>/.agentkate/worktrees/ on its own branch.
+func Create(repoRoot, threadID, mode string) (Worktree, error) {
+	direct := Worktree{
+		ThreadID: threadID,
+		RepoRoot: repoRoot,
+		Path:     repoRoot,
+		Isolated: false,
+	}
+	if mode == ModeWorkspace {
+		return direct, nil
+	}
+
 	base, ok := headCommit(repoRoot)
 	if !ok {
-		// Not a git repo, or no commits yet — run directly in the workspace.
-		return Worktree{
-			ThreadID: threadID,
-			RepoRoot: repoRoot,
-			Path:     repoRoot,
-			Isolated: false,
-		}, nil
+		// No commit to branch from — isolation is impossible.
+		if mode == ModeIsolated {
+			return Worktree{}, fmt.Errorf(
+				"isolation needs at least one commit in %s", repoRoot)
+		}
+		return direct, nil // ModeAuto falls back to the workspace
 	}
 
 	dir := filepath.Join(repoRoot, ".agentkate", "worktrees", threadID)
@@ -75,6 +98,69 @@ func Create(repoRoot, threadID string) (Worktree, error) {
 		Base:     base,
 		Isolated: true,
 	}, nil
+}
+
+// Promote turns a non-isolated worktree into an isolated one without losing
+// in-progress work: it stashes the working tree, creates a dedicated worktree
+// and branch, then re-applies the stash inside that worktree. The main
+// workspace is left clean. repoRoot must have at least one commit.
+//
+// The caller still has to move the agent — and its Claude Code session — into
+// the returned worktree.
+func Promote(wt Worktree) (Worktree, error) {
+	if wt.Isolated {
+		return wt, nil // already isolated — nothing to do
+	}
+	repoRoot := wt.RepoRoot
+	base, ok := headCommit(repoRoot)
+	if !ok {
+		return Worktree{}, fmt.Errorf("cannot isolate: %s has no commit yet", repoRoot)
+	}
+
+	// Stash the working tree (including untracked files) so it can be carried
+	// into the new worktree.
+	out, err := git(repoRoot, "stash", "push", "--include-untracked",
+		"-m", "agentkate-promote-"+wt.ThreadID)
+	if err != nil {
+		return Worktree{}, fmt.Errorf("stash: %w", err)
+	}
+	stashed := !strings.Contains(out, "No local changes")
+
+	unstash := func() {
+		if stashed {
+			_, _ = git(repoRoot, "stash", "pop")
+		}
+	}
+
+	dir := filepath.Join(repoRoot, ".agentkate", "worktrees", wt.ThreadID)
+	branch := "agentkate/" + wt.ThreadID
+	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
+		unstash()
+		return Worktree{}, err
+	}
+	if _, err := git(repoRoot, "worktree", "add", "-b", branch, dir, base); err != nil {
+		unstash()
+		return Worktree{}, err
+	}
+
+	isolated := Worktree{
+		ThreadID: wt.ThreadID,
+		RepoRoot: repoRoot,
+		Path:     dir,
+		Branch:   branch,
+		Base:     base,
+		Isolated: true,
+	}
+	if stashed {
+		// Apply the stash inside the new worktree. The worktree is clean and at
+		// the same commit the stash was taken from, so this applies cleanly.
+		if _, err := git(dir, "stash", "pop"); err != nil {
+			return isolated, fmt.Errorf(
+				"worktree created on %s, but re-applying the changes hit a "+
+					"conflict — the stash was kept: %w", branch, err)
+		}
+	}
+	return isolated, nil
 }
 
 // Diff returns a unified diff of everything the thread changed.

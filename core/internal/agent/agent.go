@@ -350,6 +350,17 @@ func (s *Supervisor) thread(id string) *Thread {
 	return s.threads[id]
 }
 
+// Running reports whether a thread currently has a live process.
+func (s *Supervisor) Running(threadID string) bool {
+	t := s.thread(threadID)
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.alive
+}
+
 func (s *Supervisor) emitLifecycle(threadID, phase, detail string) {
 	s.emitObj(threadID, map[string]any{"type": "_lifecycle", "phase": phase, "detail": detail})
 }

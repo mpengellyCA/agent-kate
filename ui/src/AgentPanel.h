@@ -34,7 +34,7 @@ public:
 
     // Bind this panel to a persisted-but-not-running thread; resume() relaunches
     // it through the core's agent.resume.
-    void setDormant(const QString &threadId, const QString &title);
+    void setDormant(const QString &threadId, const QString &title, bool isolated);
     void resume();
 
 Q_SIGNALS:
@@ -55,6 +55,7 @@ private:
     void onSendClicked();
     void onStopClicked();
     void onChangesClicked();
+    void onPromoteClicked();
     void onAttachClicked();
     void rebuildAttachChips();
     void onNotification(const QString &method, const QJsonObject &params);
@@ -72,13 +73,15 @@ private:
     QString m_threadId;
     QString m_branch;
     bool m_isolated = false;
-    bool m_idle = false;    // turn finished, awaiting a follow-up
-    bool m_dormant = false; // has a thread id, but no live process — resumable
+    bool m_idle = false;      // turn finished, awaiting a follow-up
+    bool m_dormant = false;   // has a thread id, but no live process — resumable
+    bool m_promoting = false; // a promote-to-worktree is in flight
 
     QLabel *m_header = nullptr;
     QTextEdit *m_transcript = nullptr;
     QPlainTextEdit *m_input = nullptr;
     QComboBox *m_modeCombo = nullptr;
+    QComboBox *m_isolationCombo = nullptr;
     QPushButton *m_sendBtn = nullptr;
     QPushButton *m_stopBtn = nullptr;
     QPushButton *m_diffBtn = nullptr;
@@ -95,6 +98,10 @@ private:
     QPushButton *m_permAllow = nullptr;
     QPushButton *m_permDeny = nullptr;
     QList<QJsonObject> m_permQueue;
+
+    // Promote-to-worktree bar, shown while a thread runs non-isolated.
+    QFrame *m_promoteBar = nullptr;
+    QPushButton *m_promoteBtn = nullptr;
 
     // AskUserQuestion form, built dynamically when the agent asks a question.
     QFrame *m_questionBox = nullptr;

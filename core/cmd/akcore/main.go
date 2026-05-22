@@ -158,6 +158,7 @@ type agentStartParams struct {
 	WorkspacePath  string             `json:"workspacePath"`
 	Prompt         string             `json:"prompt"`
 	PermissionMode string             `json:"permissionMode"`
+	Isolation      string             `json:"isolation"` // worktree.Mode*; "" = auto
 	Attachments    []agent.Attachment `json:"attachments"`
 }
 
@@ -246,6 +247,27 @@ func registerHandlers(d handlerDeps) {
 		}
 		go resumeAgentThread(d, rec)
 		return map[string]any{"threadId": rec.ThreadID, "sessionId": rec.SessionID}, nil
+	})
+
+	// agent.promote upgrades a non-isolated thread into a dedicated git
+	// worktree, carrying its working-tree changes and Claude Code session over.
+	d.srv.Handle("agent.promote", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID string `json:"threadId"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		rec, ok := d.sessions.Get(p.ThreadID)
+		if !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		}
+		if rec.Worktree.Isolated {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams,
+				"this thread already runs in an isolated worktree")
+		}
+		go promoteAgentThread(d, rec)
+		return map[string]any{"threadId": rec.ThreadID}, nil
 	})
 
 	// session.listThreads returns persisted threads (running and dormant),
@@ -615,7 +637,7 @@ func registerHandlers(d handlerDeps) {
 // rather than as an error reply, since the agent.start reply has already been
 // sent by the time this runs.
 func startAgentThread(d handlerDeps, threadID, sessionID string, p agentStartParams) {
-	wt, err := worktree.Create(p.WorkspacePath, threadID)
+	wt, err := worktree.Create(p.WorkspacePath, threadID, p.Isolation)
 	if err != nil {
 		d.log.Error("worktree create failed", "thread", threadID, "err", err)
 		emitLifecycle(d.srv, threadID, "error", "worktree: "+err.Error(), nil)
@@ -704,6 +726,38 @@ func resumeAgentThread(d handlerDeps, rec session.Record) {
 	})
 	d.log.Info("agent thread resumed", "thread", rec.ThreadID, "session", rec.SessionID)
 	emitLifecycle(d.srv, rec.ThreadID, "resumed", "resumed Claude Code session", &rec.Worktree)
+}
+
+// promoteAgentThread upgrades a non-isolated thread to an isolated worktree: it
+// stops the agent, moves the working tree and Claude Code session into a fresh
+// worktree, then resumes the thread there.
+func promoteAgentThread(d handlerDeps, rec session.Record) {
+	// Stop any live process and wait for it to exit before touching git.
+	_ = d.sup.Stop(rec.ThreadID)
+	for i := 0; i < 60 && d.sup.Running(rec.ThreadID); i++ {
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	iso, err := worktree.Promote(rec.Worktree)
+	if err != nil {
+		emitLifecycle(d.srv, rec.ThreadID, "error", "promote: "+err.Error(), &rec.Worktree)
+		return
+	}
+	// Relocate the Claude Code session so `--resume` finds it in the worktree.
+	if err := session.PromoteTranscript(rec.SessionID, rec.ThreadID); err != nil {
+		emitLifecycle(d.srv, rec.ThreadID, "error", "promote: "+err.Error(), &iso)
+		return
+	}
+
+	rec.Worktree = iso
+	_ = d.sessions.Update(rec.ThreadID, func(r *session.Record) { r.Worktree = iso })
+	d.threads.put(rec.ThreadID, iso)
+	d.log.Info("agent thread promoted", "thread", rec.ThreadID, "branch", iso.Branch)
+	emitLifecycle(d.srv, rec.ThreadID, "promoted",
+		"promoted to an isolated worktree on "+iso.Branch, &iso)
+
+	// Bring the thread back up, now inside its isolated worktree.
+	resumeAgentThread(d, rec)
 }
 
 // summarizePrompt makes a short, single-line title from an opening prompt.

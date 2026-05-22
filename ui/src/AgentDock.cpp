@@ -186,7 +186,8 @@ void AgentDock::attachSession(const QString &project, const QString &threadId,
         }
     }
     ensureProject(project);
-    AgentPanel *panel = addDormantAgent(project, threadId, title);
+    // An attached external session resumes in its own directory, non-isolated.
+    AgentPanel *panel = addDormantAgent(project, threadId, title, /*isolated=*/false);
     if (!m_agents.isEmpty()) {
         m_roster->setCurrentAgent(m_agents.constLast().id); // focus the new agent
     }
@@ -211,7 +212,7 @@ AgentPanel *AgentDock::addAgent(const QString &projectPath)
 // addDormantAgent restores a persisted, not-running thread into the roster
 // without stealing focus from the active agent.
 AgentPanel *AgentDock::addDormantAgent(const QString &project, const QString &threadId,
-                                       const QString &title)
+                                       const QString &title, bool isolated)
 {
     const int id = ++m_counter;
     auto *panel = new AgentPanel(m_core, this);
@@ -222,7 +223,7 @@ AgentPanel *AgentDock::addDormantAgent(const QString &project, const QString &th
     const QString label = title.isEmpty() ? QStringLiteral("Agent %1").arg(id) : title;
     m_roster->addAgent(project, id, label);
     wireAgentPanel(id, panel);
-    panel->setDormant(threadId, label); // emits dormantChanged -> roster marks it
+    panel->setDormant(threadId, label, isolated); // emits dormantChanged
     return panel;
 }
 
@@ -270,8 +271,13 @@ void AgentDock::restoreThreads(const QString &project)
                          if (threadId.isEmpty() || hasThread(threadId)) {
                              continue;
                          }
+                         const bool isolated = rec.value(QStringLiteral("worktree"))
+                                                   .toObject()
+                                                   .value(QStringLiteral("isolated"))
+                                                   .toBool();
                          addDormantAgent(project, threadId,
-                                         rec.value(QStringLiteral("title")).toString());
+                                         rec.value(QStringLiteral("title")).toString(),
+                                         isolated);
                      }
                  });
 }

@@ -43,7 +43,7 @@ private:
     void ensureProject(const QString &path);
     AgentPanel *addAgent(const QString &projectPath);
     AgentPanel *addDormantAgent(const QString &project, const QString &threadId,
-                                const QString &title);
+                                const QString &title, bool isolated);
     void wireAgentPanel(int agentId, AgentPanel *panel);
     void restoreThreads(const QString &project);
     bool hasThread(const QString &threadId) const;

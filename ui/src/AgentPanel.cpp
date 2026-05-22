@@ -1,6 +1,9 @@
 #include "AgentPanel.h"
 #include "ipc/CoreClient.h"
 
+#include <KConfigGroup>
+#include <KSharedConfig>
+
 #include <QAbstractButton>
 #include <QCheckBox>
 #include <QComboBox>
@@ -137,6 +140,23 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     m_questionLayout->setContentsMargins(10, 10, 10, 10);
     m_questionLayout->setSpacing(4);
 
+    // --- promote-to-worktree bar (shown while a thread runs non-isolated) ---
+    m_promoteBar = new QFrame(this);
+    m_promoteBar->setObjectName(QStringLiteral("promoteBar"));
+    m_promoteBar->setStyleSheet(QStringLiteral(
+        "QFrame#promoteBar { border: 1px solid palette(mid); border-radius: 6px; }"));
+    m_promoteBar->setVisible(false);
+    auto *promoteLabel = new QLabel(
+        QStringLiteral("Running directly in the workspace — this agent is not isolated."),
+        m_promoteBar);
+    promoteLabel->setWordWrap(true);
+    m_promoteBtn = new QPushButton(QStringLiteral("Promote to worktree"), m_promoteBar);
+    m_promoteBtn->setCursor(Qt::PointingHandCursor);
+    auto *promoteLayout = new QHBoxLayout(m_promoteBar);
+    promoteLayout->setContentsMargins(10, 6, 10, 6);
+    promoteLayout->addWidget(promoteLabel, 1);
+    promoteLayout->addWidget(m_promoteBtn);
+
     m_input = new QPlainTextEdit(this);
     m_input->setPlaceholderText(
         QStringLiteral("Describe a task for the agent…   (Ctrl+Enter to send)"));
@@ -148,6 +168,34 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     m_modeCombo->addItem(QStringLiteral("Auto"), QStringLiteral("auto"));
     m_modeCombo->addItem(QStringLiteral("Unsafe (bypass)"), QStringLiteral("bypassPermissions"));
     m_modeCombo->setToolTip(QStringLiteral("Permission mode for this agent (fixed once it starts)"));
+
+    m_isolationCombo = new QComboBox(this);
+    m_isolationCombo->addItem(QStringLiteral("Auto isolation"), QStringLiteral("auto"));
+    m_isolationCombo->addItem(QStringLiteral("Isolated worktree"),
+                              QStringLiteral("isolated"));
+    m_isolationCombo->addItem(QStringLiteral("In the workspace"),
+                              QStringLiteral("workspace"));
+    m_isolationCombo->setToolTip(QStringLiteral(
+        "Where this agent runs, fixed once it starts:\n"
+        "• Auto isolation — its own git worktree when the repo has commits,\n"
+        "  otherwise directly in the workspace\n"
+        "• Isolated worktree — always its own worktree on branch agentkate/<id>\n"
+        "• In the workspace — directly in the project, no isolation"));
+    // Sticky: the last choice becomes the default for the next agent.
+    {
+        const QString saved = KSharedConfig::openConfig()
+                                  ->group(QStringLiteral("Agent"))
+                                  .readEntry("isolation", QStringLiteral("auto"));
+        const int savedIdx = m_isolationCombo->findData(saved);
+        if (savedIdx >= 0) {
+            m_isolationCombo->setCurrentIndex(savedIdx);
+        }
+    }
+    connect(m_isolationCombo, &QComboBox::currentIndexChanged, this, [this] {
+        KSharedConfig::openConfig()
+            ->group(QStringLiteral("Agent"))
+            .writeEntry("isolation", m_isolationCombo->currentData().toString());
+    });
 
     // Attachment chip bar — hidden until files are attached.
     m_attachBar = new QWidget(this);
@@ -168,6 +216,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
 
     auto *buttons = new QHBoxLayout;
     buttons->addWidget(m_modeCombo);
+    buttons->addWidget(m_isolationCombo);
     buttons->addWidget(m_attachBtn);
     buttons->addWidget(m_diffBtn);
     buttons->addStretch(1);
@@ -180,6 +229,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     body->addWidget(m_transcript, 1);
     body->addWidget(m_permBar);
     body->addWidget(m_questionBox);
+    body->addWidget(m_promoteBar);
     body->addWidget(m_attachBar);
     body->addWidget(m_input);
     body->addLayout(buttons);
@@ -193,6 +243,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     connect(m_sendBtn, &QPushButton::clicked, this, &AgentPanel::onSendClicked);
     connect(m_stopBtn, &QPushButton::clicked, this, &AgentPanel::onStopClicked);
     connect(m_diffBtn, &QPushButton::clicked, this, &AgentPanel::onChangesClicked);
+    connect(m_promoteBtn, &QPushButton::clicked, this, &AgentPanel::onPromoteClicked);
     connect(m_attachBtn, &QPushButton::clicked, this, &AgentPanel::onAttachClicked);
     connect(m_permAllow, &QPushButton::clicked, this, [this] { answerPermission(true); });
     connect(m_permDeny, &QPushButton::clicked, this, [this] { answerPermission(false); });
@@ -220,10 +271,11 @@ void AgentPanel::setWorkspace(const QString &path)
     refresh();
 }
 
-void AgentPanel::setDormant(const QString &threadId, const QString &title)
+void AgentPanel::setDormant(const QString &threadId, const QString &title, bool isolated)
 {
     m_threadId = threadId;
     m_dormant = true;
+    m_isolated = isolated;
     append(QStringLiteral(
                "<p class='dim'>— dormant agent · %1<br>"
                "Resume to continue. The agent keeps the whole conversation; "
@@ -259,7 +311,12 @@ void AgentPanel::refresh()
                                             : QStringLiteral("Start agent")));
     m_stopBtn->setEnabled(running);
     m_diffBtn->setEnabled(running);
-    m_modeCombo->setEnabled(m_threadId.isEmpty()); // mode is fixed once a thread exists
+    // The permission and isolation modes are fixed once a thread exists.
+    m_modeCombo->setEnabled(m_threadId.isEmpty());
+    m_isolationCombo->setEnabled(m_threadId.isEmpty());
+
+    // Offer promotion while a thread runs non-isolated in the workspace.
+    m_promoteBar->setVisible(!m_threadId.isEmpty() && !m_isolated && !m_promoting);
 
     QString dot;
     QString text;
@@ -341,6 +398,8 @@ void AgentPanel::onSendClicked()
                                  {QStringLiteral("prompt"), text},
                                  {QStringLiteral("permissionMode"),
                                   m_modeCombo->currentData().toString()},
+                                 {QStringLiteral("isolation"),
+                                  m_isolationCombo->currentData().toString()},
                                  {QStringLiteral("attachments"), attachments}},
                      [this](const QJsonObject &result, const QJsonObject &error) {
                          if (!error.isEmpty()) {
@@ -467,6 +526,29 @@ void AgentPanel::onChangesClicked()
                      }
                      emit openDiff(tid + QStringLiteral(" — changes.diff"), diff);
                  });
+}
+
+void AgentPanel::onPromoteClicked()
+{
+    if (m_threadId.isEmpty() || m_isolated || m_promoting) {
+        return;
+    }
+    m_promoting = true;
+    append(QStringLiteral("<p class='sys'>promoting to an isolated worktree — "
+                          "the agent will restart in its own branch…</p>"));
+    m_core->call(QStringLiteral("agent.promote"),
+                 QJsonObject{{QStringLiteral("threadId"), m_threadId}},
+                 [this](const QJsonObject &, const QJsonObject &error) {
+                     if (!error.isEmpty()) {
+                         m_promoting = false;
+                         append(QStringLiteral("<p class='err'>Could not promote: %1</p>")
+                                    .arg(error.value(QStringLiteral("message"))
+                                             .toString()
+                                             .toHtmlEscaped()));
+                         refresh();
+                     }
+                 });
+    refresh();
 }
 
 void AgentPanel::onNotification(const QString &method, const QJsonObject &params)
@@ -756,9 +838,16 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             if (!m_input->toPlainText().trimmed().isEmpty() || !m_attachments.isEmpty()) {
                 onSendClicked();
             }
+        } else if (phase == QLatin1String("promoted")) {
+            m_isolated = true;
+            m_branch = ev.value(QStringLiteral("branch")).toString();
+            m_promoting = false;
+            append(QStringLiteral("<p class='dim'>— %1</p>").arg(detail));
+            refresh();
         } else if (phase == QLatin1String("error")) {
             append(QStringLiteral("<p class='err'>agent failed: %1</p>").arg(detail));
             m_idle = false;
+            m_promoting = false;
             if (!m_dormant) {
                 m_threadId.clear(); // a fresh start failed — back to a blank panel
             }
