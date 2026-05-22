@@ -10,6 +10,7 @@
 
 class CoreClient;
 class ToolCard;
+class WorkingIndicator;
 class QAbstractButton;
 class QComboBox;
 class QEvent;
@@ -98,6 +99,7 @@ private:
     QWidget *m_feed = nullptr;
     QVBoxLayout *m_feedLayout = nullptr;
     QHash<QString, ToolCard *> m_toolCards; // keyed by tool_use id
+    WorkingIndicator *m_working = nullptr;
     QPlainTextEdit *m_input = nullptr;
     QComboBox *m_modeCombo = nullptr;
     QComboBox *m_isolationCombo = nullptr;

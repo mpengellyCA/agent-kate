@@ -19,6 +19,8 @@
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLayout>
+#include <QPaintEvent>
+#include <QPainter>
 #include <QPalette>
 #include <QPlainTextEdit>
 #include <QPushButton>
@@ -102,6 +104,33 @@ QString toolResultText(const QJsonValue &content)
         }
     }
     return parts.join(QLatin1Char('\n'));
+}
+
+// activityFor maps a tool name to a personable status line for the
+// "Kate at work" indicator.
+QString activityFor(const QString &tool)
+{
+    if (tool == QLatin1String("Bash")) {
+        return QStringLiteral("Kate is running commands…");
+    }
+    if (tool == QLatin1String("Edit") || tool == QLatin1String("Write")
+        || tool == QLatin1String("MultiEdit") || tool == QLatin1String("NotebookEdit")) {
+        return QStringLiteral("Kate is writing code…");
+    }
+    if (tool == QLatin1String("Read") || tool == QLatin1String("Grep")
+        || tool == QLatin1String("Glob")) {
+        return QStringLiteral("Kate is combing through the code…");
+    }
+    if (tool == QLatin1String("WebFetch") || tool == QLatin1String("WebSearch")) {
+        return QStringLiteral("Kate is scouring the web…");
+    }
+    if (tool == QLatin1String("Task") || tool == QLatin1String("TodoWrite")) {
+        return QStringLiteral("Kate is mapping out the work…");
+    }
+    if (tool.startsWith(QLatin1String("mcp__"))) {
+        return QStringLiteral("Kate is coordinating with the team…");
+    }
+    return QStringLiteral("Kate is working with %1…").arg(tool);
 }
 
 // clearLayout removes and deletes every item (and widget) in a layout.
@@ -200,6 +229,101 @@ private:
     bool m_done = false;
 };
 
+// WorkingIndicator is the animated "Kate at work" status: a rotating spinner
+// and a personable, activity-aware line, shown while the agent computes.
+class WorkingIndicator : public QWidget
+{
+public:
+    explicit WorkingIndicator(QWidget *parent)
+        : QWidget(parent)
+        , m_generic{
+              QStringLiteral("Kate is thinking it through…"),
+              QStringLiteral("Kate is battling the problem…"),
+              QStringLiteral("Kate is breaking it down…"),
+              QStringLiteral("Kate is connecting the dots…"),
+              QStringLiteral("Kate is wrangling the logic…"),
+              QStringLiteral("Kate is plotting the next move…"),
+              QStringLiteral("Kate is untangling the details…"),
+          }
+    {
+        setFixedHeight(30);
+        setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        m_timer = new QTimer(this);
+        m_timer->setInterval(70);
+        connect(m_timer, &QTimer::timeout, this, [this] {
+            m_angle = (m_angle + 26) % 360;
+            if (++m_ticks % 48 == 0) {
+                ++m_genericIndex;
+            }
+            update();
+        });
+        setVisible(false);
+    }
+
+    void setActive(bool on)
+    {
+        if (on == m_active) {
+            return;
+        }
+        m_active = on;
+        setVisible(on);
+        if (on) {
+            m_timer->start();
+        } else {
+            m_timer->stop();
+        }
+    }
+
+    void setActivity(const QString &message)
+    {
+        if (message == m_activity) {
+            return;
+        }
+        m_activity = message;
+        update();
+    }
+
+protected:
+    void paintEvent(QPaintEvent *) override
+    {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing);
+        const bool dark = palette().color(QPalette::Base).lightness() < 128;
+        const QColor accent =
+            dark ? QColor(0x5f, 0xd3, 0xbf) : QColor(0x1a, 0x7f, 0x6b);
+
+        // Rotating arc spinner.
+        const qreal d = 15;
+        const qreal cx = 9 + d / 2;
+        const qreal cy = height() / 2.0;
+        QPen pen(accent, 2.4);
+        pen.setCapStyle(Qt::RoundCap);
+        p.setPen(pen);
+        p.drawArc(QRectF(cx - d / 2, cy - d / 2, d, d),
+                  -m_angle * 16, -280 * 16);
+
+        // Personable, activity-aware message.
+        const QString msg = m_activity.isEmpty()
+            ? m_generic.at(m_genericIndex % m_generic.size())
+            : m_activity;
+        QColor textCol = palette().color(QPalette::WindowText);
+        textCol.setAlpha(200);
+        p.setPen(textCol);
+        const int textX = int(cx + d / 2 + 12);
+        p.drawText(QRect(textX, 0, width() - textX, height()),
+                   Qt::AlignVCenter | Qt::AlignLeft, msg);
+    }
+
+private:
+    QTimer *m_timer = nullptr;
+    QStringList m_generic;
+    QString m_activity;
+    int m_angle = 0;
+    int m_ticks = 0;
+    int m_genericIndex = 0;
+    bool m_active = false;
+};
+
 AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     : QWidget(parent)
     , m_core(core)
@@ -221,6 +345,8 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     m_feedScroll->setWidgetResizable(true);
     m_feedScroll->setFrameShape(QFrame::NoFrame);
     m_feedScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+
+    m_working = new WorkingIndicator(this);
 
     // --- per-tool approval banner (hidden until a request arrives) ---------
     m_permBar = new QFrame(this);
@@ -366,6 +492,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     body->setContentsMargins(12, 12, 12, 12);
     body->setSpacing(10);
     body->addWidget(m_feedScroll, 1);
+    body->addWidget(m_working);
     body->addWidget(m_permBar);
     body->addWidget(m_questionBox);
     body->addWidget(m_promoteBar);
@@ -502,6 +629,9 @@ void AgentPanel::refresh()
     // Offer promotion while a thread runs non-isolated in the workspace.
     m_promoteBar->setVisible(!m_threadId.isEmpty() && !m_isolated && !m_promoting);
 
+    // "Kate at work" indicator: animate while a turn is actually computing.
+    m_working->setActive(running && !m_idle && m_permQueue.isEmpty());
+
     QString dot;
     QString text;
     if (m_workspace.isEmpty()) {
@@ -617,6 +747,7 @@ void AgentPanel::onSendClicked()
                    isDark(this) ? QStringLiteral("#7cb7ff") : QStringLiteral("#1a5fb4"),
                    youLine);
     m_idle = false;
+    m_working->setActivity(QString()); // a new turn starts in generic mode
 
     // Detach the pending attachments for this message, then clear the bar.
     const QJsonArray attachments = m_attachments;
@@ -1031,6 +1162,7 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
                                    isDark(this) ? QStringLiteral("#5fd3bf")
                                                 : QStringLiteral("#1a7f6b"),
                                    markdownToHtml(t));
+                    m_working->setActivity(QString()); // text → generic reasoning
                 }
             } else if (bt == QLatin1String("tool_use")) {
                 const QString name = b.value(QStringLiteral("name")).toString();
@@ -1057,6 +1189,7 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
                     m_toolCards.insert(id, card);
                 }
                 appendToFeed(card);
+                m_working->setActivity(activityFor(name));
             }
         }
 
