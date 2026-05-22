@@ -125,6 +125,39 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
                          }
                      });
     });
+    connect(m_roster, &AgentRoster::landRequested, this, [this](int id) {
+        Entry *e = entryById(id);
+        if (!e || e->panel->threadId().isEmpty()) {
+            emit statusMessage(QStringLiteral("Start the agent before merging its work"));
+            return;
+        }
+        if (!e->panel->isIsolated()) {
+            emit statusMessage(QStringLiteral(
+                "This agent runs in the workspace — it has no branch to merge"));
+            return;
+        }
+        if (QMessageBox::question(
+                this, QStringLiteral("Merge into local main"),
+                QStringLiteral(
+                    "Merge this agent's branch into your local main branch?\n\n"
+                    "Its commits are merged into the workspace locally — nothing "
+                    "is pushed to GitHub."))
+            != QMessageBox::Yes) {
+            return;
+        }
+        m_core->call(QStringLiteral("agent.land"),
+                     QJsonObject{{QStringLiteral("threadId"), e->panel->threadId()}},
+                     [this](const QJsonObject &result, const QJsonObject &error) {
+                         if (!error.isEmpty()) {
+                             emit statusMessage(QStringLiteral("Merge failed: %1")
+                                 .arg(error.value(QStringLiteral("message")).toString()));
+                         } else {
+                             emit statusMessage(QStringLiteral("Merged %1 into %2")
+                                 .arg(result.value(QStringLiteral("branch")).toString(),
+                                      result.value(QStringLiteral("into")).toString()));
+                         }
+                     });
+    });
     connect(m_roster, &AgentRoster::discardRequested, this, [this](int id) {
         Entry *e = entryById(id);
         if (!e) {

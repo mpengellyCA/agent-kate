@@ -199,6 +199,49 @@ func Commit(wt Worktree, message string) error {
 	return err
 }
 
+// Land merges a thread's worktree branch into the repository's main working
+// tree — a purely local integration, with no remote involved. It returns the
+// name of the branch the work was merged into.
+//
+// The thread must be isolated with at least one commit, and the main working
+// tree must have no uncommitted tracked changes so the merge is safe. On a
+// merge conflict the merge is aborted and the workspace is left untouched.
+func Land(wt Worktree) (string, error) {
+	if !wt.Isolated || wt.Branch == "" {
+		return "", fmt.Errorf("this agent is not running on its own branch")
+	}
+	ahead, err := git(wt.RepoRoot, "rev-list", "--count", wt.Base+".."+wt.Branch)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(ahead) == "0" {
+		return "", fmt.Errorf("this agent has no commits to land — commit its changes first")
+	}
+	// The main working tree must be free of uncommitted tracked changes.
+	status, err := git(wt.RepoRoot, "status", "--porcelain", "--untracked-files=no")
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(status) != "" {
+		return "", fmt.Errorf(
+			"the workspace has uncommitted changes — commit or stash them first")
+	}
+	target, err := git(wt.RepoRoot, "branch", "--show-current")
+	if err != nil {
+		return "", err
+	}
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return "", fmt.Errorf("the workspace is not on a branch")
+	}
+	if out, err := git(wt.RepoRoot, "merge", "--no-edit", wt.Branch); err != nil {
+		_, _ = git(wt.RepoRoot, "merge", "--abort")
+		return "", fmt.Errorf("merge failed (the workspace was left untouched): %s",
+			strings.TrimSpace(out))
+	}
+	return target, nil
+}
+
 // OpenPR pushes the thread's branch and opens a GitHub pull request through the
 // gh CLI, returning the PR URL. It fails descriptively when the thread is not
 // isolated, gh is missing, or there is no 'origin' remote.

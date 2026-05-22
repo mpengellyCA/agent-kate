@@ -428,6 +428,28 @@ func registerHandlers(d handlerDeps) {
 		return map[string]any{"url": url}, nil
 	})
 
+	// agent.land merges a thread's branch into the workspace's main branch — a
+	// local integration, separate from agent.openPR which targets GitHub.
+	d.srv.Handle("agent.land", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID string `json:"threadId"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		rec, ok := d.sessions.Get(p.ThreadID)
+		if !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		}
+		target, err := worktree.Land(rec.Worktree)
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		d.log.Info("agent thread landed", "thread", p.ThreadID,
+			"branch", rec.Worktree.Branch, "into", target)
+		return map[string]any{"branch": rec.Worktree.Branch, "into": target}, nil
+	})
+
 	d.srv.Handle("agent.discard", func(_ context.Context, raw json.RawMessage) (any, error) {
 		var p struct {
 			ThreadID string `json:"threadId"`

@@ -197,6 +197,51 @@ func TestPromoteAlreadyIsolated(t *testing.T) {
 	}
 }
 
+func TestLand(t *testing.T) {
+	repo := initRepo(t)
+	wt, err := Create(repo, "t-land", ModeIsolated)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// The agent commits work inside its own worktree.
+	if err := os.WriteFile(filepath.Join(wt.Path, "feature.txt"),
+		[]byte("agent work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Commit(wt, "add feature"); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	target, err := Land(wt)
+	if err != nil {
+		t.Fatalf("Land: %v", err)
+	}
+	if target == "" {
+		t.Fatal("Land returned no target branch")
+	}
+	// The committed work is now in the main working tree.
+	if b, _ := os.ReadFile(filepath.Join(repo, "feature.txt")); string(b) != "agent work\n" {
+		t.Fatalf("feature.txt was not landed into the main tree: %q", b)
+	}
+}
+
+func TestLandNoCommits(t *testing.T) {
+	repo := initRepo(t)
+	wt, _ := Create(repo, "t-empty", ModeIsolated)
+	if _, err := Land(wt); err == nil {
+		t.Fatal("Land should fail when the agent has no commits")
+	}
+}
+
+func TestLandNonIsolated(t *testing.T) {
+	repo := initRepo(t)
+	wt, _ := Create(repo, "t-ws", ModeWorkspace)
+	if _, err := Land(wt); err == nil {
+		t.Fatal("Land should fail for a non-isolated thread")
+	}
+}
+
 func TestNonGitFallback(t *testing.T) {
 	dir := t.TempDir() // a plain directory, not a git repo
 	wt, err := Create(dir, "t-x", ModeAuto)

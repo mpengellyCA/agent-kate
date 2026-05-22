@@ -75,6 +75,7 @@ AgentRoster::AgentRoster(QWidget *parent)
             }
             QAction *commitAct = menu.addAction(QStringLiteral("Commit changes…"));
             QAction *prAct = menu.addAction(QStringLiteral("Create pull request…"));
+            QAction *landAct = menu.addAction(QStringLiteral("Merge into local main…"));
             QAction *discardAct = menu.addAction(QStringLiteral("Discard worktree"));
             menu.addSeparator();
             QAction *closeAct = menu.addAction(QStringLiteral("Close agent"));
@@ -85,6 +86,8 @@ AgentRoster::AgentRoster(QWidget *parent)
                 emit commitRequested(id);
             } else if (chosen == prAct) {
                 emit prRequested(id);
+            } else if (chosen == landAct) {
+                emit landRequested(id);
             } else if (chosen == discardAct) {
                 emit discardRequested(id);
             } else if (chosen == closeAct) {

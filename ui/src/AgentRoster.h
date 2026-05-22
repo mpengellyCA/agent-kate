@@ -33,6 +33,7 @@ Q_SIGNALS:
     void resumeRequested(int agentId);
     void commitRequested(int agentId);
     void prRequested(int agentId);
+    void landRequested(int agentId);
     void discardRequested(int agentId);
     void closeRequested(int agentId);
 
