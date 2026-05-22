@@ -187,7 +187,8 @@ public:
         m_result->setWordWrap(true);
         m_result->setTextInteractionFlags(Qt::TextSelectableByMouse);
         m_result->setStyleSheet(QStringLiteral(
-            "font-family: monospace; font-size: small; color: palette(mid);"));
+            "font-family: monospace; font-size: small;"));
+        m_result->setForegroundRole(QPalette::WindowText);
         m_result->setVisible(false);
         dv->addWidget(m_result);
         m_detail->setVisible(false);

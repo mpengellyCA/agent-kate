@@ -29,7 +29,6 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QKeySequence>
-#include <QLabel>
 #include <QMenu>
 #include <QMenuBar>
 #include <QStatusBar>
@@ -105,11 +104,11 @@ void MainWindow::setupUi()
     // Bottom: the Problems panel, fed by the LSP manager.
     m_lsp = new LspManager(this);
     auto *problems = new ProblemsPanel(m_lsp, this);
-    auto *problemsDock = new QDockWidget(i18n("Problems"), this);
-    problemsDock->setObjectName(QStringLiteral("problemsDock"));
-    problemsDock->setWindowIcon(QIcon::fromTheme(QStringLiteral("dialog-warning")));
-    problemsDock->setWidget(problems);
-    addDockWidget(Qt::BottomDockWidgetArea, problemsDock);
+    m_problemsDock = new QDockWidget(i18n("Problems"), this);
+    m_problemsDock->setObjectName(QStringLiteral("problemsDock"));
+    m_problemsDock->setWindowIcon(QIcon::fromTheme(QStringLiteral("dialog-warning")));
+    m_problemsDock->setWidget(problems);
+    addDockWidget(Qt::BottomDockWidgetArea, m_problemsDock);
     connect(problems, &ProblemsPanel::activated, this,
             [this](const QString &path, int line) {
                 m_editor->openFile(groupKey(), path, line);
@@ -117,22 +116,22 @@ void MainWindow::setupUi()
 
     // References panel — tabbed beside Problems in the bottom row.
     auto *references = new ReferencesPanel(this);
-    auto *referencesDock = new QDockWidget(i18n("References"), this);
-    referencesDock->setObjectName(QStringLiteral("referencesDock"));
-    referencesDock->setWindowIcon(QIcon::fromTheme(QStringLiteral("dialog-information")));
-    referencesDock->setWidget(references);
-    addDockWidget(Qt::BottomDockWidgetArea, referencesDock);
-    tabifyDockWidget(problemsDock, referencesDock);
+    m_referencesDock = new QDockWidget(i18n("References"), this);
+    m_referencesDock->setObjectName(QStringLiteral("referencesDock"));
+    m_referencesDock->setWindowIcon(QIcon::fromTheme(QStringLiteral("dialog-information")));
+    m_referencesDock->setWidget(references);
+    addDockWidget(Qt::BottomDockWidgetArea, m_referencesDock);
+    tabifyDockWidget(m_problemsDock, m_referencesDock);
 
     // Terminal — embedded Konsole sessions, in the same bottom row.
     m_terminal = new TerminalPanel(this);
-    auto *terminalDock = new QDockWidget(i18n("Terminal"), this);
-    terminalDock->setObjectName(QStringLiteral("terminalDock"));
-    terminalDock->setWindowIcon(QIcon::fromTheme(QStringLiteral("utilities-terminal")));
-    terminalDock->setWidget(m_terminal);
-    addDockWidget(Qt::BottomDockWidgetArea, terminalDock);
-    tabifyDockWidget(problemsDock, terminalDock);
-    problemsDock->raise();
+    m_terminalDock = new QDockWidget(i18n("Terminal"), this);
+    m_terminalDock->setObjectName(QStringLiteral("terminalDock"));
+    m_terminalDock->setWindowIcon(QIcon::fromTheme(QStringLiteral("utilities-terminal")));
+    m_terminalDock->setWidget(m_terminal);
+    addDockWidget(Qt::BottomDockWidgetArea, m_terminalDock);
+    tabifyDockWidget(m_problemsDock, m_terminalDock);
+    m_problemsDock->raise();
 
     // Kate-style tool tabs: along the bottom edge, spanning the full width.
     setTabPosition(Qt::BottomDockWidgetArea, QTabWidget::South);
@@ -154,7 +153,12 @@ void MainWindow::setupUi()
             });
     connect(m_lsp, &LspManager::referencesResolved, references, &ReferencesPanel::setLocations);
     connect(m_lsp, &LspManager::referencesResolved, this,
-            [referencesDock](const QList<Location> &) { referencesDock->raise(); });
+            [this](const QList<Location> &) {
+                if (m_toggleBottomAct && !m_toggleBottomAct->isChecked()) {
+                    m_toggleBottomAct->setChecked(true);
+                }
+                m_referencesDock->raise();
+            });
     connect(references, &ReferencesPanel::activated, this,
             [this](const QString &path, int line) {
                 m_editor->openFile(groupKey(), path, line);
@@ -172,13 +176,11 @@ void MainWindow::setupUi()
 
     resizeDocks({rosterDock, treeDock}, {270, 480}, Qt::Horizontal);
     resizeDocks({treeDock, editorDock}, {240, 620}, Qt::Vertical);
-    resizeDocks({problemsDock}, {230}, Qt::Vertical);
+    resizeDocks({m_problemsDock}, {230}, Qt::Vertical);
 
     connect(m_agent, &AgentDock::agentActivated, this, &MainWindow::onAgentActivated);
     connect(m_agent, &AgentDock::projectFocused, this,
             [this](const QString &path) { m_tree->setRoot(path); });
-    connect(m_agent, &AgentDock::statusMessage, this,
-            [this](const QString &t) { statusBar()->showMessage(t, 4000); });
     connect(m_agent, &AgentDock::openDiff, this,
             [this](const QString &title, const QString &diff) {
                 m_editor->openDiff(groupKey(), title, diff);
@@ -187,8 +189,6 @@ void MainWindow::setupUi()
     connect(m_tree, &ProjectTree::fileActivated, this,
             [this](const QString &path) { m_editor->openFile(groupKey(), path); });
     connect(m_editor, &EditorArea::openFilesChanged, this, &MainWindow::pushOpenFilesToCore);
-    connect(m_editor, &EditorArea::statusMessage, this,
-            [this](const QString &t) { statusBar()->showMessage(t, 4000); });
     connect(m_editor, &EditorArea::currentFileChanged, this, [this](const QString &path) {
         if (m_core->isConnected()) {
             m_core->call(QStringLiteral("coop.setPresence"),
@@ -270,6 +270,29 @@ void MainWindow::setupActions()
         m_agent->applyChatSettings();
     });
 
+    QMenu *viewMenu = menuBar()->addMenu(i18n("&View"));
+    const KConfigGroup viewCfg =
+        KSharedConfig::openConfig()->group(QStringLiteral("View"));
+    const bool bottomVisible = viewCfg.readEntry("bottomPanelVisible", true);
+    m_toggleBottomAct = viewMenu->addAction(i18n("Show &Bottom Panel"));
+    m_toggleBottomAct->setCheckable(true);
+    m_toggleBottomAct->setChecked(bottomVisible);
+    m_toggleBottomAct->setShortcut(Qt::CTRL | Qt::Key_J);
+    m_toggleBottomAct->setToolTip(
+        i18n("Collapse the Terminal / References / Problems row to reclaim vertical space."));
+    auto applyBottomVisible = [this](bool show) {
+        m_problemsDock->setVisible(show);
+        m_referencesDock->setVisible(show);
+        m_terminalDock->setVisible(show);
+    };
+    applyBottomVisible(bottomVisible);
+    connect(m_toggleBottomAct, &QAction::toggled, this, [applyBottomVisible](bool show) {
+        applyBottomVisible(show);
+        KSharedConfig::openConfig()
+            ->group(QStringLiteral("View"))
+            .writeEntry("bottomPanelVisible", show);
+    });
+
     QMenu *codeMenu = menuBar()->addMenu(i18n("&Code"));
     QAction *defAct = codeMenu->addAction(i18n("Go to &Definition"));
     defAct->setShortcut(Qt::Key_F12);
@@ -304,28 +327,19 @@ void MainWindow::setupActions()
 
 void MainWindow::setupCore()
 {
-    m_coreStatus = new QLabel(i18n("Core: starting…"), this);
-    statusBar()->addPermanentWidget(m_coreStatus);
+    statusBar()->hide();
 
     connect(m_core, &CoreClient::coreLog, this,
             [](const QString &line) { qInfo().noquote() << "[akcore]" << line; });
-    connect(m_core, &CoreClient::failed, this, [this](const QString &msg) {
-        m_coreStatus->setText(i18n("Core: failed"));
+    connect(m_core, &CoreClient::failed, this, [](const QString &msg) {
         qWarning().noquote() << "[core]" << msg;
     });
-    connect(m_core, &CoreClient::disconnected, this,
-            [this] { m_coreStatus->setText(i18n("Core: disconnected")); });
     connect(m_core, &CoreClient::connected, this, [this] {
         m_core->call(QStringLiteral("handshake"), {},
-                     [this](const QJsonObject &result, const QJsonObject &error) {
+                     [this](const QJsonObject &, const QJsonObject &error) {
                          if (!error.isEmpty()) {
-                             m_coreStatus->setText(i18n("Core: handshake error"));
                              return;
                          }
-                         m_coreStatus->setText(
-                             i18n("Core: %1 %2",
-                                  result.value(QStringLiteral("name")).toString(),
-                                  result.value(QStringLiteral("version")).toString()));
                          pushOpenFilesToCore();
                          reloadExtensionServers();
                      });

@@ -9,7 +9,8 @@ class ProjectTree;
 class AgentDock;
 class LspManager;
 class TerminalPanel;
-class QLabel;
+class QAction;
+class QDockWidget;
 
 // MainWindow is the AgentKate arena shell — a project-aware, agent-centric KDE
 // main window. The agent roster (left) holds projects and their agents; the
@@ -38,7 +39,10 @@ private:
     AgentDock *m_agent = nullptr;
     LspManager *m_lsp = nullptr;
     TerminalPanel *m_terminal = nullptr;
-    QLabel *m_coreStatus = nullptr;
+    QDockWidget *m_problemsDock = nullptr;
+    QDockWidget *m_referencesDock = nullptr;
+    QDockWidget *m_terminalDock = nullptr;
+    QAction *m_toggleBottomAct = nullptr;
 
     QString m_activeProject;
     int m_activeAgentId = -1;
