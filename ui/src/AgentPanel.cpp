@@ -8,54 +8,49 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDir>
+#include <QEvent>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFrame>
-#include <QHash>
 #include <QHBoxLayout>
 #include <QJsonArray>
 #include <QJsonDocument>
-#include <QKeySequence>
+#include <QKeyEvent>
 #include <QLabel>
 #include <QLayout>
 #include <QPalette>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QRadioButton>
+#include <QScrollArea>
 #include <QScrollBar>
-#include <QShortcut>
 #include <QTextDocument>
-#include <QTextEdit>
+#include <QTimer>
+#include <QToolButton>
 #include <QVBoxLayout>
 
 namespace {
-// Transcript styling, derived from the active palette so accent colours stay
-// legible on whatever KDE colour scheme is in use. Body (.asst) text carries
-// no colour override and inherits the widget's palette text colour.
-QString transcriptCss(const QPalette &pal)
+bool isDark(const QWidget *w)
 {
-    const bool dark = pal.color(QPalette::Base).lightness() < 128;
-    const QString you   = dark ? QStringLiteral("#7cb7ff") : QStringLiteral("#1a5fb4");
-    const QString tool  = dark ? QStringLiteral("#79b8ff") : QStringLiteral("#1c71d8");
-    const QString muted = dark ? QStringLiteral("#b4b2bc") : QStringLiteral("#5e5c64");
-    const QString ok    = dark ? QStringLiteral("#5fd38a") : QStringLiteral("#1a7f37");
-    const QString err   = dark ? QStringLiteral("#ff8a80") : QStringLiteral("#c01c28");
-    const QString dim   = dark ? QStringLiteral("#8c8c94") : QStringLiteral("#8a8a8a");
-    return QStringLiteral("p { margin: 6px 2px; }"
-                          ".you  { color: %1; }"
-                          ".tool { color: %2; font-family: monospace; }"
-                          ".res  { color: %3; font-family: monospace; font-size: small; }"
-                          ".sys  { color: %3; }"
-                          ".ok   { color: %4; font-weight: bold; }"
-                          ".err  { color: %5; font-weight: bold; }"
-                          ".dim  { color: %6; font-size: small; }")
-        .arg(you, tool, muted, ok, err, dim);
+    return w->palette().color(QPalette::Base).lightness() < 128;
 }
 
-// markdownToHtml renders an assistant message (Markdown) to an HTML fragment
-// that inserts cleanly into the transcript. Default-coloured text carries no
-// explicit colour, so it inherits the transcript's palette text colour.
+// noteColor picks a palette-aware colour for a quiet status line.
+QString noteColor(const QString &kind, bool dark)
+{
+    if (kind == QLatin1String("ok")) {
+        return dark ? QStringLiteral("#5fd38a") : QStringLiteral("#1a7f37");
+    }
+    if (kind == QLatin1String("err")) {
+        return dark ? QStringLiteral("#ff8a80") : QStringLiteral("#c01c28");
+    }
+    return dark ? QStringLiteral("#9a9aa3") : QStringLiteral("#6b6b72"); // sys / dim
+}
+
+// markdownToHtml renders an assistant message (Markdown) to an HTML fragment.
+// Default-coloured text carries no explicit colour, so it inherits the card's
+// palette text colour.
 QString markdownToHtml(const QString &md)
 {
     QTextDocument doc;
@@ -70,7 +65,7 @@ QString markdownToHtml(const QString &md)
     return html;
 }
 
-// permSummary renders a gated tool request as a short, human-readable line.
+// permSummary renders a tool's input as a short, human-readable line.
 QString permSummary(const QString &toolName, const QJsonObject &input)
 {
     if (toolName == QLatin1String("Bash")) {
@@ -82,7 +77,31 @@ QString permSummary(const QString &toolName, const QJsonObject &input)
     if (toolName == QLatin1String("WebSearch")) {
         return input.value(QStringLiteral("query")).toString();
     }
+    for (const QString &key : {QStringLiteral("file_path"), QStringLiteral("path"),
+                               QStringLiteral("pattern"), QStringLiteral("description")}) {
+        const QString v = input.value(key).toString();
+        if (!v.isEmpty()) {
+            return v;
+        }
+    }
     return QString::fromUtf8(QJsonDocument(input).toJson(QJsonDocument::Compact));
+}
+
+// toolResultText pulls plain text out of a tool_result content value, which may
+// be a bare string or an array of content blocks.
+QString toolResultText(const QJsonValue &content)
+{
+    if (content.isString()) {
+        return content.toString();
+    }
+    QStringList parts;
+    for (const QJsonValue &v : content.toArray()) {
+        const QJsonObject o = v.toObject();
+        if (o.value(QStringLiteral("type")).toString() == QLatin1String("text")) {
+            parts << o.value(QStringLiteral("text")).toString();
+        }
+    }
+    return parts.join(QLatin1Char('\n'));
 }
 
 // clearLayout removes and deletes every item (and widget) in a layout.
@@ -97,6 +116,90 @@ void clearLayout(QLayout *layout)
 }
 } // namespace
 
+// ToolCard is a collapsible card for one tool call: its header is the minimal
+// summary, and clicking it reveals the full input and result.
+class ToolCard : public QFrame
+{
+public:
+    ToolCard(const QString &tool, const QString &summary, const QString &detail,
+             QWidget *parent)
+        : QFrame(parent)
+        , m_tool(tool)
+        , m_summary(summary)
+    {
+        setObjectName(QStringLiteral("toolCard"));
+        setStyleSheet(QStringLiteral(
+            "QFrame#toolCard { border: 1px solid palette(mid); border-radius: 7px; }"
+            "QToolButton { border: none; text-align: left; padding: 5px 8px; }"));
+
+        auto *outer = new QVBoxLayout(this);
+        outer->setContentsMargins(2, 2, 2, 2);
+        outer->setSpacing(0);
+
+        m_header = new QToolButton(this);
+        m_header->setCheckable(true);
+        m_header->setCursor(Qt::PointingHandCursor);
+        m_header->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        updateHeader();
+        outer->addWidget(m_header);
+
+        m_detail = new QWidget(this);
+        auto *dv = new QVBoxLayout(m_detail);
+        dv->setContentsMargins(10, 2, 10, 8);
+        dv->setSpacing(6);
+        if (!detail.trimmed().isEmpty()) {
+            auto *in = new QLabel(detail.trimmed(), m_detail);
+            in->setWordWrap(true);
+            in->setTextInteractionFlags(Qt::TextSelectableByMouse);
+            in->setStyleSheet(QStringLiteral("font-family: monospace; font-size: small;"));
+            dv->addWidget(in);
+        }
+        m_result = new QLabel(m_detail);
+        m_result->setWordWrap(true);
+        m_result->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        m_result->setStyleSheet(QStringLiteral(
+            "font-family: monospace; font-size: small; color: palette(mid);"));
+        m_result->setVisible(false);
+        dv->addWidget(m_result);
+        m_detail->setVisible(false);
+        outer->addWidget(m_detail);
+
+        connect(m_header, &QToolButton::toggled, m_header, [this](bool on) {
+            m_detail->setVisible(on);
+            updateHeader();
+        });
+    }
+
+    void setResult(const QString &text)
+    {
+        QString t = text.trimmed();
+        if (t.size() > 4000) {
+            t = t.left(4000) + QStringLiteral("\n… (truncated)");
+        }
+        m_result->setText(t.isEmpty() ? QStringLiteral("(no output)") : t);
+        m_result->setVisible(true);
+        m_done = true;
+        updateHeader();
+    }
+
+private:
+    void updateHeader()
+    {
+        const QString arrow =
+            m_header->isChecked() ? QStringLiteral("▾") : QStringLiteral("▸");
+        const QString mark = m_done ? QStringLiteral("✓") : QStringLiteral("⋯");
+        m_header->setText(QStringLiteral("%1  %2  🔧 %3   %4")
+                              .arg(arrow, mark, m_tool, m_summary));
+    }
+
+    QToolButton *m_header = nullptr;
+    QWidget *m_detail = nullptr;
+    QLabel *m_result = nullptr;
+    QString m_tool;
+    QString m_summary;
+    bool m_done = false;
+};
+
 AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     : QWidget(parent)
     , m_core(core)
@@ -106,10 +209,18 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     m_header->setStyleSheet(
         QStringLiteral("padding: 9px 12px; border-bottom: 1px solid palette(mid);"));
 
-    m_transcript = new QTextEdit(this);
-    m_transcript->setReadOnly(true);
-    m_transcript->setFrameShape(QFrame::NoFrame);
-    m_transcript->document()->setDefaultStyleSheet(transcriptCss(palette()));
+    // --- conversation feed: a scrollable column of cards ------------------
+    m_feed = new QWidget;
+    m_feedLayout = new QVBoxLayout(m_feed);
+    m_feedLayout->setContentsMargins(4, 4, 4, 4);
+    m_feedLayout->setSpacing(8);
+    m_feedLayout->addStretch(1); // trailing stretch keeps cards top-aligned
+
+    m_feedScroll = new QScrollArea(this);
+    m_feedScroll->setWidget(m_feed);
+    m_feedScroll->setWidgetResizable(true);
+    m_feedScroll->setFrameShape(QFrame::NoFrame);
+    m_feedScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
 
     // --- per-tool approval banner (hidden until a request arrives) ---------
     m_permBar = new QFrame(this);
@@ -158,9 +269,8 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     promoteLayout->addWidget(m_promoteBtn);
 
     m_input = new QPlainTextEdit(this);
-    m_input->setPlaceholderText(
-        QStringLiteral("Describe a task for the agent…   (Ctrl+Enter to send)"));
     m_input->setFixedHeight(94);
+    m_input->installEventFilter(this); // for the configurable send key
 
     m_modeCombo = new QComboBox(this);
     m_modeCombo->addItem(QStringLiteral("Accept edits"), QStringLiteral("acceptEdits"));
@@ -226,7 +336,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     auto *body = new QVBoxLayout;
     body->setContentsMargins(12, 12, 12, 12);
     body->setSpacing(10);
-    body->addWidget(m_transcript, 1);
+    body->addWidget(m_feedScroll, 1);
     body->addWidget(m_permBar);
     body->addWidget(m_questionBox);
     body->addWidget(m_promoteBar);
@@ -249,9 +359,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     connect(m_permDeny, &QPushButton::clicked, this, [this] { answerPermission(false); });
     connect(m_core, &CoreClient::notification, this, &AgentPanel::onNotification);
 
-    auto *sendShortcut = new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_Return), m_input);
-    connect(sendShortcut, &QShortcut::activated, this, &AgentPanel::onSendClicked);
-
+    applyChatSettings();
     refresh();
 }
 
@@ -271,16 +379,61 @@ void AgentPanel::setWorkspace(const QString &path)
     refresh();
 }
 
+void AgentPanel::applyChatSettings()
+{
+    const KConfigGroup cfg = KSharedConfig::openConfig()->group(QStringLiteral("Agent"));
+    const bool enterSends = cfg.readEntry("enterSends", false);
+    m_input->setPlaceholderText(
+        enterSends
+            ? QStringLiteral("Describe a task for the agent…   "
+                             "(Enter to send · Shift+Enter for a new line)")
+            : QStringLiteral("Describe a task for the agent…   (Ctrl+Enter to send)"));
+
+    const bool showTools = cfg.readEntry("showTools", true);
+    for (ToolCard *card : std::as_const(m_toolCards)) {
+        card->setVisible(showTools);
+    }
+}
+
+bool AgentPanel::eventFilter(QObject *obj, QEvent *event)
+{
+    if (obj == m_input && event->type() == QEvent::KeyPress) {
+        auto *key = static_cast<QKeyEvent *>(event);
+        if (key->key() == Qt::Key_Return || key->key() == Qt::Key_Enter) {
+            const bool ctrl = key->modifiers().testFlag(Qt::ControlModifier);
+            const bool shift = key->modifiers().testFlag(Qt::ShiftModifier);
+            const bool enterSends = KSharedConfig::openConfig()
+                                        ->group(QStringLiteral("Agent"))
+                                        .readEntry("enterSends", false);
+            if (enterSends) {
+                // Enter sends; Ctrl/Shift+Enter inserts a newline.
+                if (ctrl || shift) {
+                    m_input->insertPlainText(QStringLiteral("\n"));
+                } else {
+                    onSendClicked();
+                }
+                return true;
+            }
+            // Ctrl+Enter sends; plain Enter falls through to a newline.
+            if (ctrl) {
+                onSendClicked();
+                return true;
+            }
+        }
+    }
+    return QWidget::eventFilter(obj, event);
+}
+
 void AgentPanel::setDormant(const QString &threadId, const QString &title, bool isolated)
 {
     m_threadId = threadId;
     m_dormant = true;
     m_isolated = isolated;
-    append(QStringLiteral(
-               "<p class='dim'>— dormant agent · %1<br>"
-               "Resume to continue. The agent keeps the whole conversation; "
-               "earlier messages just are not shown here.</p>")
-               .arg(title.toHtmlEscaped()));
+    addNote(QStringLiteral("dormant agent · %1 — Resume to continue. The agent keeps "
+                           "the whole conversation; earlier messages just are not "
+                           "shown here.")
+                .arg(title.toHtmlEscaped()),
+            QStringLiteral("sys"));
     emit dormantChanged(true);
     refresh();
 }
@@ -290,15 +443,16 @@ void AgentPanel::resume()
     if (!m_dormant || m_threadId.isEmpty()) {
         return;
     }
-    append(QStringLiteral("<p class='sys'>resuming the Claude Code session…</p>"));
+    addNote(QStringLiteral("resuming the Claude Code session…"), QStringLiteral("sys"));
     m_core->call(QStringLiteral("agent.resume"),
                  QJsonObject{{QStringLiteral("threadId"), m_threadId}},
                  [this](const QJsonObject &, const QJsonObject &error) {
                      if (!error.isEmpty()) {
-                         append(QStringLiteral("<p class='err'>Could not resume: %1</p>")
-                                    .arg(error.value(QStringLiteral("message"))
-                                             .toString()
-                                             .toHtmlEscaped()));
+                         addNote(QStringLiteral("Could not resume: %1")
+                                     .arg(error.value(QStringLiteral("message"))
+                                              .toString()
+                                              .toHtmlEscaped()),
+                                 QStringLiteral("err"));
                      }
                  });
 }
@@ -349,6 +503,59 @@ void AgentPanel::refresh()
     emit stateChanged(dot);
 }
 
+// --- conversation feed ------------------------------------------------------
+
+void AgentPanel::appendToFeed(QWidget *entry)
+{
+    QScrollBar *bar = m_feedScroll->verticalScrollBar();
+    const bool atBottom = bar->value() >= bar->maximum() - 48;
+    // Insert before the trailing stretch.
+    m_feedLayout->insertWidget(m_feedLayout->count() - 1, entry);
+    if (atBottom) {
+        QTimer::singleShot(0, this, [this] {
+            QScrollBar *b = m_feedScroll->verticalScrollBar();
+            b->setValue(b->maximum());
+        });
+    }
+}
+
+void AgentPanel::addMessageCard(const QString &role, const QString &accentHex,
+                                const QString &bodyHtml)
+{
+    auto *card = new QFrame(m_feed);
+    card->setObjectName(QStringLiteral("msgCard"));
+    card->setStyleSheet(QStringLiteral(
+        "QFrame#msgCard { background: palette(alternate-base); border-radius: 8px; }"));
+    auto *v = new QVBoxLayout(card);
+    v->setContentsMargins(12, 9, 12, 11);
+    v->setSpacing(3);
+
+    auto *roleLabel = new QLabel(role, card);
+    roleLabel->setStyleSheet(
+        QStringLiteral("color: %1; font-weight: bold;").arg(accentHex));
+    v->addWidget(roleLabel);
+
+    auto *bodyLabel = new QLabel(bodyHtml, card);
+    bodyLabel->setTextFormat(Qt::RichText);
+    bodyLabel->setWordWrap(true);
+    bodyLabel->setTextInteractionFlags(Qt::TextSelectableByMouse
+                                       | Qt::LinksAccessibleByMouse);
+    bodyLabel->setOpenExternalLinks(true);
+    v->addWidget(bodyLabel);
+
+    appendToFeed(card);
+}
+
+void AgentPanel::addNote(const QString &html, const QString &kind)
+{
+    auto *note = new QLabel(html, m_feed);
+    note->setTextFormat(Qt::RichText);
+    note->setWordWrap(true);
+    note->setStyleSheet(QStringLiteral("color: %1; font-size: small; padding: 1px 8px;")
+                            .arg(noteColor(kind, isDark(this))));
+    appendToFeed(note);
+}
+
 void AgentPanel::onSendClicked()
 {
     // A dormant agent must be resumed first; any typed message is sent once the
@@ -372,10 +579,13 @@ void AgentPanel::onSendClicked()
         if (!youLine.isEmpty()) {
             youLine += QStringLiteral("<br>");
         }
-        youLine += QStringLiteral("<span class='dim'>&#128206; %1 attachment(s)</span>")
+        youLine += QStringLiteral("<span style='color:palette(mid)'>&#128206; %1 "
+                                  "attachment(s)</span>")
                        .arg(m_attachments.size());
     }
-    append(QStringLiteral("<p class='you'><b>You</b> &nbsp; %1</p>").arg(youLine));
+    addMessageCard(QStringLiteral("You"),
+                   isDark(this) ? QStringLiteral("#7cb7ff") : QStringLiteral("#1a5fb4"),
+                   youLine);
     m_idle = false;
 
     // Detach the pending attachments for this message, then clear the bar.
@@ -403,10 +613,11 @@ void AgentPanel::onSendClicked()
                                  {QStringLiteral("attachments"), attachments}},
                      [this](const QJsonObject &result, const QJsonObject &error) {
                          if (!error.isEmpty()) {
-                             append(QStringLiteral("<p class='err'>Failed to start agent: %1</p>")
-                                        .arg(error.value(QStringLiteral("message"))
-                                                 .toString()
-                                                 .toHtmlEscaped()));
+                             addNote(QStringLiteral("Failed to start agent: %1")
+                                         .arg(error.value(QStringLiteral("message"))
+                                                  .toString()
+                                                  .toHtmlEscaped()),
+                                     QStringLiteral("err"));
                              return;
                          }
                          m_threadId = result.value(QStringLiteral("threadId")).toString();
@@ -534,17 +745,19 @@ void AgentPanel::onPromoteClicked()
         return;
     }
     m_promoting = true;
-    append(QStringLiteral("<p class='sys'>promoting to an isolated worktree — "
-                          "the agent will restart in its own branch…</p>"));
+    addNote(QStringLiteral("promoting to an isolated worktree — the agent will "
+                           "restart in its own branch…"),
+            QStringLiteral("sys"));
     m_core->call(QStringLiteral("agent.promote"),
                  QJsonObject{{QStringLiteral("threadId"), m_threadId}},
                  [this](const QJsonObject &, const QJsonObject &error) {
                      if (!error.isEmpty()) {
                          m_promoting = false;
-                         append(QStringLiteral("<p class='err'>Could not promote: %1</p>")
-                                    .arg(error.value(QStringLiteral("message"))
-                                             .toString()
-                                             .toHtmlEscaped()));
+                         addNote(QStringLiteral("Could not promote: %1")
+                                     .arg(error.value(QStringLiteral("message"))
+                                              .toString()
+                                              .toHtmlEscaped()),
+                                 QStringLiteral("err"));
                          refresh();
                      }
                  });
@@ -563,8 +776,9 @@ void AgentPanel::onNotification(const QString &method, const QJsonObject &params
     } else if (method == QLatin1String("agent.reviewRequested")) {
         if (!m_threadId.isEmpty()
             && params.value(QStringLiteral("threadId")).toString() == m_threadId) {
-            append(QStringLiteral("<p class='ok'>&#128203; Review requested: %1</p>")
-                       .arg(params.value(QStringLiteral("summary")).toString().toHtmlEscaped()));
+            addNote(QStringLiteral("&#128203; Review requested: %1")
+                        .arg(params.value(QStringLiteral("summary")).toString().toHtmlEscaped()),
+                    QStringLiteral("ok"));
             emit statusMessage(QStringLiteral("Agent %1 requested a review").arg(m_threadId));
         }
     }
@@ -579,10 +793,11 @@ void AgentPanel::onPermissionRequested(const QJsonObject &params)
     m_permQueue.append(params);
     const QString tool = params.value(QStringLiteral("toolName")).toString();
     if (tool == QLatin1String("AskUserQuestion")) {
-        append(QStringLiteral("<p class='sys'>&#10067; the agent is asking a question</p>"));
+        addNote(QStringLiteral("&#10067; the agent is asking a question"),
+                QStringLiteral("sys"));
     } else {
-        append(QStringLiteral("<p class='sys'>&#128274; permission requested: %1</p>")
-                   .arg(tool.toHtmlEscaped()));
+        addNote(QStringLiteral("&#128274; permission requested: %1").arg(tool.toHtmlEscaped()),
+                QStringLiteral("sys"));
     }
     showNextPermission();
     refresh();
@@ -622,10 +837,10 @@ void AgentPanel::answerPermission(bool allow)
     m_core->call(QStringLiteral("permission.respond"),
                  QJsonObject{{QStringLiteral("requestId"), req.value(QStringLiteral("requestId"))},
                              {QStringLiteral("allow"), allow}});
-    append(QStringLiteral("<p class='%1'>&#128274; %2 — %3</p>")
-               .arg(allow ? QStringLiteral("ok") : QStringLiteral("err"),
-                    req.value(QStringLiteral("toolName")).toString().toHtmlEscaped(),
-                    allow ? QStringLiteral("approved") : QStringLiteral("denied")));
+    addNote(QStringLiteral("&#128274; %1 — %2")
+                .arg(req.value(QStringLiteral("toolName")).toString().toHtmlEscaped(),
+                     allow ? QStringLiteral("approved") : QStringLiteral("denied")),
+            allow ? QStringLiteral("ok") : QStringLiteral("err"));
     m_permBar->setVisible(false);
     showNextPermission();
     refresh();
@@ -739,7 +954,7 @@ void AgentPanel::onQuestionSubmit()
                     {QStringLiteral("allow"), true},
                     {QStringLiteral("updatedInput"), updatedInput}});
 
-    append(QStringLiteral("<p class='ok'>&#10067; answered the agent's question</p>"));
+    addNote(QStringLiteral("&#10067; answered the agent's question"), QStringLiteral("ok"));
 
     if (!m_permQueue.isEmpty()) {
         m_permQueue.removeFirst();
@@ -754,7 +969,7 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
     const QString type = ev.value(QStringLiteral("type")).toString();
 
     if (type == QLatin1String("system")) {
-        // Only the init system event is worth showing in the transcript.
+        // Only the init system event is worth showing in the feed.
         if (ev.value(QStringLiteral("subtype")).toString() != QLatin1String("init")) {
             return;
         }
@@ -769,7 +984,7 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
         if (!mcp.isEmpty()) {
             line += QStringLiteral(", MCP: ") + mcp.join(QStringLiteral(", ")).toHtmlEscaped();
         }
-        append(QStringLiteral("<p class='sys'>%1</p>").arg(line));
+        addNote(line, QStringLiteral("sys"));
 
     } else if (type == QLatin1String("assistant")) {
         const QJsonArray content =
@@ -780,7 +995,10 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             if (bt == QLatin1String("text")) {
                 const QString t = b.value(QStringLiteral("text")).toString().trimmed();
                 if (!t.isEmpty()) {
-                    append(markdownToHtml(t));
+                    addMessageCard(QStringLiteral("Kate"),
+                                   isDark(this) ? QStringLiteral("#5fd3bf")
+                                                : QStringLiteral("#1a7f6b"),
+                                   markdownToHtml(t));
                 }
             } else if (bt == QLatin1String("tool_use")) {
                 const QString name = b.value(QStringLiteral("name")).toString();
@@ -790,8 +1008,23 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
                     || name == QLatin1String("AskUserQuestion")) {
                     continue;
                 }
-                append(QStringLiteral("<p class='tool'>&#128295; %1</p>")
-                           .arg(name.toHtmlEscaped()));
+                const QJsonObject input = b.value(QStringLiteral("input")).toObject();
+                QString summary = permSummary(name, input).simplified();
+                if (summary.length() > 96) {
+                    summary = summary.left(95) + QChar(0x2026);
+                }
+                const QString detail = QString::fromUtf8(
+                    QJsonDocument(input).toJson(QJsonDocument::Indented));
+                auto *card = new ToolCard(name, summary, detail, m_feed);
+                const bool show = KSharedConfig::openConfig()
+                                      ->group(QStringLiteral("Agent"))
+                                      .readEntry("showTools", true);
+                card->setVisible(show);
+                const QString id = b.value(QStringLiteral("id")).toString();
+                if (!id.isEmpty()) {
+                    m_toolCards.insert(id, card);
+                }
+                appendToFeed(card);
             }
         }
 
@@ -799,23 +1032,26 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
         const QJsonArray content =
             ev.value(QStringLiteral("message")).toObject().value(QStringLiteral("content")).toArray();
         for (const QJsonValue &bv : content) {
-            if (bv.toObject().value(QStringLiteral("type")).toString()
-                == QLatin1String("tool_result")) {
-                append(QStringLiteral("<p class='res'>&#8627; tool result</p>"));
+            const QJsonObject b = bv.toObject();
+            if (b.value(QStringLiteral("type")).toString() == QLatin1String("tool_result")) {
+                const QString id = b.value(QStringLiteral("tool_use_id")).toString();
+                if (ToolCard *card = m_toolCards.value(id, nullptr)) {
+                    card->setResult(toolResultText(b.value(QStringLiteral("content"))));
+                }
             }
         }
 
     } else if (type == QLatin1String("result")) {
         const bool err = ev.value(QStringLiteral("is_error")).toBool();
-        append(QStringLiteral("<p class='%1'>%2 turn complete</p>")
-                   .arg(err ? QStringLiteral("err") : QStringLiteral("ok"),
-                        err ? QStringLiteral("✗") : QStringLiteral("✓")));
+        addNote(err ? QStringLiteral("✗ turn ended with an error")
+                    : QStringLiteral("✓ turn complete"),
+                err ? QStringLiteral("err") : QStringLiteral("ok"));
         m_idle = true;
         refresh();
 
     } else if (type == QLatin1String("_stderr")) {
-        append(QStringLiteral("<p class='dim'>%1</p>")
-                   .arg(ev.value(QStringLiteral("text")).toString().toHtmlEscaped()));
+        addNote(ev.value(QStringLiteral("text")).toString().toHtmlEscaped(),
+                QStringLiteral("dim"));
 
     } else if (type == QLatin1String("_lifecycle")) {
         const QString phase = ev.value(QStringLiteral("phase")).toString();
@@ -823,15 +1059,15 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
         if (phase == QLatin1String("started")) {
             m_isolated = ev.value(QStringLiteral("isolated")).toBool();
             m_branch = ev.value(QStringLiteral("branch")).toString();
-            append(QStringLiteral("<p class='dim'>— %1</p>").arg(detail));
+            addNote(detail, QStringLiteral("sys"));
             refresh();
         } else if (phase == QLatin1String("resumed")) {
             m_isolated = ev.value(QStringLiteral("isolated")).toBool();
             m_branch = ev.value(QStringLiteral("branch")).toString();
             m_dormant = false;
             m_idle = true;
-            append(QStringLiteral("<p class='dim'>— %1 · ready for a follow-up</p>")
-                       .arg(detail));
+            addNote(detail + QStringLiteral(" · ready for a follow-up"),
+                    QStringLiteral("sys"));
             emit dormantChanged(false);
             refresh();
             // Deliver any message the human typed before pressing Resume.
@@ -842,10 +1078,10 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             m_isolated = true;
             m_branch = ev.value(QStringLiteral("branch")).toString();
             m_promoting = false;
-            append(QStringLiteral("<p class='dim'>— %1</p>").arg(detail));
+            addNote(detail, QStringLiteral("sys"));
             refresh();
         } else if (phase == QLatin1String("error")) {
-            append(QStringLiteral("<p class='err'>agent failed: %1</p>").arg(detail));
+            addNote(QStringLiteral("agent failed: %1").arg(detail), QStringLiteral("err"));
             m_idle = false;
             m_promoting = false;
             if (!m_dormant) {
@@ -853,7 +1089,7 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             }
             refresh();
         } else if (phase == QLatin1String("exited")) {
-            append(QStringLiteral("<p class='dim'>— agent exited: %1</p>").arg(detail));
+            addNote(QStringLiteral("agent exited: %1").arg(detail), QStringLiteral("dim"));
             m_idle = false;
             m_permQueue.clear();
             m_permBar->setVisible(false);
@@ -867,10 +1103,4 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             refresh();
         }
     }
-}
-
-void AgentPanel::append(const QString &html)
-{
-    m_transcript->append(html);
-    m_transcript->verticalScrollBar()->setValue(m_transcript->verticalScrollBar()->maximum());
 }

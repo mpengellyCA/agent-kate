@@ -27,6 +27,9 @@ public:
     void attachSession(const QString &project, const QString &threadId,
                        const QString &title);
 
+    // Re-apply chat preferences (send key, tool-card visibility) to every panel.
+    void applyChatSettings();
+
 Q_SIGNALS:
     void statusMessage(const QString &text);
     void openDiff(const QString &title, const QString &diffText);

@@ -231,8 +231,8 @@ void MainWindow::setupActions()
     fileMenu->addSeparator();
     fileMenu->addAction(KStandardAction::quit(this, &QWidget::close, this));
 
-    QMenu *viewMenu = menuBar()->addMenu(i18n("&View"));
-    QMenu *grouping = viewMenu->addMenu(i18n("Editor Tabs Grouped By"));
+    QMenu *optionsMenu = menuBar()->addMenu(i18n("&Options"));
+    QMenu *grouping = optionsMenu->addMenu(i18n("Editor Tabs Grouped By"));
     auto *groupingActs = new QActionGroup(this);
     QAction *byProject = grouping->addAction(i18n("Project"));
     QAction *byAgent = grouping->addAction(i18n("Agent"));
@@ -243,6 +243,32 @@ void MainWindow::setupActions()
     (m_tabsByAgent ? byAgent : byProject)->setChecked(true);
     connect(byProject, &QAction::triggered, this, [this] { setTabsByAgent(false); });
     connect(byAgent, &QAction::triggered, this, [this] { setTabsByAgent(true); });
+
+    optionsMenu->addSeparator();
+    const KConfigGroup agentCfg =
+        KSharedConfig::openConfig()->group(QStringLiteral("Agent"));
+
+    auto *enterSendsAct = optionsMenu->addAction(i18n("&Enter Sends the Message"));
+    enterSendsAct->setCheckable(true);
+    enterSendsAct->setChecked(agentCfg.readEntry("enterSends", false));
+    enterSendsAct->setToolTip(i18n("On: Enter sends, Shift+Enter starts a new line. "
+                                   "Off: Ctrl+Enter sends."));
+    connect(enterSendsAct, &QAction::toggled, this, [this](bool on) {
+        KSharedConfig::openConfig()
+            ->group(QStringLiteral("Agent"))
+            .writeEntry("enterSends", on);
+        m_agent->applyChatSettings();
+    });
+
+    auto *showToolsAct = optionsMenu->addAction(i18n("Show &Tool Calls"));
+    showToolsAct->setCheckable(true);
+    showToolsAct->setChecked(agentCfg.readEntry("showTools", true));
+    connect(showToolsAct, &QAction::toggled, this, [this](bool on) {
+        KSharedConfig::openConfig()
+            ->group(QStringLiteral("Agent"))
+            .writeEntry("showTools", on);
+        m_agent->applyChatSettings();
+    });
 
     QMenu *codeMenu = menuBar()->addMenu(i18n("&Code"));
     QAction *defAct = codeMenu->addAction(i18n("Go to &Definition"));

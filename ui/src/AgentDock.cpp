@@ -245,6 +245,13 @@ void AgentDock::attachSession(const QString &project, const QString &threadId,
     panel->resume();
 }
 
+void AgentDock::applyChatSettings()
+{
+    for (const Entry &e : m_agents) {
+        e.panel->applyChatSettings();
+    }
+}
+
 AgentPanel *AgentDock::addAgent(const QString &projectPath)
 {
     const int id = ++m_counter;
