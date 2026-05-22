@@ -65,6 +65,7 @@ type StartOptions struct {
 	Prompt         string       // initial user message
 	MCPConfig      string       // optional path to a --mcp-config file
 	PermissionMode string       // claude --permission-mode; defaults to acceptEdits
+	Effort         string       // claude --effort level; empty leaves Claude Code's default
 	Attachments    []Attachment // files attached to the opening message
 	SessionID      string       // Claude Code session id (a UUID)
 	Resume         bool         // true: --resume the session; false: --session-id a new one
@@ -143,6 +144,11 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 		// The Cooperation MCP is always allowed so every agent can see and
 		// coordinate with its collaborators without a permission prompt.
 		"--allowedTools", "mcp__cooperation",
+	}
+	// Reasoning effort is optional: an empty value leaves Claude Code on
+	// whatever default the user has configured.
+	if opts.Effort != "" {
+		args = append(args, "--effort", opts.Effort)
 	}
 	// A fresh thread is pinned to a session id we choose, so it can be resumed
 	// later; a resumed thread replays that same Claude Code session.

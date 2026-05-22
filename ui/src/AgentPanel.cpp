@@ -197,6 +197,34 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
             .writeEntry("isolation", m_isolationCombo->currentData().toString());
     });
 
+    m_effortCombo = new QComboBox(this);
+    // An empty value passes no --effort flag, leaving Claude Code's own default.
+    m_effortCombo->addItem(QStringLiteral("Default effort"), QString());
+    m_effortCombo->addItem(QStringLiteral("Low effort"), QStringLiteral("low"));
+    m_effortCombo->addItem(QStringLiteral("Medium effort"), QStringLiteral("medium"));
+    m_effortCombo->addItem(QStringLiteral("High effort"), QStringLiteral("high"));
+    m_effortCombo->addItem(QStringLiteral("Extra-high effort"), QStringLiteral("xhigh"));
+    m_effortCombo->addItem(QStringLiteral("Max effort"), QStringLiteral("max"));
+    m_effortCombo->setToolTip(QStringLiteral(
+        "Reasoning effort for this agent, fixed once it starts.\n"
+        "Higher levels let Claude Code think longer before it acts.\n"
+        "Default effort leaves Claude Code's own configured level untouched."));
+    // Sticky: the last choice becomes the default for the next agent.
+    {
+        const QString saved = KSharedConfig::openConfig()
+                                  ->group(QStringLiteral("Agent"))
+                                  .readEntry("effort", QString());
+        const int savedIdx = m_effortCombo->findData(saved);
+        if (savedIdx >= 0) {
+            m_effortCombo->setCurrentIndex(savedIdx);
+        }
+    }
+    connect(m_effortCombo, &QComboBox::currentIndexChanged, this, [this] {
+        KSharedConfig::openConfig()
+            ->group(QStringLiteral("Agent"))
+            .writeEntry("effort", m_effortCombo->currentData().toString());
+    });
+
     // Attachment chip bar — hidden until files are attached.
     m_attachBar = new QWidget(this);
     m_attachLayout = new QHBoxLayout(m_attachBar);
@@ -217,6 +245,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     auto *buttons = new QHBoxLayout;
     buttons->addWidget(m_modeCombo);
     buttons->addWidget(m_isolationCombo);
+    buttons->addWidget(m_effortCombo);
     buttons->addWidget(m_attachBtn);
     buttons->addWidget(m_diffBtn);
     buttons->addStretch(1);
@@ -311,9 +340,10 @@ void AgentPanel::refresh()
                                             : QStringLiteral("Start agent")));
     m_stopBtn->setEnabled(running);
     m_diffBtn->setEnabled(running);
-    // The permission and isolation modes are fixed once a thread exists.
+    // The permission, isolation and effort modes are fixed once a thread exists.
     m_modeCombo->setEnabled(m_threadId.isEmpty());
     m_isolationCombo->setEnabled(m_threadId.isEmpty());
+    m_effortCombo->setEnabled(m_threadId.isEmpty());
 
     // Offer promotion while a thread runs non-isolated in the workspace.
     m_promoteBar->setVisible(!m_threadId.isEmpty() && !m_isolated && !m_promoting);
@@ -400,6 +430,8 @@ void AgentPanel::onSendClicked()
                                   m_modeCombo->currentData().toString()},
                                  {QStringLiteral("isolation"),
                                   m_isolationCombo->currentData().toString()},
+                                 {QStringLiteral("effort"),
+                                  m_effortCombo->currentData().toString()},
                                  {QStringLiteral("attachments"), attachments}},
                      [this](const QJsonObject &result, const QJsonObject &error) {
                          if (!error.isEmpty()) {
