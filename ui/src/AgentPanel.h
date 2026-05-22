@@ -31,6 +31,7 @@ public:
 
     void setWorkspace(const QString &path);
     QString threadId() const { return m_threadId; }
+    bool isIsolated() const { return m_isolated; }
 
     // Bind this panel to a persisted-but-not-running thread; resume() relaunches
     // it through the core's agent.resume.

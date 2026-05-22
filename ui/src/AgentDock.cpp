@@ -61,6 +61,20 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
             emit statusMessage(QStringLiteral("Start the agent before committing"));
             return;
         }
+        // A non-isolated agent commits onto the workspace's current branch —
+        // make that explicit before it lands somewhere unexpected (e.g. main).
+        if (!e->panel->isIsolated()
+            && QMessageBox::warning(
+                   this, QStringLiteral("Commit in the workspace"),
+                   QStringLiteral(
+                       "This agent runs directly in the workspace, so the commit "
+                       "will land on the workspace's current branch — it is not "
+                       "isolated.\n\nPromote the agent to a worktree first to keep "
+                       "its commits on their own branch.\n\nCommit here anyway?"),
+                   QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel)
+                   != QMessageBox::Yes) {
+            return;
+        }
         bool ok = false;
         const QString msg = QInputDialog::getText(
             this, QStringLiteral("Commit agent changes"), QStringLiteral("Commit message:"),
@@ -76,8 +90,12 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
                              emit statusMessage(QStringLiteral("Commit failed: %1")
                                  .arg(error.value(QStringLiteral("message")).toString()));
                          } else {
-                             emit statusMessage(QStringLiteral("Committed to %1")
-                                 .arg(result.value(QStringLiteral("branch")).toString()));
+                             const QString branch =
+                                 result.value(QStringLiteral("branch")).toString();
+                             emit statusMessage(
+                                 branch.isEmpty()
+                                     ? QStringLiteral("Committed the agent's changes")
+                                     : QStringLiteral("Committed to %1").arg(branch));
                          }
                      });
     });
