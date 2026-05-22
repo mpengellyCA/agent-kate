@@ -1,0 +1,19 @@
+# Build output
+/build/
+/akcore
+/agentkate
+
+# Go
+/core/akcore
+*.test
+*.out
+
+# Editor / OS
+*.sock
+.cache/
+*.o
+*.user
+compile_commands.json
+
+# Agent worktrees (created at runtime under .agentkate/)
+/.agentkate/
