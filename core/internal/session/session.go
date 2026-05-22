@@ -33,7 +33,8 @@ type Record struct {
 	Project        string            `json:"project"`   // workspace path
 	Worktree       worktree.Worktree `json:"worktree"`
 	PermissionMode string            `json:"permissionMode"`
-	Title          string            `json:"title"` // short summary of the opening prompt
+	Effort         string            `json:"effort"` // claude --effort level; "" = Claude Code default
+	Title          string            `json:"title"`  // short summary of the opening prompt
 	Created        time.Time         `json:"created"`
 	Updated        time.Time         `json:"updated"`
 	Status         string            `json:"status"`

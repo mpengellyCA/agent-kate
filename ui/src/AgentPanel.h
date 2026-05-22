@@ -101,6 +101,7 @@ private:
     QPlainTextEdit *m_input = nullptr;
     QComboBox *m_modeCombo = nullptr;
     QComboBox *m_isolationCombo = nullptr;
+    QComboBox *m_effortCombo = nullptr;
     QPushButton *m_sendBtn = nullptr;
     QPushButton *m_stopBtn = nullptr;
     QPushButton *m_diffBtn = nullptr;

@@ -158,6 +158,7 @@ type agentStartParams struct {
 	WorkspacePath  string             `json:"workspacePath"`
 	Prompt         string             `json:"prompt"`
 	PermissionMode string             `json:"permissionMode"`
+	Effort         string             `json:"effort"`    // claude --effort level; "" = default
 	Isolation      string             `json:"isolation"` // worktree.Mode*; "" = auto
 	Attachments    []agent.Attachment `json:"attachments"`
 }
@@ -679,6 +680,7 @@ func startAgentThread(d handlerDeps, threadID, sessionID string, p agentStartPar
 		Prompt:         p.Prompt,
 		MCPConfig:      mcpConfig,
 		PermissionMode: p.PermissionMode,
+		Effort:         p.Effort,
 		Attachments:    p.Attachments,
 		SessionID:      sessionID,
 	}); err != nil {
@@ -699,6 +701,7 @@ func startAgentThread(d handlerDeps, threadID, sessionID string, p agentStartPar
 		Project:        p.WorkspacePath,
 		Worktree:       wt,
 		PermissionMode: permMode,
+		Effort:         p.Effort,
 		Title:          summarizePrompt(p.Prompt),
 		Created:        time.Now(),
 		Status:         session.StatusRunning,
@@ -735,6 +738,7 @@ func resumeAgentThread(d handlerDeps, rec session.Record) {
 		WorkDir:        rec.Worktree.Path,
 		MCPConfig:      mcpConfig,
 		PermissionMode: rec.PermissionMode,
+		Effort:         rec.Effort,
 		SessionID:      rec.SessionID,
 		Resume:         true,
 	}); err != nil {
