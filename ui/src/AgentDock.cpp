@@ -148,13 +148,25 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
         m_core->call(QStringLiteral("agent.land"),
                      QJsonObject{{QStringLiteral("threadId"), e->panel->threadId()}},
                      [this](const QJsonObject &result, const QJsonObject &error) {
+                         // Land is a deliberate, destructive-ish operation —
+                         // its result must be unmissable, not a transient toast.
                          if (!error.isEmpty()) {
-                             emit statusMessage(QStringLiteral("Merge failed: %1")
-                                 .arg(error.value(QStringLiteral("message")).toString()));
+                             const QString msg =
+                                 error.value(QStringLiteral("message")).toString();
+                             emit statusMessage(QStringLiteral("Merge failed: %1").arg(msg));
+                             QMessageBox::warning(this,
+                                 QStringLiteral("Merge into local main failed"), msg);
                          } else {
+                             const QString branch =
+                                 result.value(QStringLiteral("branch")).toString();
+                             const QString into =
+                                 result.value(QStringLiteral("into")).toString();
                              emit statusMessage(QStringLiteral("Merged %1 into %2")
-                                 .arg(result.value(QStringLiteral("branch")).toString(),
-                                      result.value(QStringLiteral("into")).toString()));
+                                 .arg(branch, into));
+                             QMessageBox::information(this,
+                                 QStringLiteral("Merge into local main"),
+                                 QStringLiteral("Merged %1 into %2.")
+                                     .arg(branch, into));
                          }
                      });
     });

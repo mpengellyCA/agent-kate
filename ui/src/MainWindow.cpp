@@ -327,7 +327,13 @@ void MainWindow::setupActions()
 
 void MainWindow::setupCore()
 {
-    statusBar()->hide();
+    // The status bar is the landing spot for transient agent feedback —
+    // "Merged X into main", "Commit failed: …", etc. Without it those
+    // messages are silently dropped (see AgentDock::statusMessage).
+    statusBar()->setSizeGripEnabled(false);
+    connect(m_agent, &AgentDock::statusMessage, this, [this](const QString &text) {
+        statusBar()->showMessage(text, 8000);
+    });
 
     connect(m_core, &CoreClient::coreLog, this,
             [](const QString &line) { qInfo().noquote() << "[akcore]" << line; });
