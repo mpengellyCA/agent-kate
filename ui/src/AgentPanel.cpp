@@ -780,6 +780,13 @@ void AgentPanel::addMessageCard(const QString &role, const QString &accentHex,
     bodyLabel->setTextInteractionFlags(Qt::TextSelectableByMouse
                                        | Qt::LinksAccessibleByMouse);
     bodyLabel->setOpenExternalLinks(true);
+    // QLabel's minimumSizeHint with word-wrap includes the widest unbreakable
+    // token (inline <code>, long URLs, paths in numbered list items). That
+    // propagates up and prevents the panel from ever shrinking below the
+    // widest line. Ignoring the horizontal sizeHint lets the parent's width
+    // drive wrapping instead.
+    bodyLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::MinimumExpanding);
+    bodyLabel->setMinimumWidth(0);
     v->addWidget(bodyLabel);
 
     appendToFeed(card);
@@ -790,6 +797,8 @@ void AgentPanel::addNote(const QString &html, const QString &kind)
     auto *note = new QLabel(html, m_feed);
     note->setTextFormat(Qt::RichText);
     note->setWordWrap(true);
+    note->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::MinimumExpanding);
+    note->setMinimumWidth(0);
     note->setStyleSheet(QStringLiteral("color: %1; font-size: small; padding: 1px 8px;")
                             .arg(noteColor(kind, isDark(this))));
     appendToFeed(note);
