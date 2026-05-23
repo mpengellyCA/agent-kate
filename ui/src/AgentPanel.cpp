@@ -405,6 +405,31 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     m_modeCombo->addItem(QStringLiteral("Auto"), QStringLiteral("auto"));
     m_modeCombo->addItem(QStringLiteral("Unsafe (bypass)"), QStringLiteral("bypassPermissions"));
     m_modeCombo->setToolTip(QStringLiteral("Permission mode for this agent (fixed once it starts)"));
+    // Sticky: the last choice becomes the default for the next agent — except
+    // for "Unsafe (bypass)", which resets to "Auto" so it's never re-armed
+    // accidentally on the next conversation.
+    {
+        QString saved = KSharedConfig::openConfig()
+                            ->group(QStringLiteral("Agent"))
+                            .readEntry("permissionMode", QStringLiteral("acceptEdits"));
+        if (saved == QLatin1String("bypassPermissions")) {
+            saved = QStringLiteral("auto");
+        }
+        const int savedIdx = m_modeCombo->findData(saved);
+        if (savedIdx >= 0) {
+            m_modeCombo->setCurrentIndex(savedIdx);
+        }
+    }
+    connect(m_modeCombo, &QComboBox::currentIndexChanged, this, [this] {
+        const QString mode = m_modeCombo->currentData().toString();
+        // Don't persist the unsafe choice — next agent falls back to Auto.
+        if (mode == QLatin1String("bypassPermissions")) {
+            return;
+        }
+        KSharedConfig::openConfig()
+            ->group(QStringLiteral("Agent"))
+            .writeEntry("permissionMode", mode);
+    });
 
     m_isolationCombo = new QComboBox(this);
     m_isolationCombo->addItem(QStringLiteral("Auto isolation"), QStringLiteral("auto"));
@@ -539,11 +564,11 @@ void AgentPanel::setWorkspace(const QString &path)
 void AgentPanel::applyChatSettings()
 {
     const KConfigGroup cfg = KSharedConfig::openConfig()->group(QStringLiteral("Agent"));
-    const bool enterSends = cfg.readEntry("enterSends", false);
+    const bool enterSends = cfg.readEntry("enterSends", true);
     m_input->setPlaceholderText(
         enterSends
             ? QStringLiteral("Describe a task for the agent…   "
-                             "(Enter to send · Shift+Enter for a new line)")
+                             "(Enter to send · Ctrl/Shift+Enter for a new line)")
             : QStringLiteral("Describe a task for the agent…   (Ctrl+Enter to send)"));
 
     const bool showTools = cfg.readEntry("showTools", true);
@@ -561,7 +586,7 @@ bool AgentPanel::eventFilter(QObject *obj, QEvent *event)
             const bool shift = key->modifiers().testFlag(Qt::ShiftModifier);
             const bool enterSends = KSharedConfig::openConfig()
                                         ->group(QStringLiteral("Agent"))
-                                        .readEntry("enterSends", false);
+                                        .readEntry("enterSends", true);
             if (enterSends) {
                 // Enter sends; Ctrl/Shift+Enter inserts a newline.
                 if (ctrl || shift) {
@@ -586,13 +611,45 @@ void AgentPanel::setDormant(const QString &threadId, const QString &title, bool 
     m_threadId = threadId;
     m_dormant = true;
     m_isolated = isolated;
-    addNote(QStringLiteral("dormant agent · %1 — Resume to continue. The agent keeps "
-                           "the whole conversation; earlier messages just are not "
-                           "shown here.")
+    loadTranscript();
+    addNote(QStringLiteral("dormant agent · %1 — Resume to continue.")
                 .arg(title.toHtmlEscaped()),
             QStringLiteral("sys"));
     emit dormantChanged(true);
     refresh();
+}
+
+void AgentPanel::loadTranscript()
+{
+    if (m_threadId.isEmpty() || !m_core->isConnected()) {
+        return;
+    }
+    const QString tid = m_threadId;
+    m_core->call(QStringLiteral("agent.transcript"),
+                 QJsonObject{{QStringLiteral("threadId"), tid}},
+                 [this, tid](const QJsonObject &result, const QJsonObject &error) {
+                     if (tid != m_threadId) {
+                         return; // panel moved to another thread before this returned
+                     }
+                     if (!error.isEmpty()) {
+                         addNote(QStringLiteral("Could not load history: %1")
+                                     .arg(error.value(QStringLiteral("message"))
+                                              .toString()
+                                              .toHtmlEscaped()),
+                                 QStringLiteral("dim"));
+                         return;
+                     }
+                     const QJsonArray events =
+                         result.value(QStringLiteral("events")).toArray();
+                     if (events.isEmpty()) {
+                         return;
+                     }
+                     for (const QJsonValue &v : events) {
+                         renderEvent(v.toObject());
+                     }
+                     addNote(QStringLiteral("— prior conversation restored —"),
+                             QStringLiteral("dim"));
+                 });
 }
 
 void AgentPanel::resume()

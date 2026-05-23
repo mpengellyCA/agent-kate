@@ -73,6 +73,9 @@ private:
     void onNotification(const QString &method, const QJsonObject &params);
     void renderEvent(const QJsonObject &event);
     void onPermissionRequested(const QJsonObject &params);
+    // Pull the persisted Claude Code transcript and replay it into the feed so
+    // a reopened dormant thread shows its prior conversation.
+    void loadTranscript();
     void showNextPermission();
     void answerPermission(bool allow);
     void buildQuestionForm(const QJsonObject &req);

@@ -250,6 +250,33 @@ func registerHandlers(d handlerDeps) {
 		return map[string]any{"threadId": rec.ThreadID, "sessionId": rec.SessionID}, nil
 	})
 
+	// agent.transcript returns the Claude Code session transcript for a
+	// thread, as the raw JSONL events. The UI replays these to rebuild the
+	// conversation feed when reopening a dormant thread.
+	d.srv.Handle("agent.transcript", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID string `json:"threadId"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		rec, ok := d.sessions.Get(p.ThreadID)
+		if !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		}
+		if rec.SessionID == "" {
+			return map[string]any{"events": []json.RawMessage{}}, nil
+		}
+		events, err := session.ReadTranscript(rec.SessionID)
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		if events == nil {
+			events = []json.RawMessage{}
+		}
+		return map[string]any{"events": events}, nil
+	})
+
 	// agent.promote upgrades a non-isolated thread into a dedicated git
 	// worktree, carrying its working-tree changes and Claude Code session over.
 	d.srv.Handle("agent.promote", func(_ context.Context, raw json.RawMessage) (any, error) {

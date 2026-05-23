@@ -250,7 +250,7 @@ void MainWindow::setupActions()
 
     auto *enterSendsAct = optionsMenu->addAction(i18n("&Enter Sends the Message"));
     enterSendsAct->setCheckable(true);
-    enterSendsAct->setChecked(agentCfg.readEntry("enterSends", false));
+    enterSendsAct->setChecked(agentCfg.readEntry("enterSends", true));
     enterSendsAct->setToolTip(i18n("On: Enter sends, Shift+Enter starts a new line. "
                                    "Off: Ctrl+Enter sends."));
     connect(enterSendsAct, &QAction::toggled, this, [this](bool on) {

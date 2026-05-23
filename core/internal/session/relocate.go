@@ -1,11 +1,42 @@
 package session
 
 import (
+	"bufio"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 )
+
+// ReadTranscript returns the raw JSON lines from a session's Claude Code
+// transcript, in order, so the UI can replay the conversation when reopening a
+// dormant thread. Returns nil with no error if there is no transcript yet.
+func ReadTranscript(sessionID string) ([]json.RawMessage, error) {
+	path := findTranscript(sessionID)
+	if path == "" {
+		return nil, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	var out []json.RawMessage
+	for sc.Scan() {
+		line := sc.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		out = append(out, append(json.RawMessage(nil), line...))
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
 
 // encodeProjectPath turns a filesystem path into the directory name Claude Code
 // uses for it under ~/.claude/projects — every "/" and "." becomes "-".
