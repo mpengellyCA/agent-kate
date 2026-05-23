@@ -9,6 +9,7 @@ class ProjectTree;
 class AgentDock;
 class LspManager;
 class TerminalPanel;
+class KMultiTabBar;
 class QAction;
 class QDockWidget;
 
@@ -33,6 +34,11 @@ private:
     QString groupKey() const;
     void pushOpenFilesToCore();
 
+    void setupBottomStrip();
+    void showBottomTab(int id);
+    void hideBottomTab(int id);
+    void syncBottomTabFromDock(int id, bool visible);
+
     CoreClient *m_core = nullptr;
     EditorArea *m_editor = nullptr;
     ProjectTree *m_tree = nullptr;
@@ -43,6 +49,8 @@ private:
     QDockWidget *m_referencesDock = nullptr;
     QDockWidget *m_terminalDock = nullptr;
     QAction *m_toggleBottomAct = nullptr;
+    KMultiTabBar *m_bottomStrip = nullptr;
+    int m_lastBottomTab = -1; // last tab raised by the user, used to restore on Ctrl+J
 
     QString m_activeProject;
     int m_activeAgentId = -1;
