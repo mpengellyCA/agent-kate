@@ -121,7 +121,14 @@ def main():
               f"echo agentkate-perm-ok > {perm_file} && cat {perm_file}. Then use the "
               f"cooperation MCP tool request_review with summary 'smoke test'. "
               f"Finally reply with the single word DONE and nothing else.")
-    start_id = call("agent.start", {"workspacePath": workspace, "prompt": prompt})
+    # Pin to Haiku — this test exercises the supervisor/IPC/permission
+    # plumbing, not model intelligence, so the cheapest current model is fine
+    # and keeps a smoke run at roughly a fifth of Opus cost.
+    start_id = call("agent.start", {
+        "workspacePath": workspace,
+        "prompt": prompt,
+        "model": "claude-haiku-4-5-20251001",
+    })
 
     saw_mcp_connected = False
     saw_permission = False

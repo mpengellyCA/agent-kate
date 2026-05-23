@@ -66,6 +66,7 @@ type StartOptions struct {
 	MCPConfig      string       // optional path to a --mcp-config file
 	PermissionMode string       // claude --permission-mode; defaults to acceptEdits
 	Effort         string       // claude --effort level; empty leaves Claude Code's default
+	Model          string       // claude --model id; empty leaves Claude Code's default (smoke tests pin Haiku)
 	Attachments    []Attachment // files attached to the opening message
 	SessionID      string       // Claude Code session id (a UUID)
 	Resume         bool         // true: --resume the session; false: --session-id a new one
@@ -110,8 +111,10 @@ type Thread struct {
 	mu        sync.Mutex
 	cmd       *exec.Cmd
 	stdin     io.WriteCloser
-	sessionID string // captured from stream-json, for future --resume
-	mcpConfig string // temp --mcp-config file to clean up on exit
+	sessionID string      // captured from stream-json, for future --resume
+	mcpConfig string      // temp --mcp-config file to clean up on exit
+	meter     *toolMeter  // measures tool_result sizes for token-cost telemetry
+	usage     *usageMeter // measures per-turn LLM token usage and billed cost
 	alive     bool
 }
 
@@ -149,6 +152,11 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 	// whatever default the user has configured.
 	if opts.Effort != "" {
 		args = append(args, "--effort", opts.Effort)
+	}
+	// Model is optional: empty means inherit Claude Code's configured default
+	// (typically Opus). Smoke tests pin Haiku to keep their token spend low.
+	if opts.Model != "" {
+		args = append(args, "--model", opts.Model)
 	}
 	// A fresh thread is pinned to a session id we choose, so it can be resumed
 	// later; a resumed thread replays that same Claude Code session.
@@ -195,6 +203,8 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 		stdin:     stdin,
 		sessionID: opts.SessionID,
 		mcpConfig: opts.MCPConfig,
+		meter:     newToolMeter(s.log, id),
+		usage:     newUsageMeter(s.log, id),
 	}
 
 	if err := cmd.Start(); err != nil {
@@ -311,6 +321,10 @@ func (s *Supervisor) pumpStdout(t *Thread, r io.Reader) {
 			t.sessionID = probe.SessionID
 			t.mu.Unlock()
 		}
+		// Telemetry: where context tokens go (tool outputs) and what we are
+		// billed for (per-turn usage). Both observe; neither alters the stream.
+		t.meter.Observe(raw)
+		t.usage.Observe(raw)
 		s.emit(t.ID, json.RawMessage(raw))
 	}
 }
@@ -337,6 +351,11 @@ func (s *Supervisor) reap(t *Thread) {
 		_ = os.Remove(t.mcpConfig)
 	}
 	t.mu.Unlock()
+
+	// Telemetry: per-tool totals (what filled the context) plus per-thread
+	// usage (what we were billed for, in case no `result` event arrived).
+	t.meter.Summary()
+	t.usage.Summary()
 
 	s.mu.Lock()
 	delete(s.threads, t.ID)

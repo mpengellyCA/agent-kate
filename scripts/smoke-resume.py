@@ -163,10 +163,14 @@ def main():
         if c1.call("handshake", {})["result"].get("name") != "akcore":
             sys.exit("core#1 handshake failed")
 
+        # Pin to Haiku — this test verifies resume/persistence, not model
+        # intelligence; Haiku is ~5x cheaper and still remembers a 4-digit
+        # code across a restart.
         start = c1.call("agent.start", {
             "workspacePath": workspace,
             "prompt": (f"Remember this secret code for later: {SECRET}. "
                        f"Do not use any tools. Reply with only the word OK."),
+            "model": "claude-haiku-4-5-20251001",
         })
         if start.get("error"):
             sys.exit(f"agent.start failed: {start['error']}")
