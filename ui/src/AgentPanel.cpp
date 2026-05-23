@@ -347,6 +347,20 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     m_feedScroll->setFrameShape(QFrame::NoFrame);
     m_feedScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
 
+    // Sticky-bottom: the feed auto-scrolls to keep the latest entry in view.
+    // Scrolling upward releases the stick; scrolling back to the bottom reclaims
+    // it. rangeChanged covers the case where a card's wrapped height arrives a
+    // frame after insertion (long tool output, markdown reflow, …).
+    QScrollBar *bar = m_feedScroll->verticalScrollBar();
+    connect(bar, &QScrollBar::valueChanged, this, [this, bar](int v) {
+        m_stickBottom = (v >= bar->maximum() - 48);
+    });
+    connect(bar, &QScrollBar::rangeChanged, this, [this, bar](int, int max) {
+        if (m_stickBottom) {
+            bar->setValue(max);
+        }
+    });
+
     m_working = new WorkingIndicator(this);
 
     // --- per-tool approval banner (hidden until a request arrives) ---------
@@ -649,6 +663,7 @@ void AgentPanel::loadTranscript()
                      }
                      addNote(QStringLiteral("— prior conversation restored —"),
                              QStringLiteral("dim"));
+                     scrollFeedToBottom();
                  });
 }
 
@@ -725,16 +740,22 @@ void AgentPanel::refresh()
 
 void AgentPanel::appendToFeed(QWidget *entry)
 {
-    QScrollBar *bar = m_feedScroll->verticalScrollBar();
-    const bool atBottom = bar->value() >= bar->maximum() - 48;
-    // Insert before the trailing stretch.
+    // Insert before the trailing stretch. The scrollbar's rangeChanged handler
+    // takes care of riding the bottom when m_stickBottom is true.
     m_feedLayout->insertWidget(m_feedLayout->count() - 1, entry);
-    if (atBottom) {
-        QTimer::singleShot(0, this, [this] {
-            QScrollBar *b = m_feedScroll->verticalScrollBar();
-            b->setValue(b->maximum());
-        });
-    }
+}
+
+void AgentPanel::scrollFeedToBottom()
+{
+    m_stickBottom = true;
+    QScrollBar *bar = m_feedScroll->verticalScrollBar();
+    bar->setValue(bar->maximum());
+    // A second tick after the event loop has processed layout — long cards or
+    // markdown reflow can push the maximum further than the value we just set.
+    QTimer::singleShot(0, this, [this] {
+        QScrollBar *b = m_feedScroll->verticalScrollBar();
+        b->setValue(b->maximum());
+    });
 }
 
 void AgentPanel::addMessageCard(const QString &role, const QString &accentHex,

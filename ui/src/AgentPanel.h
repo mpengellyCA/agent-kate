@@ -87,6 +87,7 @@ private:
     void addMessageCard(const QString &role, const QString &accentHex,
                         const QString &bodyHtml);
     void addNote(const QString &html, const QString &kind);
+    void scrollFeedToBottom();
 
     CoreClient *m_core = nullptr;
     QString m_workspace;
@@ -101,6 +102,7 @@ private:
     QScrollArea *m_feedScroll = nullptr;
     QWidget *m_feed = nullptr;
     QVBoxLayout *m_feedLayout = nullptr;
+    bool m_stickBottom = true; // auto-scroll until the user scrolls upward
     QHash<QString, ToolCard *> m_toolCards; // keyed by tool_use id
     WorkingIndicator *m_working = nullptr;
     QPlainTextEdit *m_input = nullptr;
