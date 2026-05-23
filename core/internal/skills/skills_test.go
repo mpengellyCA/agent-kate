@@ -1,0 +1,111 @@
+package skills
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func writeFile(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestListAndInstall(t *testing.T) {
+	root := t.TempDir()
+	catDir := filepath.Join(root, "catalog")
+
+	writeFile(t, filepath.Join(catDir, "review", "SKILL.md"),
+		"---\nname: review\ndescription: Code review helper\n---\nbody\n")
+	writeFile(t, filepath.Join(catDir, "quickfix.md"),
+		"---\ndescription: \"Single-file skill\"\n---\nbody\n")
+	writeFile(t, filepath.Join(catDir, "garbage", "not-a-skill.txt"), "x") // ignored
+
+	c := New(catDir)
+	skills, err := c.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(skills) != 2 {
+		t.Fatalf("want 2 skills, got %d: %+v", len(skills), skills)
+	}
+	byName := map[string]Skill{}
+	for _, s := range skills {
+		byName[s.Name] = s
+	}
+	if byName["review"].Description != "Code review helper" || !byName["review"].IsDir {
+		t.Errorf("bad review skill: %+v", byName["review"])
+	}
+	if byName["quickfix"].Description != "Single-file skill" || byName["quickfix"].IsDir {
+		t.Errorf("bad quickfix skill: %+v", byName["quickfix"])
+	}
+
+	target := filepath.Join(root, "project")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Install("review", target); err != nil {
+		t.Fatalf("install review: %v", err)
+	}
+	if _, err := c.Install("quickfix", target); err != nil {
+		t.Fatalf("install quickfix: %v", err)
+	}
+
+	installed, err := c.ListInstalled(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(installed) != 2 {
+		t.Fatalf("want 2 installed, got %d: %+v", len(installed), installed)
+	}
+	for _, i := range installed {
+		if !i.InCatalog {
+			t.Errorf("installed %q should be marked InCatalog: %+v", i.Name, i)
+		}
+	}
+
+	// Re-install replaces cleanly.
+	if _, err := c.Install("review", target); err != nil {
+		t.Fatalf("re-install: %v", err)
+	}
+
+	// Uninstall removes the symlinks.
+	if err := c.Uninstall("review", target); err != nil {
+		t.Fatalf("uninstall review: %v", err)
+	}
+	if err := c.Uninstall("quickfix", target); err != nil {
+		t.Fatalf("uninstall quickfix: %v", err)
+	}
+	installed, err = c.ListInstalled(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(installed) != 0 {
+		t.Errorf("want 0 installed after uninstall, got %+v", installed)
+	}
+}
+
+func TestUninstallRefusesNonSymlink(t *testing.T) {
+	root := t.TempDir()
+	c := New(filepath.Join(root, "catalog"))
+	target := filepath.Join(root, "project")
+	// A real (non-symlink) skill directory inside the target — user's own work.
+	writeFile(t, filepath.Join(target, ".claude", "skills", "mine", "SKILL.md"), "---\n---\n")
+	if err := c.Uninstall("mine", target); err == nil {
+		t.Error("expected refusal to remove a non-symlink skill")
+	}
+}
+
+func TestValidateName(t *testing.T) {
+	c := New(t.TempDir())
+	for _, bad := range []string{"", "..", "../etc", "a/b", `a\b`, "."} {
+		if _, err := c.Get(bad); err == nil {
+			t.Errorf("Get(%q) should have errored", bad)
+		}
+	}
+}

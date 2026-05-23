@@ -24,6 +24,7 @@ import (
 	"agentkate/internal/ipc"
 	"agentkate/internal/permission"
 	"agentkate/internal/session"
+	"agentkate/internal/skills"
 	"agentkate/internal/vsix"
 	"agentkate/internal/worktree"
 )
@@ -93,6 +94,7 @@ func runCore() {
 	threads := newThreadRegistry()
 	broker := permission.New()
 	extensions := vsix.NewManager(vsix.DefaultCacheDir())
+	skillCatalog := skills.New(skills.DefaultDir())
 
 	sessions, err := session.NewStore(session.DefaultPath())
 	if err != nil {
@@ -127,6 +129,7 @@ func runCore() {
 		broker:     broker,
 		extensions: extensions,
 		sessions:   sessions,
+		skills:     skillCatalog,
 		socketPath: *socket,
 		exePath:    exePath,
 		log:        log,
@@ -196,6 +199,7 @@ type handlerDeps struct {
 	broker     *permission.Broker
 	extensions *vsix.Manager
 	sessions   *session.Store
+	skills     *skills.Catalog
 	socketPath string
 	exePath    string
 	log        *slog.Logger
@@ -679,6 +683,68 @@ func registerHandlers(d handlerDeps) {
 			exts = []*vsix.Extension{}
 		}
 		return map[string]any{"extensions": exts}, nil
+	})
+
+	// --- Claude Code skills ------------------------------------------------
+	// skills.listCatalog returns every skill in the central AgentKate catalog
+	// (XDG_DATA_HOME/agentkate/skills). An empty catalog is fine — the UI
+	// reveals the catalog directory so the user can drop skills into it.
+	d.srv.Handle("skills.listCatalog", func(_ context.Context, _ json.RawMessage) (any, error) {
+		if err := d.skills.EnsureDir(); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		list, err := d.skills.List()
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		return map[string]any{"skills": list, "catalogDir": d.skills.Dir()}, nil
+	})
+
+	// skills.listInstalled enumerates target/.claude/skills, flagging the
+	// entries the catalog owns so the UI can show their install state.
+	d.srv.Handle("skills.listInstalled", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			Target string `json:"target"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		list, err := d.skills.ListInstalled(p.Target)
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		return map[string]any{"installed": list}, nil
+	})
+
+	d.srv.Handle("skills.install", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			Name   string `json:"name"`
+			Target string `json:"target"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		path, err := d.skills.Install(p.Name, p.Target)
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		d.log.Info("skill installed", "name", p.Name, "target", p.Target, "path", path)
+		return map[string]any{"path": path}, nil
+	})
+
+	d.srv.Handle("skills.uninstall", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			Name   string `json:"name"`
+			Target string `json:"target"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		if err := d.skills.Uninstall(p.Name, p.Target); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		d.log.Info("skill uninstalled", "name", p.Name, "target", p.Target)
+		return map[string]any{"ok": true}, nil
 	})
 }
 

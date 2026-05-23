@@ -1,0 +1,324 @@
+// Package skills manages a central catalog of Claude Code skills and links
+// them into individual projects or worktrees on demand.
+//
+// A skill is a directory containing a SKILL.md file (the canonical Claude Code
+// format) — a single standalone "<name>.md" file is also accepted. The
+// catalog lives under XDG_DATA_HOME/agentkate/skills (default
+// ~/.local/share/agentkate/skills); installing a skill into a target creates
+// a symlink at <target>/.claude/skills/<name> pointing back at the catalog,
+// so edits to the central copy propagate without re-installing.
+package skills
+
+import (
+	"bufio"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+// Skill is one entry in the central catalog.
+type Skill struct {
+	Name        string `json:"name"`        // identifier; matches the directory or file stem
+	Description string `json:"description"` // one-line summary from the YAML frontmatter
+	Path        string `json:"path"`        // absolute source path in the catalog
+	IsDir       bool   `json:"isDir"`       // true for SKILL.md directories, false for single-file skills
+}
+
+// Catalog is a directory of skills available to install into projects.
+type Catalog struct {
+	dir string
+}
+
+// New returns a Catalog backed by dir. The directory is created on demand
+// (List on a missing dir returns an empty slice, not an error).
+func New(dir string) *Catalog {
+	return &Catalog{dir: dir}
+}
+
+// DefaultDir is the catalog location when the UI does not override it.
+func DefaultDir() string {
+	if d := os.Getenv("XDG_DATA_HOME"); d != "" {
+		return filepath.Join(d, "agentkate", "skills")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = os.TempDir()
+	}
+	return filepath.Join(home, ".local", "share", "agentkate", "skills")
+}
+
+// Dir is the catalog's filesystem location.
+func (c *Catalog) Dir() string { return c.dir }
+
+// EnsureDir creates the catalog directory if it does not yet exist.
+func (c *Catalog) EnsureDir() error {
+	return os.MkdirAll(c.dir, 0o755)
+}
+
+// List scans the catalog and returns every skill it can parse. Entries that
+// look like skills but fail to parse are skipped silently — a malformed
+// SKILL.md should not stop the dialog from listing valid neighbours.
+func (c *Catalog) List() ([]Skill, error) {
+	entries, err := os.ReadDir(c.dir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return []Skill{}, nil
+		}
+		return nil, err
+	}
+	out := make([]Skill, 0, len(entries))
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
+		full := filepath.Join(c.dir, name)
+		if e.IsDir() {
+			md := filepath.Join(full, "SKILL.md")
+			if _, err := os.Stat(md); err != nil {
+				continue // a directory without SKILL.md is not a skill
+			}
+			desc, _ := readDescription(md)
+			out = append(out, Skill{Name: name, Description: desc, Path: full, IsDir: true})
+			continue
+		}
+		if strings.HasSuffix(name, ".md") && !strings.EqualFold(name, "README.md") {
+			desc, _ := readDescription(full)
+			out = append(out, Skill{
+				Name:        strings.TrimSuffix(name, ".md"),
+				Description: desc,
+				Path:        full,
+				IsDir:       false,
+			})
+		}
+	}
+	return out, nil
+}
+
+// Get returns one skill by name, or an error if it is missing or unparseable.
+func (c *Catalog) Get(name string) (Skill, error) {
+	if err := validateName(name); err != nil {
+		return Skill{}, err
+	}
+	dir := filepath.Join(c.dir, name)
+	if st, err := os.Stat(dir); err == nil && st.IsDir() {
+		md := filepath.Join(dir, "SKILL.md")
+		if _, err := os.Stat(md); err != nil {
+			return Skill{}, fmt.Errorf("skill %q has no SKILL.md", name)
+		}
+		desc, _ := readDescription(md)
+		return Skill{Name: name, Description: desc, Path: dir, IsDir: true}, nil
+	}
+	file := filepath.Join(c.dir, name+".md")
+	if st, err := os.Stat(file); err == nil && !st.IsDir() {
+		desc, _ := readDescription(file)
+		return Skill{Name: name, Description: desc, Path: file, IsDir: false}, nil
+	}
+	return Skill{}, fmt.Errorf("skill %q not found in catalog", name)
+}
+
+// Install symlinks skillName from the catalog into target/.claude/skills.
+// An existing entry of the same name is replaced; the catalog directory and
+// the target's .claude/skills directory are created if needed.
+func (c *Catalog) Install(skillName, target string) (string, error) {
+	if target == "" {
+		return "", errors.New("target is required")
+	}
+	skill, err := c.Get(skillName)
+	if err != nil {
+		return "", err
+	}
+	dest := filepath.Join(target, ".claude", "skills")
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		return "", err
+	}
+	linkName := skill.Name
+	if !skill.IsDir {
+		linkName = skill.Name + ".md"
+	}
+	linkPath := filepath.Join(dest, linkName)
+	// Replace any previous install so re-installing always reflects the
+	// catalog's current shape (a single-file skill replacing a directory or
+	// vice versa).
+	if err := removeIfPresent(linkPath); err != nil {
+		return "", err
+	}
+	if err := os.Symlink(skill.Path, linkPath); err != nil {
+		return "", err
+	}
+	return linkPath, nil
+}
+
+// Uninstall removes a previously installed skill from target/.claude/skills.
+// Only entries that resolve back into the catalog are removed — a hand-edited
+// skill of the same name in the target is left alone.
+func (c *Catalog) Uninstall(skillName, target string) error {
+	if err := validateName(skillName); err != nil {
+		return err
+	}
+	if target == "" {
+		return errors.New("target is required")
+	}
+	dest := filepath.Join(target, ".claude", "skills")
+	for _, n := range []string{skillName, skillName + ".md"} {
+		p := filepath.Join(dest, n)
+		st, err := os.Lstat(p)
+		if err != nil {
+			continue
+		}
+		if st.Mode()&os.ModeSymlink == 0 {
+			// Not a symlink — refuse to delete a real, possibly user-owned dir.
+			return fmt.Errorf("%s is not a managed skill (not a symlink)", p)
+		}
+		dest, _ := os.Readlink(p)
+		if !linkPointsInto(dest, c.dir) {
+			return fmt.Errorf("%s does not point into the catalog; refusing to remove", p)
+		}
+		if err := os.Remove(p); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Installed describes one entry under target/.claude/skills.
+type Installed struct {
+	Name      string `json:"name"`      // identifier (no .md suffix for either form)
+	Path      string `json:"path"`      // the link/file inside target/.claude/skills
+	LinkedTo  string `json:"linkedTo"`  // resolved symlink target, empty when not a symlink
+	InCatalog bool   `json:"inCatalog"` // true when the link resolves into this catalog
+}
+
+// ListInstalled returns every entry under target/.claude/skills, flagging
+// which ones this catalog owns. A target with no .claude/skills directory is
+// not an error — it just has nothing installed yet.
+func (c *Catalog) ListInstalled(target string) ([]Installed, error) {
+	if target == "" {
+		return nil, errors.New("target is required")
+	}
+	dir := filepath.Join(target, ".claude", "skills")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return []Installed{}, nil
+		}
+		return nil, err
+	}
+	out := make([]Installed, 0, len(entries))
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
+		p := filepath.Join(dir, name)
+		st, err := os.Lstat(p)
+		if err != nil {
+			continue
+		}
+		entry := Installed{
+			Name: strings.TrimSuffix(name, ".md"),
+			Path: p,
+		}
+		if st.Mode()&os.ModeSymlink != 0 {
+			if dest, err := os.Readlink(p); err == nil {
+				entry.LinkedTo = dest
+				entry.InCatalog = linkPointsInto(dest, c.dir)
+			}
+		}
+		out = append(out, entry)
+	}
+	return out, nil
+}
+
+// readDescription pulls the `description:` value out of a SKILL.md or
+// standalone .md file's YAML frontmatter. Returns "" when no frontmatter is
+// present or the field is missing.
+func readDescription(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 4096), 64*1024)
+	if !sc.Scan() {
+		return "", nil
+	}
+	if strings.TrimSpace(sc.Text()) != "---" {
+		return "", nil
+	}
+	for sc.Scan() {
+		line := sc.Text()
+		if strings.TrimSpace(line) == "---" {
+			return "", nil
+		}
+		key, val, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(key) == "description" {
+			return cleanYAMLValue(val), nil
+		}
+	}
+	return "", sc.Err()
+}
+
+func cleanYAMLValue(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.TrimSuffix(s, "\r")
+	if len(s) >= 2 && (s[0] == '"' || s[0] == '\'') && s[len(s)-1] == s[0] {
+		s = s[1 : len(s)-1]
+	}
+	return s
+}
+
+// validateName rejects names that would let a caller escape the catalog dir.
+func validateName(name string) error {
+	if name == "" {
+		return errors.New("skill name is required")
+	}
+	if strings.ContainsAny(name, "/\\") || name == "." || name == ".." {
+		return fmt.Errorf("invalid skill name %q", name)
+	}
+	return nil
+}
+
+// linkPointsInto returns true when linkTarget resolves to a path inside dir.
+func linkPointsInto(linkTarget, dir string) bool {
+	if linkTarget == "" || dir == "" {
+		return false
+	}
+	abs, err := filepath.Abs(linkTarget)
+	if err != nil {
+		return false
+	}
+	dirAbs, err := filepath.Abs(dir)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(dirAbs, abs)
+	if err != nil {
+		return false
+	}
+	return !strings.HasPrefix(rel, "..")
+}
+
+func removeIfPresent(path string) error {
+	st, err := os.Lstat(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	// A symlink (managed) goes via Remove; a real directory under our own
+	// install path can also be removed since the user explicitly asked to
+	// re-install the skill.
+	if st.IsDir() && st.Mode()&os.ModeSymlink == 0 {
+		return os.RemoveAll(path)
+	}
+	return os.Remove(path)
+}
