@@ -33,6 +33,7 @@ add_executable(agentkate
     src/ProjectTree.cpp
     src/TerminalPanel.cpp
     src/SessionBrowserDialog.cpp
+    src/SkillsDialog.cpp
     src/AgentRoster.cpp
     src/AgentDock.cpp
     src/AgentPanel.cpp

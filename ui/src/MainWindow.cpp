@@ -7,6 +7,7 @@
 #include "ProjectTree.h"
 #include "ReferencesPanel.h"
 #include "SessionBrowserDialog.h"
+#include "SkillsDialog.h"
 #include "TerminalPanel.h"
 #include "ipc/CoreClient.h"
 #include "lsp/LspManager.h"
@@ -307,6 +308,18 @@ void MainWindow::setupActions()
         dlg->show();
     });
     codeMenu->addAction(extAct);
+
+    auto *skillsAct = new QAction(QIcon::fromTheme(QStringLiteral("preferences-plugin")),
+                                  i18n("Manage Claude &Skills…"), this);
+    connect(skillsAct, &QAction::triggered, this, [this] {
+        if (m_activeProject.isEmpty()) {
+            return;
+        }
+        auto *dlg = new SkillsDialog(m_core, m_activeProject, this);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+    });
+    codeMenu->addAction(skillsAct);
 
     auto *helpMenu = new KHelpMenu(this, KAboutData::applicationData());
     menuBar()->addMenu(helpMenu->menu());
