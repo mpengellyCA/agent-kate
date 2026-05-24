@@ -41,6 +41,7 @@ add_executable(agentkate
     src/git/CommitDialog.cpp
     src/git/ConflictDialog.cpp
     src/git/GutterController.cpp
+    src/git/PRDialog.cpp
     src/ipc/CoreClient.cpp
     src/lsp/LspClient.cpp
     src/lsp/LspCompletionModel.cpp

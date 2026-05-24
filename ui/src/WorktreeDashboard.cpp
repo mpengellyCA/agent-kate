@@ -4,6 +4,7 @@
 #include "WorktreeDashboard.h"
 #include "git/CommitDialog.h"
 #include "git/ConflictDialog.h"
+#include "git/PRDialog.h"
 #include "ipc/CoreClient.h"
 
 #include <QHBoxLayout>
@@ -150,11 +151,14 @@ WorktreeDashboard::WorktreeDashboard(CoreClient *core, QWidget *parent)
     m_commitBtn->setEnabled(false);
     m_landBtn = new QPushButton(QStringLiteral("Land into main…"), this);
     m_landBtn->setEnabled(false);
+    m_prBtn = new QPushButton(QStringLiteral("Open PR…"), this);
+    m_prBtn->setEnabled(false);
     auto *toolbar = new QHBoxLayout;
     toolbar->setContentsMargins(6, 4, 6, 4);
     toolbar->addStretch(1);
     toolbar->addWidget(m_commitBtn);
     toolbar->addWidget(m_landBtn);
+    toolbar->addWidget(m_prBtn);
 
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
@@ -170,15 +174,18 @@ WorktreeDashboard::WorktreeDashboard(CoreClient *core, QWidget *parent)
             [this] {
                 const WorktreeRow *r = selectedRow();
                 m_commitBtn->setEnabled(r != nullptr);
-                // Land only makes sense for an isolated worktree on its own
-                // branch — and only when there are commits to merge.
-                m_landBtn->setEnabled(r != nullptr && r->isolated && r->ahead > 0);
+                // Land and Open PR only make sense for an isolated worktree
+                // on its own branch with commits actually to merge / push.
+                const bool merging = r != nullptr && r->isolated && r->ahead > 0;
+                m_landBtn->setEnabled(merging);
+                m_prBtn->setEnabled(merging);
             });
     connect(m_view, &QTableView::doubleClicked, this,
             [this](const QModelIndex &) { openCommitDialog(); });
     connect(m_commitBtn, &QPushButton::clicked, this,
             &WorktreeDashboard::openCommitDialog);
     connect(m_landBtn, &QPushButton::clicked, this, &WorktreeDashboard::landSelected);
+    connect(m_prBtn, &QPushButton::clicked, this, &WorktreeDashboard::openPRDialog);
 }
 
 const WorktreeRow *WorktreeDashboard::selectedRow() const
@@ -188,6 +195,23 @@ const WorktreeRow *WorktreeDashboard::selectedRow() const
         return nullptr;
     }
     return m_model->rowAt(sel.first().row());
+}
+
+void WorktreeDashboard::openPRDialog()
+{
+    const WorktreeRow *r = selectedRow();
+    if (!r || r->branch.isEmpty()) {
+        return;
+    }
+    auto *dlg = new PRDialog(m_core, r->threadId, r->branch, this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    connect(dlg, &PRDialog::prOpened, this, [this](const QString &url) {
+        emit statusMessage(url.isEmpty()
+                               ? QStringLiteral("PR opened")
+                               : QStringLiteral("PR opened: %1").arg(url));
+        refresh();
+    });
+    dlg->show();
 }
 
 void WorktreeDashboard::landSelected()
