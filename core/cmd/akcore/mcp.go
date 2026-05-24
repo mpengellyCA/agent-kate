@@ -266,6 +266,124 @@ func (b *mcpBridge) runTool(name string, args json.RawMessage) (string, error) {
 		}
 		return "Review requested — the human has been notified in AgentKate.", nil
 
+	case "list_agents":
+		var a struct {
+			AllWorkspaces bool `json:"all_workspaces"`
+		}
+		_ = json.Unmarshal(args, &a)
+		project := b.workspace
+		if a.AllWorkspaces {
+			project = ""
+		}
+		var res struct {
+			Threads []struct {
+				ThreadID string    `json:"threadId"`
+				Project  string    `json:"project"`
+				Title    string    `json:"title"`
+				Status   string    `json:"status"`
+				Branch   string    `json:"branch"`
+				Path     string    `json:"path"`
+				Isolated bool      `json:"isolated"`
+				Number   int       `json:"number"`
+				Created  time.Time `json:"created"`
+				LastTurn time.Time `json:"lastTurn"`
+				Model    string    `json:"model"`
+			} `json:"threads"`
+		}
+		if err := b.client.Call("agent.list",
+			map[string]any{"project": project}, &res); err != nil {
+			return "", err
+		}
+		if len(res.Threads) == 0 {
+			return "No agent threads on record.", nil
+		}
+		now := time.Now()
+		var sb strings.Builder
+		for _, t := range res.Threads {
+			self := ""
+			if t.ThreadID == b.thread {
+				self = " (you)"
+			}
+			title := t.Title
+			if title == "" {
+				title = "(no title)"
+			}
+			age := now.Sub(t.Created).Round(time.Minute)
+			idleNote := ""
+			if !t.LastTurn.IsZero() {
+				idleNote = fmt.Sprintf(", idle %s", now.Sub(t.LastTurn).Round(time.Minute))
+			}
+			wtKind := "workspace"
+			if t.Isolated {
+				wtKind = "isolated"
+			}
+			fmt.Fprintf(&sb, "#%d %s%s — %s [%s, %s, age %s%s]\n",
+				t.Number, t.ThreadID, self, title, t.Status, wtKind, age, idleNote)
+			if t.Branch != "" {
+				fmt.Fprintf(&sb, "    branch: %s\n", t.Branch)
+			}
+			if t.Path != "" {
+				fmt.Fprintf(&sb, "    path:   %s\n", t.Path)
+			}
+		}
+		return strings.TrimRight(sb.String(), "\n"), nil
+
+	case "discard_agent":
+		var a struct {
+			ThreadID string `json:"thread_id"`
+			Force    bool   `json:"force"`
+		}
+		_ = json.Unmarshal(args, &a)
+		a.ThreadID = strings.TrimSpace(a.ThreadID)
+		if a.ThreadID == "" {
+			return "", fmt.Errorf("discard_agent requires 'thread_id'")
+		}
+		if a.ThreadID == b.thread {
+			return "", fmt.Errorf("an agent cannot discard itself — ask the human to remove this thread")
+		}
+		var list struct {
+			Threads []struct {
+				ThreadID string `json:"threadId"`
+				Status   string `json:"status"`
+				Branch   string `json:"branch"`
+				Path     string `json:"path"`
+				Isolated bool   `json:"isolated"`
+			} `json:"threads"`
+		}
+		if err := b.client.Call("agent.list", map[string]any{"project": ""}, &list); err != nil {
+			return "", err
+		}
+		var found *struct {
+			ThreadID string `json:"threadId"`
+			Status   string `json:"status"`
+			Branch   string `json:"branch"`
+			Path     string `json:"path"`
+			Isolated bool   `json:"isolated"`
+		}
+		for i := range list.Threads {
+			if list.Threads[i].ThreadID == a.ThreadID {
+				found = &list.Threads[i]
+				break
+			}
+		}
+		if found == nil {
+			return "", fmt.Errorf("unknown thread %q", a.ThreadID)
+		}
+		if found.Status == "running" && !a.Force {
+			return "", fmt.Errorf("thread %s is still running; stop it first or pass force=true",
+				a.ThreadID)
+		}
+		if err := b.client.Call("agent.discard",
+			map[string]any{"threadId": a.ThreadID}, nil); err != nil {
+			return "", err
+		}
+		detail := "removed from registry"
+		if found.Isolated {
+			detail = fmt.Sprintf("removed worktree %s and deleted branch %s",
+				found.Path, found.Branch)
+		}
+		return fmt.Sprintf("Discarded agent %s (%s).", a.ThreadID, detail), nil
+
 	case "request_permission":
 		// Claude Code calls this for any gated tool. Forward the request to
 		// the core (which prompts the human in the agent panel) and answer
@@ -394,6 +512,44 @@ func toolDefs() []map[string]any {
 					"summary": map[string]any{"type": "string", "description": "Short summary of the changes."},
 				},
 				"required": []string{"summary"},
+			},
+		},
+		{
+			"name": "list_agents",
+			"description": "List every AgentKate agent thread on record — its id, title, " +
+				"status (running/dormant), worktree branch and path, and how long it has " +
+				"been idle. Defaults to the current workspace; pass all_workspaces=true " +
+				"to include every project. Use this to find stale agents to clean up.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"all_workspaces": map[string]any{
+						"type":        "boolean",
+						"description": "Include threads from every workspace, not just this one.",
+					},
+				},
+			},
+		},
+		{
+			"name": "discard_agent",
+			"description": "Permanently delete an agent thread: stop its process, remove " +
+				"its git worktree, and delete its branch. DESTRUCTIVE — any uncommitted " +
+				"work in that worktree is lost. Refuses to discard the calling agent or " +
+				"a running thread (pass force=true to override the running check). Use " +
+				"list_agents first to pick the right thread_id.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"thread_id": map[string]any{
+						"type":        "string",
+						"description": "Agent thread id to discard.",
+					},
+					"force": map[string]any{
+						"type":        "boolean",
+						"description": "Discard even if the thread is currently running.",
+					},
+				},
+				"required": []string{"thread_id"},
 			},
 		},
 		{

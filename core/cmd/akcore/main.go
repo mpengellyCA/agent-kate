@@ -556,6 +556,32 @@ func registerHandlers(d handlerDeps) {
 		return map[string]any{"branch": rec.Worktree.Branch, "into": target}, nil
 	})
 
+	d.srv.Handle("agent.list", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			Project string `json:"project"`
+		}
+		_ = json.Unmarshal(raw, &p)
+		recs := d.sessions.List(p.Project)
+		out := make([]map[string]any, 0, len(recs))
+		for _, r := range recs {
+			out = append(out, map[string]any{
+				"threadId": r.ThreadID,
+				"project":  r.Project,
+				"title":    r.Title,
+				"status":   r.Status,
+				"branch":   r.Worktree.Branch,
+				"path":     r.Worktree.Path,
+				"isolated": r.Worktree.Isolated,
+				"number":   r.Worktree.Number,
+				"created":  r.Created,
+				"updated":  r.Updated,
+				"lastTurn": r.LastTurnAt,
+				"model":    r.Model,
+			})
+		}
+		return map[string]any{"threads": out}, nil
+	})
+
 	d.srv.Handle("agent.discard", func(_ context.Context, raw json.RawMessage) (any, error) {
 		var p struct {
 			ThreadID string `json:"threadId"`
