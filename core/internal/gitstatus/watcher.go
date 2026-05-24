@@ -51,8 +51,15 @@ func (w *watcher) Close() error {
 // Directories in the skip set (.git, node_modules, dotfile dirs, …) are not
 // descended into; the rest are added one at a time because inotify is not
 // recursive on Linux.
+//
+// .git itself is skipped by the general walk because its objects/ tree is
+// huge and noisy, but commits / branch updates / index changes happen *inside*
+// .git — so we add a curated set of watches in there too (HEAD, index, refs,
+// packed-refs, MERGE_HEAD, …). Without this the dashboard stayed stale after
+// any commit that didn't go through the daemon's own git.* RPCs.
 func (w *watcher) Watch(threadID, root string) {
 	w.addDirRecursive(threadID, root, true)
+	w.addGitMetaWatches(threadID, root)
 }
 
 // Unwatch removes every watch that was added under this thread's root.
@@ -71,6 +78,68 @@ func (w *watcher) Unwatch(threadID string) {
 	for _, p := range paths {
 		_ = w.fs.Remove(p)
 	}
+}
+
+// addGitMetaWatches adds inotify watches inside .git so HEAD / index / refs
+// changes invalidate the cache. Skips objects/, logs/, lfs/ which are large
+// and write-noisy without affecting visible status. Handles both real .git
+// directories and the gitfile pointer used by linked worktrees.
+func (w *watcher) addGitMetaWatches(threadID, worktreeRoot string) {
+	gitDir := resolveGitDir(worktreeRoot)
+	if gitDir == "" {
+		return
+	}
+	skipTop := map[string]bool{"objects": true, "logs": true, "lfs": true}
+	_ = filepath.WalkDir(gitDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !d.IsDir() {
+			return nil
+		}
+		if path != gitDir {
+			rel, _ := filepath.Rel(gitDir, path)
+			first, _, _ := strings.Cut(rel, string(filepath.Separator))
+			if skipTop[first] {
+				return filepath.SkipDir
+			}
+		}
+		w.mu.Lock()
+		w.dirOwner[path] = threadID
+		w.mu.Unlock()
+		if err := w.fs.Add(path); err != nil {
+			w.log.Debug("git meta watch add failed", "path", path, "err", err)
+		}
+		return nil
+	})
+}
+
+// resolveGitDir returns the real .git directory for a worktree root. For a
+// linked worktree, .git is a file containing "gitdir: <path>" pointing at the
+// per-worktree subdir under the main repo's .git.
+func resolveGitDir(worktreeRoot string) string {
+	gitPath := filepath.Join(worktreeRoot, ".git")
+	info, err := os.Stat(gitPath)
+	if err != nil {
+		return ""
+	}
+	if info.IsDir() {
+		return gitPath
+	}
+	data, err := os.ReadFile(gitPath)
+	if err != nil {
+		return ""
+	}
+	line := strings.TrimSpace(string(data))
+	const prefix = "gitdir: "
+	if !strings.HasPrefix(line, prefix) {
+		return ""
+	}
+	actual := strings.TrimPrefix(line, prefix)
+	if !filepath.IsAbs(actual) {
+		actual = filepath.Join(worktreeRoot, actual)
+	}
+	return actual
 }
 
 func (w *watcher) addDirRecursive(threadID, root string, isRoot bool) {
