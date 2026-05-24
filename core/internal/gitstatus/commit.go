@@ -186,7 +186,10 @@ func CommitDiff(wt worktree.Worktree, sha, relPath string) (string, error) {
 	if wt.Path == "" || sha == "" {
 		return "", nil
 	}
-	args := []string{"show", "--no-color", "-M", sha}
+	// `-m --first-parent` makes merge commits show their diff against the
+	// first parent (default `git show` emits header-only for merges, which
+	// leaves the diff pane blank even though our file list has entries).
+	args := []string{"show", "--no-color", "-M", "-m", "--first-parent", sha}
 	if relPath != "" {
 		args = append(args, "--", filepath.FromSlash(relPath))
 	}

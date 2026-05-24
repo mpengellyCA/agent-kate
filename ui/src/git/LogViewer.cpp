@@ -330,13 +330,12 @@ void LogViewer::onSelectionChanged()
         return;
     }
     const QString sha = m_model->shaAt(idx.row());
-    if (sha.isEmpty() || m_source.threadId.isEmpty()) {
-        // Workspace-branch sources don't surface a thread-scoped detail RPC
-        // yet, so clear the panel rather than show stale data.
+    if (sha.isEmpty()
+        || (m_source.threadId.isEmpty() && m_source.repoRoot.isEmpty())) {
         m_detail->clear();
         return;
     }
-    m_detail->setCommit(m_source.threadId, sha);
+    m_detail->setCommit(m_source.threadId, m_source.repoRoot, sha);
 }
 
 void LogViewer::onNotification(const QString &method, const QJsonObject &params)

@@ -28,7 +28,9 @@ class CommitDetailPanel : public QWidget
 public:
     CommitDetailPanel(CoreClient *core, QWidget *parent = nullptr);
 
-    void setCommit(const QString &threadId, const QString &sha);
+    // Either threadId or repoRoot must be set — the former scopes to an agent
+    // worktree, the latter to the surrounding workspace branch.
+    void setCommit(const QString &threadId, const QString &repoRoot, const QString &sha);
     void clear();
 
 private:
@@ -37,9 +39,12 @@ private:
     void applyDetail(const QJsonObject &detail);
     void replaceDiff(const QString &patch);
     void onFileRowChanged(int row);
+    QJsonObject sourceParams() const;
+    bool hasSource() const;
 
     CoreClient *m_core;
     QString m_threadId;
+    QString m_repoRoot;
     QString m_sha;
     // Bumped on every setCommit() so in-flight replies for a stale commit can
     // be discarded — the user can click through commits faster than RPCs
