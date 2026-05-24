@@ -1,0 +1,5 @@
+usr/bin/agentkate
+usr/bin/akcore
+usr/share/applications/org.kde.agentkate.desktop
+usr/share/metainfo/org.kde.agentkate.metainfo.xml
+usr/share/icons/hicolor/*/apps/agentkate.*

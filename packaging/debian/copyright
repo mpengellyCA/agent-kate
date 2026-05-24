@@ -1,0 +1,10 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: AgentKate
+Upstream-Contact: Mike Pengelly <mike@leadrix.io>
+Source: https://github.com/mpengelly/AgentKate
+
+Files: *
+Copyright: 2026 Mike Pengelly
+License: LGPL-2.0-or-later
+ On Debian systems, the complete text of the GNU Lesser General Public
+ License version 2 can be found in /usr/share/common-licenses/LGPL-2.

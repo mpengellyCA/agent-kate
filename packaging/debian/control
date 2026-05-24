@@ -1,0 +1,34 @@
+Source: agentkate
+Section: devel
+Priority: optional
+Maintainer: Mike Pengelly <mike@leadrix.io>
+Build-Depends: debhelper-compat (= 13),
+               cmake (>= 3.20),
+               ninja-build,
+               golang-go (>= 2:1.22~) | golang-1.22-go | golang-1.23-go,
+               pkg-config,
+               extra-cmake-modules (>= 6.0),
+               qt6-base-dev (>= 6.6),
+               qt6-tools-dev,
+               libkf6texteditor-dev,
+               libkf6syntaxhighlighting-dev,
+               libkf6xmlgui-dev,
+               libkf6configwidgets-dev,
+               libkf6config-dev,
+               libkf6coreaddons-dev,
+               libkf6i18n-dev,
+               libkf6parts-dev,
+               libkf6widgetsaddons-dev
+Standards-Version: 4.6.2
+Homepage: https://github.com/mpengelly/AgentKate
+Rules-Requires-Root: no
+
+Package: agentkate
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends},
+         konsole
+Recommends: git
+Description: Native KDE multi-agent coding arena built on Kate
+ AgentKate combines the Kate text editor with an orchestration core for
+ running multiple coding agents in parallel, with integrated git, LSP,
+ terminal, and worktree management.

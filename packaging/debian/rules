@@ -1,0 +1,19 @@
+#!/usr/bin/make -f
+# Build with cmake + ninja. Force the Go toolchain into vendor/offline mode
+# so dh_auto_build does not try to fetch modules over the network.
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+export GOFLAGS = -mod=vendor -trimpath
+export GOPROXY = off
+export GOCACHE = $(CURDIR)/.gocache
+export GOMODCACHE = $(CURDIR)/.gomodcache
+
+%:
+	dh $@ --buildsystem=cmake+ninja
+
+override_dh_auto_configure:
+	dh_auto_configure -- \
+		-DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+override_dh_auto_test:
+	# No upstream test target wired into CMake yet.

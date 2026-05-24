@@ -1,0 +1,54 @@
+# Maintainer: Mike Pengelly <mike@leadrix.io>
+pkgname=agentkate
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Native KDE multi-agent coding arena built on the Kate editor engine"
+arch=('x86_64' 'aarch64')
+url="https://github.com/mpengelly/AgentKate"
+license=('LGPL-2.0-or-later')
+depends=(
+    'qt6-base'
+    'kcoreaddons'
+    'kconfig'
+    'kconfigwidgets'
+    'ki18n'
+    'kxmlgui'
+    'kparts'
+    'kwidgetsaddons'
+    'ktexteditor'
+    'syntax-highlighting'
+    'konsole'
+)
+makedepends=(
+    'cmake'
+    'ninja'
+    'extra-cmake-modules'
+    'go'
+    'git'
+)
+optdepends=('git: source control integration')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/mpengelly/AgentKate/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+    cd "AgentKate-$pkgver/core"
+    # Vendor Go deps so the build step does not hit the network during makepkg.
+    go mod vendor
+}
+
+build() {
+    cd "AgentKate-$pkgver"
+    export GOFLAGS="-mod=vendor -trimpath"
+    export GOPROXY=off
+    cmake -S . -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+        -DCMAKE_INSTALL_PREFIX=/usr
+    cmake --build build
+}
+
+package() {
+    cd "AgentKate-$pkgver"
+    DESTDIR="$pkgdir" cmake --install build
+    install -Dm644 LICENSES/LGPL-2.0-or-later.txt \
+        "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

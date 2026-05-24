@@ -19,5 +19,9 @@ add_custom_target(akcore ALL
     USES_TERMINAL
 )
 
+include(GNUInstallDirs)
+install(PROGRAMS ${CMAKE_BINARY_DIR}/akcore
+        DESTINATION ${CMAKE_INSTALL_BINDIR})
+
 # --- C++/Qt UI (agentkate) -------------------------------------------------
 add_subdirectory(ui)

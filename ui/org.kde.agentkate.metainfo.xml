@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.kde.agentkate</id>
+  <launchable type="desktop-id">org.kde.agentkate.desktop</launchable>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>LGPL-2.0-or-later</project_license>
+  <name>AgentKate</name>
+  <summary>Native KDE multi-agent coding arena built on the Kate editor engine</summary>
+  <description>
+    <p>
+      AgentKate is a native KDE application that combines the Kate text editor
+      with an orchestration core for running multiple coding agents in parallel,
+      with integrated git, LSP, terminal, and worktree management.
+    </p>
+  </description>
+  <url type="homepage">https://github.com/mpengelly/AgentKate</url>
+  <developer_name>Mike Pengelly</developer_name>
+  <categories>
+    <category>Development</category>
+    <category>IDE</category>
+  </categories>
+  <provides>
+    <binary>agentkate</binary>
+  </provides>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-05-24"/>
+  </releases>
+</component>
