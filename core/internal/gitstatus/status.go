@@ -19,6 +19,7 @@ import (
 // straight to the UI.
 type Snapshot struct {
 	ThreadID     string       `json:"threadId"`
+	Number       int          `json:"number,omitempty"` // project-scoped agent number (#N)
 	RepoRoot     string       `json:"repoRoot"`
 	Path         string       `json:"path"`
 	Branch       string       `json:"branch"`
@@ -58,6 +59,7 @@ const (
 func computeSnapshot(wt worktree.Worktree) (*Snapshot, error) {
 	snap := &Snapshot{
 		ThreadID:  wt.ThreadID,
+		Number:    wt.Number,
 		RepoRoot:  wt.RepoRoot,
 		Path:      wt.Path,
 		Branch:    wt.Branch,

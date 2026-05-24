@@ -21,6 +21,10 @@ type Worktree struct {
 	Branch   string `json:"branch"`   // git branch; empty when not isolated
 	Base     string `json:"base"`     // base commit; empty when not isolated
 	Isolated bool   `json:"isolated"` // true = real worktree, false = direct in workspace
+	// Number is a project-scoped, monotonically assigned agent ID surfaced
+	// in the UI as "#3" so users have a short handle for each agent's
+	// worktree. Zero until the session layer stamps it.
+	Number int `json:"number,omitempty"`
 }
 
 func git(dir string, args ...string) (string, error) {

@@ -47,6 +47,8 @@ QVariant WorktreeModel::data(const QModelIndex &index, int role) const
     const WorktreeRow &r = m_rows.at(index.row());
     if (role == Qt::DisplayRole) {
         switch (index.column()) {
+        case ColAgent:
+            return r.number > 0 ? QStringLiteral("#%1").arg(r.number) : QString();
         case ColBranch:
             return r.branch.isEmpty() ? QStringLiteral("(detached)") : r.branch;
         case ColIsolation:
@@ -76,6 +78,7 @@ QVariant WorktreeModel::data(const QModelIndex &index, int role) const
     }
     if (role == Qt::TextAlignmentRole) {
         switch (index.column()) {
+        case ColAgent:
         case ColAhead:
         case ColBehind:
         case ColDirty:
@@ -91,6 +94,8 @@ QVariant WorktreeModel::headerData(int section, Qt::Orientation orientation, int
         return {};
     }
     switch (section) {
+    case ColAgent:
+        return QStringLiteral("Agent");
     case ColBranch:
         return QStringLiteral("Branch");
     case ColIsolation:
@@ -174,6 +179,8 @@ WorktreeDashboard::WorktreeDashboard(CoreClient *core, QWidget *parent)
     m_view->setAlternatingRowColors(true);
     m_view->verticalHeader()->setVisible(false);
     m_view->horizontalHeader()->setStretchLastSection(true);
+    m_view->horizontalHeader()->setSectionResizeMode(
+        WorktreeModel::ColAgent, QHeaderView::ResizeToContents);
     m_view->horizontalHeader()->setSectionResizeMode(
         WorktreeModel::ColBranch, QHeaderView::ResizeToContents);
     m_view->horizontalHeader()->setSectionResizeMode(
@@ -369,6 +376,7 @@ void WorktreeDashboard::refresh()
                          const QJsonObject o = v.toObject();
                          WorktreeRow r;
                          r.threadId = o.value(QStringLiteral("threadId")).toString();
+                         r.number = o.value(QStringLiteral("number")).toInt();
                          r.branch = o.value(QStringLiteral("branch")).toString();
                          r.path = o.value(QStringLiteral("path")).toString();
                          r.isolated = o.value(QStringLiteral("isolated")).toBool();

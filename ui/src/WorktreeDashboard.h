@@ -18,6 +18,7 @@ class QTableView;
 // returns via git.snapshot, flattened for display.
 struct WorktreeRow {
     QString threadId;
+    int number = 0; // project-scoped agent number; 0 = not yet assigned
     QString branch;
     QString path;
     bool isolated = false;
@@ -35,7 +36,8 @@ class WorktreeModel : public QAbstractTableModel
     Q_OBJECT
 public:
     enum Column {
-        ColBranch = 0,
+        ColAgent = 0,
+        ColBranch,
         ColIsolation,
         ColAhead,
         ColBehind,

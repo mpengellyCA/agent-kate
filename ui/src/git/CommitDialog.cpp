@@ -66,12 +66,17 @@ CommitDialog::CommitDialog(CoreClient *core, const QString &threadId, const QStr
     m_message->setFixedHeight(110);
 
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Cancel, this);
+    m_suggestBtn = buttons->addButton(QStringLiteral("Suggest with Sonnet"),
+                                      QDialogButtonBox::ActionRole);
+    m_suggestBtn->setToolTip(QStringLiteral(
+        "Ask Claude Sonnet to draft a commit message for the current diff."));
     m_commitBtn = buttons->addButton(QStringLiteral("Commit"),
                                      QDialogButtonBox::AcceptRole);
     m_commitBtn->setEnabled(false);
     m_cancelBtn = buttons->button(QDialogButtonBox::Cancel);
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
     connect(m_commitBtn, &QPushButton::clicked, this, &CommitDialog::onCommitClicked);
+    connect(m_suggestBtn, &QPushButton::clicked, this, &CommitDialog::onSuggestClicked);
 
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(12, 12, 12, 12);
@@ -175,6 +180,48 @@ void CommitDialog::loadDiff()
                      }
                      m_diff = new DiffView(patch, this);
                      m_diffSlot->addWidget(m_diff);
+                 });
+}
+
+void CommitDialog::onSuggestClicked()
+{
+    if (!m_core->isConnected()) {
+        return;
+    }
+    const QString prevText = m_suggestBtn->text();
+    m_suggestBtn->setEnabled(false);
+    m_suggestBtn->setText(QStringLiteral("Drafting…"));
+    const QString prevPlaceholder = m_message->placeholderText();
+    m_message->setPlaceholderText(QStringLiteral("Sonnet is drafting a message…"));
+    const QString thread = m_threadId;
+    m_core->call(QStringLiteral("git.suggestCommitMessage"),
+                 QJsonObject{{QStringLiteral("threadId"), thread}},
+                 [this, thread, prevText, prevPlaceholder]
+                 (const QJsonObject &result, const QJsonObject &error) {
+                     if (thread != m_threadId) {
+                         return;
+                     }
+                     m_suggestBtn->setEnabled(true);
+                     m_suggestBtn->setText(prevText);
+                     if (!error.isEmpty()) {
+                         m_message->setPlaceholderText(
+                             QStringLiteral("Suggestion failed: %1")
+                                 .arg(error.value(QStringLiteral("message"))
+                                          .toString()));
+                         return;
+                     }
+                     m_message->setPlaceholderText(prevPlaceholder);
+                     const QString msg =
+                         result.value(QStringLiteral("message")).toString();
+                     if (msg.isEmpty()) {
+                         m_message->setPlaceholderText(
+                             QStringLiteral("Sonnet returned no message — "
+                                            "is the diff empty?"));
+                         return;
+                     }
+                     // Replace whatever is in the editor with the suggestion;
+                     // the user can still edit it before committing.
+                     m_message->setPlainText(msg);
                  });
 }
 

@@ -102,7 +102,65 @@ func (s *Store) load() error {
 		r.Status = StatusDormant // nothing is running in a fresh process
 		s.recs[r.ThreadID] = r
 	}
+	// Backfill the project-scoped Worktree.Number for records from before
+	// the field existed. Assign sequentially in Created order so older
+	// agents keep the lower numbers a user would expect.
+	if s.backfillNumbers() {
+		_ = s.flush()
+	}
 	return nil
+}
+
+// backfillNumbers stamps Worktree.Number on every record that lacks one,
+// numbering each project's records 1..N in Created order. Returns true if
+// anything changed. Caller holds s.mu (or is in single-threaded load()).
+func (s *Store) backfillNumbers() bool {
+	byProject := make(map[string][]Record)
+	for _, r := range s.recs {
+		byProject[r.Project] = append(byProject[r.Project], r)
+	}
+	changed := false
+	for _, list := range byProject {
+		sort.Slice(list, func(i, j int) bool { return list[i].Created.Before(list[j].Created) })
+		used := make(map[int]bool)
+		for _, r := range list {
+			if r.Worktree.Number > 0 {
+				used[r.Worktree.Number] = true
+			}
+		}
+		next := 1
+		for _, r := range list {
+			if r.Worktree.Number > 0 {
+				continue
+			}
+			for used[next] {
+				next++
+			}
+			r.Worktree.Number = next
+			used[next] = true
+			s.recs[r.ThreadID] = r
+			changed = true
+		}
+	}
+	return changed
+}
+
+// NextNumber returns the next project-scoped agent number to assign. Numbers
+// monotonically increase per project; gaps left by removed records are not
+// re-used (predictable history beats compactness).
+func (s *Store) NextNumber(project string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	max := 0
+	for _, r := range s.recs {
+		if r.Project != project {
+			continue
+		}
+		if r.Worktree.Number > max {
+			max = r.Worktree.Number
+		}
+	}
+	return max + 1
 }
 
 // flush writes the store to disk atomically. The caller holds s.mu.

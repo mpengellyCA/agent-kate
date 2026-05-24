@@ -80,10 +80,11 @@ LogViewer::LogViewer(CoreClient *core, QWidget *parent)
 
     connect(m_threadPicker, qOverload<int>(&QComboBox::currentIndexChanged), this,
             [this](int idx) {
-                const QString id =
-                    idx < 0 ? QString() : m_threadPicker->itemData(idx).toString();
-                if (id != m_threadId) {
-                    m_threadId = id;
+                const Source s = sourceForIndex(idx);
+                if (s.threadId != m_source.threadId
+                    || s.repoRoot != m_source.repoRoot
+                    || s.branch != m_source.branch) {
+                    m_source = s;
                     reloadFromFirstPage();
                 }
             });
@@ -104,10 +105,10 @@ LogViewer::LogViewer(CoreClient *core, QWidget *parent)
 
 void LogViewer::setThreadId(const QString &threadId)
 {
-    if (threadId == m_threadId) {
+    if (threadId == m_source.threadId && m_source.repoRoot.isEmpty()) {
         return;
     }
-    m_threadId = threadId;
+    m_source = Source{threadId, QString(), QString()};
     // Try to reflect the selection in the picker; if the snapshot hasn't
     // arrived yet the next refreshThreads() will line it back up.
     const int idx = m_threadPicker->findData(threadId);
@@ -116,6 +117,17 @@ void LogViewer::setThreadId(const QString &threadId)
         m_threadPicker->setCurrentIndex(idx);
     }
     reloadFromFirstPage();
+}
+
+LogViewer::Source LogViewer::sourceForIndex(int idx) const
+{
+    if (idx < 0) {
+        return {};
+    }
+    const QVariantMap m = m_threadPicker->itemData(idx).toMap();
+    return Source{m.value(QStringLiteral("threadId")).toString(),
+                  m.value(QStringLiteral("repoRoot")).toString(),
+                  m.value(QStringLiteral("branch")).toString()};
 }
 
 void LogViewer::showEvent(QShowEvent *e)
@@ -137,43 +149,77 @@ void LogViewer::refreshThreads()
                          return;
                      }
                      m_threadsLoaded = true;
-                     const QJsonArray arr =
+                     const QJsonArray threads =
                          result.value(QStringLiteral("threads")).toArray();
-                     const QString prev = m_threadId;
+                     const QJsonArray workspaces =
+                         result.value(QStringLiteral("workspaces")).toArray();
+                     const Source prev = m_source;
                      QSignalBlocker block(m_threadPicker);
                      m_threadPicker->clear();
-                     for (const QJsonValue &v : arr) {
+                     // Workspace branches first so "main" is the easy default
+                     // for users who haven't started any agent yet.
+                     for (const QJsonValue &v : workspaces) {
+                         const QJsonObject o = v.toObject();
+                         const QString repoRoot =
+                             o.value(QStringLiteral("repoRoot")).toString();
+                         const QString branch =
+                             o.value(QStringLiteral("branch")).toString();
+                         if (repoRoot.isEmpty()) {
+                             continue;
+                         }
+                         const QString label =
+                             branch.isEmpty()
+                                 ? tr("workspace · (detached)")
+                                 : tr("workspace · %1").arg(branch);
+                         QVariantMap d;
+                         d.insert(QStringLiteral("repoRoot"), repoRoot);
+                         d.insert(QStringLiteral("branch"), branch);
+                         m_threadPicker->addItem(label, d);
+                     }
+                     for (const QJsonValue &v : threads) {
                          const QJsonObject o = v.toObject();
                          const QString id =
                              o.value(QStringLiteral("threadId")).toString();
                          const QString branch =
                              o.value(QStringLiteral("branch")).toString();
-                         const QString label =
-                             branch.isEmpty()
-                                 ? id
-                                 : QStringLiteral("%1 — %2").arg(branch, id);
-                         m_threadPicker->addItem(label, id);
+                         const int number =
+                             o.value(QStringLiteral("number")).toInt();
+                         QString label = branch.isEmpty() ? id : branch;
+                         if (number > 0) {
+                             label = QStringLiteral("#%1 · %2").arg(number).arg(label);
+                         }
+                         QVariantMap d;
+                         d.insert(QStringLiteral("threadId"), id);
+                         m_threadPicker->addItem(label, d);
                      }
                      int target = -1;
-                     if (!prev.isEmpty()) {
-                         target = m_threadPicker->findData(prev);
+                     for (int i = 0; i < m_threadPicker->count(); ++i) {
+                         const Source s = sourceForIndex(i);
+                         if (s.threadId == prev.threadId
+                             && s.repoRoot == prev.repoRoot
+                             && s.branch == prev.branch
+                             && (!s.threadId.isEmpty() || !s.repoRoot.isEmpty())) {
+                             target = i;
+                             break;
+                         }
                      }
                      if (target < 0 && m_threadPicker->count() > 0) {
                          target = 0;
                      }
                      if (target >= 0) {
                          m_threadPicker->setCurrentIndex(target);
-                         const QString id =
-                             m_threadPicker->itemData(target).toString();
-                         if (id != m_threadId) {
-                             m_threadId = id;
+                         const Source s = sourceForIndex(target);
+                         if (s.threadId != m_source.threadId
+                             || s.repoRoot != m_source.repoRoot
+                             || s.branch != m_source.branch) {
+                             m_source = s;
                              // Picker signal is blocked, so fire the load here.
                              reloadFromFirstPage();
                          } else if (m_model->loadedCount() == 0) {
                              reloadFromFirstPage();
                          }
                      } else {
-                         m_threadId.clear();
+                         m_source = {};
                          m_model->reset();
                          m_detail->clear();
                      }
@@ -187,7 +233,8 @@ void LogViewer::reloadFromFirstPage()
     m_pageInFlight = false;
     m_model->reset();
     m_detail->clear();
-    if (m_threadId.isEmpty() || !m_core->isConnected()) {
+    if ((m_source.threadId.isEmpty() && m_source.repoRoot.isEmpty())
+        || !m_core->isConnected()) {
         return;
     }
     loadNextPage();
@@ -195,17 +242,25 @@ void LogViewer::reloadFromFirstPage()
 
 void LogViewer::loadNextPage()
 {
-    if (m_pageInFlight || m_endReached || m_threadId.isEmpty()
+    if (m_pageInFlight || m_endReached
+        || (m_source.threadId.isEmpty() && m_source.repoRoot.isEmpty())
         || !m_core->isConnected()) {
         return;
     }
     m_pageInFlight = true;
     const int token = m_loadToken;
     const int skip = m_model->loadedCount();
-    m_core->call(QStringLiteral("git.log"),
-                 QJsonObject{{QStringLiteral("threadId"), m_threadId},
-                             {QStringLiteral("skip"), skip},
-                             {QStringLiteral("limit"), kPageSize}},
+    QJsonObject params{{QStringLiteral("skip"), skip},
+                       {QStringLiteral("limit"), kPageSize}};
+    if (!m_source.threadId.isEmpty()) {
+        params.insert(QStringLiteral("threadId"), m_source.threadId);
+    } else {
+        params.insert(QStringLiteral("repoRoot"), m_source.repoRoot);
+        if (!m_source.branch.isEmpty()) {
+            params.insert(QStringLiteral("branch"), m_source.branch);
+        }
+    }
+    m_core->call(QStringLiteral("git.log"), params,
                  [this, token](const QJsonObject &result, const QJsonObject &error) {
                      if (token != m_loadToken) {
                          return;
@@ -275,18 +330,20 @@ void LogViewer::onSelectionChanged()
         return;
     }
     const QString sha = m_model->shaAt(idx.row());
-    if (sha.isEmpty() || m_threadId.isEmpty()) {
+    if (sha.isEmpty() || m_source.threadId.isEmpty()) {
+        // Workspace-branch sources don't surface a thread-scoped detail RPC
+        // yet, so clear the panel rather than show stale data.
         m_detail->clear();
         return;
     }
-    m_detail->setCommit(m_threadId, sha);
+    m_detail->setCommit(m_source.threadId, sha);
 }
 
 void LogViewer::onNotification(const QString &method, const QJsonObject &params)
 {
     if (method == QLatin1String("git.log.invalidated")) {
         const QString id = params.value(QStringLiteral("threadId")).toString();
-        if (!id.isEmpty() && id == m_threadId) {
+        if (!id.isEmpty() && id == m_source.threadId) {
             reloadFromFirstPage();
         }
         return;
@@ -296,7 +353,7 @@ void LogViewer::onNotification(const QString &method, const QJsonObject &params)
         // know about yet. Only refresh the picker if we don't have one
         // selected — refreshing while the user is actively reading would
         // wipe pagination.
-        if (m_threadId.isEmpty()) {
+        if (m_source.threadId.isEmpty() && m_source.repoRoot.isEmpty()) {
             refreshThreads();
         }
     }

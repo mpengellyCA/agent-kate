@@ -285,6 +285,7 @@ func (c *Cache) ensureSnapshot(e *entry) *Snapshot {
 		// dashboard — a single broken worktree should not blank the others.
 		snap = &Snapshot{
 			ThreadID:  e.wt.ThreadID,
+			Number:    e.wt.Number,
 			RepoRoot:  e.wt.RepoRoot,
 			Branch:    e.wt.Branch,
 			Isolated:  e.wt.Isolated,
