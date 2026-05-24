@@ -8,6 +8,7 @@ namespace KTextEditor {
 class Document;
 }
 class GutterController;
+class BlameController;
 
 class CoreClient;
 class EditorArea;
@@ -63,6 +64,8 @@ private:
     int m_lastBottomTab = -1; // last tab raised by the user, used to restore on Ctrl+J
 
     QHash<KTextEditor::Document *, GutterController *> m_gutters;
+    QHash<KTextEditor::Document *, BlameController *> m_blames;
+    QAction *m_blameToggle = nullptr;
     QString m_activeFilePath;
 
     QString m_activeProject;

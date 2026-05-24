@@ -10,8 +10,12 @@
 #include "SkillsDialog.h"
 #include "TerminalPanel.h"
 #include "WorktreeDashboard.h"
+#include "git/BlameController.h"
 #include "git/GutterController.h"
 #include "ipc/CoreClient.h"
+
+#include <KTextEditor/Document>
+#include <KTextEditor/View>
 #include "lsp/LspManager.h"
 
 #include <KAboutData>
@@ -210,6 +214,16 @@ void MainWindow::setupUi()
     connect(m_editor, &EditorArea::documentOpened, this,
             [this](KTextEditor::Document *doc, const QString &path) {
                 m_lsp->documentOpened(doc, m_activeProject);
+                // Attach a per-document git blame controller (off by default;
+                // the View menu's "Toggle Git Blame" turns it on for the
+                // active view). The view to render against is the current
+                // editor view, looked up via the editor area.
+                if (!m_blames.contains(doc)) {
+                    if (auto *view = m_editor->currentView()) {
+                        auto *bc = new BlameController(doc, view, path, m_core, this);
+                        m_blames.insert(doc, bc);
+                    }
+                }
                 // Attach a per-document git gutter. The controller stops
                 // polling itself when the document is closed.
                 if (!m_gutters.contains(doc)) {
@@ -237,6 +251,9 @@ void MainWindow::setupUi()
                 m_lsp->documentClosed(doc);
                 if (auto *gc = m_gutters.take(doc)) {
                     gc->deleteLater();
+                }
+                if (auto *bc = m_blames.take(doc)) {
+                    bc->deleteLater();
                 }
             });
 }
@@ -308,6 +325,35 @@ void MainWindow::setupActions()
     });
 
     QMenu *viewMenu = menuBar()->addMenu(i18n("&View"));
+    m_blameToggle = viewMenu->addAction(i18n("Show Git &Blame"));
+    m_blameToggle->setCheckable(true);
+    m_blameToggle->setShortcut(Qt::CTRL | Qt::SHIFT | Qt::Key_B);
+    m_blameToggle->setToolTip(
+        i18n("Show per-line author / sha annotations for the active editor."));
+    connect(m_blameToggle, &QAction::toggled, this, [this](bool on) {
+        KTextEditor::View *view = m_editor->currentView();
+        if (!view) {
+            return;
+        }
+        BlameController *bc = m_blames.value(view->document(), nullptr);
+        if (!bc) {
+            return;
+        }
+        bc->setEnabled(on);
+    });
+    // Sync the checkbox state when the user moves between editor tabs: the
+    // toggle reflects the active view's controller, not a window-wide flag.
+    connect(m_editor, &EditorArea::currentFileChanged, this, [this](const QString &) {
+        if (!m_blameToggle) {
+            return;
+        }
+        KTextEditor::View *view = m_editor->currentView();
+        BlameController *bc = view ? m_blames.value(view->document(), nullptr) : nullptr;
+        QSignalBlocker block(m_blameToggle);
+        m_blameToggle->setChecked(bc != nullptr && bc->isEnabled());
+        m_blameToggle->setEnabled(bc != nullptr);
+    });
+    viewMenu->addSeparator();
     m_toggleBottomAct = viewMenu->addAction(i18n("Toggle &Bottom Panel"));
     m_toggleBottomAct->setShortcut(Qt::CTRL | Qt::Key_J);
     m_toggleBottomAct->setToolTip(

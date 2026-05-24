@@ -38,6 +38,7 @@ add_executable(agentkate
     src/AgentDock.cpp
     src/AgentPanel.cpp
     src/WorktreeDashboard.cpp
+    src/git/BlameController.cpp
     src/git/CommitDialog.cpp
     src/git/ConflictDialog.cpp
     src/git/GutterController.cpp
