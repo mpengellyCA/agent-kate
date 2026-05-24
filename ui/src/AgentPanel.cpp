@@ -30,6 +30,7 @@
 #include <QScrollArea>
 #include <QScrollBar>
 #include <QSignalBlocker>
+#include <QMenu>
 #include <QTextDocument>
 #include <QTimer>
 #include <QToolButton>
@@ -554,6 +555,35 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
         pushCompactStrategy();
     });
 
+    // "Compact now ▾" — one-shot compaction with any backend, independent of
+    // the scheduled strategy above. Hot Opus needs a live thread; the other
+    // backends just need the recorded Claude Code session id.
+    m_compactNowBtn = new QToolButton(this);
+    m_compactNowBtn->setText(QStringLiteral("Compact now"));
+    m_compactNowBtn->setPopupMode(QToolButton::InstantPopup);
+    m_compactNowBtn->setToolButtonStyle(Qt::ToolButtonTextOnly);
+    m_compactNowBtn->setCursor(Qt::PointingHandCursor);
+    m_compactNowBtn->setToolTip(QStringLiteral(
+        "Compact this thread now with the backend of your choice.\n"
+        "Hot Opus runs inline on the live thread and needs it running.\n"
+        "Cold backends (Opus/Sonnet/Haiku) re-read the saved transcript.\n"
+        "Local is free and behaviourally-lossless."));
+    {
+        auto *menu = new QMenu(m_compactNowBtn);
+        auto add = [this, menu](const QString &label, const QString &token) {
+            QAction *a = menu->addAction(label);
+            connect(a, &QAction::triggered, this, [this, token] { runCompactNow(token); });
+            return a;
+        };
+        add(QStringLiteral("Hot Opus (live thread)"), QStringLiteral("hot"));
+        menu->addSeparator();
+        add(QStringLiteral("Cold Opus"), QStringLiteral("opus"));
+        add(QStringLiteral("Cold Sonnet"), QStringLiteral("sonnet"));
+        add(QStringLiteral("Cold Haiku"), QStringLiteral("haiku"));
+        add(QStringLiteral("Local (programmatic)"), QStringLiteral("local"));
+        m_compactNowBtn->setMenu(menu);
+    }
+
     // Attachment chip bar — hidden until files are attached.
     m_attachBar = new QWidget(this);
     m_attachLayout = new QHBoxLayout(m_attachBar);
@@ -577,6 +607,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     buttons->addWidget(m_effortCombo);
     buttons->addWidget(m_compactCombo);
     buttons->addWidget(m_compactStrip);
+    buttons->addWidget(m_compactNowBtn);
     buttons->addWidget(m_attachBtn);
     buttons->addWidget(m_diffBtn);
     buttons->addStretch(1);
@@ -757,6 +788,49 @@ void AgentPanel::pushCompactStrategy()
                  });
 }
 
+void AgentPanel::runCompactNow(const QString &model)
+{
+    if (m_threadId.isEmpty() || !m_core || !m_core->isConnected()) {
+        addNote(QStringLiteral("Cannot compact: no thread or core is offline."),
+                QStringLiteral("err"));
+        return;
+    }
+    if (model == QLatin1String("hot") && m_dormant) {
+        addNote(QStringLiteral("Hot Opus needs a running thread. Resume first, "
+                               "or pick a cold backend."),
+                QStringLiteral("err"));
+        return;
+    }
+    addNote(QStringLiteral("compacting with <b>%1</b>…").arg(model.toHtmlEscaped()),
+            QStringLiteral("sys"));
+    const QString tid = m_threadId;
+    m_core->call(QStringLiteral("agent.compactNow"),
+                 QJsonObject{
+                     {QStringLiteral("threadId"), tid},
+                     {QStringLiteral("model"), model},
+                 },
+                 [this, tid](const QJsonObject &res, const QJsonObject &err) {
+                     if (tid != m_threadId) {
+                         return;
+                     }
+                     if (!err.isEmpty()) {
+                         addNote(QStringLiteral("Compaction failed: %1")
+                                     .arg(err.value(QStringLiteral("message"))
+                                              .toString()
+                                              .toHtmlEscaped()),
+                                 QStringLiteral("err"));
+                         return;
+                     }
+                     addNote(QStringLiteral("compacted via %1 (%2 turns, %3 bytes).")
+                                 .arg(res.value(QStringLiteral("strategy"))
+                                          .toString()
+                                          .toHtmlEscaped())
+                                 .arg(res.value(QStringLiteral("turns")).toInt())
+                                 .arg(res.value(QStringLiteral("bodyBytes")).toInt()),
+                             QStringLiteral("ok"));
+                 });
+}
+
 void AgentPanel::doResume()
 {
     addNote(QStringLiteral("resuming the Claude Code session…"), QStringLiteral("sys"));
@@ -899,6 +973,17 @@ void AgentPanel::refresh()
                                             : QStringLiteral("Start agent")));
     m_stopBtn->setEnabled(running);
     m_diffBtn->setEnabled(running);
+    // Compact-now needs a thread on disk (running or dormant). The Hot Opus
+    // menu item is the only one that further needs the thread to be live.
+    if (m_compactNowBtn) {
+        m_compactNowBtn->setEnabled(!m_threadId.isEmpty());
+        if (auto *menu = m_compactNowBtn->menu()) {
+            const auto actions = menu->actions();
+            if (!actions.isEmpty()) {
+                actions.first()->setEnabled(running); // "Hot Opus (live thread)"
+            }
+        }
+    }
     // The permission, isolation and effort modes are fixed once a thread exists.
     m_modeCombo->setEnabled(m_threadId.isEmpty());
     m_isolationCombo->setEnabled(m_threadId.isEmpty());

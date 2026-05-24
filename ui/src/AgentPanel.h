@@ -21,6 +21,7 @@ class QLabel;
 class QPlainTextEdit;
 class QPushButton;
 class QScrollArea;
+class QToolButton;
 class QVBoxLayout;
 
 // AgentPanel drives one agent thread: it starts a headless `claude` via the
@@ -84,6 +85,10 @@ private:
     // thread. No-op when no thread exists yet — the choice is then sticky
     // local-only until a thread is created.
     void pushCompactStrategy();
+    // Dispatch an on-demand compaction with the given model token
+    // ("hot", "opus", "sonnet", "haiku", "local"). Reports progress and
+    // result in the feed; does not change the thread's scheduled strategy.
+    void runCompactNow(const QString &model);
     // Issue the actual agent.resume call. Called by resume() after any
     // pre-resume compaction has run (or been declined).
     void doResume();
@@ -124,6 +129,9 @@ private:
     // is condensed to keep resume cost down. Both are sticky to last used.
     QComboBox *m_compactCombo = nullptr;
     QCheckBox *m_compactStrip = nullptr;
+    // On-demand compactor: pick any backend (Hot Opus on the live thread, or
+    // cold Opus/Sonnet/Haiku/Local) without changing the scheduled strategy.
+    QToolButton *m_compactNowBtn = nullptr;
     QPushButton *m_sendBtn = nullptr;
     QPushButton *m_stopBtn = nullptr;
     QPushButton *m_diffBtn = nullptr;

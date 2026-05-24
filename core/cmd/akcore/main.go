@@ -625,11 +625,11 @@ func registerHandlers(d handlerDeps) {
 		return out, nil
 	})
 
-	// agent.compactNow runs a cold compaction synchronously with the given
-	// model (or "local" for the programmatic compactor). Used by both the
-	// resume-time recovery dialog and the explicit "Compact now" UI action.
-	// model accepts: "opus", "sonnet", "haiku", "local" (case-insensitive)
-	// or a full claude --model id like "claude-sonnet-4-6".
+	// agent.compactNow runs a compaction synchronously with the given model.
+	// Used by the resume-time recovery dialog and the explicit "Compact now"
+	// UI action. model accepts: "hot" / "opus_hot" (inline on the live
+	// thread), "opus", "sonnet", "haiku", "local" (case-insensitive), or a
+	// full claude --model id like "claude-sonnet-4-6".
 	d.srv.Handle("agent.compactNow", func(ctx context.Context, raw json.RawMessage) (any, error) {
 		var p struct {
 			ThreadID string `json:"threadId"`
@@ -645,25 +645,52 @@ func registerHandlers(d handlerDeps) {
 		if rec.SessionID == "" {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "thread has no Claude Code session yet")
 		}
-		modelID, strategy, isLocal := resolveCompactModel(p.Model)
 
 		var sum compact.Summary
-		var err error
-		if isLocal {
-			events, rerr := session.ReadTranscript(rec.SessionID)
-			if rerr != nil {
-				return nil, ipc.Errorf(ipc.CodeInternalError, rerr.Error())
+		token := strings.ToLower(strings.TrimSpace(p.Model))
+		if token == "hot" || token == "opus_hot" || token == "hot_opus" {
+			// Hot path: send the compact prompt into the live thread and use
+			// its assistant reply as the summary. Requires a running thread.
+			if !d.sup.Running(p.ThreadID) {
+				return nil, ipc.Errorf(ipc.CodeInvalidParams,
+					"Hot Opus compaction requires a running thread; resume it first")
 			}
-			sum = compact.Programmatic(p.ThreadID, rec.SessionID, events)
-		} else {
-			sum, err = compact.RunLLM(ctx, p.ThreadID, strategy, compact.LLMOptions{
-				WorkDir:   rec.Worktree.Path,
+			hctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+			defer cancel()
+			text, herr := d.sup.Compact(hctx, p.ThreadID, compact.CompactPrompt)
+			if herr != nil {
+				return nil, ipc.Errorf(ipc.CodeInternalError, herr.Error())
+			}
+			if strings.TrimSpace(text) == "" {
+				return nil, ipc.Errorf(ipc.CodeInternalError, "hot compaction returned empty body")
+			}
+			sum = compact.Summary{
+				ThreadID:  p.ThreadID,
 				SessionID: rec.SessionID,
-				Model:     modelID,
-				Timeout:   5 * time.Minute,
-			})
-			if err != nil {
-				return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+				Strategy:  compact.ExitOpusHot,
+				Stripped:  rec.CompactStrip,
+				Created:   time.Now().UTC(),
+				Body:      text,
+			}
+		} else {
+			modelID, strategy, isLocal := resolveCompactModel(p.Model)
+			if isLocal {
+				events, rerr := session.ReadTranscript(rec.SessionID)
+				if rerr != nil {
+					return nil, ipc.Errorf(ipc.CodeInternalError, rerr.Error())
+				}
+				sum = compact.Programmatic(p.ThreadID, rec.SessionID, events)
+			} else {
+				var err error
+				sum, err = compact.RunLLM(ctx, p.ThreadID, strategy, compact.LLMOptions{
+					WorkDir:   rec.Worktree.Path,
+					SessionID: rec.SessionID,
+					Model:     modelID,
+					Timeout:   5 * time.Minute,
+				})
+				if err != nil {
+					return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+				}
 			}
 		}
 		if err := d.summaries.Put(sum); err != nil {
