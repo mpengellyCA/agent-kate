@@ -160,6 +160,8 @@ void MainWindow::setupUi()
     addDockWidget(Qt::RightDockWidgetArea, worktreeDock);
     tabifyDockWidget(treeDock, worktreeDock);
     treeDock->raise();
+    connect(m_worktreeDashboard, &WorktreeDashboard::statusMessage, this,
+            [this](const QString &text) { statusBar()->showMessage(text, 6000); });
 
     connect(m_lsp, &LspManager::definitionResolved, this,
             [this](const QString &path, int line) {

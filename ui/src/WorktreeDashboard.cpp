@@ -2,12 +2,16 @@
 // SPDX-FileCopyrightText: 2026 The AgentKate developers
 
 #include "WorktreeDashboard.h"
+#include "git/CommitDialog.h"
 #include "ipc/CoreClient.h"
 
+#include <QHBoxLayout>
 #include <QHeaderView>
+#include <QItemSelectionModel>
 #include <QJsonArray>
 #include <QJsonValue>
 #include <QPalette>
+#include <QPushButton>
 #include <QTableView>
 #include <QVBoxLayout>
 
@@ -140,14 +144,56 @@ WorktreeDashboard::WorktreeDashboard(CoreClient *core, QWidget *parent)
     m_view->horizontalHeader()->setSectionResizeMode(
         WorktreeModel::ColDirty, QHeaderView::ResizeToContents);
 
+    m_commitBtn = new QPushButton(QStringLiteral("Commit selected…"), this);
+    m_commitBtn->setEnabled(false);
+    auto *toolbar = new QHBoxLayout;
+    toolbar->setContentsMargins(6, 4, 6, 4);
+    toolbar->addStretch(1);
+    toolbar->addWidget(m_commitBtn);
+
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
-    layout->addWidget(m_view);
+    layout->setSpacing(0);
+    layout->addWidget(m_view, 1);
+    layout->addLayout(toolbar);
 
     m_pollTimer->setInterval(kPollIntervalMs);
     connect(m_pollTimer, &QTimer::timeout, this, &WorktreeDashboard::refresh);
     connect(m_core, &CoreClient::notification, this, &WorktreeDashboard::onNotification);
     connect(m_core, &CoreClient::connected, this, &WorktreeDashboard::refresh);
+    connect(m_view->selectionModel(), &QItemSelectionModel::selectionChanged, this,
+            [this] { m_commitBtn->setEnabled(selectedRow() != nullptr); });
+    connect(m_view, &QTableView::doubleClicked, this,
+            [this](const QModelIndex &) { openCommitDialog(); });
+    connect(m_commitBtn, &QPushButton::clicked, this,
+            &WorktreeDashboard::openCommitDialog);
+}
+
+const WorktreeRow *WorktreeDashboard::selectedRow() const
+{
+    const QModelIndexList sel = m_view->selectionModel()->selectedRows();
+    if (sel.isEmpty()) {
+        return nullptr;
+    }
+    return m_model->rowAt(sel.first().row());
+}
+
+void WorktreeDashboard::openCommitDialog()
+{
+    const WorktreeRow *r = selectedRow();
+    if (!r || r->threadId.isEmpty()) {
+        return;
+    }
+    auto *dlg = new CommitDialog(m_core, r->threadId, r->branch, this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    connect(dlg, &CommitDialog::committed, this,
+            [this](const QString &, const QString &branch) {
+                emit statusMessage(branch.isEmpty()
+                                       ? QStringLiteral("Commit successful")
+                                       : QStringLiteral("Committed to %1").arg(branch));
+                refresh();
+            });
+    dlg->show();
 }
 
 void WorktreeDashboard::showEvent(QShowEvent *e)
@@ -201,9 +247,9 @@ void WorktreeDashboard::refresh()
 
 void WorktreeDashboard::onNotification(const QString &method, const QJsonObject &)
 {
-    // Phase 1: there is no git.invalidated push yet (planned for phase 2), but
-    // already react to it when it lands so the dashboard reflects core-side
-    // mutations immediately instead of waiting up to one poll tick.
+    // git.invalidated lands on every fs event the core's watcher sees as
+    // well as on its own commit / land / discard mutations. Short-cut the
+    // next poll so the dashboard reflects the change sub-second.
     if (method == QLatin1String("git.invalidated")) {
         refresh();
     }

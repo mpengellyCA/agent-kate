@@ -96,7 +96,15 @@ func runCore() {
 	broker := permission.New()
 	extensions := vsix.NewManager(vsix.DefaultCacheDir())
 	skillCatalog := skills.New(skills.DefaultDir())
-	gitCache := gitstatus.NewCache()
+	gitCache := gitstatus.NewCache(log)
+	// Push a git.invalidated notification to every UI client whenever an
+	// entry flips clean→dirty (fs watcher events or mutating RPCs). The UI
+	// uses this to short-cut its next 1 Hz poll.
+	gitCache.OnInvalidate(func(threadID string) {
+		srv.Notify("git.invalidated", map[string]any{
+			"threadIds": []string{threadID},
+		})
+	})
 
 	sessions, err := session.NewStore(session.DefaultPath())
 	if err != nil {
@@ -770,14 +778,61 @@ func registerHandlers(d handlerDeps) {
 	// from the cache. The UI polls this at ~1 Hz to drive the worktree
 	// dashboard.
 	d.srv.Handle("git.snapshot", func(_ context.Context, _ json.RawMessage) (any, error) {
-		// Always force a recompute on poll: phase 1 has no fs watcher, so the
-		// cache is here for concurrent-reader coalescing, not freshness.
-		d.gitCache.InvalidateAll()
+		// The fs watcher keeps the cache honest, so polling just reads —
+		// only stale entries pay the recompute cost.
 		snaps := d.gitCache.Snapshots()
 		if snaps == nil {
 			snaps = []*gitstatus.Snapshot{}
 		}
 		return map[string]any{"threads": snaps}, nil
+	})
+
+	// git.commit stages a subset of paths (or everything when paths is
+	// empty) and commits them to the thread's branch. agent.commit is kept
+	// as the "commit everything with this message" shortcut.
+	d.srv.Handle("git.commit", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID string   `json:"threadId"`
+			Message  string   `json:"message"`
+			Paths    []string `json:"paths"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		wt, ok := d.threads.get(p.ThreadID)
+		if !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		}
+		if err := worktree.CommitPaths(wt, p.Message, p.Paths); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		d.gitCache.Invalidate(p.ThreadID)
+		return map[string]any{"ok": true, "branch": wt.Branch}, nil
+	})
+
+	// git.diff returns a unified patch of the worktree vs HEAD, scoped to a
+	// single path when one is given. Untracked files are folded in as full
+	// new-file diffs, and the index is never touched.
+	d.srv.Handle("git.diff", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID string `json:"threadId"`
+			Path     string `json:"path"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		wt, ok := d.threads.get(p.ThreadID)
+		if !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		}
+		patch, err := gitstatus.UnifiedDiff(wt, p.Path)
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		return map[string]any{
+			"patch":  patch,
+			"branch": wt.Branch,
+		}, nil
 	})
 
 	// git.file returns line-level hunks for one absolute file path vs the

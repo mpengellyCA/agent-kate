@@ -185,11 +185,27 @@ func Diff(wt Worktree) (string, error) {
 // Commit stages every change in the worktree and commits it to the thread's
 // branch. It returns a friendly error when there is nothing to commit.
 func Commit(wt Worktree, message string) error {
+	return CommitPaths(wt, message, nil)
+}
+
+// CommitPaths stages a chosen subset of paths (or everything when paths is
+// empty) and commits the result. Paths are worktree-relative; passing a nil or
+// empty slice is the same as Commit's "stage everything" behaviour.
+func CommitPaths(wt Worktree, message string, paths []string) error {
 	if strings.TrimSpace(message) == "" {
 		message = "AgentKate change"
 	}
-	if _, err := git(wt.Path, "add", "-A"); err != nil {
-		return err
+	if len(paths) == 0 {
+		if _, err := git(wt.Path, "add", "-A"); err != nil {
+			return err
+		}
+	} else {
+		// `git add --` accepts any number of paths; the explicit `--` keeps
+		// pathnames beginning with a dash from being read as options.
+		args := append([]string{"add", "--"}, paths...)
+		if _, err := git(wt.Path, args...); err != nil {
+			return err
+		}
 	}
 	// `git diff --cached --quiet` exits 0 (no error) when nothing is staged.
 	if _, err := git(wt.Path, "diff", "--cached", "--quiet"); err == nil {
