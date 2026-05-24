@@ -17,6 +17,7 @@ class AgentDock;
 class LspManager;
 class TerminalPanel;
 class WorktreeDashboard;
+class LogViewer;
 class KMultiTabBar;
 class QAction;
 class QDockWidget;
@@ -55,6 +56,7 @@ private:
     LspManager *m_lsp = nullptr;
     TerminalPanel *m_terminal = nullptr;
     WorktreeDashboard *m_worktreeDashboard = nullptr;
+    LogViewer *m_logViewer = nullptr;
     QLabel *m_gitStatusLabel = nullptr; // status-bar git widget for the active editor
     QDockWidget *m_problemsDock = nullptr;
     QDockWidget *m_referencesDock = nullptr;

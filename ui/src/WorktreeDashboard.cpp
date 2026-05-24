@@ -109,9 +109,47 @@ QVariant WorktreeModel::headerData(int section, Qt::Orientation orientation, int
 
 void WorktreeModel::setRows(QList<WorktreeRow> rows)
 {
-    beginResetModel();
-    m_rows = std::move(rows);
-    endResetModel();
+    // The core sorts snapshots by threadId (cd8ec6a) and threadIds are
+    // immutable, so old and new lists are both sorted on the same stable key.
+    // A merge walk emits insertions / removals / dataChanged in place — no
+    // beginResetModel, which would otherwise clear the QTableView's selection
+    // on every 1 Hz poll.
+    int i = 0;
+    int j = 0;
+    while (i < m_rows.size() || j < rows.size()) {
+        if (j >= rows.size()) {
+            beginRemoveRows({}, i, i);
+            m_rows.removeAt(i);
+            endRemoveRows();
+            continue;
+        }
+        if (i >= m_rows.size()) {
+            beginInsertRows({}, i, i);
+            m_rows.append(std::move(rows[j]));
+            endInsertRows();
+            ++i;
+            ++j;
+            continue;
+        }
+        const QString &oldId = m_rows[i].threadId;
+        const QString &newId = rows[j].threadId;
+        if (oldId == newId) {
+            m_rows[i] = std::move(rows[j]);
+            emit dataChanged(index(i, 0), index(i, ColCount - 1));
+            ++i;
+            ++j;
+        } else if (oldId < newId) {
+            beginRemoveRows({}, i, i);
+            m_rows.removeAt(i);
+            endRemoveRows();
+        } else {
+            beginInsertRows({}, i, i);
+            m_rows.insert(i, std::move(rows[j]));
+            endInsertRows();
+            ++i;
+            ++j;
+        }
+    }
 }
 
 const WorktreeRow *WorktreeModel::rowAt(int row) const
