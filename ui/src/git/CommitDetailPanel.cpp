@@ -87,6 +87,7 @@ CommitDetailPanel::CommitDetailPanel(CoreClient *core, QWidget *parent)
 void CommitDetailPanel::clear()
 {
     m_threadId.clear();
+    m_repoRoot.clear();
     m_sha.clear();
     ++m_token;
     m_header->setText(QStringLiteral("<i>Select a commit to see details.</i>"));
@@ -95,12 +96,29 @@ void CommitDetailPanel::clear()
     replaceDiff(QString());
 }
 
-void CommitDetailPanel::setCommit(const QString &threadId, const QString &sha)
+bool CommitDetailPanel::hasSource() const
 {
-    if (threadId == m_threadId && sha == m_sha) {
+    return !m_threadId.isEmpty() || !m_repoRoot.isEmpty();
+}
+
+QJsonObject CommitDetailPanel::sourceParams() const
+{
+    QJsonObject p{{QStringLiteral("sha"), m_sha}};
+    if (!m_threadId.isEmpty()) {
+        p.insert(QStringLiteral("threadId"), m_threadId);
+    } else if (!m_repoRoot.isEmpty()) {
+        p.insert(QStringLiteral("repoRoot"), m_repoRoot);
+    }
+    return p;
+}
+
+void CommitDetailPanel::setCommit(const QString &threadId, const QString &repoRoot, const QString &sha)
+{
+    if (threadId == m_threadId && repoRoot == m_repoRoot && sha == m_sha) {
         return;
     }
     m_threadId = threadId;
+    m_repoRoot = repoRoot;
     m_sha = sha;
     ++m_token;
     m_header->setText(QStringLiteral("<i>Loading %1…</i>")
@@ -116,13 +134,12 @@ void CommitDetailPanel::setCommit(const QString &threadId, const QString &sha)
 
 void CommitDetailPanel::loadDetail()
 {
-    if (!m_core->isConnected() || m_threadId.isEmpty() || m_sha.isEmpty()) {
+    if (!m_core->isConnected() || !hasSource() || m_sha.isEmpty()) {
         return;
     }
     const int token = m_token;
     m_core->call(QStringLiteral("git.commit.detail"),
-                 QJsonObject{{QStringLiteral("threadId"), m_threadId},
-                             {QStringLiteral("sha"), m_sha}},
+                 sourceParams(),
                  [this, token](const QJsonObject &result, const QJsonObject &error) {
                      if (token != m_token) {
                          return;
@@ -141,12 +158,11 @@ void CommitDetailPanel::loadDetail()
 
 void CommitDetailPanel::loadDiff(const QString &path)
 {
-    if (!m_core->isConnected() || m_threadId.isEmpty() || m_sha.isEmpty()) {
+    if (!m_core->isConnected() || !hasSource() || m_sha.isEmpty()) {
         return;
     }
     const int token = m_token;
-    QJsonObject params{{QStringLiteral("threadId"), m_threadId},
-                       {QStringLiteral("sha"), m_sha}};
+    QJsonObject params = sourceParams();
     if (!path.isEmpty()) {
         params.insert(QStringLiteral("path"), path);
     }

@@ -1394,14 +1394,15 @@ func registerHandlers(d handlerDeps) {
 	d.srv.Handle("git.commit.detail", func(_ context.Context, raw json.RawMessage) (any, error) {
 		var p struct {
 			ThreadID string `json:"threadId"`
+			RepoRoot string `json:"repoRoot"` // workspace fallback when no thread
 			SHA      string `json:"sha"`
 		}
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
-		wt, ok := d.threads.get(p.ThreadID)
-		if !ok {
-			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		wt, err := resolveLogSource(d, p.ThreadID, p.RepoRoot)
+		if err != nil {
+			return nil, err
 		}
 		detail, err := gitstatus.CommitDetailFn(wt, p.SHA)
 		if err != nil {
@@ -1415,15 +1416,16 @@ func registerHandlers(d handlerDeps) {
 	d.srv.Handle("git.commit.diff", func(_ context.Context, raw json.RawMessage) (any, error) {
 		var p struct {
 			ThreadID string `json:"threadId"`
+			RepoRoot string `json:"repoRoot"` // workspace fallback when no thread
 			SHA      string `json:"sha"`
 			Path     string `json:"path"`
 		}
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
-		wt, ok := d.threads.get(p.ThreadID)
-		if !ok {
-			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		wt, err := resolveLogSource(d, p.ThreadID, p.RepoRoot)
+		if err != nil {
+			return nil, err
 		}
 		patch, err := gitstatus.CommitDiff(wt, p.SHA, p.Path)
 		if err != nil {
@@ -1431,6 +1433,24 @@ func registerHandlers(d handlerDeps) {
 		}
 		return map[string]any{"patch": patch}, nil
 	})
+}
+
+// resolveLogSource maps the (threadId, repoRoot) pair the log-viewer RPCs
+// accept to a Worktree go-git can read. Workspace-branch sources synthesize a
+// Worktree pointing at the repo root since the workspace itself is a working
+// repo.
+func resolveLogSource(d handlerDeps, threadID, repoRoot string) (worktree.Worktree, error) {
+	if threadID != "" {
+		w, ok := d.threads.get(threadID)
+		if !ok {
+			return worktree.Worktree{}, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+threadID)
+		}
+		return w, nil
+	}
+	if repoRoot != "" {
+		return worktree.Worktree{Path: repoRoot, RepoRoot: repoRoot}, nil
+	}
+	return worktree.Worktree{}, ipc.Errorf(ipc.CodeInvalidParams, "requires threadId or repoRoot")
 }
 
 // startAgentThread creates the thread's worktree, writes its MCP config and
