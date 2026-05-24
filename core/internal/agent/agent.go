@@ -123,10 +123,24 @@ type Thread struct {
 
 // hotCompact tracks an in-flight Hot-Opus compaction: assistant text is
 // accumulated until a `result` event signals turn completion, at which
-// point the buffered text is delivered on done and the field is cleared.
+// point done is closed and all callers in Compact() read the buffered text.
+// Multiple callers (e.g. agent.stop + akcore shutdown) share one compaction;
+// the starter sends the prompt, everyone else waits on done.
 type hotCompact struct {
 	text strings.Builder
-	done chan string
+	done chan struct{}
+	err  error
+	once sync.Once
+}
+
+// finish closes done at most once. Safe to call from observeHotCompact
+// (on `result`), from a failed Send in Compact(), or from reap() when the
+// agent dies before its summary turn lands.
+func (hc *hotCompact) finish(err error) {
+	hc.once.Do(func() {
+		hc.err = err
+		close(hc.done)
+	})
 }
 
 // NewThreadID returns a fresh, unique agent thread id.
@@ -373,11 +387,7 @@ func observeHotCompact(t *Thread, raw json.RawMessage) {
 			}
 		}
 	case "result":
-		select {
-		case hc.done <- hc.text.String():
-		default:
-			// already delivered; drop
-		}
+		hc.finish(nil)
 	}
 }
 
@@ -386,8 +396,13 @@ func observeHotCompact(t *Thread, raw json.RawMessage) {
 // to capture a summary while the model's KV cache is still warm — the
 // summary then seeds the thread's next resume.
 //
-// Returns ("", err) on a dead thread, a duplicate compact already in flight,
-// a send failure, or ctx cancellation.
+// Concurrent callers share one compaction: the first to arrive sends the
+// prompt; the rest just wait on the same result. This makes the agent.stop
+// handler and the akcore shutdown path safely composable — both can call
+// Compact() and both block until the summary lands (or the agent dies).
+//
+// Returns ("", err) on a dead thread, a send failure, ctx cancellation,
+// or if the agent process exits before the summary turn arrives.
 func (s *Supervisor) Compact(ctx context.Context, threadID, prompt string) (string, error) {
 	t := s.thread(threadID)
 	if t == nil {
@@ -398,25 +413,30 @@ func (s *Supervisor) Compact(ctx context.Context, threadID, prompt string) (stri
 		t.mu.Unlock()
 		return "", fmt.Errorf("thread %q is not running", threadID)
 	}
-	if t.hotCompact != nil {
-		t.mu.Unlock()
-		return "", fmt.Errorf("a compact is already in flight for %q", threadID)
+	hc := t.hotCompact
+	starter := hc == nil
+	if starter {
+		hc = &hotCompact{done: make(chan struct{})}
+		t.hotCompact = hc
 	}
-	hc := &hotCompact{done: make(chan string, 1)}
-	t.hotCompact = hc
 	t.mu.Unlock()
-	defer func() {
-		t.mu.Lock()
-		t.hotCompact = nil
-		t.mu.Unlock()
-	}()
 
-	if err := s.Send(threadID, prompt, nil); err != nil {
-		return "", fmt.Errorf("send compact prompt: %w", err)
+	if starter {
+		defer func() {
+			t.mu.Lock()
+			if t.hotCompact == hc {
+				t.hotCompact = nil
+			}
+			t.mu.Unlock()
+		}()
+		if err := s.Send(threadID, prompt, nil); err != nil {
+			hc.finish(fmt.Errorf("send compact prompt: %w", err))
+		}
 	}
+
 	select {
-	case text := <-hc.done:
-		return text, nil
+	case <-hc.done:
+		return hc.text.String(), hc.err
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
@@ -440,6 +460,10 @@ func (s *Supervisor) reap(t *Thread) {
 
 	t.mu.Lock()
 	t.alive = false
+	// Unblock any in-flight Compact waiters: the summary turn isn't coming.
+	if t.hotCompact != nil {
+		t.hotCompact.finish(fmt.Errorf("agent exited before compact completed"))
+	}
 	if t.mcpConfig != "" {
 		_ = os.Remove(t.mcpConfig)
 	}

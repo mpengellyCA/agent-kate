@@ -84,7 +84,19 @@ MainWindow::MainWindow(const QString &openPath, QWidget *parent)
     setAutoSaveSettings();
 }
 
-MainWindow::~MainWindow() = default;
+MainWindow::~MainWindow()
+{
+    // BlameController / GutterController are created as MainWindow children
+    // when documents open — i.e. AFTER setupCore's one-shot reparent — so
+    // m_core ends up mid-list and gets destroyed before them. Their pending
+    // QTimer ticks then dereference a dangling m_core and segfault on exit.
+    // Re-tail m_core once more here, immediately before ~QObject deletes the
+    // child list, so it goes last regardless of what was added in between.
+    if (m_core) {
+        m_core->setParent(nullptr);
+        m_core->setParent(this);
+    }
+}
 
 void MainWindow::setupUi()
 {
