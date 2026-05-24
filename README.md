@@ -36,3 +36,9 @@ scripts/run.sh        # launches the app (the UI spawns akcore itself)
 Early. Milestones M0 (scaffold + build + IPC handshake) and M1 (walking skeleton:
 editor + one live agent in a worktree + Cooperation MCP) are the current focus.
 The goal of M1 is **self-hosting** — developing AgentKate from inside AgentKate.
+
+## License
+
+AgentKate is licensed under the **GNU Lesser General Public License, version 2 or
+later** (LGPL-2.0-or-later) — the same license as the Kate editor and
+`KTextEditor`. See [`COPYING.LIB`](COPYING.LIB) for the full text.

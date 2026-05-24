@@ -37,10 +37,8 @@ int main(int argc, char *argv[])
                          i18n("AgentKate"),
                          QStringLiteral("0.1.0"),
                          i18n("Native multi-agent coding arena"),
-                         KAboutLicense::MIT,
-                         i18n("© 2026 Leadrix"));
-    aboutData.addAuthor(i18n("Mike"), i18n("Creator"), QStringLiteral("mike@leadrix.io"));
-    aboutData.setHomepage(QStringLiteral("https://leadrix.io"));
+                         KAboutLicense::LGPL_V2,
+                         i18n("© 2026 The AgentKate Authors"));
     KAboutData::setApplicationData(aboutData);
 
     QCommandLineParser parser;
