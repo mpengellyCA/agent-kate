@@ -1,0 +1,83 @@
+// SPDX-License-Identifier: LGPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 The AgentKate developers
+
+#pragma once
+
+#include <QAbstractTableModel>
+#include <QJsonObject>
+#include <QList>
+#include <QString>
+#include <QTimer>
+#include <QWidget>
+
+class CoreClient;
+class QTableView;
+
+// WorktreeRow is one row in the dashboard: the per-thread git state the core
+// returns via git.snapshot, flattened for display.
+struct WorktreeRow {
+    QString threadId;
+    QString branch;
+    QString path;
+    bool isolated = false;
+    int ahead = 0;
+    int behindBase = 0;
+    int dirty = 0;
+    bool conflicts = false;
+    QString error;
+};
+
+// WorktreeModel is the table model behind WorktreeDashboard. Pure data — the
+// poll, the RPC, and the row mapping live in the dashboard widget itself.
+class WorktreeModel : public QAbstractTableModel
+{
+    Q_OBJECT
+public:
+    enum Column {
+        ColBranch = 0,
+        ColIsolation,
+        ColAhead,
+        ColBehind,
+        ColDirty,
+        ColPath,
+        ColCount,
+    };
+
+    explicit WorktreeModel(QObject *parent = nullptr);
+    int rowCount(const QModelIndex &parent = {}) const override;
+    int columnCount(const QModelIndex &parent = {}) const override;
+    QVariant data(const QModelIndex &index, int role = Qt::DisplayRole) const override;
+    QVariant headerData(int section, Qt::Orientation orientation,
+                        int role = Qt::DisplayRole) const override;
+
+    void setRows(QList<WorktreeRow> rows);
+    const WorktreeRow *rowAt(int row) const;
+
+private:
+    QList<WorktreeRow> m_rows;
+};
+
+// WorktreeDashboard renders the git state of every active agent's worktree:
+// branch, ahead/behind vs the fork point, dirty file count, conflict flag.
+// It polls git.snapshot at 1 Hz while visible and listens for git.invalidated
+// to short-cut the next tick.
+class WorktreeDashboard : public QWidget
+{
+    Q_OBJECT
+public:
+    explicit WorktreeDashboard(CoreClient *core, QWidget *parent = nullptr);
+
+protected:
+    void showEvent(QShowEvent *e) override;
+    void hideEvent(QHideEvent *e) override;
+
+private:
+    void refresh();
+    void onNotification(const QString &method, const QJsonObject &params);
+
+    CoreClient *m_core = nullptr;
+    QTableView *m_view = nullptr;
+    WorktreeModel *m_model = nullptr;
+    QTimer *m_pollTimer = nullptr;
+    bool m_inFlight = false;
+};
