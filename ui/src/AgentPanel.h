@@ -18,6 +18,7 @@ class QEvent;
 class QFrame;
 class QHBoxLayout;
 class QLabel;
+class QMenu;
 class QPlainTextEdit;
 class QPushButton;
 class QScrollArea;
@@ -132,6 +133,9 @@ private:
     // On-demand compactor: pick any backend (Hot Opus on the live thread, or
     // cold Opus/Sonnet/Haiku/Local) without changing the scheduled strategy.
     QToolButton *m_compactNowBtn = nullptr;
+    // "Compact now" submenu inside the Compaction popup. Held so refresh()
+    // can disable it (and its Hot Opus entry) based on thread state.
+    QMenu *m_compactNowMenu = nullptr;
     QPushButton *m_sendBtn = nullptr;
     QPushButton *m_stopBtn = nullptr;
     QPushButton *m_diffBtn = nullptr;
