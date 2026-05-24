@@ -1,0 +1,9 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+  <qresource prefix="/icons/hicolor/32x32/apps"><file alias="agentkate.png">32-apps-agentkate.png</file></qresource>
+  <qresource prefix="/icons/hicolor/48x48/apps"><file alias="agentkate.png">48-apps-agentkate.png</file></qresource>
+  <qresource prefix="/icons/hicolor/64x64/apps"><file alias="agentkate.png">64-apps-agentkate.png</file></qresource>
+  <qresource prefix="/icons/hicolor/128x128/apps"><file alias="agentkate.png">128-apps-agentkate.png</file></qresource>
+  <qresource prefix="/icons/hicolor/256x256/apps"><file alias="agentkate.png">256-apps-agentkate.png</file></qresource>
+  <qresource prefix="/branding"><file alias="logo.png">256-apps-agentkate.png</file></qresource>
+</RCC>

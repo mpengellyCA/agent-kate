@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=AgentKate
+GenericName=Multi-Agent Coding Arena
+Comment=Native KDE multi-agent coding arena built on the Kate editor engine
+Exec=agentkate %F
+Icon=agentkate
+Categories=Development;IDE;TextEditor;Qt;KDE;
+Terminal=false
+MimeType=text/plain;inode/directory;
+StartupNotify=true
+StartupWMClass=agentkate

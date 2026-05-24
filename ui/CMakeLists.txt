@@ -2,9 +2,12 @@
 find_package(ECM 6.0 NO_MODULE)
 if(ECM_FOUND)
     list(APPEND CMAKE_MODULE_PATH ${ECM_MODULE_PATH})
+    include(KDEInstallDirs)
+    include(ECMInstallIcons)
 endif()
 
 set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -53,6 +56,7 @@ add_executable(agentkate
     src/lsp/LspCompletionModel.cpp
     src/lsp/LspHoverProvider.cpp
     src/lsp/LspManager.cpp
+    icons/agentkate.qrc
 )
 
 target_include_directories(agentkate PRIVATE src)
@@ -78,3 +82,23 @@ target_link_libraries(agentkate PRIVATE
 set_target_properties(agentkate PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
 )
+
+# Install hicolor application icons and the .desktop entry so that KDE/Plasma
+# (taskbar, KRunner, Kickoff, window decorations) shows the AgentKate logo.
+if(ECM_FOUND)
+    ecm_install_icons(
+        ICONS
+            ${CMAKE_CURRENT_SOURCE_DIR}/icons/16-apps-agentkate.png
+            ${CMAKE_CURRENT_SOURCE_DIR}/icons/22-apps-agentkate.png
+            ${CMAKE_CURRENT_SOURCE_DIR}/icons/32-apps-agentkate.png
+            ${CMAKE_CURRENT_SOURCE_DIR}/icons/48-apps-agentkate.png
+            ${CMAKE_CURRENT_SOURCE_DIR}/icons/64-apps-agentkate.png
+            ${CMAKE_CURRENT_SOURCE_DIR}/icons/128-apps-agentkate.png
+            ${CMAKE_CURRENT_SOURCE_DIR}/icons/256-apps-agentkate.png
+            ${CMAKE_CURRENT_SOURCE_DIR}/icons/512-apps-agentkate.png
+        DESTINATION ${KDE_INSTALL_ICONDIR}
+        THEME hicolor
+    )
+    install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/org.kde.agentkate.desktop
+            DESTINATION ${KDE_INSTALL_APPDIR})
+endif()

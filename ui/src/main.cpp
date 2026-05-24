@@ -3,6 +3,8 @@
 
 #include <QApplication>
 #include <QCommandLineParser>
+#include <QIcon>
+#include <QImage>
 
 #include <KAboutData>
 #include <KLocalizedString>
@@ -33,12 +35,30 @@ int main(int argc, char *argv[])
     QApplication app(argc, argv);
     KLocalizedString::setApplicationDomain("agentkate");
 
+    // The hicolor PNGs are installed system-wide by CMake, but also live in
+    // the binary as Qt resources so the icon shows up when running straight
+    // from the build directory (uninstalled dogfood loop) and on systems where
+    // the hicolor theme cache hasn't picked them up yet.
+    QIcon::setFallbackSearchPaths(QIcon::fallbackSearchPaths()
+                                  << QStringLiteral(":/icons/hicolor/256x256/apps"));
+    QIcon appIcon = QIcon::fromTheme(QStringLiteral("agentkate"));
+    if (appIcon.isNull()) {
+        appIcon = QIcon(QStringLiteral(":/icons/hicolor/256x256/apps/agentkate.png"));
+        for (const QString &size : {QStringLiteral("32"), QStringLiteral("48"),
+                                    QStringLiteral("64"), QStringLiteral("128"),
+                                    QStringLiteral("256")}) {
+            appIcon.addFile(QStringLiteral(":/icons/hicolor/%1x%1/apps/agentkate.png").arg(size));
+        }
+    }
+    QApplication::setWindowIcon(appIcon);
+
     KAboutData aboutData(QStringLiteral("agentkate"),
                          i18n("AgentKate"),
                          QStringLiteral("0.1.0"),
                          i18n("Native multi-agent coding arena"),
                          KAboutLicense::LGPL_V2,
                          i18n("© 2026 The AgentKate Authors"));
+    aboutData.setProgramLogo(QImage(QStringLiteral(":/branding/logo.png")));
     KAboutData::setApplicationData(aboutData);
 
     QCommandLineParser parser;
