@@ -10,6 +10,7 @@
 package gitstatus
 
 import (
+	"sort"
 	"sync"
 	"time"
 
@@ -120,6 +121,9 @@ func (c *Cache) Snapshots() []*Snapshot {
 			out = append(out, s)
 		}
 	}
+	// Go map iteration is randomised, which would make the UI re-order its
+	// rows on every poll. Stable sort by thread id pins each row in place.
+	sort.Slice(out, func(i, j int) bool { return out[i].ThreadID < out[j].ThreadID })
 	return out
 }
 
