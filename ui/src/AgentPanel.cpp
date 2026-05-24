@@ -107,30 +107,30 @@ QString toolResultText(const QJsonValue &content)
 }
 
 // activityFor maps a tool name to a personable status line for the
-// "Kate at work" indicator.
+// "Agent Kate at work" indicator.
 QString activityFor(const QString &tool)
 {
     if (tool == QLatin1String("Bash")) {
-        return QStringLiteral("Kate is running commands…");
+        return QStringLiteral("Agent Kate is running commands…");
     }
     if (tool == QLatin1String("Edit") || tool == QLatin1String("Write")
         || tool == QLatin1String("MultiEdit") || tool == QLatin1String("NotebookEdit")) {
-        return QStringLiteral("Kate is writing code…");
+        return QStringLiteral("Agent Kate is writing code…");
     }
     if (tool == QLatin1String("Read") || tool == QLatin1String("Grep")
         || tool == QLatin1String("Glob")) {
-        return QStringLiteral("Kate is combing through the code…");
+        return QStringLiteral("Agent Kate is combing through the code…");
     }
     if (tool == QLatin1String("WebFetch") || tool == QLatin1String("WebSearch")) {
-        return QStringLiteral("Kate is scouring the web…");
+        return QStringLiteral("Agent Kate is scouring the web…");
     }
     if (tool == QLatin1String("Task") || tool == QLatin1String("TodoWrite")) {
-        return QStringLiteral("Kate is mapping out the work…");
+        return QStringLiteral("Agent Kate is mapping out the work…");
     }
     if (tool.startsWith(QLatin1String("mcp__"))) {
-        return QStringLiteral("Kate is coordinating with the team…");
+        return QStringLiteral("Agent Kate is coordinating with the team…");
     }
-    return QStringLiteral("Kate is working with %1…").arg(tool);
+    return QStringLiteral("Agent Kate is working with %1…").arg(tool);
 }
 
 // clearLayout removes and deletes every item (and widget) in a layout.
@@ -230,7 +230,7 @@ private:
     bool m_done = false;
 };
 
-// WorkingIndicator is the animated "Kate at work" status: a rotating spinner
+// WorkingIndicator is the animated "Agent Kate at work" status: a rotating spinner
 // and a personable, activity-aware line, shown while the agent computes.
 class WorkingIndicator : public QWidget
 {
@@ -238,13 +238,13 @@ public:
     explicit WorkingIndicator(QWidget *parent)
         : QWidget(parent)
         , m_generic{
-              QStringLiteral("Kate is thinking it through…"),
-              QStringLiteral("Kate is battling the problem…"),
-              QStringLiteral("Kate is breaking it down…"),
-              QStringLiteral("Kate is connecting the dots…"),
-              QStringLiteral("Kate is wrangling the logic…"),
-              QStringLiteral("Kate is plotting the next move…"),
-              QStringLiteral("Kate is untangling the details…"),
+              QStringLiteral("Agent Kate is thinking it through…"),
+              QStringLiteral("Agent Kate is battling the problem…"),
+              QStringLiteral("Agent Kate is breaking it down…"),
+              QStringLiteral("Agent Kate is connecting the dots…"),
+              QStringLiteral("Agent Kate is wrangling the logic…"),
+              QStringLiteral("Agent Kate is plotting the next move…"),
+              QStringLiteral("Agent Kate is untangling the details…"),
           }
     {
         setFixedHeight(30);
@@ -702,7 +702,7 @@ void AgentPanel::refresh()
     // Offer promotion while a thread runs non-isolated in the workspace.
     m_promoteBar->setVisible(!m_threadId.isEmpty() && !m_isolated && !m_promoting);
 
-    // "Kate at work" indicator: animate while a turn is actually computing.
+    // "Agent Kate at work" indicator: animate while a turn is actually computing.
     m_working->setActive(running && !m_idle && m_permQueue.isEmpty());
 
     QString dot;
@@ -1246,7 +1246,7 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             if (bt == QLatin1String("text")) {
                 const QString t = b.value(QStringLiteral("text")).toString().trimmed();
                 if (!t.isEmpty()) {
-                    addMessageCard(QStringLiteral("Kate"),
+                    addMessageCard(QStringLiteral("Agent Kate"),
                                    isDark(this) ? QStringLiteral("#5fd3bf")
                                                 : QStringLiteral("#1a7f6b"),
                                    markdownToHtml(t));
