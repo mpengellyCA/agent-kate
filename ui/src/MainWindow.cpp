@@ -12,6 +12,7 @@
 #include "WorktreeDashboard.h"
 #include "git/BlameController.h"
 #include "git/GutterController.h"
+#include "git/LogViewer.h"
 #include "ipc/CoreClient.h"
 
 #include <KTextEditor/Document>
@@ -178,6 +179,17 @@ void MainWindow::setupUi()
     treeDock->raise();
     connect(m_worktreeDashboard, &WorktreeDashboard::statusMessage, this,
             [this](const QString &text) { statusBar()->showMessage(text, 6000); });
+
+    // Git log viewer — paginated history with lane graph + commit detail pane
+    // for the selected worktree. Tabified alongside the worktree dashboard so
+    // "what's git doing?" lives in one place.
+    m_logViewer = new LogViewer(m_core, this);
+    auto *logDock = new QDockWidget(i18n("Git Log"), this);
+    logDock->setObjectName(QStringLiteral("gitLogDock"));
+    logDock->setWindowIcon(QIcon::fromTheme(QStringLiteral("vcs-commit")));
+    logDock->setWidget(m_logViewer);
+    addDockWidget(Qt::RightDockWidgetArea, logDock);
+    tabifyDockWidget(worktreeDock, logDock);
 
     connect(m_lsp, &LspManager::definitionResolved, this,
             [this](const QString &path, int line) {

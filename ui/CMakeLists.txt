@@ -45,6 +45,7 @@ add_executable(agentkate
     src/git/GutterController.cpp
     src/git/LogGraphDelegate.cpp
     src/git/LogModel.cpp
+    src/git/LogViewer.cpp
     src/git/PRDialog.cpp
     src/git/RefChipDelegate.cpp
     src/ipc/CoreClient.cpp
