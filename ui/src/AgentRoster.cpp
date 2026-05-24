@@ -15,7 +15,21 @@
 
 namespace {
 // Project items store their path at Qt::UserRole; agent items store their id
-// at Qt::UserRole and a "dormant" bool at Qt::UserRole + 1.
+// at Qt::UserRole, a "dormant" bool at Qt::UserRole + 1, the raw title at
+// Qt::UserRole + 2, and the worktree number (int, 0 = unknown) at
+// Qt::UserRole + 3. Title and number are stored separately so the visible
+// label can be recomposed when either changes.
+constexpr int RoleTitle  = Qt::UserRole + 2;
+constexpr int RoleNumber = Qt::UserRole + 3;
+
+QString composeLabel(int number, const QString &title)
+{
+    if (number > 0) {
+        return QStringLiteral("#%1  %2").arg(number).arg(title);
+    }
+    return title;
+}
+
 QIcon dotIcon(const QString &hex)
 {
     QPixmap pm(14, 14);
@@ -140,8 +154,10 @@ void AgentRoster::addAgent(const QString &projectPath, int agentId, const QStrin
         return;
     }
     auto *item = new QTreeWidgetItem(project);
-    item->setText(0, title);
     item->setData(0, Qt::UserRole, agentId);
+    item->setData(0, RoleTitle, title);
+    item->setData(0, RoleNumber, 0);
+    item->setText(0, composeLabel(0, title));
     item->setIcon(0, dotIcon(QStringLiteral("#8b91a0")));
     project->setExpanded(true);
 }
@@ -149,8 +165,22 @@ void AgentRoster::addAgent(const QString &projectPath, int agentId, const QStrin
 void AgentRoster::setAgentTitle(int agentId, const QString &title)
 {
     if (QTreeWidgetItem *item = agentItem(agentId)) {
-        item->setText(0, title);
+        item->setData(0, RoleTitle, title);
+        item->setText(0, composeLabel(item->data(0, RoleNumber).toInt(), title));
     }
+}
+
+void AgentRoster::setAgentNumber(int agentId, int number)
+{
+    QTreeWidgetItem *item = agentItem(agentId);
+    if (!item) {
+        return;
+    }
+    if (item->data(0, RoleNumber).toInt() == number) {
+        return;
+    }
+    item->setData(0, RoleNumber, number);
+    item->setText(0, composeLabel(number, item->data(0, RoleTitle).toString()));
 }
 
 void AgentRoster::setAgentStatus(int agentId, const QString &dotColorHex)

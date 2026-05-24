@@ -49,6 +49,9 @@ private:
                                 const QString &title, bool isolated);
     void wireAgentPanel(int agentId, AgentPanel *panel);
     void restoreThreads(const QString &project);
+    // Pull git.snapshot and push each thread's worktree Number into the
+    // roster, so the #N badge stays in sync with WorktreeDashboard.
+    void refreshAgentNumbers();
     bool hasThread(const QString &threadId) const;
     void removeAgentEntry(int agentId);
     void closeAgent(int agentId);

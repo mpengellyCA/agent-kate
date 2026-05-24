@@ -5,6 +5,7 @@
 
 #include <QDir>
 #include <QFileDialog>
+#include <QHash>
 #include <QInputDialog>
 #include <QJsonArray>
 #include <QJsonObject>
@@ -54,7 +55,17 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
         for (const QString &project : projects) {
             restoreThreads(project);
         }
+        refreshAgentNumbers();
     });
+    // git.invalidated fires whenever a worktree appears / mutates, which is
+    // exactly when an agent's #N may have just been assigned (fresh start)
+    // or changed. Keep the roster badges in sync with the dashboard.
+    connect(m_core, &CoreClient::notification, this,
+            [this](const QString &method, const QJsonObject &) {
+                if (method == QLatin1String("git.invalidated")) {
+                    refreshAgentNumbers();
+                }
+            });
     connect(m_roster, &AgentRoster::commitRequested, this, [this](int id) {
         Entry *e = entryById(id);
         if (!e || e->panel->threadId().isEmpty()) {
@@ -348,6 +359,39 @@ void AgentDock::restoreThreads(const QString &project)
                          addDormantAgent(project, threadId,
                                          rec.value(QStringLiteral("title")).toString(),
                                          isolated);
+                     }
+                     refreshAgentNumbers();
+                 });
+}
+
+void AgentDock::refreshAgentNumbers()
+{
+    if (!m_core->isConnected()) {
+        return;
+    }
+    m_core->call(QStringLiteral("git.snapshot"), {},
+                 [this](const QJsonObject &result, const QJsonObject &error) {
+                     if (!error.isEmpty()) {
+                         return;
+                     }
+                     QHash<QString, int> byThread;
+                     const QJsonArray threads =
+                         result.value(QStringLiteral("threads")).toArray();
+                     for (const QJsonValue &v : threads) {
+                         const QJsonObject o = v.toObject();
+                         const QString id =
+                             o.value(QStringLiteral("threadId")).toString();
+                         const int n = o.value(QStringLiteral("number")).toInt();
+                         if (!id.isEmpty() && n > 0) {
+                             byThread.insert(id, n);
+                         }
+                     }
+                     for (const Entry &e : m_agents) {
+                         const QString tid = e.panel->threadId();
+                         if (tid.isEmpty()) {
+                             continue;
+                         }
+                         m_roster->setAgentNumber(e.id, byThread.value(tid, 0));
                      }
                  });
 }
