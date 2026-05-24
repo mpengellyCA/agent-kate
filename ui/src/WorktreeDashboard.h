@@ -11,6 +11,7 @@
 #include <QWidget>
 
 class CoreClient;
+class QPushButton;
 class QTableView;
 
 // WorktreeRow is one row in the dashboard: the per-thread git state the core
@@ -67,6 +68,9 @@ class WorktreeDashboard : public QWidget
 public:
     explicit WorktreeDashboard(CoreClient *core, QWidget *parent = nullptr);
 
+Q_SIGNALS:
+    void statusMessage(const QString &text);
+
 protected:
     void showEvent(QShowEvent *e) override;
     void hideEvent(QHideEvent *e) override;
@@ -74,10 +78,13 @@ protected:
 private:
     void refresh();
     void onNotification(const QString &method, const QJsonObject &params);
+    void openCommitDialog();
+    const WorktreeRow *selectedRow() const;
 
     CoreClient *m_core = nullptr;
     QTableView *m_view = nullptr;
     WorktreeModel *m_model = nullptr;
     QTimer *m_pollTimer = nullptr;
+    QPushButton *m_commitBtn = nullptr;
     bool m_inFlight = false;
 };

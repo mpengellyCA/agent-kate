@@ -10,6 +10,7 @@
 package gitstatus
 
 import (
+	"log/slog"
 	"sort"
 	"sync"
 	"time"
@@ -19,9 +20,17 @@ import (
 
 // Cache holds per-thread git status, keyed by thread id. Snapshots and per-file
 // hunks are recomputed on demand and shared across concurrent readers.
+//
+// If an fs watcher is attached, entries flip to dirty on any change inside the
+// worktree and the next read recomputes; without a watcher (older kernels, no
+// inotify) callers must Invalidate explicitly to bust the cache.
 type Cache struct {
 	mu      sync.RWMutex
 	entries map[string]*entry
+
+	watcher      *watcher // nil when fsnotify is unavailable
+	log          *slog.Logger
+	onInvalidate func(threadID string)
 }
 
 // entry is the cached state for one worktree. Its own mutex serialises the
@@ -42,9 +51,43 @@ type hunkCacheLine struct {
 	generation uint64
 }
 
-// NewCache creates an empty cache.
-func NewCache() *Cache {
-	return &Cache{entries: make(map[string]*entry)}
+// NewCache creates an empty cache. If log is non-nil it also spins up an
+// fsnotify-backed watcher; on platforms or systems where that fails the
+// watcher is silently skipped and callers fall back to Invalidate-driven
+// freshness.
+func NewCache(log *slog.Logger) *Cache {
+	c := &Cache{
+		entries: make(map[string]*entry),
+		log:     log,
+	}
+	if log != nil {
+		if w, err := newWatcher(log); err == nil {
+			c.watcher = w
+			go w.run(c)
+		} else {
+			log.Warn("git fs watcher unavailable; per-snapshot recompute will be used",
+				"err", err)
+		}
+	}
+	return c
+}
+
+// OnInvalidate registers a callback fired whenever an entry's dirty flag flips
+// from clean to dirty. This is the bus push hook: the core wires it to send a
+// git.invalidated notification so the UI can short-cut its next poll.
+func (c *Cache) OnInvalidate(fn func(threadID string)) {
+	c.mu.Lock()
+	c.onInvalidate = fn
+	c.mu.Unlock()
+}
+
+// Close stops the fs watcher. The Cache stays usable; reads just fall back to
+// Invalidate-driven freshness.
+func (c *Cache) Close() error {
+	if c.watcher == nil {
+		return nil
+	}
+	return c.watcher.Close()
 }
 
 // Register tells the cache a thread exists. The cache only serves status for
@@ -68,6 +111,9 @@ func (c *Cache) Register(wt worktree.Worktree) {
 		fileHunks: make(map[string]hunkCacheLine),
 		dirty:     true,
 	}
+	if c.watcher != nil {
+		c.watcher.Watch(wt.ThreadID, wt.Path)
+	}
 }
 
 // Forget drops a thread from the cache, called when the thread is removed.
@@ -75,32 +121,43 @@ func (c *Cache) Forget(threadID string) {
 	c.mu.Lock()
 	delete(c.entries, threadID)
 	c.mu.Unlock()
+	if c.watcher != nil {
+		c.watcher.Unwatch(threadID)
+	}
 }
 
 // Invalidate marks a thread's cached data stale so the next read recomputes.
-// Without a filesystem watcher (phase 2) callers force this on every read; the
-// method also exists so mutating RPC handlers (commit, land) can short-cut the
-// next poll.
+// Called by the fs watcher on each event and by mutating RPC handlers (commit,
+// land) so the next poll sees the new state without waiting for inotify.
 func (c *Cache) Invalidate(threadID string) {
 	c.mu.RLock()
 	e, ok := c.entries[threadID]
+	cb := c.onInvalidate
 	c.mu.RUnlock()
 	if !ok {
 		return
 	}
 	e.mu.Lock()
+	wasDirty := e.dirty
 	e.dirty = true
 	e.mu.Unlock()
+	if !wasDirty && cb != nil {
+		cb(threadID) // only fire on the clean→dirty edge to keep notifications quiet
+	}
 }
 
 // InvalidateAll marks every thread stale.
 func (c *Cache) InvalidateAll() {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	for _, e := range c.entries {
+	for id, e := range c.entries {
 		e.mu.Lock()
+		wasDirty := e.dirty
 		e.dirty = true
 		e.mu.Unlock()
+		if !wasDirty && c.onInvalidate != nil {
+			c.onInvalidate(id)
+		}
 	}
 }
 
