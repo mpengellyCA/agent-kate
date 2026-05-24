@@ -19,6 +19,9 @@ public:
     void addAgent(const QString &projectPath, int agentId, const QString &title);
     void setAgentTitle(int agentId, const QString &title);
     void setAgentStatus(int agentId, const QString &dotColorHex);
+    // Worktree number (the same #N the WorktreeDashboard shows), so the
+    // roster row can be cross-referenced with that table. 0 hides it.
+    void setAgentNumber(int agentId, int number);
     void setAgentDormant(int agentId, bool dormant);
     void removeAgent(int agentId);
     void removeProject(const QString &path);
