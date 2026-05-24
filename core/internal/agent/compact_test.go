@@ -6,7 +6,7 @@ import (
 )
 
 func newCompactTestThread() (*Thread, *hotCompact) {
-	hc := &hotCompact{done: make(chan string, 1)}
+	hc := &hotCompact{done: make(chan struct{})}
 	t := &Thread{hotCompact: hc}
 	return t, hc
 }
@@ -36,8 +36,8 @@ func TestObserveHotCompactAccumulatesAssistantTextThenDeliversOnResult(t *testin
 	observeHotCompact(th, mustMarshal(t, json.RawMessage(`{"type":"result","subtype":"success"}`)))
 
 	select {
-	case got := <-hc.done:
-		if got != "hello world" {
+	case <-hc.done:
+		if got := hc.text.String(); got != "hello world" {
 			t.Errorf("got %q, want %q", got, "hello world")
 		}
 	default:
@@ -64,8 +64,8 @@ func TestObserveHotCompactIgnoresNonAssistantBlocks(t *testing.T) {
 	}))
 	observeHotCompact(th, mustMarshal(t, json.RawMessage(`{"type":"result"}`)))
 
-	got := <-hc.done
-	if got != "" {
+	<-hc.done
+	if got := hc.text.String(); got != "" {
 		t.Errorf("expected empty accumulated text, got %q", got)
 	}
 }
@@ -76,3 +76,19 @@ func TestObserveHotCompactNoOpWithoutPending(t *testing.T) {
 	observeHotCompact(th, mustMarshal(t, map[string]any{"type": "assistant"}))
 	observeHotCompact(th, mustMarshal(t, map[string]any{"type": "result"}))
 }
+
+// finish is idempotent: multiple callers can fire it without double-close
+// panics, and the first error wins.
+func TestHotCompactFinishIsIdempotent(t *testing.T) {
+	hc := &hotCompact{done: make(chan struct{})}
+	hc.finish(nil)
+	hc.finish(errSentinel{}) // would panic on double close if not guarded
+	<-hc.done
+	if hc.err != nil {
+		t.Errorf("first finish(nil) should win; got err=%v", hc.err)
+	}
+}
+
+type errSentinel struct{}
+
+func (errSentinel) Error() string { return "sentinel" }
