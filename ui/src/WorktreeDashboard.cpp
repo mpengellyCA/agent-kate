@@ -233,6 +233,15 @@ WorktreeDashboard::WorktreeDashboard(CoreClient *core, QWidget *parent)
     connect(m_prBtn, &QPushButton::clicked, this, &WorktreeDashboard::openPRDialog);
 }
 
+void WorktreeDashboard::setActiveProject(const QString &projectPath)
+{
+    if (projectPath == m_activeProject) {
+        return;
+    }
+    m_activeProject = projectPath;
+    refresh();
+}
+
 const WorktreeRow *WorktreeDashboard::selectedRow() const
 {
     const QModelIndexList sel = m_view->selectionModel()->selectedRows();
@@ -374,6 +383,14 @@ void WorktreeDashboard::refresh()
                      rows.reserve(arr.size());
                      for (const QJsonValue &v : arr) {
                          const QJsonObject o = v.toObject();
+                         // Workspace scoping: the dashboard reflects the
+                         // currently-selected project, not every project
+                         // the daemon knows about.
+                         if (!m_activeProject.isEmpty()
+                             && o.value(QStringLiteral("repoRoot")).toString()
+                                    != m_activeProject) {
+                             continue;
+                         }
                          WorktreeRow r;
                          r.threadId = o.value(QStringLiteral("threadId")).toString();
                          r.number = o.value(QStringLiteral("number")).toInt();

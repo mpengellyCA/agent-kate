@@ -70,6 +70,10 @@ class WorktreeDashboard : public QWidget
 public:
     explicit WorktreeDashboard(CoreClient *core, QWidget *parent = nullptr);
 
+    // Restrict the dashboard to worktrees whose RepoRoot matches projectPath.
+    // An empty path shows everything (legacy behaviour).
+    void setActiveProject(const QString &projectPath);
+
 Q_SIGNALS:
     void statusMessage(const QString &text);
 
@@ -92,5 +96,6 @@ private:
     QPushButton *m_commitBtn = nullptr;
     QPushButton *m_landBtn = nullptr;
     QPushButton *m_prBtn = nullptr;
+    QString m_activeProject;
     bool m_inFlight = false;
 };
