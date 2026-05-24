@@ -157,7 +157,7 @@ func runCore() {
 		}
 	})
 
-	registerHandlers(handlerDeps{
+	deps := handlerDeps{
 		srv:        srv,
 		sup:        sup,
 		coop:       coopState,
@@ -171,7 +171,8 @@ func runCore() {
 		socketPath: *socket,
 		exePath:    exePath,
 		log:        log,
-	})
+	}
+	registerHandlers(deps)
 
 	// Rehydrate the git cache with every persisted thread that still has a
 	// worktree on disk, so the dashboard shows dormant threads after a restart.
@@ -188,6 +189,10 @@ func runCore() {
 	})
 
 	serveErr := srv.Serve(ctx)
+	// Run Hot-Opus compacts in parallel for any thread configured for them
+	// while the live process is still cache-warm; cold strategies fire from
+	// the exit lifecycle handler after the process terminates.
+	runHotCompactsAtShutdown(deps)
 	sup.StopAll()
 	if serveErr != nil {
 		log.Error("ipc server stopped", "err", serveErr)
@@ -446,6 +451,10 @@ func registerHandlers(d handlerDeps) {
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
+		// Hot-Opus runs against the live session so it has to happen BEFORE
+		// the supervisor terminates the process; cold strategies fire from
+		// the exit lifecycle handler instead.
+		runHotCompactIfConfigured(d, p.ThreadID)
 		if err := d.sup.Stop(p.ThreadID); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
@@ -1451,6 +1460,75 @@ func summarizePrompt(prompt string) string {
 		s = s[:max] + "…"
 	}
 	return s
+}
+
+// runHotCompactIfConfigured runs a Hot-Opus compaction on the live thread
+// (if its strategy calls for one) before the caller terminates the process.
+// Synchronous on purpose: the supervisor must wait for the compact to land
+// before reap, so the assistant's final turn — the summary itself — is
+// captured. No-op when the strategy is something else or the thread is
+// already dead.
+func runHotCompactIfConfigured(d handlerDeps, threadID string) {
+	rec, ok := d.sessions.Get(threadID)
+	if !ok {
+		return
+	}
+	if compact.Strategy(rec.CompactStrategy).Resolve() != compact.ExitOpusHot {
+		return
+	}
+	if !d.sup.Running(threadID) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	text, err := d.sup.Compact(ctx, threadID, compact.CompactPrompt)
+	if err != nil {
+		d.log.Warn("hot-opus compact failed", "thread", threadID, "err", err)
+		return
+	}
+	if strings.TrimSpace(text) == "" {
+		d.log.Warn("hot-opus compact returned empty body", "thread", threadID)
+		return
+	}
+	sum := compact.Summary{
+		ThreadID:  threadID,
+		SessionID: rec.SessionID,
+		Strategy:  compact.ExitOpusHot,
+		Stripped:  rec.CompactStrip,
+		Created:   time.Now().UTC(),
+		Body:      text,
+	}
+	if err := d.summaries.Put(sum); err != nil {
+		d.log.Warn("could not store hot summary", "thread", threadID, "err", err)
+		return
+	}
+	_ = d.sessions.Update(threadID, func(r *session.Record) {
+		r.SummaryUpdatedAt = sum.Created
+	})
+	d.log.Info("hot-opus compact complete",
+		"thread", threadID, "body_bytes", len(sum.Body))
+}
+
+// runHotCompactsAtShutdown fires Hot-Opus in parallel for every running
+// thread configured for it, before the supervisor terminates them all.
+// Each compact has its own 2-minute timeout, so a stuck thread cannot
+// hold up shutdown of the others.
+func runHotCompactsAtShutdown(d handlerDeps) {
+	var wg sync.WaitGroup
+	for _, rec := range d.sessions.List("") {
+		if !d.sup.Running(rec.ThreadID) {
+			continue
+		}
+		if compact.Strategy(rec.CompactStrategy).Resolve() != compact.ExitOpusHot {
+			continue
+		}
+		wg.Add(1)
+		go func(threadID string) {
+			defer wg.Done()
+			runHotCompactIfConfigured(d, threadID)
+		}(rec.ThreadID)
+	}
+	wg.Wait()
 }
 
 // runExitCompact performs a cold compaction in the background after an agent

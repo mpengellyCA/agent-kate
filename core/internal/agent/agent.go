@@ -6,6 +6,7 @@ package agent
 
 import (
 	"bufio"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 )
@@ -108,14 +110,23 @@ type Thread struct {
 	ID      string
 	WorkDir string
 
-	mu        sync.Mutex
-	cmd       *exec.Cmd
-	stdin     io.WriteCloser
-	sessionID string      // captured from stream-json, for future --resume
-	mcpConfig string      // temp --mcp-config file to clean up on exit
-	meter     *toolMeter  // measures tool_result sizes for token-cost telemetry
-	usage     *usageMeter // measures per-turn LLM token usage and billed cost
-	alive     bool
+	mu         sync.Mutex
+	cmd        *exec.Cmd
+	stdin      io.WriteCloser
+	sessionID  string      // captured from stream-json, for future --resume
+	mcpConfig  string      // temp --mcp-config file to clean up on exit
+	meter      *toolMeter  // measures tool_result sizes for token-cost telemetry
+	usage      *usageMeter // measures per-turn LLM token usage and billed cost
+	alive      bool
+	hotCompact *hotCompact // when non-nil, the next assistant turn is captured for a summary
+}
+
+// hotCompact tracks an in-flight Hot-Opus compaction: assistant text is
+// accumulated until a `result` event signals turn completion, at which
+// point the buffered text is delivered on done and the field is cleared.
+type hotCompact struct {
+	text strings.Builder
+	done chan string
 }
 
 // NewThreadID returns a fresh, unique agent thread id.
@@ -321,11 +332,93 @@ func (s *Supervisor) pumpStdout(t *Thread, r io.Reader) {
 			t.sessionID = probe.SessionID
 			t.mu.Unlock()
 		}
+		// If a Hot-Opus compaction is in flight, accumulate the assistant
+		// text from this event and complete the channel on the next result.
+		observeHotCompact(t, raw)
 		// Telemetry: where context tokens go (tool outputs) and what we are
 		// billed for (per-turn usage). Both observe; neither alters the stream.
 		t.meter.Observe(raw)
 		t.usage.Observe(raw)
 		s.emit(t.ID, json.RawMessage(raw))
+	}
+}
+
+// observeHotCompact pulls assistant text out of one stream-json event into
+// the thread's pending hot-compact buffer (if any), and delivers the
+// accumulated text on the channel when a `result` event is seen.
+func observeHotCompact(t *Thread, raw json.RawMessage) {
+	t.mu.Lock()
+	hc := t.hotCompact
+	t.mu.Unlock()
+	if hc == nil {
+		return
+	}
+	var head struct {
+		Type    string `json:"type"`
+		Message struct {
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"message"`
+	}
+	if json.Unmarshal(raw, &head) != nil {
+		return
+	}
+	switch head.Type {
+	case "assistant":
+		for _, blk := range head.Message.Content {
+			if blk.Type == "text" {
+				hc.text.WriteString(blk.Text)
+			}
+		}
+	case "result":
+		select {
+		case hc.done <- hc.text.String():
+		default:
+			// already delivered; drop
+		}
+	}
+}
+
+// Compact sends a one-shot summarisation prompt to a live thread and waits
+// for the next assistant turn's text. Used by the Hot-Opus exit-compact path
+// to capture a summary while the model's KV cache is still warm — the
+// summary then seeds the thread's next resume.
+//
+// Returns ("", err) on a dead thread, a duplicate compact already in flight,
+// a send failure, or ctx cancellation.
+func (s *Supervisor) Compact(ctx context.Context, threadID, prompt string) (string, error) {
+	t := s.thread(threadID)
+	if t == nil {
+		return "", fmt.Errorf("unknown thread %q", threadID)
+	}
+	t.mu.Lock()
+	if !t.alive {
+		t.mu.Unlock()
+		return "", fmt.Errorf("thread %q is not running", threadID)
+	}
+	if t.hotCompact != nil {
+		t.mu.Unlock()
+		return "", fmt.Errorf("a compact is already in flight for %q", threadID)
+	}
+	hc := &hotCompact{done: make(chan string, 1)}
+	t.hotCompact = hc
+	t.mu.Unlock()
+	defer func() {
+		t.mu.Lock()
+		t.hotCompact = nil
+		t.mu.Unlock()
+	}()
+
+	if err := s.Send(threadID, prompt, nil); err != nil {
+		return "", fmt.Errorf("send compact prompt: %w", err)
+	}
+	select {
+	case text := <-hc.done:
+		return text, nil
+	case <-ctx.Done():
+		return "", ctx.Err()
 	}
 }
 
