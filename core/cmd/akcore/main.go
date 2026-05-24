@@ -995,6 +995,60 @@ func registerHandlers(d handlerDeps) {
 		}, nil
 	})
 
+	// git.blame returns one BlameLine per source line of an absolute file
+	// path. The path is resolved against registered worktrees the same way
+	// git.file does it, so an open editor file maps to its owning agent's
+	// branch without the UI having to know the thread id.
+	d.srv.Handle("git.blame", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			Path     string `json:"path"`
+			ThreadID string `json:"threadId"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		if p.Path == "" {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "path is required")
+		}
+		// Resolve owning worktree + relative path, mirroring git.file.
+		var wt worktree.Worktree
+		var relPath string
+		if p.ThreadID != "" {
+			if rec, ok := d.threads.get(p.ThreadID); ok {
+				if rel, err := filepath.Rel(rec.Path, p.Path); err == nil &&
+					!strings.HasPrefix(rel, "..") {
+					wt = rec
+					relPath = filepath.ToSlash(rel)
+				}
+			}
+		}
+		if wt.Path == "" {
+			s, rel, ok := d.gitCache.FindByPath(p.Path)
+			if !ok {
+				return map[string]any{"lines": []gitstatus.BlameLine{}}, nil
+			}
+			// FindByPath returns a snapshot; we just need the worktree behind
+			// it. Look it up via the thread registry / sessions store.
+			if rec, ok := d.threads.get(s.ThreadID); ok {
+				wt = rec
+			} else if rec, ok := d.sessions.Get(s.ThreadID); ok {
+				wt = rec.Worktree
+			}
+			relPath = rel
+		}
+		if wt.Path == "" {
+			return map[string]any{"lines": []gitstatus.BlameLine{}}, nil
+		}
+		lines, err := gitstatus.Blame(wt, relPath)
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		if lines == nil {
+			lines = []gitstatus.BlameLine{}
+		}
+		return map[string]any{"lines": lines}, nil
+	})
+
 	// git.file returns line-level hunks for one absolute file path vs the
 	// owning worktree's HEAD. The UI's gutter polls this per open buffer.
 	d.srv.Handle("git.file", func(_ context.Context, raw json.RawMessage) (any, error) {
