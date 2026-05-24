@@ -15,3 +15,25 @@ func openRepo(path string) (*git.Repository, error) {
 		EnableDotGitCommonDir: true,
 	})
 }
+
+// WorkspaceHeadBranch returns the short branch name HEAD points at in the
+// given repo, or the empty string when HEAD is detached, the repo is not on
+// a branch yet, or the directory is not a git repo. Used to label the
+// "view workspace branch" entry in the log viewer.
+func WorkspaceHeadBranch(repoRoot string) string {
+	if repoRoot == "" {
+		return ""
+	}
+	repo, err := openRepo(repoRoot)
+	if err != nil {
+		return ""
+	}
+	head, err := repo.Head()
+	if err != nil {
+		return ""
+	}
+	if !head.Name().IsBranch() {
+		return ""
+	}
+	return head.Name().Short()
+}

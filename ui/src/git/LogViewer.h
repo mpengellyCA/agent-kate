@@ -47,6 +47,15 @@ private:
     void onNotification(const QString &method, const QJsonObject &params);
     void onScrolled(int value);
 
+    // A log "source" is either an agent worktree (threadId set) or a
+    // workspace branch (repoRoot + branch set).
+    struct Source {
+        QString threadId;
+        QString repoRoot;
+        QString branch;
+    };
+    Source sourceForIndex(int idx) const;
+
     CoreClient *m_core = nullptr;
     QComboBox *m_threadPicker = nullptr;
     QPushButton *m_refreshBtn = nullptr;
@@ -55,7 +64,7 @@ private:
     LogGraphDelegate *m_graphDelegate = nullptr;
     CommitDetailPanel *m_detail = nullptr;
 
-    QString m_threadId;
+    Source m_source;
     // Bumped on every reload so in-flight page replies for a stale query are
     // dropped silently.
     int m_loadToken = 0;

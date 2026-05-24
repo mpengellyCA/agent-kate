@@ -34,6 +34,7 @@ private:
     void loadSnapshot();
     void loadDiff();
     void onCommitClicked();
+    void onSuggestClicked();
 
     CoreClient *m_core;
     QString m_threadId;
@@ -43,6 +44,7 @@ private:
     DiffView *m_diff = nullptr;
     QVBoxLayout *m_diffSlot = nullptr;
     QPlainTextEdit *m_message = nullptr;
+    QPushButton *m_suggestBtn = nullptr;
     QPushButton *m_commitBtn = nullptr;
     QPushButton *m_cancelBtn = nullptr;
 };

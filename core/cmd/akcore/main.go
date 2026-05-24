@@ -183,11 +183,14 @@ func runCore() {
 	}
 	registerHandlers(deps)
 
-	// Rehydrate the git cache with every persisted thread that still has a
-	// worktree on disk, so the dashboard shows dormant threads after a restart.
+	// Rehydrate the git cache and thread registry with every persisted thread
+	// that still has a worktree on disk, so the dashboard shows dormant threads
+	// after a restart and per-thread RPCs (git.log, git.diff, …) resolve before
+	// the agent has been re-attached.
 	for _, rec := range sessions.List("") {
 		if _, err := os.Stat(rec.Worktree.Path); err == nil {
 			gitCache.Register(rec.Worktree)
+			threads.put(rec.ThreadID, rec.Worktree)
 		}
 	}
 
@@ -975,7 +978,22 @@ func registerHandlers(d handlerDeps) {
 		if snaps == nil {
 			snaps = []*gitstatus.Snapshot{}
 		}
-		return map[string]any{"threads": snaps}, nil
+		// Surface each distinct workspace alongside the threads so the log
+		// viewer can offer "view main" as a picker entry without needing the
+		// user to have started an agent on the workspace.
+		seen := make(map[string]bool)
+		workspaces := []map[string]any{}
+		for _, s := range snaps {
+			if s.RepoRoot == "" || seen[s.RepoRoot] {
+				continue
+			}
+			seen[s.RepoRoot] = true
+			workspaces = append(workspaces, map[string]any{
+				"repoRoot": s.RepoRoot,
+				"branch":   gitstatus.WorkspaceHeadBranch(s.RepoRoot),
+			})
+		}
+		return map[string]any{"threads": snaps, "workspaces": workspaces}, nil
 	})
 
 	// git.prDraft returns a suggested PR title and body for the thread's
@@ -1161,6 +1179,29 @@ func registerHandlers(d handlerDeps) {
 		return map[string]any{"ok": true, "branch": wt.Branch}, nil
 	})
 
+	// git.suggestCommitMessage asks Sonnet to draft a commit message for the
+	// worktree's current diff. Used by the Commit dialog's "Suggest" button.
+	// Long-running (one Claude turn); the IPC dispatcher already runs each
+	// handler on its own goroutine so this does not block the bus.
+	d.srv.Handle("git.suggestCommitMessage", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID string `json:"threadId"`
+			Model    string `json:"model"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		wt, ok := d.threads.get(p.ThreadID)
+		if !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		}
+		msg, err := gitstatus.SuggestCommitMessage(ctx, wt, "", p.Model)
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		return map[string]any{"message": msg}, nil
+	})
+
 	// git.diff returns a unified patch of the worktree vs HEAD, scoped to a
 	// single path when one is given. Untracked files are folded in as full
 	// new-file diffs, and the index is never touched.
@@ -1310,6 +1351,7 @@ func registerHandlers(d handlerDeps) {
 	d.srv.Handle("git.log", func(_ context.Context, raw json.RawMessage) (any, error) {
 		var p struct {
 			ThreadID string `json:"threadId"`
+			RepoRoot string `json:"repoRoot"` // workspace fallback when no thread
 			Skip     int    `json:"skip"`
 			Limit    int    `json:"limit"`
 			Path     string `json:"path"`
@@ -1318,9 +1360,19 @@ func registerHandlers(d handlerDeps) {
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
-		wt, ok := d.threads.get(p.ThreadID)
-		if !ok {
-			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		var wt worktree.Worktree
+		if p.ThreadID != "" {
+			w, ok := d.threads.get(p.ThreadID)
+			if !ok {
+				return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+			}
+			wt = w
+		} else if p.RepoRoot != "" {
+			// Workspace-level log: synthesize a Worktree pointing at the
+			// repo root so gitstatus.Log can resolve the requested branch.
+			wt = worktree.Worktree{Path: p.RepoRoot, RepoRoot: p.RepoRoot}
+		} else {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "git.log requires threadId or repoRoot")
 		}
 		entries, err := gitstatus.Log(wt, gitstatus.LogOptions{
 			Skip:   p.Skip,
@@ -1392,6 +1444,7 @@ func startAgentThread(d handlerDeps, threadID, sessionID string, p agentStartPar
 		emitLifecycle(d.srv, threadID, "error", "worktree: "+err.Error(), nil)
 		return
 	}
+	wt.Number = d.sessions.NextNumber(p.WorkspacePath)
 	d.threads.put(threadID, wt)
 	d.gitCache.Register(wt)
 
