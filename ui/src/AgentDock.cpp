@@ -1,4 +1,5 @@
 #include "AgentDock.h"
+#include "RecentProjects.h"
 #include "AgentPanel.h"
 #include "AgentRoster.h"
 #include "ipc/CoreClient.h"
@@ -248,6 +249,7 @@ void AgentDock::ensureProject(const QString &path)
         name = path;
     }
     m_roster->addProject(path, name);
+    RecentProjects::remember(path); // welcome screen reads this on next launch
 }
 
 void AgentDock::addProject(const QString &path)

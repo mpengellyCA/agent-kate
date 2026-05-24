@@ -1,5 +1,6 @@
 // agentkate — native multi-agent coding arena (C++/Qt6/KF6 KDE application).
 #include "MainWindow.h"
+#include "WelcomeDialog.h"
 
 #include <QApplication>
 #include <QCommandLineParser>
@@ -71,6 +72,21 @@ int main(int argc, char *argv[])
     QString openPath;
     if (!parser.positionalArguments().isEmpty()) {
         openPath = parser.positionalArguments().constFirst();
+    }
+
+    // No path on the command line? Show the welcome dialog so the user can
+    // pick a recent project, open a folder, or create a new one — otherwise
+    // we would silently fall back to the current working directory (which is
+    // $HOME for the installed .desktop launcher).
+    if (openPath.isEmpty()) {
+        WelcomeDialog welcome;
+        if (welcome.exec() != QDialog::Accepted) {
+            return 0;
+        }
+        openPath = welcome.selectedPath();
+        if (openPath.isEmpty()) {
+            return 0;
+        }
     }
 
     auto *window = new MainWindow(openPath);

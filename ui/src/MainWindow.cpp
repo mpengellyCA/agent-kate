@@ -9,6 +9,7 @@
 #include "SessionBrowserDialog.h"
 #include "SkillsDialog.h"
 #include "TerminalPanel.h"
+#include "WelcomeDialog.h"
 #include "WorktreeDashboard.h"
 #include "git/BlameController.h"
 #include "git/GutterController.h"
@@ -291,6 +292,17 @@ void MainWindow::setupActions()
     openAct->setShortcut(QKeySequence::Open);
     connect(openAct, &QAction::triggered, this, [this] { m_agent->openProjectDialog(); });
     fileMenu->addAction(openAct);
+
+    auto *welcomeAct = new QAction(QIcon::fromTheme(QStringLiteral("go-home")),
+                                   i18n("&Welcome Screen…"), this);
+    welcomeAct->setToolTip(i18n("Pick a recent project, open a folder, or start a new one."));
+    connect(welcomeAct, &QAction::triggered, this, [this] {
+        WelcomeDialog dlg(this);
+        if (dlg.exec() == QDialog::Accepted && !dlg.selectedPath().isEmpty()) {
+            m_agent->addProject(dlg.selectedPath());
+        }
+    });
+    fileMenu->addAction(welcomeAct);
 
     auto *resumeAct = new QAction(QIcon::fromTheme(QStringLiteral("document-open-recent")),
                                   i18n("&Resume a Session…"), this);
