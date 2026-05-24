@@ -12,6 +12,7 @@ class CoreClient;
 class ToolCard;
 class WorkingIndicator;
 class QAbstractButton;
+class QCheckBox;
 class QComboBox;
 class QEvent;
 class QFrame;
@@ -41,6 +42,9 @@ public:
     // Bind this panel to a persisted-but-not-running thread; resume() relaunches
     // it through the core's agent.resume.
     void setDormant(const QString &threadId, const QString &title, bool isolated);
+    // resume() may first prompt the user to choose a compaction model when no
+    // current summary is on disk, then dispatch to doResume() for the actual
+    // agent.resume call.
     void resume();
 
     // Re-read chat preferences (send key, tool-card visibility) from KConfig.
@@ -76,6 +80,13 @@ private:
     // Pull the persisted Claude Code transcript and replay it into the feed so
     // a reopened dormant thread shows its prior conversation.
     void loadTranscript();
+    // Send the current compact-combo + strip values to the core for this
+    // thread. No-op when no thread exists yet — the choice is then sticky
+    // local-only until a thread is created.
+    void pushCompactStrategy();
+    // Issue the actual agent.resume call. Called by resume() after any
+    // pre-resume compaction has run (or been declined).
+    void doResume();
     void showNextPermission();
     void answerPermission(bool allow);
     void buildQuestionForm(const QJsonObject &req);
@@ -109,6 +120,10 @@ private:
     QComboBox *m_modeCombo = nullptr;
     QComboBox *m_isolationCombo = nullptr;
     QComboBox *m_effortCombo = nullptr;
+    // Compaction strategy + strip flag — controls how the thread's transcript
+    // is condensed to keep resume cost down. Both are sticky to last used.
+    QComboBox *m_compactCombo = nullptr;
+    QCheckBox *m_compactStrip = nullptr;
     QPushButton *m_sendBtn = nullptr;
     QPushButton *m_stopBtn = nullptr;
     QPushButton *m_diffBtn = nullptr;

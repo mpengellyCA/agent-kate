@@ -7,6 +7,8 @@
 #include <QAbstractButton>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QDir>
 #include <QEvent>
 #include <QFile>
@@ -27,6 +29,7 @@
 #include <QRadioButton>
 #include <QScrollArea>
 #include <QScrollBar>
+#include <QSignalBlocker>
 #include <QTextDocument>
 #include <QTimer>
 #include <QToolButton>
@@ -501,6 +504,56 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
             .writeEntry("effort", m_effortCombo->currentData().toString());
     });
 
+    // Compaction strategy. Keeping a thread resumable cheaply needs a
+    // condensed summary on disk — otherwise the next resume re-caches the
+    // whole transcript. The five options encode (when, model) combos; the
+    // strip flag asks LLM-based compactors to pre-trim noisy events.
+    m_compactCombo = new QComboBox(this);
+    m_compactCombo->addItem(QStringLiteral("Compact on Exit (Hot Opus)"),
+                            QStringLiteral("exit_opus_hot"));
+    m_compactCombo->addItem(QStringLiteral("Compact on Exit (Cold Sonnet)"),
+                            QStringLiteral("exit_sonnet_cold"));
+    m_compactCombo->addItem(QStringLiteral("Compact on Resume (Cold Sonnet)"),
+                            QStringLiteral("resume_sonnet_cold"));
+    m_compactCombo->addItem(QStringLiteral("Compact on Resume (Cold Haiku)"),
+                            QStringLiteral("resume_haiku_cold"));
+    m_compactCombo->addItem(QStringLiteral("Compact on Resume (Local)"),
+                            QStringLiteral("resume_local"));
+    m_compactCombo->setToolTip(QStringLiteral(
+        "When and how this thread's transcript is condensed for resumption.\n"
+        "Hot Opus is most accurate and cheapest in dollars but spends Opus quota.\n"
+        "Sonnet on a Max plan uses a separate quota bucket. Local is free but\n"
+        "behaviourally-lossless only — preserves decisions, drops tool outputs."));
+    {
+        const QString saved = KSharedConfig::openConfig()
+                                  ->group(QStringLiteral("Agent"))
+                                  .readEntry("compactStrategy",
+                                             QStringLiteral("exit_opus_hot"));
+        const int savedIdx = m_compactCombo->findData(saved);
+        if (savedIdx >= 0) {
+            m_compactCombo->setCurrentIndex(savedIdx);
+        }
+    }
+    m_compactStrip = new QCheckBox(QStringLiteral("Strip"), this);
+    m_compactStrip->setToolTip(QStringLiteral(
+        "Pre-trim noisy events (stale reads, lifecycle, etc.) before handing\n"
+        "the transcript to an LLM compactor. No effect on the Local strategy."));
+    m_compactStrip->setChecked(KSharedConfig::openConfig()
+                                   ->group(QStringLiteral("Agent"))
+                                   .readEntry("compactStrip", false));
+    connect(m_compactCombo, &QComboBox::currentIndexChanged, this, [this] {
+        KSharedConfig::openConfig()
+            ->group(QStringLiteral("Agent"))
+            .writeEntry("compactStrategy", m_compactCombo->currentData().toString());
+        pushCompactStrategy();
+    });
+    connect(m_compactStrip, &QCheckBox::toggled, this, [this](bool on) {
+        KSharedConfig::openConfig()
+            ->group(QStringLiteral("Agent"))
+            .writeEntry("compactStrip", on);
+        pushCompactStrategy();
+    });
+
     // Attachment chip bar — hidden until files are attached.
     m_attachBar = new QWidget(this);
     m_attachLayout = new QHBoxLayout(m_attachBar);
@@ -522,6 +575,8 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     buttons->addWidget(m_modeCombo);
     buttons->addWidget(m_isolationCombo);
     buttons->addWidget(m_effortCombo);
+    buttons->addWidget(m_compactCombo);
+    buttons->addWidget(m_compactStrip);
     buttons->addWidget(m_attachBtn);
     buttons->addWidget(m_diffBtn);
     buttons->addStretch(1);
@@ -626,6 +681,28 @@ void AgentPanel::setDormant(const QString &threadId, const QString &title, bool 
     m_dormant = true;
     m_isolated = isolated;
     loadTranscript();
+    // Pull the thread's persisted compaction strategy and reflect it in the
+    // dropdown — overrides whatever sticky default the panel was showing.
+    const QString tid = m_threadId;
+    m_core->call(QStringLiteral("agent.summaryStatus"),
+                 QJsonObject{{QStringLiteral("threadId"), tid}},
+                 [this, tid](const QJsonObject &result, const QJsonObject &) {
+                     if (tid != m_threadId) {
+                         return;
+                     }
+                     const QString strategy =
+                         result.value(QStringLiteral("strategy")).toString();
+                     if (!strategy.isEmpty()) {
+                         const int idx = m_compactCombo->findData(strategy);
+                         if (idx >= 0) {
+                             QSignalBlocker blocker(m_compactCombo);
+                             m_compactCombo->setCurrentIndex(idx);
+                         }
+                     }
+                     QSignalBlocker blocker(m_compactStrip);
+                     m_compactStrip->setChecked(
+                         result.value(QStringLiteral("strip")).toBool(false));
+                 });
     addNote(QStringLiteral("dormant agent · %1 — Resume to continue.")
                 .arg(title.toHtmlEscaped()),
             QStringLiteral("sys"));
@@ -667,11 +744,21 @@ void AgentPanel::loadTranscript()
                  });
 }
 
-void AgentPanel::resume()
+void AgentPanel::pushCompactStrategy()
 {
-    if (!m_dormant || m_threadId.isEmpty()) {
+    if (m_threadId.isEmpty() || !m_core || !m_core->isConnected()) {
         return;
     }
+    m_core->call(QStringLiteral("agent.setCompactStrategy"),
+                 QJsonObject{
+                     {QStringLiteral("threadId"), m_threadId},
+                     {QStringLiteral("strategy"), m_compactCombo->currentData().toString()},
+                     {QStringLiteral("strip"), m_compactStrip->isChecked()},
+                 });
+}
+
+void AgentPanel::doResume()
+{
     addNote(QStringLiteral("resuming the Claude Code session…"), QStringLiteral("sys"));
     m_core->call(QStringLiteral("agent.resume"),
                  QJsonObject{{QStringLiteral("threadId"), m_threadId}},
@@ -683,6 +770,124 @@ void AgentPanel::resume()
                                               .toHtmlEscaped()),
                                  QStringLiteral("err"));
                      }
+                 });
+}
+
+// askRecoveryModel pops a modal asking which model should produce a missing
+// compacted summary before resume. Returns "opus"|"sonnet"|"haiku"|"local",
+// or "" if the user cancelled (in which case the caller should resume on the
+// full transcript and pay the re-cache cost knowingly).
+static QString askRecoveryModel(QWidget *parent)
+{
+    QDialog dlg(parent);
+    dlg.setWindowTitle(QObject::tr("Resume — choose compactor"));
+
+    auto *layout = new QVBoxLayout(&dlg);
+    auto *msg = new QLabel(QObject::tr(
+        "This thread has no current compacted summary, so resuming would "
+        "replay its full transcript. Choose which model should produce a "
+        "summary now:"));
+    msg->setWordWrap(true);
+    layout->addWidget(msg);
+
+    QString choice;
+    auto *btnLayout = new QHBoxLayout;
+    auto add = [&](const QString &label, const QString &result, bool recommended) {
+        auto *btn = new QPushButton(label, &dlg);
+        if (recommended) {
+            btn->setDefault(true);
+            QFont f = btn->font();
+            f.setBold(true);
+            btn->setFont(f);
+        }
+        QObject::connect(btn, &QPushButton::clicked, &dlg, [&dlg, &choice, result] {
+            choice = result;
+            dlg.accept();
+        });
+        btnLayout->addWidget(btn);
+    };
+    add(QObject::tr("Opus"), QStringLiteral("opus"), false);
+    add(QObject::tr("Sonnet (recommended)"), QStringLiteral("sonnet"), true);
+    add(QObject::tr("Haiku"), QStringLiteral("haiku"), false);
+    add(QObject::tr("Local"), QStringLiteral("local"), false);
+    layout->addLayout(btnLayout);
+
+    auto *bb = new QDialogButtonBox(QDialogButtonBox::Cancel, &dlg);
+    QObject::connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    layout->addWidget(bb);
+
+    if (dlg.exec() == QDialog::Accepted) {
+        return choice;
+    }
+    return QString();
+}
+
+void AgentPanel::resume()
+{
+    if (!m_dormant || m_threadId.isEmpty()) {
+        return;
+    }
+    const QString tid = m_threadId;
+    // Check whether a current compacted summary already exists. If not, ask
+    // the user which model should produce one before we resume — see the
+    // recovery dialog. If yes, resume straight away.
+    m_core->call(QStringLiteral("agent.summaryStatus"),
+                 QJsonObject{{QStringLiteral("threadId"), tid}},
+                 [this, tid](const QJsonObject &result, const QJsonObject &error) {
+                     if (tid != m_threadId) {
+                         return;
+                     }
+                     if (!error.isEmpty()) {
+                         // Status call failed — don't block the user; resume
+                         // on the full transcript and log the issue.
+                         addNote(QStringLiteral("Could not check summary status (%1); "
+                                                "resuming on the full transcript.")
+                                     .arg(error.value(QStringLiteral("message"))
+                                              .toString()
+                                              .toHtmlEscaped()),
+                                 QStringLiteral("dim"));
+                         doResume();
+                         return;
+                     }
+                     const bool stale =
+                         result.value(QStringLiteral("stale")).toBool(true);
+                     if (!stale) {
+                         doResume();
+                         return;
+                     }
+                     const QString model = askRecoveryModel(this);
+                     if (model.isEmpty()) {
+                         addNote(QStringLiteral("Resuming without compaction. "
+                                                "The next turn will pay the full re-cache cost."),
+                                 QStringLiteral("dim"));
+                         doResume();
+                         return;
+                     }
+                     addNote(QStringLiteral("compacting with <b>%1</b>…").arg(model.toHtmlEscaped()),
+                             QStringLiteral("sys"));
+                     m_core->call(QStringLiteral("agent.compactNow"),
+                                  QJsonObject{
+                                      {QStringLiteral("threadId"), tid},
+                                      {QStringLiteral("model"), model},
+                                  },
+                                  [this, tid](const QJsonObject &res, const QJsonObject &cErr) {
+                                      if (tid != m_threadId) {
+                                          return;
+                                      }
+                                      if (!cErr.isEmpty()) {
+                                          addNote(QStringLiteral("Compaction failed: %1. Resuming anyway.")
+                                                      .arg(cErr.value(QStringLiteral("message"))
+                                                               .toString()
+                                                               .toHtmlEscaped()),
+                                                  QStringLiteral("err"));
+                                      } else {
+                                          addNote(QStringLiteral("compacted (%1 turns, %2 bytes).")
+                                                      .arg(res.value(QStringLiteral("turns")).toInt())
+                                                      .arg(res.value(QStringLiteral("bodyBytes")).toInt()),
+                                                  QStringLiteral("dim"));
+                                      }
+                                      doResume();
+                                  });
                  });
 }
 
@@ -882,6 +1087,9 @@ void AgentPanel::onSendClicked()
                              return;
                          }
                          m_threadId = result.value(QStringLiteral("threadId")).toString();
+                         // Apply the user's chosen compaction strategy now
+                         // that the thread exists on the server.
+                         pushCompactStrategy();
                          refresh();
                      });
     } else {
