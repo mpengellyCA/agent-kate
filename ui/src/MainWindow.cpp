@@ -417,6 +417,14 @@ void MainWindow::setupCore()
         QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("akcore"));
     qInfo("spawning core: %s", qPrintable(corePath));
     m_core->start(corePath);
+
+    // Qt destroys QObject children in the order they were added. m_core was
+    // constructed first in setupUi(), so it would be deleted first at shutdown
+    // — before AgentPanel, WorktreeDashboard, GutterController, etc., whose
+    // destructors call back into m_core. Reparenting moves m_core to the tail
+    // of the child list so it outlives its dependents.
+    m_core->setParent(nullptr);
+    m_core->setParent(this);
 }
 
 void MainWindow::onAgentActivated(int agentId, const QString &projectPath)
