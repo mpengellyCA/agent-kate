@@ -601,6 +601,8 @@ func registerHandlers(d handlerDeps) {
 		_ = d.sessions.Remove(p.ThreadID)
 		_ = d.summaries.Remove(p.ThreadID)
 		d.gitCache.Forget(p.ThreadID)
+		// Tell every UI client to drop this thread from its roster.
+		d.srv.Notify("agent.discarded", map[string]any{"threadId": p.ThreadID})
 		return map[string]any{"ok": true}, nil
 	})
 

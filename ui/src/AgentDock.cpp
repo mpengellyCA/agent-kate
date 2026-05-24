@@ -61,9 +61,21 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
     // exactly when an agent's #N may have just been assigned (fresh start)
     // or changed. Keep the roster badges in sync with the dashboard.
     connect(m_core, &CoreClient::notification, this,
-            [this](const QString &method, const QJsonObject &) {
+            [this](const QString &method, const QJsonObject &params) {
                 if (method == QLatin1String("git.invalidated")) {
                     refreshAgentNumbers();
+                } else if (method == QLatin1String("agent.discarded")) {
+                    const QString threadId =
+                        params.value(QStringLiteral("threadId")).toString();
+                    if (threadId.isEmpty()) {
+                        return;
+                    }
+                    for (const Entry &e : m_agents) {
+                        if (e.panel->threadId() == threadId) {
+                            closeAgent(e.id);
+                            break;
+                        }
+                    }
                 }
             });
     connect(m_roster, &AgentRoster::commitRequested, this, [this](int id) {
