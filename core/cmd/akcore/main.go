@@ -44,6 +44,12 @@ func defaultSocketPath() string {
 }
 
 func main() {
+	// Desktop-launched runs inherit a minimal PATH that often omits user bin
+	// dirs like ~/.local/bin where `claude` lives. Augment it before anything
+	// else so subprocesses (claude, git, gh, ...) resolve the same way they
+	// do under a terminal-launched dev build.
+	augmentPath()
+
 	// Subcommand dispatch: `akcore mcp` is the Cooperation MCP stdio bridge.
 	if len(os.Args) > 1 && os.Args[1] == "mcp" {
 		runMCPBridge(os.Args[2:])
