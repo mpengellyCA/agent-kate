@@ -11,9 +11,15 @@
 #include <QIcon>
 #include <QLabel>
 #include <QTabWidget>
-#include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
+
+namespace {
+// Each session widget carries the absolute project path it was started under,
+// stashed as a dynamic property so we can show/hide on project switch without
+// a side-table.
+constexpr const char *kProjectProp = "ak.projectPath";
+} // namespace
 
 TerminalPanel::TerminalPanel(QWidget *parent)
     : QWidget(parent)
@@ -42,16 +48,50 @@ TerminalPanel::TerminalPanel(QWidget *parent)
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->addWidget(m_tabs);
-
-    // Open the first terminal once the window has finished assembling, so it
-    // picks up the active project's directory.
-    QTimer::singleShot(0, this, &TerminalPanel::newTerminal);
+    // First terminal is created lazily by setWorkingDirectory once the active
+    // project is known — opening it eagerly here would anchor the session to
+    // the home directory.
 }
 
 void TerminalPanel::setWorkingDirectory(const QString &dir)
 {
-    if (!dir.isEmpty()) {
-        m_workdir = dir;
+    if (dir.isEmpty() || dir == m_workdir) {
+        // Same project — but on the very first call we may still have no tabs
+        // because the constructor deferred to us. Make sure one exists.
+        if (dir == m_workdir && m_tabs->count() == 0 && !m_konsoleMissing) {
+            newTerminal();
+        }
+        return;
+    }
+    m_workdir = dir;
+    applyVisibility();
+    // Ensure the active project has at least one visible tab.
+    bool anyVisible = false;
+    for (int i = 0; i < m_tabs->count(); ++i) {
+        if (m_tabs->isTabVisible(i)) {
+            anyVisible = true;
+            break;
+        }
+    }
+    if (!anyVisible && !m_konsoleMissing) {
+        newTerminal();
+    }
+}
+
+void TerminalPanel::applyVisibility()
+{
+    int firstVisible = -1;
+    for (int i = 0; i < m_tabs->count(); ++i) {
+        QWidget *w = m_tabs->widget(i);
+        const QString proj = w ? w->property(kProjectProp).toString() : QString();
+        const bool visible = (proj == m_workdir);
+        m_tabs->setTabVisible(i, visible);
+        if (visible && firstVisible < 0) {
+            firstVisible = i;
+        }
+    }
+    if (firstVisible >= 0) {
+        m_tabs->setCurrentIndex(firstVisible);
     }
 }
 
@@ -64,10 +104,16 @@ void TerminalPanel::newTerminal()
     if (!session) {
         return;
     }
+    session->setProperty(kProjectProp, m_workdir);
     const int idx = m_tabs->addTab(session, i18n("Terminal %1", ++m_counter));
-    m_tabs->setCurrentIndex(idx);
-    if (QWidget *fw = session->focusWidget()) {
-        fw->setFocus();
+    // Re-apply visibility so a freshly created tab in a non-active project
+    // (shouldn't happen, but defensive) doesn't accidentally show up.
+    applyVisibility();
+    if (m_tabs->isTabVisible(idx)) {
+        m_tabs->setCurrentIndex(idx);
+        if (QWidget *fw = session->focusWidget()) {
+            fw->setFocus();
+        }
     }
 }
 
