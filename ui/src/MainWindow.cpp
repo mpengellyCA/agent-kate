@@ -9,6 +9,8 @@
 #include "SessionBrowserDialog.h"
 #include "SkillsDialog.h"
 #include "TerminalPanel.h"
+#include "WorktreeDashboard.h"
+#include "git/GutterController.h"
 #include "ipc/CoreClient.h"
 #include "lsp/LspManager.h"
 
@@ -33,8 +35,10 @@
 #include <QKeySequence>
 #include <QMenu>
 #include <QMenuBar>
+#include <QLabel>
 #include <QStatusBar>
 #include <QTabWidget>
+#include <QTimer>
 #include <QToolBar>
 
 #include <array>
@@ -144,6 +148,17 @@ void MainWindow::setupUi()
     outlineDock->setWidget(outline);
     addDockWidget(Qt::RightDockWidgetArea, outlineDock);
     tabifyDockWidget(treeDock, outlineDock);
+
+    // Worktree dashboard — every agent's branch / ahead / behind / dirty
+    // count, polled at 1 Hz. Tabbed with the file tree so the right column
+    // doubles as "what are the agents doing to git right now?".
+    m_worktreeDashboard = new WorktreeDashboard(m_core, this);
+    auto *worktreeDock = new QDockWidget(i18n("Worktrees"), this);
+    worktreeDock->setObjectName(QStringLiteral("worktreeDock"));
+    worktreeDock->setWindowIcon(QIcon::fromTheme(QStringLiteral("vcs-branch")));
+    worktreeDock->setWidget(m_worktreeDashboard);
+    addDockWidget(Qt::RightDockWidgetArea, worktreeDock);
+    tabifyDockWidget(treeDock, worktreeDock);
     treeDock->raise();
 
     connect(m_lsp, &LspManager::definitionResolved, this,
@@ -191,11 +206,37 @@ void MainWindow::setupUi()
         }
     });
     connect(m_editor, &EditorArea::documentOpened, this,
-            [this](KTextEditor::Document *doc, const QString &) {
+            [this](KTextEditor::Document *doc, const QString &path) {
                 m_lsp->documentOpened(doc, m_activeProject);
+                // Attach a per-document git gutter. The controller stops
+                // polling itself when the document is closed.
+                if (!m_gutters.contains(doc)) {
+                    auto *gc = new GutterController(doc, path, m_core, this);
+                    m_gutters.insert(doc, gc);
+                    connect(gc, &GutterController::statusUpdated, this,
+                            [this](const QString &p, const QString &branch,
+                                   const QString &status, int hunks) {
+                                if (p != m_activeFilePath || !m_gitStatusLabel) {
+                                    return;
+                                }
+                                const QString left = branch.isEmpty()
+                                    ? QStringLiteral("—") : branch;
+                                m_gitStatusLabel->setText(
+                                    QStringLiteral("⎇ %1 · %2 · %3 hunks")
+                                        .arg(left,
+                                             status.isEmpty()
+                                                 ? QStringLiteral("clean") : status)
+                                        .arg(hunks));
+                            });
+                }
             });
     connect(m_editor, &EditorArea::documentClosed, this,
-            [this](KTextEditor::Document *doc) { m_lsp->documentClosed(doc); });
+            [this](KTextEditor::Document *doc) {
+                m_lsp->documentClosed(doc);
+                if (auto *gc = m_gutters.take(doc)) {
+                    gc->deleteLater();
+                }
+            });
 }
 
 void MainWindow::setupActions()
@@ -333,6 +374,25 @@ void MainWindow::setupCore()
     statusBar()->setSizeGripEnabled(false);
     connect(m_agent, &AgentDock::statusMessage, this, [this](const QString &text) {
         statusBar()->showMessage(text, 8000);
+    });
+
+    // Permanent git status widget on the right of the status bar. Populated
+    // by the active editor's GutterController as it polls the core.
+    m_gitStatusLabel = new QLabel(this);
+    m_gitStatusLabel->setContentsMargins(8, 0, 8, 0);
+    m_gitStatusLabel->setStyleSheet(QStringLiteral("color: palette(mid);"));
+    statusBar()->addPermanentWidget(m_gitStatusLabel);
+
+    connect(m_editor, &EditorArea::currentFileChanged, this, [this](const QString &path) {
+        m_activeFilePath = path;
+        if (!m_gitStatusLabel) {
+            return;
+        }
+        if (path.isEmpty()) {
+            m_gitStatusLabel->clear();
+        } else {
+            m_gitStatusLabel->setText(QStringLiteral("⎇ …"));
+        }
     });
 
     connect(m_core, &CoreClient::coreLog, this,

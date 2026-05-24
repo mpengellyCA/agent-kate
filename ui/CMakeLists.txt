@@ -37,6 +37,8 @@ add_executable(agentkate
     src/AgentRoster.cpp
     src/AgentDock.cpp
     src/AgentPanel.cpp
+    src/WorktreeDashboard.cpp
+    src/git/GutterController.cpp
     src/ipc/CoreClient.cpp
     src/lsp/LspClient.cpp
     src/lsp/LspCompletionModel.cpp

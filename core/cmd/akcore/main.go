@@ -21,6 +21,7 @@ import (
 
 	"agentkate/internal/agent"
 	"agentkate/internal/coop"
+	"agentkate/internal/gitstatus"
 	"agentkate/internal/ipc"
 	"agentkate/internal/permission"
 	"agentkate/internal/session"
@@ -95,6 +96,7 @@ func runCore() {
 	broker := permission.New()
 	extensions := vsix.NewManager(vsix.DefaultCacheDir())
 	skillCatalog := skills.New(skills.DefaultDir())
+	gitCache := gitstatus.NewCache()
 
 	sessions, err := session.NewStore(session.DefaultPath())
 	if err != nil {
@@ -130,10 +132,19 @@ func runCore() {
 		extensions: extensions,
 		sessions:   sessions,
 		skills:     skillCatalog,
+		gitCache:   gitCache,
 		socketPath: *socket,
 		exePath:    exePath,
 		log:        log,
 	})
+
+	// Rehydrate the git cache with every persisted thread that still has a
+	// worktree on disk, so the dashboard shows dormant threads after a restart.
+	for _, rec := range sessions.List("") {
+		if _, err := os.Stat(rec.Worktree.Path); err == nil {
+			gitCache.Register(rec.Worktree)
+		}
+	}
 
 	// Don't outlive the UI: when the last client disconnects, shut down.
 	srv.OnAllClientsGone(func() {
@@ -201,6 +212,7 @@ type handlerDeps struct {
 	extensions *vsix.Manager
 	sessions   *session.Store
 	skills     *skills.Catalog
+	gitCache   *gitstatus.Cache
 	socketPath string
 	exePath    string
 	log        *slog.Logger
@@ -439,6 +451,7 @@ func registerHandlers(d handlerDeps) {
 		if err := worktree.Commit(wt, p.Message); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
 		}
+		d.gitCache.Invalidate(p.ThreadID)
 		return map[string]any{"ok": true, "branch": wt.Branch}, nil
 	})
 
@@ -478,6 +491,9 @@ func registerHandlers(d handlerDeps) {
 		if err != nil {
 			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
 		}
+		// The land touched both the worktree and the main repo — invalidate
+		// every entry so the dashboard reflects the new ahead/behind.
+		d.gitCache.InvalidateAll()
 		d.log.Info("agent thread landed", "thread", p.ThreadID,
 			"branch", rec.Worktree.Branch, "into", target)
 		return map[string]any{"branch": rec.Worktree.Branch, "into": target}, nil
@@ -500,6 +516,7 @@ func registerHandlers(d handlerDeps) {
 		}
 		// The worktree is gone, so the thread can never be resumed — forget it.
 		_ = d.sessions.Remove(p.ThreadID)
+		d.gitCache.Forget(p.ThreadID)
 		return map[string]any{"ok": true}, nil
 	})
 
@@ -747,6 +764,83 @@ func registerHandlers(d handlerDeps) {
 		d.log.Info("skill uninstalled", "name", p.Name, "target", p.Target)
 		return map[string]any{"ok": true}, nil
 	})
+
+	// --- git status (read-only) -------------------------------------------
+	// git.snapshot returns every registered thread's worktree status, drawn
+	// from the cache. The UI polls this at ~1 Hz to drive the worktree
+	// dashboard.
+	d.srv.Handle("git.snapshot", func(_ context.Context, _ json.RawMessage) (any, error) {
+		// Always force a recompute on poll: phase 1 has no fs watcher, so the
+		// cache is here for concurrent-reader coalescing, not freshness.
+		d.gitCache.InvalidateAll()
+		snaps := d.gitCache.Snapshots()
+		if snaps == nil {
+			snaps = []*gitstatus.Snapshot{}
+		}
+		return map[string]any{"threads": snaps}, nil
+	})
+
+	// git.file returns line-level hunks for one absolute file path vs the
+	// owning worktree's HEAD. The UI's gutter polls this per open buffer.
+	d.srv.Handle("git.file", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			Path     string `json:"path"`
+			ThreadID string `json:"threadId"` // optional hint
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		if p.Path == "" {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "path is required")
+		}
+		// Locate the owning worktree. The thread hint short-cuts the search;
+		// otherwise FindByPath picks the most specific worktree containing
+		// the file (so files in .agentkate/worktrees/<id>/ map to that thread,
+		// not the parent workspace).
+		var snap *gitstatus.Snapshot
+		var relPath string
+		if p.ThreadID != "" {
+			if s, ok := d.gitCache.SnapshotFor(p.ThreadID); ok {
+				if rec, ok := d.threads.get(p.ThreadID); ok {
+					if rel, err := filepath.Rel(rec.Path, p.Path); err == nil &&
+						!strings.HasPrefix(rel, "..") {
+						snap = s
+						relPath = filepath.ToSlash(rel)
+					}
+				}
+			}
+		}
+		if snap == nil {
+			s, rel, ok := d.gitCache.FindByPath(p.Path)
+			if !ok {
+				return map[string]any{"status": gitstatus.StatusClean,
+					"hunks": []gitstatus.Hunk{}}, nil
+			}
+			snap, relPath = s, rel
+		}
+		fileStatus := gitstatus.StatusClean
+		for _, f := range snap.Files {
+			if f.Path == relPath {
+				fileStatus = f.Status
+				break
+			}
+		}
+		hunks, generation, _, err := d.gitCache.HunksFor(snap.ThreadID, relPath)
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		if hunks == nil {
+			hunks = []gitstatus.Hunk{}
+		}
+		return map[string]any{
+			"threadId":   snap.ThreadID,
+			"branch":     snap.Branch,
+			"status":     fileStatus,
+			"hunks":      hunks,
+			"headSha":    snap.HeadSHA,
+			"generation": generation,
+		}, nil
+	})
 }
 
 // startAgentThread creates the thread's worktree, writes its MCP config and
@@ -761,6 +855,7 @@ func startAgentThread(d handlerDeps, threadID, sessionID string, p agentStartPar
 		return
 	}
 	d.threads.put(threadID, wt)
+	d.gitCache.Register(wt)
 
 	mcpConfig, err := writeMCPConfig(d.exePath, d.socketPath, threadID, wt.Path)
 	if err != nil {
@@ -822,6 +917,7 @@ func resumeAgentThread(d handlerDeps, rec session.Record) {
 		return
 	}
 	d.threads.put(rec.ThreadID, rec.Worktree)
+	d.gitCache.Register(rec.Worktree)
 
 	mcpConfig, err := writeMCPConfig(d.exePath, d.socketPath, rec.ThreadID, rec.Worktree.Path)
 	if err != nil {
@@ -875,6 +971,7 @@ func promoteAgentThread(d handlerDeps, rec session.Record) {
 	rec.Worktree = iso
 	_ = d.sessions.Update(rec.ThreadID, func(r *session.Record) { r.Worktree = iso })
 	d.threads.put(rec.ThreadID, iso)
+	d.gitCache.Register(iso)
 	d.log.Info("agent thread promoted", "thread", rec.ThreadID, "branch", iso.Branch)
 	emitLifecycle(d.srv, rec.ThreadID, "promoted",
 		"promoted to an isolated worktree on "+iso.Branch, &iso)
