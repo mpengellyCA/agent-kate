@@ -30,6 +30,9 @@ public:
     // Re-apply chat preferences (send key, tool-card visibility) to every panel.
     void applyChatSettings();
 
+    // threadId of the currently-active agent panel, empty if none / not started.
+    QString currentThreadId() const;
+
 Q_SIGNALS:
     void statusMessage(const QString &text);
     void openDiff(const QString &title, const QString &diffText);

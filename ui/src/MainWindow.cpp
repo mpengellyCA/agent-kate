@@ -515,6 +515,9 @@ void MainWindow::onAgentActivated(int agentId, const QString &projectPath)
     m_activeProject = projectPath;
     m_tree->setRoot(projectPath);
     m_terminal->setWorkingDirectory(projectPath);
+    if (m_logViewer) {
+        m_logViewer->setActiveSource(projectPath, m_agent->currentThreadId());
+    }
     setWindowTitle(i18n("Agent Kate — %1", QDir(projectPath).dirName()));
     m_editor->setActiveGroup(groupKey());
 }

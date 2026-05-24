@@ -289,6 +289,18 @@ void AgentDock::applyChatSettings()
     }
 }
 
+QString AgentDock::currentThreadId() const
+{
+    QWidget *w = m_stack->currentWidget();
+    if (!w) {
+        return {};
+    }
+    if (auto *panel = qobject_cast<AgentPanel *>(w)) {
+        return panel->threadId();
+    }
+    return {};
+}
+
 AgentPanel *AgentDock::addAgent(const QString &projectPath)
 {
     const int id = ++m_counter;

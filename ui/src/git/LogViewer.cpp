@@ -9,7 +9,6 @@
 #include "RefChipDelegate.h"
 #include "ipc/CoreClient.h"
 
-#include <QComboBox>
 #include <QDateTime>
 #include <QHBoxLayout>
 #include <QHeaderView>
@@ -17,6 +16,7 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
+#include <QLabel>
 #include <QPushButton>
 #include <QScrollBar>
 #include <QSplitter>
@@ -28,15 +28,14 @@ LogViewer::LogViewer(CoreClient *core, QWidget *parent)
     : QWidget(parent)
     , m_core(core)
 {
-    m_threadPicker = new QComboBox(this);
-    m_threadPicker->setMinimumContentsLength(20);
-    m_threadPicker->setSizeAdjustPolicy(QComboBox::AdjustToContentsOnFirstShow);
+    m_sourceLabel = new QLabel(this);
+    m_sourceLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
 
     m_refreshBtn = new QPushButton(tr("Refresh"), this);
 
     auto *toolbar = new QHBoxLayout;
     toolbar->setContentsMargins(6, 4, 6, 4);
-    toolbar->addWidget(m_threadPicker, 1);
+    toolbar->addWidget(m_sourceLabel, 1);
     toolbar->addWidget(m_refreshBtn);
 
     m_model = new LogModel(this);
@@ -78,18 +77,8 @@ LogViewer::LogViewer(CoreClient *core, QWidget *parent)
     layout->addLayout(toolbar);
     layout->addWidget(split, 1);
 
-    connect(m_threadPicker, qOverload<int>(&QComboBox::currentIndexChanged), this,
-            [this](int idx) {
-                const Source s = sourceForIndex(idx);
-                if (s.threadId != m_source.threadId
-                    || s.repoRoot != m_source.repoRoot
-                    || s.branch != m_source.branch) {
-                    m_source = s;
-                    reloadFromFirstPage();
-                }
-            });
     connect(m_refreshBtn, &QPushButton::clicked, this, [this] {
-        refreshThreads();
+        resolveThreadForProject();
         reloadFromFirstPage();
     });
     connect(m_view->selectionModel(), &QItemSelectionModel::currentRowChanged, this,
@@ -97,50 +86,51 @@ LogViewer::LogViewer(CoreClient *core, QWidget *parent)
     connect(m_view->verticalScrollBar(), &QScrollBar::valueChanged, this,
             &LogViewer::onScrolled);
     connect(m_core, &CoreClient::notification, this, &LogViewer::onNotification);
-    connect(m_core, &CoreClient::connected, this, [this] {
-        m_threadsLoaded = false;
-        refreshThreads();
-    });
+    connect(m_core, &CoreClient::connected, this, [this] { resolveThreadForProject(); });
+
+    updateLabel();
 }
 
-void LogViewer::setThreadId(const QString &threadId)
+void LogViewer::setActiveSource(const QString &projectPath, const QString &threadId)
 {
-    if (threadId == m_source.threadId && m_source.repoRoot.isEmpty()) {
+    if (projectPath == m_activeProject && threadId == m_source.threadId
+        && (!threadId.isEmpty() || m_source.repoRoot == projectPath)) {
         return;
     }
-    m_source = Source{threadId, QString(), QString()};
-    // Try to reflect the selection in the picker; if the snapshot hasn't
-    // arrived yet the next refreshThreads() will line it back up.
-    const int idx = m_threadPicker->findData(threadId);
-    if (idx >= 0) {
-        QSignalBlocker block(m_threadPicker);
-        m_threadPicker->setCurrentIndex(idx);
+    m_activeProject = projectPath;
+    if (!threadId.isEmpty()) {
+        m_source = Source{threadId, QString(), QString()};
+    } else {
+        // Agent hasn't started — show the workspace branch for the project.
+        m_source = Source{QString(), projectPath, QString()};
     }
+    updateLabel();
     reloadFromFirstPage();
-}
-
-LogViewer::Source LogViewer::sourceForIndex(int idx) const
-{
-    if (idx < 0) {
-        return {};
-    }
-    const QVariantMap m = m_threadPicker->itemData(idx).toMap();
-    return Source{m.value(QStringLiteral("threadId")).toString(),
-                  m.value(QStringLiteral("repoRoot")).toString(),
-                  m.value(QStringLiteral("branch")).toString()};
-}
-
-void LogViewer::showEvent(QShowEvent *e)
-{
-    QWidget::showEvent(e);
-    if (!m_threadsLoaded && m_core->isConnected()) {
-        refreshThreads();
+    if (threadId.isEmpty()) {
+        // Will upgrade us to the agent's thread once it exists.
+        resolveThreadForProject();
     }
 }
 
-void LogViewer::refreshThreads()
+void LogViewer::updateLabel()
 {
-    if (!m_core->isConnected()) {
+    if (!m_source.threadId.isEmpty()) {
+        m_sourceLabel->setText(tr("Agent worktree · %1").arg(m_source.threadId.left(8)));
+    } else if (!m_source.repoRoot.isEmpty()) {
+        m_sourceLabel->setText(m_source.branch.isEmpty()
+                                   ? tr("Workspace · (detached)")
+                                   : tr("Workspace · %1").arg(m_source.branch));
+    } else {
+        m_sourceLabel->setText(tr("No project selected"));
+    }
+}
+
+// resolveThreadForProject asks the core for snapshots and, if the active
+// project has a thread, switches the source to it. This is the path that
+// upgrades us from "workspace" to "agent worktree" once the agent starts.
+void LogViewer::resolveThreadForProject()
+{
+    if (m_activeProject.isEmpty() || !m_core->isConnected()) {
         return;
     }
     m_core->call(QStringLiteral("git.snapshot"), {},
@@ -148,81 +138,49 @@ void LogViewer::refreshThreads()
                      if (!error.isEmpty()) {
                          return;
                      }
-                     m_threadsLoaded = true;
                      const QJsonArray threads =
                          result.value(QStringLiteral("threads")).toArray();
-                     const QJsonArray workspaces =
-                         result.value(QStringLiteral("workspaces")).toArray();
-                     const Source prev = m_source;
-                     QSignalBlocker block(m_threadPicker);
-                     m_threadPicker->clear();
-                     // Workspace branches first so "main" is the easy default
-                     // for users who haven't started any agent yet.
-                     for (const QJsonValue &v : workspaces) {
-                         const QJsonObject o = v.toObject();
-                         const QString repoRoot =
-                             o.value(QStringLiteral("repoRoot")).toString();
-                         const QString branch =
-                             o.value(QStringLiteral("branch")).toString();
-                         if (repoRoot.isEmpty()) {
-                             continue;
-                         }
-                         const QString label =
-                             branch.isEmpty()
-                                 ? tr("workspace · (detached)")
-                                 : tr("workspace · %1").arg(branch);
-                         QVariantMap d;
-                         d.insert(QStringLiteral("repoRoot"), repoRoot);
-                         d.insert(QStringLiteral("branch"), branch);
-                         m_threadPicker->addItem(label, d);
-                     }
+                     QString matchedThread;
                      for (const QJsonValue &v : threads) {
                          const QJsonObject o = v.toObject();
-                         const QString id =
-                             o.value(QStringLiteral("threadId")).toString();
-                         const QString branch =
-                             o.value(QStringLiteral("branch")).toString();
-                         const int number =
-                             o.value(QStringLiteral("number")).toInt();
-                         QString label = branch.isEmpty() ? id : branch;
-                         if (number > 0) {
-                             label = QStringLiteral("#%1 · %2").arg(number).arg(label);
-                         }
-                         QVariantMap d;
-                         d.insert(QStringLiteral("threadId"), id);
-                         m_threadPicker->addItem(label, d);
-                     }
-                     int target = -1;
-                     for (int i = 0; i < m_threadPicker->count(); ++i) {
-                         const Source s = sourceForIndex(i);
-                         if (s.threadId == prev.threadId
-                             && s.repoRoot == prev.repoRoot
-                             && s.branch == prev.branch
-                             && (!s.threadId.isEmpty() || !s.repoRoot.isEmpty())) {
-                             target = i;
-                             break;
+                         if (o.value(QStringLiteral("repoRoot")).toString()
+                             == m_activeProject) {
+                             matchedThread =
+                                 o.value(QStringLiteral("threadId")).toString();
+                             if (!matchedThread.isEmpty()) {
+                                 break;
+                             }
                          }
                      }
-                     if (target < 0 && m_threadPicker->count() > 0) {
-                         target = 0;
-                     }
-                     if (target >= 0) {
-                         m_threadPicker->setCurrentIndex(target);
-                         const Source s = sourceForIndex(target);
-                         if (s.threadId != m_source.threadId
-                             || s.repoRoot != m_source.repoRoot
-                             || s.branch != m_source.branch) {
-                             m_source = s;
-                             // Picker signal is blocked, so fire the load here.
-                             reloadFromFirstPage();
-                         } else if (m_model->loadedCount() == 0) {
-                             reloadFromFirstPage();
+                     // If we already have an explicit threadId set by
+                     // MainWindow, only adopt a matched thread when ours
+                     // is empty — never silently swap the user's view.
+                     if (matchedThread.isEmpty()
+                         || matchedThread == m_source.threadId
+                         || !m_source.threadId.isEmpty()) {
+                         // Refresh the workspace branch label if we're in
+                         // workspace mode (HEAD might have moved).
+                         if (m_source.threadId.isEmpty()
+                             && m_source.repoRoot == m_activeProject) {
+                             const QJsonArray workspaces =
+                                 result.value(QStringLiteral("workspaces"))
+                                     .toArray();
+                             for (const QJsonValue &v : workspaces) {
+                                 const QJsonObject o = v.toObject();
+                                 if (o.value(QStringLiteral("repoRoot")).toString()
+                                     == m_activeProject) {
+                                     m_source.branch =
+                                         o.value(QStringLiteral("branch")).toString();
+                                     updateLabel();
+                                     break;
+                                 }
+                             }
                          }
-                     } else {
-                         m_source = {};
-                         m_model->reset();
-                         m_detail->clear();
+                         return;
                      }
+                     m_source = Source{matchedThread, QString(), QString()};
+                     updateLabel();
+                     reloadFromFirstPage();
                  });
 }
 
@@ -313,8 +271,6 @@ void LogViewer::loadNextPage()
                      const bool wasEmpty = m_model->loadedCount() == 0;
                      m_model->appendPage(page);
                      m_graphDelegate->setMaxLane(m_model->maxLane());
-                     // Ask the view to resize the graph column so a widening
-                     // lane fan-out doesn't get clipped.
                      m_view->resizeColumnToContents(LogModel::ColGraph);
                      if (wasEmpty) {
                          m_view->selectRow(0);
@@ -348,12 +304,12 @@ void LogViewer::onNotification(const QString &method, const QJsonObject &params)
         return;
     }
     if (method == QLatin1String("git.invalidated")) {
-        // Cheap signal: the snapshot may have grown a new worktree we don't
-        // know about yet. Only refresh the picker if we don't have one
-        // selected — refreshing while the user is actively reading would
-        // wipe pagination.
-        if (m_source.threadId.isEmpty() && m_source.repoRoot.isEmpty()) {
-            refreshThreads();
+        // A new worktree may have just been registered for the active
+        // agent. Try to upgrade from workspace → thread.
+        if (m_source.threadId.isEmpty()) {
+            resolveThreadForProject();
+        } else {
+            reloadFromFirstPage();
         }
     }
 }
@@ -364,9 +320,6 @@ void LogViewer::onScrolled(int value)
     if (!bar) {
         return;
     }
-    // Fetch the next page once the scrollbar is within 8 rows of the end —
-    // QTableView keeps a steady fixed row height so a constant pixel margin
-    // works fine here.
     const int rowH = m_view->verticalHeader()->defaultSectionSize();
     if (value >= bar->maximum() - rowH * 8) {
         loadNextPage();
