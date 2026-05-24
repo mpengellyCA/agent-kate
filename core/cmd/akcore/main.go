@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"agentkate/internal/agent"
+	"agentkate/internal/compact"
 	"agentkate/internal/coop"
 	"agentkate/internal/gitstatus"
 	"agentkate/internal/ipc"
@@ -112,22 +113,47 @@ func runCore() {
 		os.Exit(1)
 	}
 
+	summaries, err := compact.NewStore(compact.DefaultDir())
+	if err != nil {
+		log.Error("cannot open the summary store", "err", err)
+		os.Exit(1)
+	}
+
 	// The agent supervisor relays every thread event to the UI as a
 	// notification, so the agent panel can render the conversation live.
 	sup := agent.NewSupervisor("", log, func(threadID string, event json.RawMessage) {
 		srv.Notify("agent.event", agentEventParams{ThreadID: threadID, Event: event})
-		// When a thread exits, drop its cooperation locks and presence, and
-		// mark it dormant so it can be resumed later.
 		var probe struct {
 			Type  string `json:"type"`
 			Phase string `json:"phase"`
 		}
-		if json.Unmarshal(event, &probe) == nil &&
-			probe.Type == "_lifecycle" && probe.Phase == "exited" {
+		if json.Unmarshal(event, &probe) != nil {
+			return
+		}
+		// Bump LastTurnAt on each turn completion. This is the staleness
+		// signal for the compaction layer — if the summary is older than the
+		// last turn, it needs to be refreshed before resume.
+		if probe.Type == "result" {
+			_ = sessions.Update(threadID, func(r *session.Record) {
+				r.LastTurnAt = time.Now()
+			})
+			return
+		}
+		// When a thread exits, drop its cooperation locks and presence, and
+		// mark it dormant so it can be resumed later. If the thread is
+		// configured for a cold-exit compaction strategy, fire it in the
+		// background — Hot-Opus is a separate pre-reap flow.
+		if probe.Type == "_lifecycle" && probe.Phase == "exited" {
 			coopState.ClearOwner(threadID)
 			_ = sessions.Update(threadID, func(r *session.Record) {
 				r.Status = session.StatusDormant
 			})
+			if rec, ok := sessions.Get(threadID); ok {
+				strat := compact.Strategy(rec.CompactStrategy).Resolve()
+				if strat.RunsOnExit() && strat != compact.ExitOpusHot {
+					go runExitCompact(log, sessions, summaries, rec, strat)
+				}
+			}
 		}
 	})
 
@@ -139,6 +165,7 @@ func runCore() {
 		broker:     broker,
 		extensions: extensions,
 		sessions:   sessions,
+		summaries:  summaries,
 		skills:     skillCatalog,
 		gitCache:   gitCache,
 		socketPath: *socket,
@@ -219,6 +246,7 @@ type handlerDeps struct {
 	broker     *permission.Broker
 	extensions *vsix.Manager
 	sessions   *session.Store
+	summaries  *compact.Store
 	skills     *skills.Catalog
 	gitCache   *gitstatus.Cache
 	socketPath string
@@ -524,8 +552,126 @@ func registerHandlers(d handlerDeps) {
 		}
 		// The worktree is gone, so the thread can never be resumed — forget it.
 		_ = d.sessions.Remove(p.ThreadID)
+		_ = d.summaries.Remove(p.ThreadID)
 		d.gitCache.Forget(p.ThreadID)
 		return map[string]any{"ok": true}, nil
+	})
+
+	// --- compaction --------------------------------------------------------
+	// Reduces prefix re-cache cost on resume. See package compact.
+	d.srv.Handle("agent.setCompactStrategy", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID string `json:"threadId"`
+			Strategy string `json:"strategy"`
+			Strip    bool   `json:"strip"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		s := compact.Strategy(p.Strategy)
+		if p.Strategy != "" && !s.Valid() {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown strategy "+p.Strategy)
+		}
+		if err := d.sessions.Update(p.ThreadID, func(r *session.Record) {
+			r.CompactStrategy = p.Strategy
+			r.CompactStrip = p.Strip
+		}); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		return map[string]any{"ok": true}, nil
+	})
+
+	// agent.summaryStatus reports whether a thread has a current compacted
+	// summary on disk, used by the UI to drive the recovery dialog on resume.
+	d.srv.Handle("agent.summaryStatus", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID string `json:"threadId"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		rec, ok := d.sessions.Get(p.ThreadID)
+		if !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		}
+		sum, err := d.summaries.Get(p.ThreadID)
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		out := map[string]any{
+			"hasSummary":  sum != nil,
+			"strategy":    rec.CompactStrategy,
+			"strip":       rec.CompactStrip,
+			"lastTurnAt":  rec.LastTurnAt,
+			"updatedAt":   rec.SummaryUpdatedAt,
+		}
+		if sum != nil {
+			out["summaryTurns"] = sum.Turns
+			out["summaryCreated"] = sum.Created
+		}
+		// Stale when there is no summary at all, or the latest user/assistant
+		// turn happened after the last compaction.
+		out["stale"] = sum == nil ||
+			(!rec.LastTurnAt.IsZero() && rec.LastTurnAt.After(rec.SummaryUpdatedAt))
+		return out, nil
+	})
+
+	// agent.compactNow runs a cold compaction synchronously with the given
+	// model (or "local" for the programmatic compactor). Used by both the
+	// resume-time recovery dialog and the explicit "Compact now" UI action.
+	// model accepts: "opus", "sonnet", "haiku", "local" (case-insensitive)
+	// or a full claude --model id like "claude-sonnet-4-6".
+	d.srv.Handle("agent.compactNow", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID string `json:"threadId"`
+			Model    string `json:"model"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		rec, ok := d.sessions.Get(p.ThreadID)
+		if !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		}
+		if rec.SessionID == "" {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "thread has no Claude Code session yet")
+		}
+		modelID, strategy, isLocal := resolveCompactModel(p.Model)
+
+		var sum compact.Summary
+		var err error
+		if isLocal {
+			events, rerr := session.ReadTranscript(rec.SessionID)
+			if rerr != nil {
+				return nil, ipc.Errorf(ipc.CodeInternalError, rerr.Error())
+			}
+			sum = compact.Programmatic(p.ThreadID, rec.SessionID, events)
+		} else {
+			sum, err = compact.RunLLM(ctx, p.ThreadID, strategy, compact.LLMOptions{
+				WorkDir:   rec.Worktree.Path,
+				SessionID: rec.SessionID,
+				Model:     modelID,
+				Timeout:   5 * time.Minute,
+			})
+			if err != nil {
+				return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+			}
+		}
+		if err := d.summaries.Put(sum); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		_ = d.sessions.Update(p.ThreadID, func(r *session.Record) {
+			r.SummaryUpdatedAt = sum.Created
+		})
+		d.log.Info("compaction complete",
+			"thread", p.ThreadID, "strategy", sum.Strategy,
+			"turns", sum.Turns, "body_bytes", len(sum.Body))
+		return map[string]any{
+			"ok":        true,
+			"strategy":  string(sum.Strategy),
+			"turns":     sum.Turns,
+			"bodyBytes": len(sum.Body),
+		}, nil
 	})
 
 	// --- cooperation state (shared with the Cooperation MCP) ---------------
@@ -1260,6 +1406,57 @@ func summarizePrompt(prompt string) string {
 		s = s[:max] + "…"
 	}
 	return s
+}
+
+// runExitCompact performs a cold compaction in the background after an agent
+// exits. Errors are logged but do not block anything — the next resume will
+// either find a usable summary or trigger the recovery dialog in the UI.
+func runExitCompact(log *slog.Logger, sessions *session.Store, summaries *compact.Store,
+	rec session.Record, strategy compact.Strategy) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	sum, err := compact.RunLLM(ctx, rec.ThreadID, strategy, compact.LLMOptions{
+		WorkDir:   rec.Worktree.Path,
+		SessionID: rec.SessionID,
+		Model:     strategy.Model(),
+		Timeout:   5 * time.Minute,
+	})
+	if err != nil {
+		log.Warn("exit compaction failed",
+			"thread", rec.ThreadID, "strategy", strategy, "err", err)
+		return
+	}
+	if err := summaries.Put(sum); err != nil {
+		log.Warn("could not store summary", "thread", rec.ThreadID, "err", err)
+		return
+	}
+	_ = sessions.Update(rec.ThreadID, func(r *session.Record) {
+		r.SummaryUpdatedAt = sum.Created
+	})
+	log.Info("exit compaction complete",
+		"thread", rec.ThreadID, "strategy", strategy,
+		"turns", sum.Turns, "body_bytes", len(sum.Body))
+}
+
+// resolveCompactModel maps the UI-facing model token from the recovery dialog
+// ("opus", "sonnet", "haiku", "local") to the claude --model id we spawn with
+// and the strategy stamp for the resulting summary. Empty or unrecognised
+// tokens fall through to the programmatic compactor, the safe free fallback.
+func resolveCompactModel(token string) (modelID string, strategy compact.Strategy, isLocal bool) {
+	switch strings.ToLower(strings.TrimSpace(token)) {
+	case "opus":
+		return "claude-opus-4-7", compact.ResumeOpusCold, false
+	case "sonnet":
+		return "claude-sonnet-4-6", compact.ResumeSonnetCold, false
+	case "haiku":
+		return "claude-haiku-4-5-20251001", compact.ResumeHaikuCold, false
+	case "local", "":
+		return "", compact.ResumeLocal, true
+	default:
+		// Treat as a literal claude --model id; stamp the closest bucket.
+		return token, compact.ResumeSonnetCold, false
+	}
 }
 
 // emitLifecycle pushes a synthetic _lifecycle agent event to the UI.

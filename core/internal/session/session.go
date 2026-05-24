@@ -39,6 +39,18 @@ type Record struct {
 	Created        time.Time         `json:"created"`
 	Updated        time.Time         `json:"updated"`
 	Status         string            `json:"status"`
+
+	// Compaction policy and state. The strategy chooses when and how the
+	// transcript is condensed so a resume does not pay the full re-cache
+	// cost on a long thread; the strip flag is a per-thread sticky that
+	// asks LLM-based compactors to first apply local lossless passes.
+	// SummaryUpdatedAt is zero when no summary has been produced yet; if
+	// LastTurnAt is after it, the summary is stale and a fresh compact is
+	// due. Empty CompactStrategy is treated as the compact-package default.
+	CompactStrategy  string    `json:"compactStrategy,omitempty"`
+	CompactStrip     bool      `json:"compactStrip,omitempty"`
+	SummaryUpdatedAt time.Time `json:"summaryUpdatedAt,omitempty"`
+	LastTurnAt       time.Time `json:"lastTurnAt,omitempty"`
 }
 
 // Store is the on-disk set of thread records, mirrored in memory.
