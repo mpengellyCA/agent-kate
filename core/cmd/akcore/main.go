@@ -787,6 +787,117 @@ func registerHandlers(d handlerDeps) {
 		return map[string]any{"threads": snaps}, nil
 	})
 
+	// git.land merges the thread's branch into the workspace's current
+	// branch. Always takes keepConflicts: the UI passes true so conflicts
+	// surface as a banner instead of silently rolling back. agent.land
+	// remains the always-rollback shortcut for callers that want that.
+	d.srv.Handle("git.land", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID      string `json:"threadId"`
+			KeepConflicts bool   `json:"keepConflicts"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		rec, ok := d.sessions.Get(p.ThreadID)
+		if !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		}
+		res, err := worktree.LandWithOptions(rec.Worktree, p.KeepConflicts)
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		// Whether clean or conflicting, both worktrees' state moved.
+		d.gitCache.InvalidateAll()
+		if len(res.Conflicts) == 0 {
+			d.log.Info("git.land complete", "thread", p.ThreadID,
+				"branch", res.Branch, "into", res.Into)
+		} else {
+			d.log.Info("git.land left conflicts", "thread", p.ThreadID,
+				"branch", res.Branch, "into", res.Into,
+				"conflicts", len(res.Conflicts))
+		}
+		return res, nil
+	})
+
+	// git.abortMerge rolls back an in-progress merge in the thread's
+	// workspace, restoring it to pre-merge state.
+	d.srv.Handle("git.abortMerge", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID string `json:"threadId"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		rec, ok := d.sessions.Get(p.ThreadID)
+		if !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		}
+		if err := worktree.AbortMerge(rec.Worktree.RepoRoot); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		d.gitCache.InvalidateAll()
+		return map[string]any{"ok": true}, nil
+	})
+
+	// git.finalizeMerge commits the in-progress merge in the thread's
+	// workspace using git's default merge message. Fails if any conflict
+	// markers are still present.
+	d.srv.Handle("git.finalizeMerge", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID string `json:"threadId"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		rec, ok := d.sessions.Get(p.ThreadID)
+		if !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		}
+		if err := worktree.FinalizeMerge(rec.Worktree.RepoRoot); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		d.gitCache.InvalidateAll()
+		return map[string]any{"ok": true}, nil
+	})
+
+	// git.openConflictTool spawns KDiff3 (via git mergetool) for every
+	// unmerged path in the thread's workspace, detached so akcore doesn't
+	// wait. The fs watcher catches each save and keeps the dashboard fresh.
+	d.srv.Handle("git.openConflictTool", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID string `json:"threadId"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		rec, ok := d.sessions.Get(p.ThreadID)
+		if !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		}
+		if err := worktree.OpenConflictTool(rec.Worktree.RepoRoot); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		return map[string]any{"ok": true}, nil
+	})
+
+	// git.workspaceMergeStatus tells the UI whether the workspace is mid-
+	// merge and which paths are still unresolved. Polled by the conflict
+	// banner so it can dismiss itself once the human finishes in KDiff3.
+	d.srv.Handle("git.workspaceMergeStatus", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID string `json:"threadId"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		rec, ok := d.sessions.Get(p.ThreadID)
+		if !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		}
+		return worktree.WorkspaceMergeStatus(rec.Worktree.RepoRoot), nil
+	})
+
 	// git.commit stages a subset of paths (or everything when paths is
 	// empty) and commits them to the thread's branch. agent.commit is kept
 	// as the "commit everything with this message" shortcut.

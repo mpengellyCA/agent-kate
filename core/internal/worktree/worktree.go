@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 // Worktree describes where an agent thread runs and how to diff its changes.
@@ -215,47 +216,182 @@ func CommitPaths(wt Worktree, message string, paths []string) error {
 	return err
 }
 
+// LandResult describes the outcome of a Land. When Conflicts is non-empty the
+// workspace is left in MERGING state (only possible when keepConflicts was
+// asked for); the caller is responsible for finishing via FinalizeMerge or
+// AbortMerge.
+type LandResult struct {
+	Branch    string   `json:"branch"`    // the agent's branch
+	Into      string   `json:"into"`      // the workspace branch we merged into
+	Conflicts []string `json:"conflicts"` // empty on a clean merge
+}
+
 // Land merges a thread's worktree branch into the repository's main working
-// tree — a purely local integration, with no remote involved. It returns the
-// name of the branch the work was merged into.
-//
-// The thread must be isolated with at least one commit, and the main working
-// tree must have no uncommitted tracked changes so the merge is safe. On a
-// merge conflict the merge is aborted and the workspace is left untouched.
+// tree, aborting on conflict. Preserved as the "safe" shim around
+// LandWithOptions so existing callers (and existing tests) keep their
+// always-rollback behaviour.
 func Land(wt Worktree) (string, error) {
+	r, err := LandWithOptions(wt, false)
+	return r.Into, err
+}
+
+// LandWithOptions merges the thread's branch into the workspace's current
+// branch. Behaviour on conflict depends on keepConflicts:
+//
+//   - false (the default): the merge is aborted, the workspace is left
+//     untouched, and a conflict counts as an error.
+//   - true: the merge is left in MERGING state with conflict markers in the
+//     working tree, the unmerged paths are returned in Conflicts, and the
+//     caller follows up with FinalizeMerge or AbortMerge.
+//
+// The thread must be isolated with at least one commit, and the workspace
+// must have no uncommitted tracked changes in either case.
+func LandWithOptions(wt Worktree, keepConflicts bool) (LandResult, error) {
+	res := LandResult{Branch: wt.Branch}
 	if !wt.Isolated || wt.Branch == "" {
-		return "", fmt.Errorf("this agent is not running on its own branch")
+		return res, fmt.Errorf("this agent is not running on its own branch")
 	}
 	ahead, err := git(wt.RepoRoot, "rev-list", "--count", wt.Base+".."+wt.Branch)
 	if err != nil {
-		return "", err
+		return res, err
 	}
 	if strings.TrimSpace(ahead) == "0" {
-		return "", fmt.Errorf("this agent has no commits to land — commit its changes first")
+		return res, fmt.Errorf("this agent has no commits to land — commit its changes first")
 	}
-	// The main working tree must be free of uncommitted tracked changes.
 	status, err := git(wt.RepoRoot, "status", "--porcelain", "--untracked-files=no")
 	if err != nil {
-		return "", err
+		return res, err
 	}
 	if strings.TrimSpace(status) != "" {
-		return "", fmt.Errorf(
+		return res, fmt.Errorf(
 			"the workspace has uncommitted changes — commit or stash them first")
 	}
 	target, err := git(wt.RepoRoot, "branch", "--show-current")
 	if err != nil {
-		return "", err
+		return res, err
 	}
-	target = strings.TrimSpace(target)
-	if target == "" {
-		return "", fmt.Errorf("the workspace is not on a branch")
+	res.Into = strings.TrimSpace(target)
+	if res.Into == "" {
+		return res, fmt.Errorf("the workspace is not on a branch")
 	}
-	if out, err := git(wt.RepoRoot, "merge", "--no-edit", wt.Branch); err != nil {
+	out, mergeErr := git(wt.RepoRoot, "merge", "--no-edit", wt.Branch)
+	if mergeErr == nil {
+		return res, nil
+	}
+	// Merge failed. Distinguish "conflict, MERGING state ready" from
+	// "outright failure" by looking for unmerged paths.
+	conflicts := unmergedPaths(wt.RepoRoot)
+	if len(conflicts) == 0 || !keepConflicts {
 		_, _ = git(wt.RepoRoot, "merge", "--abort")
-		return "", fmt.Errorf("merge failed (the workspace was left untouched): %s",
+		if len(conflicts) > 0 {
+			return res, fmt.Errorf(
+				"merge produced conflicts and was aborted (the workspace was left untouched)")
+		}
+		return res, fmt.Errorf(
+			"merge failed (the workspace was left untouched): %s",
 			strings.TrimSpace(out))
 	}
-	return target, nil
+	res.Conflicts = conflicts
+	return res, nil
+}
+
+// (LandResult.Conflicts is similarly emitted as [] not null when clean: it is
+// initialised to nil only on the conflict path, and the caller checks
+// len(Conflicts) which treats both the same way.)
+
+// unmergedPaths returns repo-relative paths with unresolved conflict markers.
+// `git diff --name-only --diff-filter=U` is the canonical query.
+func unmergedPaths(repoRoot string) []string {
+	out, err := git(repoRoot, "diff", "--name-only", "--diff-filter=U")
+	if err != nil {
+		return nil
+	}
+	var paths []string
+	for _, p := range strings.Split(strings.TrimSpace(out), "\n") {
+		if p = strings.TrimSpace(p); p != "" {
+			paths = append(paths, p)
+		}
+	}
+	return paths
+}
+
+// AbortMerge rolls back an in-progress merge in repoRoot, restoring the index
+// and working tree to pre-merge state. Safe to call when no merge is active.
+func AbortMerge(repoRoot string) error {
+	if !mergeInProgress(repoRoot) {
+		return nil
+	}
+	_, err := git(repoRoot, "merge", "--abort")
+	return err
+}
+
+// FinalizeMerge commits the in-progress merge in repoRoot using git's default
+// merge message. Fails descriptively when there are still unresolved
+// conflicts.
+func FinalizeMerge(repoRoot string) error {
+	if !mergeInProgress(repoRoot) {
+		return fmt.Errorf("no merge is in progress")
+	}
+	if conflicts := unmergedPaths(repoRoot); len(conflicts) > 0 {
+		return fmt.Errorf("%d file(s) still have unresolved conflicts", len(conflicts))
+	}
+	_, err := git(repoRoot, "commit", "--no-edit")
+	return err
+}
+
+// OpenConflictTool runs `git mergetool --tool=kdiff3 -y` from repoRoot in the
+// background. KDiff3 opens its own window for each unmerged file; -y skips
+// the per-file "was the merge successful?" terminal prompt git would otherwise
+// emit. Returns once the process has been spawned — the caller does not wait.
+func OpenConflictTool(repoRoot string) error {
+	if !mergeInProgress(repoRoot) {
+		return fmt.Errorf("no merge is in progress")
+	}
+	if _, err := exec.LookPath("kdiff3"); err != nil {
+		return fmt.Errorf("kdiff3 is not installed (looked for it on PATH)")
+	}
+	cmd := exec.Command("git", "mergetool", "--tool=kdiff3", "-y")
+	cmd.Dir = repoRoot
+	// Detach: KDiff3 is a GUI, we do not want to inherit its IO and we do
+	// not want it killed if akcore exits. Setsid puts it in a new session.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	return cmd.Start()
+}
+
+// MergeStatus describes whether a workspace is mid-merge and what is left.
+// Used to keep the conflict banner accurate while the human works in KDiff3.
+type MergeStatus struct {
+	Merging   bool     `json:"merging"`
+	Conflicts []string `json:"conflicts"`
+}
+
+// WorkspaceMergeStatus reads the merge state of repoRoot: whether a merge is
+// in progress and which paths still have conflict markers. Used by the UI's
+// conflict banner to know when to dismiss itself.
+func WorkspaceMergeStatus(repoRoot string) MergeStatus {
+	conflicts := unmergedPaths(repoRoot)
+	if conflicts == nil {
+		conflicts = []string{} // marshal as [] rather than null
+	}
+	return MergeStatus{
+		Merging:   mergeInProgress(repoRoot),
+		Conflicts: conflicts,
+	}
+}
+
+// mergeInProgress returns true when MERGE_HEAD exists in the repo's gitdir —
+// the canonical "we are mid-merge" marker git itself checks.
+func mergeInProgress(repoRoot string) bool {
+	out, err := git(repoRoot, "rev-parse", "--git-dir")
+	if err != nil {
+		return false
+	}
+	gitDir := strings.TrimSpace(out)
+	if !filepath.IsAbs(gitDir) {
+		gitDir = filepath.Join(repoRoot, gitDir)
+	}
+	_, err = os.Stat(filepath.Join(gitDir, "MERGE_HEAD"))
+	return err == nil
 }
 
 // OpenPR pushes the thread's branch and opens a GitHub pull request through the

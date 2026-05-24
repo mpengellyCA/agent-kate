@@ -226,6 +226,116 @@ func TestLand(t *testing.T) {
 	}
 }
 
+// TestLandWithOptionsKeepConflicts forces a conflicting merge and asserts the
+// workspace is left MERGING with the conflicting path reported.
+func TestLandWithOptionsKeepConflicts(t *testing.T) {
+	repo := initRepo(t)
+	wt, err := Create(repo, "t-conflict", ModeIsolated)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// Workspace and worktree both change the same line of a.txt.
+	if err := os.WriteFile(filepath.Join(repo, "a.txt"),
+		[]byte("workspace change\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, repo, "git", "add", "a.txt")
+	run(t, repo, "git", "commit", "-q", "-m", "workspace edit")
+	if err := os.WriteFile(filepath.Join(wt.Path, "a.txt"),
+		[]byte("agent change\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Commit(wt, "agent edit"); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	res, err := LandWithOptions(wt, true)
+	if err != nil {
+		t.Fatalf("LandWithOptions: %v", err)
+	}
+	if len(res.Conflicts) != 1 || res.Conflicts[0] != "a.txt" {
+		t.Fatalf("expected conflict on a.txt, got %v", res.Conflicts)
+	}
+	if status := WorkspaceMergeStatus(repo); !status.Merging {
+		t.Fatal("workspace should be MERGING after a conflict-keeping land")
+	}
+
+	// AbortMerge restores the workspace to pre-merge state.
+	if err := AbortMerge(repo); err != nil {
+		t.Fatalf("AbortMerge: %v", err)
+	}
+	if status := WorkspaceMergeStatus(repo); status.Merging {
+		t.Fatal("workspace should be clean after AbortMerge")
+	}
+}
+
+// TestLandWithOptionsAbortDefault verifies the safe default: a conflict rolls
+// the workspace back and returns an error.
+func TestLandWithOptionsAbortDefault(t *testing.T) {
+	repo := initRepo(t)
+	wt, _ := Create(repo, "t-rollback", ModeIsolated)
+	if err := os.WriteFile(filepath.Join(repo, "a.txt"),
+		[]byte("workspace change\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, repo, "git", "add", "a.txt")
+	run(t, repo, "git", "commit", "-q", "-m", "workspace edit")
+	if err := os.WriteFile(filepath.Join(wt.Path, "a.txt"),
+		[]byte("agent change\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Commit(wt, "agent edit"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := LandWithOptions(wt, false); err == nil {
+		t.Fatal("default Land should error on conflict")
+	}
+	if status := WorkspaceMergeStatus(repo); status.Merging {
+		t.Fatal("workspace should be clean after a default-mode conflict abort")
+	}
+}
+
+// TestFinalizeMerge resolves a conflict by hand, then commits the merge.
+func TestFinalizeMerge(t *testing.T) {
+	repo := initRepo(t)
+	wt, _ := Create(repo, "t-finalize", ModeIsolated)
+	if err := os.WriteFile(filepath.Join(repo, "a.txt"),
+		[]byte("workspace change\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, repo, "git", "add", "a.txt")
+	run(t, repo, "git", "commit", "-q", "-m", "workspace edit")
+	if err := os.WriteFile(filepath.Join(wt.Path, "a.txt"),
+		[]byte("agent change\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Commit(wt, "agent edit"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LandWithOptions(wt, true); err != nil {
+		t.Fatalf("LandWithOptions: %v", err)
+	}
+
+	// FinalizeMerge must refuse while conflict markers remain.
+	if err := FinalizeMerge(repo); err == nil {
+		t.Fatal("FinalizeMerge should refuse while conflicts remain")
+	}
+
+	// Resolve by overwriting the file and re-staging.
+	if err := os.WriteFile(filepath.Join(repo, "a.txt"),
+		[]byte("resolved\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, repo, "git", "add", "a.txt")
+	if err := FinalizeMerge(repo); err != nil {
+		t.Fatalf("FinalizeMerge after resolution: %v", err)
+	}
+	if status := WorkspaceMergeStatus(repo); status.Merging {
+		t.Fatal("workspace should no longer be MERGING after FinalizeMerge")
+	}
+}
+
 func TestLandNoCommits(t *testing.T) {
 	repo := initRepo(t)
 	wt, _ := Create(repo, "t-empty", ModeIsolated)

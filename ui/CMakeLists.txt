@@ -39,6 +39,7 @@ add_executable(agentkate
     src/AgentPanel.cpp
     src/WorktreeDashboard.cpp
     src/git/CommitDialog.cpp
+    src/git/ConflictDialog.cpp
     src/git/GutterController.cpp
     src/ipc/CoreClient.cpp
     src/lsp/LspClient.cpp

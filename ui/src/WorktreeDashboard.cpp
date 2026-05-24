@@ -3,6 +3,7 @@
 
 #include "WorktreeDashboard.h"
 #include "git/CommitDialog.h"
+#include "git/ConflictDialog.h"
 #include "ipc/CoreClient.h"
 
 #include <QHBoxLayout>
@@ -10,6 +11,7 @@
 #include <QItemSelectionModel>
 #include <QJsonArray>
 #include <QJsonValue>
+#include <QMessageBox>
 #include <QPalette>
 #include <QPushButton>
 #include <QTableView>
@@ -146,10 +148,13 @@ WorktreeDashboard::WorktreeDashboard(CoreClient *core, QWidget *parent)
 
     m_commitBtn = new QPushButton(QStringLiteral("Commit selected…"), this);
     m_commitBtn->setEnabled(false);
+    m_landBtn = new QPushButton(QStringLiteral("Land into main…"), this);
+    m_landBtn->setEnabled(false);
     auto *toolbar = new QHBoxLayout;
     toolbar->setContentsMargins(6, 4, 6, 4);
     toolbar->addStretch(1);
     toolbar->addWidget(m_commitBtn);
+    toolbar->addWidget(m_landBtn);
 
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
@@ -162,11 +167,18 @@ WorktreeDashboard::WorktreeDashboard(CoreClient *core, QWidget *parent)
     connect(m_core, &CoreClient::notification, this, &WorktreeDashboard::onNotification);
     connect(m_core, &CoreClient::connected, this, &WorktreeDashboard::refresh);
     connect(m_view->selectionModel(), &QItemSelectionModel::selectionChanged, this,
-            [this] { m_commitBtn->setEnabled(selectedRow() != nullptr); });
+            [this] {
+                const WorktreeRow *r = selectedRow();
+                m_commitBtn->setEnabled(r != nullptr);
+                // Land only makes sense for an isolated worktree on its own
+                // branch — and only when there are commits to merge.
+                m_landBtn->setEnabled(r != nullptr && r->isolated && r->ahead > 0);
+            });
     connect(m_view, &QTableView::doubleClicked, this,
             [this](const QModelIndex &) { openCommitDialog(); });
     connect(m_commitBtn, &QPushButton::clicked, this,
             &WorktreeDashboard::openCommitDialog);
+    connect(m_landBtn, &QPushButton::clicked, this, &WorktreeDashboard::landSelected);
 }
 
 const WorktreeRow *WorktreeDashboard::selectedRow() const
@@ -176,6 +188,70 @@ const WorktreeRow *WorktreeDashboard::selectedRow() const
         return nullptr;
     }
     return m_model->rowAt(sel.first().row());
+}
+
+void WorktreeDashboard::landSelected()
+{
+    const WorktreeRow *r = selectedRow();
+    if (!r || r->branch.isEmpty()) {
+        return;
+    }
+    const QString threadId = r->threadId;
+    const QString branch = r->branch;
+    if (QMessageBox::question(
+            this, QStringLiteral("Land into workspace?"),
+            QStringLiteral("Merge <b>%1</b> into the workspace's current branch?"
+                           "<br><br>Conflicts (if any) will open in KDiff3 "
+                           "instead of rolling back.").arg(branch.toHtmlEscaped()),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No)
+        != QMessageBox::Yes) {
+        return;
+    }
+    m_landBtn->setEnabled(false);
+    m_core->call(QStringLiteral("git.land"),
+                 QJsonObject{{QStringLiteral("threadId"), threadId},
+                             {QStringLiteral("keepConflicts"), true}},
+                 [this, threadId, branch](const QJsonObject &result,
+                                          const QJsonObject &error) {
+                     m_landBtn->setEnabled(true);
+                     if (!error.isEmpty()) {
+                         QMessageBox::warning(
+                             this, QStringLiteral("Could not land"),
+                             error.value(QStringLiteral("message")).toString());
+                         return;
+                     }
+                     const QString into =
+                         result.value(QStringLiteral("into")).toString();
+                     const QJsonArray confArr =
+                         result.value(QStringLiteral("conflicts")).toArray();
+                     if (confArr.isEmpty()) {
+                         emit statusMessage(
+                             QStringLiteral("Merged %1 into %2").arg(branch, into));
+                         refresh();
+                         return;
+                     }
+                     QStringList conflicts;
+                     conflicts.reserve(confArr.size());
+                     for (const QJsonValue &v : confArr) {
+                         conflicts << v.toString();
+                     }
+                     auto *dlg = new ConflictDialog(m_core, threadId, branch, into,
+                                                    conflicts, this);
+                     dlg->setAttribute(Qt::WA_DeleteOnClose);
+                     connect(dlg, &ConflictDialog::finalized, this,
+                             [this, branch](const QString &, const QString &i) {
+                                 emit statusMessage(QStringLiteral("Merged %1 into %2")
+                                                        .arg(branch, i));
+                                 refresh();
+                             });
+                     connect(dlg, &ConflictDialog::aborted, this,
+                             [this](const QString &) {
+                                 emit statusMessage(
+                                     QStringLiteral("Merge aborted; workspace restored"));
+                                 refresh();
+                             });
+                     dlg->show();
+                 });
 }
 
 void WorktreeDashboard::openCommitDialog()

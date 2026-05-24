@@ -79,6 +79,7 @@ private:
     void refresh();
     void onNotification(const QString &method, const QJsonObject &params);
     void openCommitDialog();
+    void landSelected();
     const WorktreeRow *selectedRow() const;
 
     CoreClient *m_core = nullptr;
@@ -86,5 +87,6 @@ private:
     WorktreeModel *m_model = nullptr;
     QTimer *m_pollTimer = nullptr;
     QPushButton *m_commitBtn = nullptr;
+    QPushButton *m_landBtn = nullptr;
     bool m_inFlight = false;
 };
