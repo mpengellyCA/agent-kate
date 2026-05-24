@@ -14,8 +14,10 @@
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFormLayout>
 #include <QFrame>
 #include <QHBoxLayout>
+#include <QIcon>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QKeyEvent>
@@ -35,6 +37,7 @@
 #include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
+#include <QWidgetAction>
 
 namespace {
 bool isDark(const QWidget *w)
@@ -592,22 +595,93 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     m_attachLayout->addStretch(1);
     m_attachBar->setVisible(false);
 
-    m_attachBtn = new QPushButton(QStringLiteral("Attach…"), this);
+    m_attachBtn = new QPushButton(
+        QIcon::fromTheme(QStringLiteral("mail-attachment")), QStringLiteral("Attach…"), this);
     m_attachBtn->setCursor(Qt::PointingHandCursor);
-    m_diffBtn = new QPushButton(QStringLiteral("Changes"), this);
+    m_diffBtn = new QPushButton(
+        QIcon::fromTheme(QStringLiteral("vcs-diff")), QStringLiteral("Changes"), this);
     m_diffBtn->setCursor(Qt::PointingHandCursor);
-    m_stopBtn = new QPushButton(QStringLiteral("Stop"), this);
+    m_stopBtn = new QPushButton(
+        QIcon::fromTheme(QStringLiteral("process-stop")), QStringLiteral("Stop"), this);
     m_stopBtn->setCursor(Qt::PointingHandCursor);
     m_sendBtn = new QPushButton(this);
+    m_sendBtn->setIcon(QIcon::fromTheme(QStringLiteral("document-send")));
     m_sendBtn->setCursor(Qt::PointingHandCursor);
 
+    // "Setup ▾" — collapses the fixed-at-start configs (mode, isolation,
+    // effort) into one popup so the toolbar isn't dominated by combos that
+    // grey out the moment the agent starts.
+    auto buildSetupMenu = [this] {
+        auto *menu = new QMenu(this);
+        auto *panel = new QWidget(menu);
+        auto *form = new QFormLayout(panel);
+        form->setContentsMargins(10, 8, 10, 8);
+        form->addRow(QStringLiteral("Permission"), m_modeCombo);
+        form->addRow(QStringLiteral("Isolation"), m_isolationCombo);
+        form->addRow(QStringLiteral("Effort"), m_effortCombo);
+        auto *action = new QWidgetAction(menu);
+        action->setDefaultWidget(panel);
+        menu->addAction(action);
+        return menu;
+    };
+    auto *setupBtn = new QToolButton(this);
+    setupBtn->setText(QStringLiteral("Setup"));
+    setupBtn->setIcon(QIcon::fromTheme(QStringLiteral("configure")));
+    setupBtn->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    setupBtn->setPopupMode(QToolButton::InstantPopup);
+    setupBtn->setCursor(Qt::PointingHandCursor);
+    setupBtn->setToolTip(QStringLiteral(
+        "Permission, isolation, and reasoning effort for this agent.\n"
+        "These are fixed once the agent starts."));
+    setupBtn->setMenu(buildSetupMenu());
+
+    // "Compaction ▾" — strategy + strip live + a "Compact now" submenu for
+    // one-shot runs. Replaces the standalone combo/checkbox/compact-now trio.
+    auto buildCompactionMenu = [this] {
+        auto *menu = new QMenu(this);
+        auto *panel = new QWidget(menu);
+        auto *form = new QFormLayout(panel);
+        form->setContentsMargins(10, 8, 10, 8);
+        form->addRow(QStringLiteral("Strategy"), m_compactCombo);
+        form->addRow(QString(), m_compactStrip);
+        auto *panelAction = new QWidgetAction(menu);
+        panelAction->setDefaultWidget(panel);
+        menu->addAction(panelAction);
+        menu->addSeparator();
+        auto *nowMenu = menu->addMenu(QStringLiteral("Compact now"));
+        m_compactNowMenu = nowMenu; // kept so updateActionStates can disable it
+        auto add = [this, nowMenu](const QString &label, const QString &token) {
+            QAction *a = nowMenu->addAction(label);
+            connect(a, &QAction::triggered, this, [this, token] { runCompactNow(token); });
+            return a;
+        };
+        add(QStringLiteral("Hot Opus (live thread)"), QStringLiteral("hot"));
+        nowMenu->addSeparator();
+        add(QStringLiteral("Cold Opus"), QStringLiteral("opus"));
+        add(QStringLiteral("Cold Sonnet"), QStringLiteral("sonnet"));
+        add(QStringLiteral("Cold Haiku"), QStringLiteral("haiku"));
+        add(QStringLiteral("Local (programmatic)"), QStringLiteral("local"));
+        return menu;
+    };
+    auto *compactionBtn = new QToolButton(this);
+    compactionBtn->setText(QStringLiteral("Compaction"));
+    compactionBtn->setIcon(QIcon::fromTheme(QStringLiteral("edit-clear-history")));
+    compactionBtn->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    compactionBtn->setPopupMode(QToolButton::InstantPopup);
+    compactionBtn->setCursor(Qt::PointingHandCursor);
+    compactionBtn->setToolTip(QStringLiteral(
+        "When and how this thread's transcript is condensed for resumption,\n"
+        "plus a one-shot \"Compact now\" with any backend."));
+    compactionBtn->setMenu(buildCompactionMenu());
+
+    // The standalone Compact-now button is now folded into the Compaction
+    // menu, but its QToolButton is still constructed above for compatibility
+    // with the existing enable/disable wiring. Hide it from the toolbar.
+    m_compactNowBtn->hide();
+
     auto *buttons = new QHBoxLayout;
-    buttons->addWidget(m_modeCombo);
-    buttons->addWidget(m_isolationCombo);
-    buttons->addWidget(m_effortCombo);
-    buttons->addWidget(m_compactCombo);
-    buttons->addWidget(m_compactStrip);
-    buttons->addWidget(m_compactNowBtn);
+    buttons->addWidget(setupBtn);
+    buttons->addWidget(compactionBtn);
     buttons->addWidget(m_attachBtn);
     buttons->addWidget(m_diffBtn);
     buttons->addStretch(1);
@@ -982,6 +1056,13 @@ void AgentPanel::refresh()
             if (!actions.isEmpty()) {
                 actions.first()->setEnabled(running); // "Hot Opus (live thread)"
             }
+        }
+    }
+    if (m_compactNowMenu) {
+        m_compactNowMenu->setEnabled(!m_threadId.isEmpty());
+        const auto actions = m_compactNowMenu->actions();
+        if (!actions.isEmpty()) {
+            actions.first()->setEnabled(running); // "Hot Opus (live thread)"
         }
     }
     // The permission, isolation and effort modes are fixed once a thread exists.
