@@ -1,6 +1,6 @@
 // Package vsix downloads VS Code extensions from the Open VSX registry,
 // unpacks them, and works out how to launch the language server each one
-// bundles — letting AgentKate reuse VS Code's language tooling (e.g.
+// bundles — letting Agent Kate reuse VS Code's language tooling (e.g.
 // Intelephense for PHP) to push Kate towards VS Code parity.
 //
 // Detecting a server inside an arbitrary extension is not generally solvable:

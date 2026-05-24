@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch AgentKate. The UI spawns akcore itself, so only the UI is started here.
+# Launch Agent Kate. The UI spawns akcore itself, so only the UI is started here.
 # Any extra arguments are passed through (e.g. a file or project path to open).
 set -euo pipefail
 cd "$(dirname "$0")/.."

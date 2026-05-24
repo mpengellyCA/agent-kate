@@ -52,7 +52,7 @@
 MainWindow::MainWindow(const QString &openPath, QWidget *parent)
     : KMainWindow(parent)
 {
-    setWindowTitle(i18n("AgentKate"));
+    setWindowTitle(i18n("Agent Kate"));
     m_tabsByAgent =
         KSharedConfig::openConfig()->group(QStringLiteral("Editor"))
             .readEntry("tabsByAgent", false);
@@ -104,7 +104,7 @@ void MainWindow::setupUi()
 {
     m_core = new CoreClient(this);
 
-    // Centre: the agent conversation — AgentKate is agent-first.
+    // Centre: the agent conversation — Agent Kate is agent-first.
     m_agent = new AgentDock(m_core, this);
     setCentralWidget(m_agent);
 
@@ -515,7 +515,7 @@ void MainWindow::onAgentActivated(int agentId, const QString &projectPath)
     m_activeProject = projectPath;
     m_tree->setRoot(projectPath);
     m_terminal->setWorkingDirectory(projectPath);
-    setWindowTitle(i18n("AgentKate — %1", QDir(projectPath).dirName()));
+    setWindowTitle(i18n("Agent Kate — %1", QDir(projectPath).dirName()));
     m_editor->setActiveGroup(groupKey());
 }
 

@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=AgentKate
+Name=Agent Kate
 GenericName=Multi-Agent Coding Arena
 Comment=Native KDE multi-agent coding arena built on the Kate editor engine
 Exec=agentkate %F

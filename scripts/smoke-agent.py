@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end smoke test for the AgentKate core.
+"""End-to-end smoke test for the Agent Kate core.
 
 Starts akcore, runs one headless `claude` agent thread through the JSON-RPC bus,
 and verifies both stream-json parsing and the Cooperation MCP round-trip. The
@@ -95,7 +95,7 @@ def main():
     workspace = tempfile.mkdtemp(prefix="ak-smoke-ws-")
     for cmd in (["git", "init", "-q"],
                 ["git", "config", "user.email", "smoke@agentkate"],
-                ["git", "config", "user.name", "AgentKate Smoke"]):
+                ["git", "config", "user.name", "Agent Kate Smoke"]):
         subprocess.run(cmd, cwd=workspace, check=True)
     with open(os.path.join(workspace, "README.md"), "w") as fh:
         fh.write("smoke test repo\n")

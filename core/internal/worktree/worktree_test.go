@@ -23,7 +23,7 @@ func initRepo(t *testing.T) string {
 	repo := t.TempDir()
 	run(t, repo, "git", "init", "-q")
 	run(t, repo, "git", "config", "user.email", "test@agentkate")
-	run(t, repo, "git", "config", "user.name", "AgentKate Test")
+	run(t, repo, "git", "config", "user.name", "Agent Kate Test")
 	if err := os.WriteFile(filepath.Join(repo, "a.txt"), []byte("hello\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}

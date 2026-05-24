@@ -28,7 +28,7 @@ SkillsDialog::SkillsDialog(CoreClient *core, const QString &target, QWidget *par
     auto *layout = new QVBoxLayout(this);
 
     auto *intro = new QLabel(
-        i18n("Install Claude Code skills from the central AgentKate catalog "
+        i18n("Install Claude Code skills from the central Agent Kate catalog "
              "into this project. Installed skills are symlinked, so editing "
              "the catalog copy updates every project that uses it."),
         this);

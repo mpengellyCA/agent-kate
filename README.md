@@ -2,14 +2,14 @@
 
 ![Agent Kate Logo](./AgentKate.png)
 
-A **native multi-agent coding arena**. AgentKate is a fast, non-webview desktop
+A **native multi-agent coding arena**. Agent Kate is a fast, non-webview desktop
 application that embeds the **Kate editor engine** (`KTextEditor`) and
 orchestrates multiple **Claude Code** instances working across one or many
 projects at once — with agents and the human cooperating through a shared MCP
 server.
 
 It is our own *harness and arena* for coding agents. Where others wrap a web
-GUI and put each agent thread on a bare git branch, AgentKate renders natively
+GUI and put each agent thread on a bare git branch, Agent Kate renders natively
 and isolates every agent in its own **git worktree** for true parallelism.
 
 ## Architecture

@@ -1,4 +1,4 @@
-// Command akcore is the AgentKate orchestration core. It supervises agent and
+// Command akcore is the Agent Kate orchestration core. It supervises agent and
 // language-server subprocesses and exposes them to the agentkate UI over a
 // local JSON-RPC bus. The UI normally spawns this binary itself.
 //
@@ -389,7 +389,7 @@ func registerHandlers(d handlerDeps) {
 	})
 
 	// session.browse lists every Claude Code session transcript on disk, so the
-	// user can attach any past conversation — even ones AgentKate did not start.
+	// user can attach any past conversation — even ones Agent Kate did not start.
 	d.srv.Handle("session.browse", func(_ context.Context, _ json.RawMessage) (any, error) {
 		found, err := session.Discover()
 		if err != nil {
@@ -412,7 +412,7 @@ func registerHandlers(d handlerDeps) {
 	})
 
 	// session.attach turns a discovered Claude Code session into a dormant
-	// AgentKate thread, which the UI then resumes like any other.
+	// Agent Kate thread, which the UI then resumes like any other.
 	d.srv.Handle("session.attach", func(_ context.Context, raw json.RawMessage) (any, error) {
 		var p struct {
 			SessionID string `json:"sessionId"`
@@ -940,7 +940,7 @@ func registerHandlers(d handlerDeps) {
 	})
 
 	// --- Claude Code skills ------------------------------------------------
-	// skills.listCatalog returns every skill in the central AgentKate catalog
+	// skills.listCatalog returns every skill in the central Agent Kate catalog
 	// (XDG_DATA_HOME/agentkate/skills). An empty catalog is fine — the UI
 	// reveals the catalog directory so the user can drop skills into it.
 	d.srv.Handle("skills.listCatalog", func(_ context.Context, _ json.RawMessage) (any, error) {
@@ -1524,7 +1524,7 @@ func startAgentThread(d handlerDeps, threadID, sessionID string, p agentStartPar
 		return
 	}
 
-	// Persist the thread so it survives a stop, a crash or an AgentKate
+	// Persist the thread so it survives a stop, a crash or an Agent Kate
 	// restart, and can later be resumed on this same Claude Code session.
 	permMode := p.PermissionMode
 	if permMode == "" {

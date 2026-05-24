@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-2.0-or-later
-// SPDX-FileCopyrightText: 2026 The AgentKate developers
+// SPDX-FileCopyrightText: 2026 The Agent Kate developers
 
 #include "ConflictDialog.h"
 #include "ipc/CoreClient.h"

@@ -48,7 +48,7 @@ SessionBrowserDialog::SessionBrowserDialog(CoreClient *core, QWidget *parent)
     auto *layout = new QVBoxLayout(this);
 
     auto *intro = new QLabel(
-        i18n("Pick a past Claude Code conversation to continue in AgentKate. "
+        i18n("Pick a past Claude Code conversation to continue in Agent Kate. "
              "Every session on disk is listed — including ones started in the "
              "claude CLI directly."),
         this);
@@ -128,7 +128,7 @@ void SessionBrowserDialog::populate(const QJsonArray &sessions)
             meta += QStringLiteral("  ·  ") + rel;
         }
         if (attached) {
-            meta += QStringLiteral("  ·  already in AgentKate");
+            meta += QStringLiteral("  ·  already in Agent Kate");
         }
         auto *item =
             new QListWidgetItem(QStringLiteral("%1\n%2").arg(title, meta), m_list);

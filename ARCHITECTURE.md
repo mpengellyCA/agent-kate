@@ -1,8 +1,8 @@
-# AgentKate Architecture
+# Agent Kate Architecture
 
 ## Two processes
 
-AgentKate is split into a native UI and a headless orchestration core. They run as
+Agent Kate is split into a native UI and a headless orchestration core. They run as
 separate processes and speak a local JSON-RPC bus. The UI spawns and owns the
 lifecycle of the core.
 

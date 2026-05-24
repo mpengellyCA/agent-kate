@@ -102,7 +102,7 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
         bool ok = false;
         const QString msg = QInputDialog::getText(
             this, QStringLiteral("Commit agent changes"), QStringLiteral("Commit message:"),
-            QLineEdit::Normal, QStringLiteral("AgentKate change"), &ok);
+            QLineEdit::Normal, QStringLiteral("Agent Kate change"), &ok);
         if (!ok) {
             return;
         }
@@ -435,7 +435,7 @@ void AgentDock::closeAgent(int agentId)
 void AgentDock::closeProject(const QString &path)
 {
     if (m_projects.size() <= 1) {
-        emit statusMessage(QStringLiteral("AgentKate keeps at least one project open"));
+        emit statusMessage(QStringLiteral("Agent Kate keeps at least one project open"));
         return;
     }
     QList<int> ids;

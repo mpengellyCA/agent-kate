@@ -31,7 +31,7 @@ Requires:       konsole
 Recommends:     git
 
 %description
-AgentKate combines the Kate text editor with an orchestration core for
+Agent Kate combines the Kate text editor with an orchestration core for
 running multiple coding agents in parallel, with integrated git, LSP,
 terminal, and worktree management.
 

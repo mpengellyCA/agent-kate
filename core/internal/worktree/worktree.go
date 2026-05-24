@@ -198,7 +198,7 @@ func Commit(wt Worktree, message string) error {
 // empty slice is the same as Commit's "stage everything" behaviour.
 func CommitPaths(wt Worktree, message string, paths []string) error {
 	if strings.TrimSpace(message) == "" {
-		message = "AgentKate change"
+		message = "Agent Kate change"
 	}
 	if len(paths) == 0 {
 		if _, err := git(wt.Path, "add", "-A"); err != nil {
@@ -444,7 +444,7 @@ func OpenPRWithOptions(wt Worktree, opts PROptions) (string, error) {
 		}
 	}
 	if title == "" {
-		title = "AgentKate: " + wt.Branch
+		title = "Agent Kate: " + wt.Branch
 	}
 
 	if _, err := git(wt.Path, "push", "-u", "origin", wt.Branch); err != nil {
@@ -481,7 +481,7 @@ func PRDraft(wt Worktree) (title, body string, err error) {
 	out, _ := git(wt.RepoRoot, "log", "-1", "--pretty=format:%s", wt.Branch)
 	title = strings.TrimSpace(out)
 	if title == "" {
-		title = "AgentKate: " + wt.Branch
+		title = "Agent Kate: " + wt.Branch
 	}
 
 	// Body — bullet list of commit subjects (oldest first, the natural
@@ -501,7 +501,7 @@ func PRDraft(wt Worktree) (title, body string, err error) {
 		sb.WriteString(s)
 		sb.WriteString("\n\n")
 	}
-	sb.WriteString("---\nOpened by AgentKate from ")
+	sb.WriteString("---\nOpened by Agent Kate from ")
 	sb.WriteString(wt.Branch)
 	sb.WriteString(".\n")
 	body = sb.String()

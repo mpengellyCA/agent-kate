@@ -54,11 +54,11 @@ int main(int argc, char *argv[])
     QApplication::setWindowIcon(appIcon);
 
     KAboutData aboutData(QStringLiteral("agentkate"),
-                         i18n("AgentKate"),
+                         i18n("Agent Kate"),
                          QStringLiteral("0.1.0"),
                          i18n("Native multi-agent coding arena"),
                          KAboutLicense::LGPL_V2,
-                         i18n("© 2026 The AgentKate Authors"));
+                         i18n("© 2026 The Agent Kate Authors"));
     aboutData.setProgramLogo(QImage(QStringLiteral(":/branding/logo.png")));
     KAboutData::setApplicationData(aboutData);
 

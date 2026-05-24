@@ -1,8 +1,8 @@
-# AgentKate superbuild: builds the C++/Qt UI and the Go orchestration core.
+# Agent Kate superbuild: builds the C++/Qt UI and the Go orchestration core.
 cmake_minimum_required(VERSION 3.20)
 project(AgentKate VERSION 0.1.0 LANGUAGES CXX)
 
-# Emit build/compile_commands.json so clangd (AgentKate's own LSP) resolves the
+# Emit build/compile_commands.json so clangd (Agent Kate's own LSP) resolves the
 # Qt6/KF6 include paths and gives accurate diagnostics for this project.
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 

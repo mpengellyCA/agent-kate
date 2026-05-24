@@ -9,7 +9,7 @@ class QLabel;
 class QPushButton;
 
 // WelcomeDialog is the launch-time project picker. Shown before MainWindow when
-// AgentKate starts without a command-line path, so the user lands on a chosen
+// Agent Kate starts without a command-line path, so the user lands on a chosen
 // project instead of whatever happens to be the current working directory
 // (which, for the installed desktop entry, is $HOME).
 //

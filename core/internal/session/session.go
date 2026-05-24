@@ -1,7 +1,7 @@
 // Package session persists agent-thread metadata so a thread can be resumed
-// later — after the process stops, or after AgentKate itself restarts.
+// later — after the process stops, or after Agent Kate itself restarts.
 //
-// Each AgentKate thread maps to one Claude Code session (a UUID). Claude Code
+// Each Agent Kate thread maps to one Claude Code session (a UUID). Claude Code
 // stores the conversation transcript on disk and can replay it with
 // `claude --resume <session-id>`; this package records just enough beside it
 // — the session id, worktree and project — to spawn that resume.

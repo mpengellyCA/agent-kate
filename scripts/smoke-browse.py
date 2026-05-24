@@ -3,7 +3,7 @@
 
 Plants a synthetic Claude Code transcript under a throwaway CLAUDE_CONFIG_DIR,
 then drives the core's session.browse / session.attach IPC to prove a past
-conversation — one AgentKate never started — can be discovered and attached as
+conversation — one Agent Kate never started — can be discovered and attached as
 a resumable thread, with de-duplication.
 
 Requires a built ./build/akcore. No `claude` CLI or network needed.

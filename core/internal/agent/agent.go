@@ -1,5 +1,5 @@
 // Package agent supervises headless Claude Code processes — the "agent threads"
-// that do the work in AgentKate's harness. Each thread is one `claude` process
+// that do the work in Agent Kate's harness. Each thread is one `claude` process
 // run in streaming-JSON mode so its conversation can be observed live and
 // continued with follow-up messages.
 package agent

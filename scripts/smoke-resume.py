@@ -2,7 +2,7 @@
 """End-to-end smoke test for session resume (M-resume increment 1).
 
 Starts an agent thread, tells it a secret, then *kills the core entirely* —
-simulating an AgentKate restart — starts a fresh core, and resumes the thread
+simulating an Agent Kate restart — starts a fresh core, and resumes the thread
 from its persisted Claude Code session. A passing run proves the thread record
 survived on disk and that `claude --resume` restored the conversation: the
 resumed agent still recalls the secret.
@@ -135,7 +135,7 @@ def make_repo():
     ws = tempfile.mkdtemp(prefix="ak-resume-ws-")
     for cmd in (["git", "init", "-q"],
                 ["git", "config", "user.email", "resume@agentkate"],
-                ["git", "config", "user.name", "AgentKate Resume"]):
+                ["git", "config", "user.name", "Agent Kate Resume"]):
         subprocess.run(cmd, cwd=ws, check=True)
     with open(os.path.join(ws, "README.md"), "w") as fh:
         fh.write("resume smoke test\n")
@@ -185,7 +185,7 @@ def main():
 
         c1.stop()
         c1 = None
-        log("core #1 stopped — simulating an AgentKate restart")
+        log("core #1 stopped — simulating an Agent Kate restart")
 
         # --- core #2: fresh process, resume the thread -----------------------
         c2 = Core(SOCK, env, "core#2")

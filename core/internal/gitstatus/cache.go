@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-2.0-or-later
-// SPDX-FileCopyrightText: 2026 The AgentKate developers
+// SPDX-FileCopyrightText: 2026 The Agent Kate developers
 
 // Package gitstatus serves read-only git state — per-worktree status, per-file
 // hunks vs HEAD — to the UI over JSON-RPC. It is cached per thread so the

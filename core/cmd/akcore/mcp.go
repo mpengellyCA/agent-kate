@@ -264,7 +264,7 @@ func (b *mcpBridge) runTool(name string, args json.RawMessage) (string, error) {
 			map[string]any{"thread": b.thread, "summary": a.Summary}, nil); err != nil {
 			return "", err
 		}
-		return "Review requested — the human has been notified in AgentKate.", nil
+		return "Review requested — the human has been notified in Agent Kate.", nil
 
 	case "list_agents":
 		var a struct {
@@ -414,7 +414,7 @@ func (b *mcpBridge) runTool(name string, args json.RawMessage) (string, error) {
 		if err := b.client.CallTimeout("permission.request",
 			map[string]any{"threadId": b.thread, "toolName": toolName, "input": input},
 			&res, 10*time.Minute); err != nil {
-			return `{"behavior":"deny","message":"AgentKate could not reach the approval UI"}`, nil
+			return `{"behavior":"deny","message":"Agent Kate could not reach the approval UI"}`, nil
 		}
 
 		var decision []byte
@@ -430,7 +430,7 @@ func (b *mcpBridge) runTool(name string, args json.RawMessage) (string, error) {
 			})
 		} else {
 			decision, _ = json.Marshal(map[string]any{
-				"behavior": "deny", "message": "Denied by the user in AgentKate",
+				"behavior": "deny", "message": "Denied by the user in Agent Kate",
 			})
 		}
 		return string(decision), nil
@@ -446,7 +446,7 @@ func toolDefs() []map[string]any {
 	return []map[string]any{
 		{
 			"name": "list_open_files",
-			"description": "List every file currently open in the AgentKate arena and " +
+			"description": "List every file currently open in the Agent Kate arena and " +
 				"who has it open (the human, or another agent thread). Check this " +
 				"before editing so you do not clobber a collaborator's work.",
 			"inputSchema": noArgs,
@@ -504,7 +504,7 @@ func toolDefs() []map[string]any {
 		},
 		{
 			"name": "request_review",
-			"description": "Flag your work for the human to review in AgentKate, with a " +
+			"description": "Flag your work for the human to review in Agent Kate, with a " +
 				"short summary of what you changed.",
 			"inputSchema": map[string]any{
 				"type": "object",
@@ -516,7 +516,7 @@ func toolDefs() []map[string]any {
 		},
 		{
 			"name": "list_agents",
-			"description": "List every AgentKate agent thread on record — its id, title, " +
+			"description": "List every Agent Kate agent thread on record — its id, title, " +
 				"status (running/dormant), worktree branch and path, and how long it has " +
 				"been idle. Defaults to the current workspace; pass all_workspaces=true " +
 				"to include every project. Use this to find stale agents to clean up.",
@@ -554,7 +554,7 @@ func toolDefs() []map[string]any {
 		},
 		{
 			"name": "request_permission",
-			"description": "Internal AgentKate permission gate — Claude Code calls this " +
+			"description": "Internal Agent Kate permission gate — Claude Code calls this " +
 				"automatically to have the human approve a gated tool use. Do not " +
 				"call it directly.",
 			"inputSchema": map[string]any{

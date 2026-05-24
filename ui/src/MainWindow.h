@@ -23,7 +23,7 @@ class QAction;
 class QDockWidget;
 class QLabel;
 
-// MainWindow is the AgentKate arena shell — a project-aware, agent-centric KDE
+// MainWindow is the Agent Kate arena shell — a project-aware, agent-centric KDE
 // main window. The agent roster (left) holds projects and their agents; the
 // active agent drives the file tree and the editor on the right.
 class MainWindow : public KMainWindow

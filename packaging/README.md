@@ -1,4 +1,4 @@
-# Packaging AgentKate
+# Packaging Agent Kate
 
 Native package recipes for the major Linux distributions. All recipes build
 both binaries (`agentkate` UI + `akcore` Go orchestration core) and install
@@ -91,7 +91,7 @@ For an AUR submission, regenerate `sha256sums` with `updpkgsums` and drop the
 
 ```sh
 which agentkate akcore        # both should be in /usr/bin
-agentkate &                   # KDE app menu also shows AgentKate
+agentkate &                   # KDE app menu also shows Agent Kate
 ```
 
 The UI spawns `akcore` from its own directory, so as long as both binaries

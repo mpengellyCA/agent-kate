@@ -29,6 +29,6 @@ Depends: ${shlibs:Depends}, ${misc:Depends},
          konsole
 Recommends: git
 Description: Native KDE multi-agent coding arena built on Kate
- AgentKate combines the Kate text editor with an orchestration core for
+ Agent Kate combines the Kate text editor with an orchestration core for
  running multiple coding agents in parallel, with integrated git, LSP,
  terminal, and worktree management.

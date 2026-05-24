@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-2.0-or-later
-// SPDX-FileCopyrightText: 2026 The AgentKate developers
+// SPDX-FileCopyrightText: 2026 The Agent Kate developers
 
 package gitstatus
 
@@ -21,9 +21,9 @@ func testGit(t *testing.T, dir string, args ...string) string {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(),
-		"GIT_AUTHOR_NAME=AgentKate Test",
+		"GIT_AUTHOR_NAME=Agent Kate Test",
 		"GIT_AUTHOR_EMAIL=test@agentkate",
-		"GIT_COMMITTER_NAME=AgentKate Test",
+		"GIT_COMMITTER_NAME=Agent Kate Test",
 		"GIT_COMMITTER_EMAIL=test@agentkate",
 	)
 	out, err := cmd.CombinedOutput()

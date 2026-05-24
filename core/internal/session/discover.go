@@ -11,13 +11,13 @@ import (
 )
 
 // Discovered is one Claude Code session found on disk — a conversation that can
-// be attached to AgentKate and resumed, whether or not AgentKate started it.
+// be attached to Agent Kate and resumed, whether or not Agent Kate started it.
 type Discovered struct {
 	SessionID string    `json:"sessionId"`
 	Project   string    `json:"project"`  // the directory the session ran in
 	Title     string    `json:"title"`    // first prompt or summary
 	Modified  time.Time `json:"modified"` // transcript file mtime
-	Attached  bool      `json:"attached"` // already tracked as an AgentKate thread
+	Attached  bool      `json:"attached"` // already tracked as an Agent Kate thread
 }
 
 // claudeHome is the Claude Code config directory (~/.claude unless overridden

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-2.0-or-later
-// SPDX-FileCopyrightText: 2026 The AgentKate developers
+// SPDX-FileCopyrightText: 2026 The Agent Kate developers
 
 package gitstatus
 
@@ -14,7 +14,7 @@ import (
 )
 
 // commitMessagePrompt asks Sonnet for a conventional git commit message in
-// the AgentKate house style: a short imperative subject line under 70 chars,
+// the Agent Kate house style: a short imperative subject line under 70 chars,
 // optionally followed by a blank line and a short body that explains *why*,
 // never *what* (the diff already shows what). No emojis, no preamble.
 const commitMessagePrompt = `You are writing a git commit message for the diff below.

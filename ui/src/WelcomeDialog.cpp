@@ -28,7 +28,7 @@ constexpr int kPathRole = Qt::UserRole + 1;
 WelcomeDialog::WelcomeDialog(QWidget *parent)
     : QDialog(parent)
 {
-    setWindowTitle(i18n("Welcome to AgentKate"));
+    setWindowTitle(i18n("Welcome to Agent Kate"));
     setWindowIcon(QIcon::fromTheme(QStringLiteral("agentkate")));
     setMinimumSize(640, 460);
 
@@ -36,7 +36,7 @@ WelcomeDialog::WelcomeDialog(QWidget *parent)
     outer->setContentsMargins(24, 24, 24, 18);
     outer->setSpacing(14);
 
-    auto *header = new QLabel(i18n("<h2 style='margin:0;'>AgentKate</h2>"
+    auto *header = new QLabel(i18n("<h2 style='margin:0;'>Agent Kate</h2>"
                                    "<p style='margin:2px 0 0 0; color:palette(mid);'>"
                                    "Native multi-agent coding arena</p>"),
                               this);

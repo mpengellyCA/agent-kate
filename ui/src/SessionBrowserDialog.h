@@ -10,8 +10,8 @@ class QListWidget;
 class QPushButton;
 
 // SessionBrowserDialog lists every Claude Code session found on disk and lets
-// the user attach one — pulling that conversation into AgentKate as a thread,
-// even if AgentKate did not start it. Backed by the core's session.browse and
+// the user attach one — pulling that conversation into Agent Kate as a thread,
+// even if Agent Kate did not start it. Backed by the core's session.browse and
 // session.attach IPC.
 class SessionBrowserDialog : public QDialog
 {

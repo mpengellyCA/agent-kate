@@ -9,7 +9,7 @@ import (
 
 // augmentPath prepends common user-install bin directories to PATH so that
 // CLIs installed under the user's home (notably `claude`, plus `gh`, `git`,
-// `kdiff3`) resolve when AgentKate is launched from a .desktop entry. KDE/
+// `kdiff3`) resolve when Agent Kate is launched from a .desktop entry. KDE/
 // Plasma sessions inherit the systemd-user PATH, which often omits the dirs
 // shell rc files add — so a terminal-launched dev build finds `claude` while
 // the installed app does not.

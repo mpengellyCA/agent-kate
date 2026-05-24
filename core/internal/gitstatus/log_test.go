@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-2.0-or-later
-// SPDX-FileCopyrightText: 2026 The AgentKate developers
+// SPDX-FileCopyrightText: 2026 The Agent Kate developers
 
 package gitstatus
 
@@ -35,8 +35,8 @@ func TestLog_LinearHistory(t *testing.T) {
 	if !strings.HasPrefix(got[0].Subject, "commit ") {
 		t.Fatalf("subject %q does not look like our test fixture", got[0].Subject)
 	}
-	if got[0].Author != "AgentKate Test" {
-		t.Fatalf("author = %q, want %q", got[0].Author, "AgentKate Test")
+	if got[0].Author != "Agent Kate Test" {
+		t.Fatalf("author = %q, want %q", got[0].Author, "Agent Kate Test")
 	}
 }
 

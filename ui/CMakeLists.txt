@@ -82,7 +82,7 @@ set_target_properties(agentkate PROPERTIES
 )
 
 # Install hicolor application icons and the .desktop entry so that KDE/Plasma
-# (taskbar, KRunner, Kickoff, window decorations) shows the AgentKate logo.
+# (taskbar, KRunner, Kickoff, window decorations) shows the Agent Kate logo.
 ecm_install_icons(
     ICONS
         ${CMAKE_CURRENT_SOURCE_DIR}/icons/16-apps-agentkate.png

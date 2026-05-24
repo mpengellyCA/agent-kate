@@ -1,4 +1,4 @@
-# clangd configuration for AgentKate.
+# clangd configuration for Agent Kate.
 #
 # Qt6/KF6 propagate GCC-only machine flags via their CMake interface — notably
 # -mno-direct-extern-access — and clangd parses with clang, which rejects them.

@@ -12,7 +12,7 @@ class QListWidgetItem;
 class QPushButton;
 
 // SkillsDialog manages Claude Code skills for the active project. It lists the
-// central AgentKate skill catalog (XDG_DATA_HOME/agentkate/skills) on the
+// central Agent Kate skill catalog (XDG_DATA_HOME/agentkate/skills) on the
 // left and the skills installed under target/.claude/skills on the right;
 // installing a skill creates a symlink so future edits to the central copy
 // propagate without re-installing.

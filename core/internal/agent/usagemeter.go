@@ -8,7 +8,7 @@ import (
 )
 
 // usageMeter records the token-usage figures Claude Code reports for each
-// assistant turn on a single agent thread, so we can see what AgentKate is
+// assistant turn on a single agent thread, so we can see what Agent Kate is
 // actually being billed for (separate from what fills the context — that is
 // the toolMeter's job). Cache-hit ratio gets its own field because a low
 // ratio is itself a kind of waste: the same context being recomputed each

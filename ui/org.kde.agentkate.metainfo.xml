@@ -4,11 +4,11 @@
   <launchable type="desktop-id">org.kde.agentkate.desktop</launchable>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>LGPL-2.0-or-later</project_license>
-  <name>AgentKate</name>
+  <name>Agent Kate</name>
   <summary>Native KDE multi-agent coding arena built on the Kate editor engine</summary>
   <description>
     <p>
-      AgentKate is a native KDE application that combines the Kate text editor
+      Agent Kate is a native KDE application that combines the Kate text editor
       with an orchestration core for running multiple coding agents in parallel,
       with integrated git, LSP, terminal, and worktree management.
     </p>

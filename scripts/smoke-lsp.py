@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Smoke test for the LSP wiring.
 
-Drives clangd through the sequence AgentKate's LspClient implements and checks
+Drives clangd through the sequence Agent Kate's LspClient implements and checks
 every LSP feature wired into the editor: diagnostics, completion, hover,
 go-to-definition, find-references, and the document-symbol outline.
 
