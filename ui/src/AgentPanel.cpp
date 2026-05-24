@@ -785,8 +785,15 @@ void AgentPanel::addMessageCard(const QString &role, const QString &accentHex,
     // propagates up and prevents the panel from ever shrinking below the
     // widest line. Ignoring the horizontal sizeHint lets the parent's width
     // drive wrapping instead.
-    bodyLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::MinimumExpanding);
+    // Horizontal Ignored: don't let widest unbreakable token pin the panel's
+    // min width. Vertical Preferred (not MinimumExpanding) so the label takes
+    // exactly its wrapped height — MinimumExpanding made the label gobble any
+    // vertical slack and render text vcentered, looking like growing padding.
+    QSizePolicy bp(QSizePolicy::Ignored, QSizePolicy::Preferred, QSizePolicy::Label);
+    bp.setHeightForWidth(true);
+    bodyLabel->setSizePolicy(bp);
     bodyLabel->setMinimumWidth(0);
+    bodyLabel->setAlignment(Qt::AlignLeft | Qt::AlignTop);
     v->addWidget(bodyLabel);
 
     appendToFeed(card);
@@ -797,8 +804,11 @@ void AgentPanel::addNote(const QString &html, const QString &kind)
     auto *note = new QLabel(html, m_feed);
     note->setTextFormat(Qt::RichText);
     note->setWordWrap(true);
-    note->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::MinimumExpanding);
+    QSizePolicy np(QSizePolicy::Ignored, QSizePolicy::Preferred, QSizePolicy::Label);
+    np.setHeightForWidth(true);
+    note->setSizePolicy(np);
     note->setMinimumWidth(0);
+    note->setAlignment(Qt::AlignLeft | Qt::AlignTop);
     note->setStyleSheet(QStringLiteral("color: %1; font-size: small; padding: 1px 8px;")
                             .arg(noteColor(kind, isDark(this))));
     appendToFeed(note);
