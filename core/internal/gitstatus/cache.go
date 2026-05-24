@@ -31,6 +31,7 @@ type Cache struct {
 	watcher      *watcher // nil when fsnotify is unavailable
 	log          *slog.Logger
 	onInvalidate func(threadID string)
+	onHeadChange func(threadID, newHeadSHA string)
 }
 
 // entry is the cached state for one worktree. Its own mutex serialises the
@@ -78,6 +79,16 @@ func NewCache(log *slog.Logger) *Cache {
 func (c *Cache) OnInvalidate(fn func(threadID string)) {
 	c.mu.Lock()
 	c.onInvalidate = fn
+	c.mu.Unlock()
+}
+
+// OnHeadChange registers a callback fired whenever a recomputed snapshot's
+// HeadSHA differs from the previously cached one. It fires far less often
+// than OnInvalidate (fs events on tracked files don't move HEAD), so it's the
+// right signal for the log viewer to refetch its first page on.
+func (c *Cache) OnHeadChange(fn func(threadID, newHeadSHA string)) {
+	c.mu.Lock()
+	c.onHeadChange = fn
 	c.mu.Unlock()
 }
 
@@ -259,9 +270,14 @@ func (c *Cache) HunksFor(threadID, relPath string) ([]Hunk, uint64, bool, error)
 // The entry mutex serialises concurrent pollers so they share one git walk.
 func (c *Cache) ensureSnapshot(e *entry) *Snapshot {
 	e.mu.Lock()
-	defer e.mu.Unlock()
+	prevHead := ""
+	if e.snapshot != nil {
+		prevHead = e.snapshot.HeadSHA
+	}
 	if e.snapshot != nil && !e.dirty {
-		return e.snapshot
+		s := e.snapshot
+		e.mu.Unlock()
+		return s
 	}
 	snap, err := computeSnapshot(e.wt)
 	if err != nil {
@@ -280,5 +296,17 @@ func (c *Cache) ensureSnapshot(e *entry) *Snapshot {
 	e.generation++
 	e.fileHunks = make(map[string]hunkCacheLine)
 	e.dirty = false
+	threadID := e.wt.ThreadID
+	newHead := snap.HeadSHA
+	e.mu.Unlock()
+
+	if newHead != "" && newHead != prevHead {
+		c.mu.RLock()
+		cb := c.onHeadChange
+		c.mu.RUnlock()
+		if cb != nil {
+			cb(threadID, newHead)
+		}
+	}
 	return snap
 }

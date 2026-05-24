@@ -106,6 +106,15 @@ func runCore() {
 			"threadIds": []string{threadID},
 		})
 	})
+	// HEAD-change is the log viewer's signal to refetch. We notify only when a
+	// recomputed snapshot shows a different HeadSHA, so editing a tracked file
+	// doesn't trigger needless log reloads.
+	gitCache.OnHeadChange(func(threadID, headSHA string) {
+		srv.Notify("git.log.invalidated", map[string]any{
+			"threadId": threadID,
+			"headSha":  headSHA,
+		})
+	})
 
 	sessions, err := session.NewStore(session.DefaultPath())
 	if err != nil {
@@ -1291,6 +1300,84 @@ func registerHandlers(d handlerDeps) {
 			"headSha":    snap.HeadSHA,
 			"generation": generation,
 		}, nil
+	})
+
+	// git.log returns one page of commits for the thread's worktree, with
+	// lane/edge metadata so the UI can render a graph rail. Skip drives
+	// pagination; Path narrows the view to a file's history (and disables the
+	// graph, since the parent edges between filtered commits would be
+	// synthetic).
+	d.srv.Handle("git.log", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID string `json:"threadId"`
+			Skip     int    `json:"skip"`
+			Limit    int    `json:"limit"`
+			Path     string `json:"path"`
+			Branch   string `json:"branch"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		wt, ok := d.threads.get(p.ThreadID)
+		if !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		}
+		entries, err := gitstatus.Log(wt, gitstatus.LogOptions{
+			Skip:   p.Skip,
+			Limit:  p.Limit,
+			Path:   p.Path,
+			Branch: p.Branch,
+		})
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		if entries == nil {
+			entries = []gitstatus.LogEntry{}
+		}
+		return map[string]any{"entries": entries}, nil
+	})
+
+	// git.commit.detail returns one commit's metadata + per-file change list
+	// for the right-hand pane of the log viewer.
+	d.srv.Handle("git.commit.detail", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID string `json:"threadId"`
+			SHA      string `json:"sha"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		wt, ok := d.threads.get(p.ThreadID)
+		if !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		}
+		detail, err := gitstatus.CommitDetailFn(wt, p.SHA)
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		return detail, nil
+	})
+
+	// git.commit.diff returns the unified diff for one commit, optionally
+	// scoped to a single file.
+	d.srv.Handle("git.commit.diff", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID string `json:"threadId"`
+			SHA      string `json:"sha"`
+			Path     string `json:"path"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		wt, ok := d.threads.get(p.ThreadID)
+		if !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		}
+		patch, err := gitstatus.CommitDiff(wt, p.SHA, p.Path)
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		return map[string]any{"patch": patch}, nil
 	})
 }
 
