@@ -787,6 +787,55 @@ func registerHandlers(d handlerDeps) {
 		return map[string]any{"threads": snaps}, nil
 	})
 
+	// git.prDraft returns a suggested PR title and body for the thread's
+	// branch, drawn from its commit history since the fork point. Pure
+	// read; no network. The UI uses it to prefill the PR dialog.
+	d.srv.Handle("git.prDraft", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID string `json:"threadId"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		rec, ok := d.sessions.Get(p.ThreadID)
+		if !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		}
+		title, body, err := worktree.PRDraft(rec.Worktree)
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		return map[string]any{"title": title, "body": body}, nil
+	})
+
+	// git.openPR pushes the thread's branch and opens a GitHub pull
+	// request, accepting an edited title / body (and a draft flag) from
+	// the UI. agent.openPR remains as the title-only shortcut.
+	d.srv.Handle("git.openPR", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID string `json:"threadId"`
+			Title    string `json:"title"`
+			Body     string `json:"body"`
+			Draft    bool   `json:"draft"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		rec, ok := d.sessions.Get(p.ThreadID)
+		if !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		}
+		url, err := worktree.OpenPRWithOptions(rec.Worktree, worktree.PROptions{
+			Title: p.Title,
+			Body:  p.Body,
+			Draft: p.Draft,
+		})
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		return map[string]any{"url": url}, nil
+	})
+
 	// git.land merges the thread's branch into the workspace's current
 	// branch. Always takes keepConflicts: the UI passes true so conflicts
 	// surface as a banner instead of silently rolling back. agent.land

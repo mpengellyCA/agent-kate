@@ -394,10 +394,30 @@ func mergeInProgress(repoRoot string) bool {
 	return err == nil
 }
 
+// PROptions controls what OpenPRWithOptions sends to `gh pr create`. Title is
+// the only field for which an empty value is meaningfully different from the
+// caller's intent — a blank Body is fine.
+type PROptions struct {
+	Title string
+	Body  string
+	Draft bool
+}
+
 // OpenPR pushes the thread's branch and opens a GitHub pull request through the
 // gh CLI, returning the PR URL. It fails descriptively when the thread is not
 // isolated, gh is missing, or there is no 'origin' remote.
+//
+// Kept as a back-compatible shim around OpenPRWithOptions; new callers should
+// prefer the options struct so title and body can be filled independently.
 func OpenPR(wt Worktree, title string) (string, error) {
+	return OpenPRWithOptions(wt, PROptions{Title: title})
+}
+
+// OpenPRWithOptions is the full PR-creation surface. Falls through to a
+// generated default title and body when the caller leaves them blank, so the
+// UI's "Open PR" can short-circuit straight from a button without showing the
+// dialog when the user wants the quick path.
+func OpenPRWithOptions(wt Worktree, opts PROptions) (string, error) {
 	if !wt.Isolated {
 		return "", fmt.Errorf("this agent is not running on its own branch")
 	}
@@ -407,22 +427,81 @@ func OpenPR(wt Worktree, title string) (string, error) {
 	if _, err := git(wt.RepoRoot, "remote", "get-url", "origin"); err != nil {
 		return "", fmt.Errorf("no 'origin' git remote is configured")
 	}
-	if strings.TrimSpace(title) == "" {
+	title := strings.TrimSpace(opts.Title)
+	body := opts.Body
+	if title == "" || body == "" {
+		// Fall back to a draft for whatever the caller didn't supply.
+		fbTitle, fbBody, _ := PRDraft(wt)
+		if title == "" {
+			title = fbTitle
+		}
+		if body == "" {
+			body = fbBody
+		}
+	}
+	if title == "" {
 		title = "AgentKate: " + wt.Branch
 	}
+
 	if _, err := git(wt.Path, "push", "-u", "origin", wt.Branch); err != nil {
 		return "", fmt.Errorf("push failed: %w", err)
 	}
-	cmd := exec.Command("gh", "pr", "create",
-		"--title", title,
-		"--body", "Opened by AgentKate from "+wt.Branch+".",
-		"--head", wt.Branch)
+	args := []string{"pr", "create", "--title", title, "--body", body,
+		"--head", wt.Branch}
+	if opts.Draft {
+		args = append(args, "--draft")
+	}
+	cmd := exec.Command("gh", args...)
 	cmd.Dir = wt.Path
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("gh pr create: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+// PRDraft suggests a title and body for the thread's branch, drawn from its
+// commit history since the fork point and a short diff stat. Pure read; no
+// network. Used to prefill the PR dialog.
+func PRDraft(wt Worktree) (title, body string, err error) {
+	if !wt.Isolated || wt.Branch == "" {
+		return "", "", fmt.Errorf("this agent is not running on its own branch")
+	}
+	if wt.Base == "" {
+		return "", "", fmt.Errorf("this agent has no recorded base commit")
+	}
+
+	// Title — the most recent commit's subject. A one-commit branch's
+	// subject IS the change; multi-commit branches tend to have the
+	// summary line in the most recent commit, which is what we want.
+	out, _ := git(wt.RepoRoot, "log", "-1", "--pretty=format:%s", wt.Branch)
+	title = strings.TrimSpace(out)
+	if title == "" {
+		title = "AgentKate: " + wt.Branch
+	}
+
+	// Body — bullet list of commit subjects (oldest first, the natural
+	// reading order for a PR description) plus a compact diff stat.
+	var sb strings.Builder
+	commitLog, _ := git(wt.RepoRoot, "log",
+		"--reverse", "--pretty=format:- %s (%h)",
+		wt.Base+".."+wt.Branch)
+	if strings.TrimSpace(commitLog) != "" {
+		sb.WriteString("## Commits\n\n")
+		sb.WriteString(strings.TrimRight(commitLog, "\n"))
+		sb.WriteString("\n\n")
+	}
+	stat, _ := git(wt.RepoRoot, "diff", "--shortstat", wt.Base+".."+wt.Branch)
+	if s := strings.TrimSpace(stat); s != "" {
+		sb.WriteString("## Diff\n\n")
+		sb.WriteString(s)
+		sb.WriteString("\n\n")
+	}
+	sb.WriteString("---\nOpened by AgentKate from ")
+	sb.WriteString(wt.Branch)
+	sb.WriteString(".\n")
+	body = sb.String()
+	return title, body, nil
 }
 
 // Remove deletes an isolated worktree and its branch. It is a no-op when the
