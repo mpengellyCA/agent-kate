@@ -1201,6 +1201,15 @@ void AgentPanel::onSendClicked()
         emit statusMessage(QStringLiteral("Open a workspace folder first"));
         return;
     }
+    if (!m_core->isConnected()) {
+        // Without this guard, the message lands in the feed but the RPC is
+        // dropped silently by CoreClient — the user just sees a dead chat.
+        emit statusMessage(QStringLiteral("Core is not connected — restart Agent Kate"));
+        addNote(QStringLiteral("Core process is not connected — the message was not sent. "
+                               "Restart Agent Kate to recover."),
+                QStringLiteral("err"));
+        return;
+    }
     m_input->clear();
 
     QString youLine = text.toHtmlEscaped().replace(QLatin1Char('\n'), QLatin1String("<br>"));

@@ -111,12 +111,16 @@ func commitFiles(c *object.Commit) ([]CommitFile, error) {
 		case from != nil && to == nil:
 			cf.Path = from.Path()
 			cf.Status = "deleted"
-		default: // both non-nil
+		case from != nil && to != nil:
 			cf.Path = to.Path()
 			cf.Status = "modified"
 			if from.Path() != to.Path() {
 				cf.OldPath = from.Path()
 			}
+		default:
+			// go-git can emit (nil, nil) for empty patches (e.g. mode-only
+			// changes on some object stores). Nothing useful to render.
+			continue
 		}
 		if fp.IsBinary() {
 			cf.Added, cf.Deleted = -1, -1
