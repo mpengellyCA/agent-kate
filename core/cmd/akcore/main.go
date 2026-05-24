@@ -1323,8 +1323,11 @@ func startAgentThread(d handlerDeps, threadID, sessionID string, p agentStartPar
 	emitLifecycle(d.srv, threadID, "started", "running "+mode, &wt)
 }
 
-// resumeAgentThread re-launches a dormant thread on its existing Claude Code
-// session, reusing the worktree it left behind.
+// resumeAgentThread re-launches a dormant thread. If a current compacted
+// summary exists, a fresh Claude Code session is started seeded with that
+// summary instead of replaying the full transcript — that is where the
+// compaction savings actually land. Without a current summary the thread
+// resumes on its original session via --resume as before.
 func resumeAgentThread(d handlerDeps, rec session.Record) {
 	if _, err := os.Stat(rec.Worktree.Path); err != nil {
 		emitLifecycle(d.srv, rec.ThreadID, "error",
@@ -1340,16 +1343,44 @@ func resumeAgentThread(d handlerDeps, rec session.Record) {
 		return
 	}
 
-	if _, err := d.sup.Start(agent.StartOptions{
+	// Pick a path: seed-from-summary if a current summary is on disk, else
+	// classic --resume. A summary is "current" when it has been refreshed
+	// after the last user/agent turn.
+	sum, _ := d.summaries.Get(rec.ThreadID)
+	current := sum != nil &&
+		(rec.LastTurnAt.IsZero() || !rec.LastTurnAt.After(rec.SummaryUpdatedAt))
+
+	opts := agent.StartOptions{
 		ID:             rec.ThreadID,
 		WorkDir:        rec.Worktree.Path,
 		MCPConfig:      mcpConfig,
 		PermissionMode: rec.PermissionMode,
 		Effort:         rec.Effort,
 		Model:          rec.Model,
-		SessionID:      rec.SessionID,
-		Resume:         true,
-	}); err != nil {
+	}
+	var sessionIDForRecord string
+	var detail string
+	if current {
+		// Fresh session seeded with the summary text. The instruction line
+		// at the bottom asks the agent to acknowledge briefly so its first
+		// turn is short — minimising the prefix that gets cached.
+		newID := session.NewID()
+		opts.SessionID = newID
+		opts.Resume = false
+		opts.Prompt = sum.Body +
+			"\n\n---\n\nThe above is prior context from a session that has " +
+			"been compacted. Acknowledge in one sentence that you have read " +
+			"it, then wait for the user's next instruction."
+		sessionIDForRecord = newID
+		detail = "resumed from compacted summary (new session)"
+	} else {
+		opts.SessionID = rec.SessionID
+		opts.Resume = true
+		sessionIDForRecord = rec.SessionID
+		detail = "resumed Claude Code session"
+	}
+
+	if _, err := d.sup.Start(opts); err != nil {
 		os.Remove(mcpConfig)
 		emitLifecycle(d.srv, rec.ThreadID, "error", err.Error(), &rec.Worktree)
 		return
@@ -1357,9 +1388,23 @@ func resumeAgentThread(d handlerDeps, rec session.Record) {
 
 	_ = d.sessions.Update(rec.ThreadID, func(r *session.Record) {
 		r.Status = session.StatusRunning
+		if current {
+			// The summary is now baked into the new session; clear our
+			// staleness signals so the next compact cycle starts fresh.
+			r.SessionID = sessionIDForRecord
+			r.SummaryUpdatedAt = time.Time{}
+			r.LastTurnAt = time.Time{}
+		}
 	})
-	d.log.Info("agent thread resumed", "thread", rec.ThreadID, "session", rec.SessionID)
-	emitLifecycle(d.srv, rec.ThreadID, "resumed", "resumed Claude Code session", &rec.Worktree)
+	if current {
+		// The previous summary belonged to the old session; drop it so a
+		// missed exit-compact on the new session does not silently reuse
+		// stale content.
+		_ = d.summaries.Remove(rec.ThreadID)
+	}
+	d.log.Info("agent thread resumed",
+		"thread", rec.ThreadID, "session", sessionIDForRecord, "seeded", current)
+	emitLifecycle(d.srv, rec.ThreadID, "resumed", detail, &rec.Worktree)
 }
 
 // promoteAgentThread upgrades a non-isolated thread to an isolated worktree: it
