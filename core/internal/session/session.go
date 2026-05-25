@@ -29,8 +29,9 @@ const (
 // Record is the persisted metadata for one agent thread — enough to resume it.
 type Record struct {
 	ThreadID       string            `json:"threadId"`
-	SessionID      string            `json:"sessionId"` // Claude Code session, for --resume
-	Project        string            `json:"project"`   // workspace path
+	Backend        string            `json:"backend,omitempty"` // "claude" (default, empty == claude) or "antigravity"
+	SessionID      string            `json:"sessionId"`         // Claude Code session, for --resume
+	Project        string            `json:"project"`           // workspace path
 	Worktree       worktree.Worktree `json:"worktree"`
 	PermissionMode string            `json:"permissionMode"`
 	Effort         string            `json:"effort"` // claude --effort level; "" = Claude Code default
