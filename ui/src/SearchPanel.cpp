@@ -227,13 +227,17 @@ void SearchPanel::onReply(const QJsonObject &result, const QJsonObject &error)
         parent->setFirstColumnSpanned(true);
         for (const QJsonValue &mv : matches) {
             const QJsonObject m = mv.toObject();
-            const int line = m.value(QStringLiteral("line")).toInt();
+            // ripgrep returns 1-indexed line numbers, but EditorArea::openFile
+            // (and KTextEditor::Cursor) is 0-indexed. Store the 0-indexed
+            // value for the result row and display the 1-indexed value.
+            const int lineOneBased = m.value(QStringLiteral("line")).toInt();
+            const int lineZeroBased = lineOneBased > 0 ? lineOneBased - 1 : 0;
             const QString preview =
                 m.value(QStringLiteral("preview")).toString().trimmed();
             auto *row = new QTreeWidgetItem(parent);
-            row->setText(0, QStringLiteral("%1: %2").arg(line, 5).arg(preview));
+            row->setText(0, QStringLiteral("%1: %2").arg(lineOneBased, 5).arg(preview));
             row->setData(0, Qt::UserRole, path);
-            row->setData(0, Qt::UserRole + 1, line);
+            row->setData(0, Qt::UserRole + 1, lineZeroBased);
             ++total;
         }
         parent->setExpanded(true);
