@@ -36,6 +36,7 @@ public:
 
 protected:
     void closeEvent(QCloseEvent *event) override;
+    bool eventFilter(QObject *watched, QEvent *event) override;
 
 private:
     void setupUi();
@@ -46,6 +47,23 @@ private:
     void setupPerspectives();
     void setupCore();
     void applyPerspective(const QString &name);
+    void applyCentreMode(const QString &mode); // "editor" | "split" | "chat"
+
+    // Panel placement: register every tool window through registerPanel so
+    // the persisted location overrides (or the default strip) decide which
+    // SideBar gets it. The key is a stable identifier used in KConfig.
+    int registerPanel(const QString &key, const QIcon &icon,
+                      const QString &label, QWidget *widget,
+                      const QString &defaultStrip);
+    SideBar *barByName(const QString &name) const;
+    QString nameForBar(SideBar *bar) const;
+    void showPanelContextMenu(SideBar *bar, int id, const QPoint &globalPos);
+    void movePanelToStrip(const QString &key, const QString &targetStrip);
+    void detachPanel(const QString &key);
+    void reattachPanel(const QString &key); // floating → previous strip
+    int panelId(const QString &key) const;
+    SideBar *panelBar(const QString &key) const;
+    void raisePanelByKey(const QString &key); // raise it (and re-attach if floating)
     void updateCursorStatus();
     void updateBreadcrumb(const QString &path);
     void updateAgentBadge();
@@ -73,24 +91,46 @@ private:
     SideBar *m_rightBar = nullptr;
     SideBar *m_bottomBar = nullptr;
 
-    int m_leftRosterId = -1;
-    int m_leftFilesId = -1;
-    int m_leftOutlineId = -1;
-    int m_leftSearchId = -1;
-    int m_rightWorktreesId = -1;
-    int m_rightGitLogId = -1;
-    int m_rightCoopId = -1;
-    int m_rightInspectorId = -1;
-    int m_bottomTerminalId = -1;
-    int m_bottomReferencesId = -1;
-    int m_bottomProblemsId = -1;
-    int m_bottomOutputId = -1;
-    int m_bottomTasksId = -1;
+    // Stable key → id within whichever SideBar currently hosts the panel.
+    // The bar pointer is looked up via m_panelHomes; keep both in sync.
+    struct PanelInfo {
+        QString key;
+        QIcon icon;
+        QString label;
+        QWidget *widget = nullptr;
+        SideBar *bar = nullptr;        // null while detached/floating
+        int barId = -1;                // id within bar (>=0) or -1
+        QWidget *floatingHost = nullptr; // window when detached
+        QString lastStrip;             // remembered strip for re-attach
+    };
+    QHash<QString, PanelInfo> m_panels;       // by stable key
+    QHash<QWidget *, QString> m_keyByWidget;  // for reverse lookup
+    // Cached ids for the few panels MainWindow refers to by name (Files for
+    // the breadcrumb, References for the LSP focus, Problems / Roster /
+    // Git Log for perspectives). Updated by registerPanel + move.
+    QString m_keyRoster = QStringLiteral("roster");
+    QString m_keyFiles = QStringLiteral("files");
+    QString m_keyOutline = QStringLiteral("outline");
+    QString m_keySearch = QStringLiteral("search");
+    QString m_keyWorktrees = QStringLiteral("worktrees");
+    QString m_keyGitLog = QStringLiteral("gitlog");
+    QString m_keyCoop = QStringLiteral("coop");
+    QString m_keyInspector = QStringLiteral("inspector");
+    QString m_keyTerminal = QStringLiteral("terminal");
+    QString m_keyReferences = QStringLiteral("references");
+    QString m_keyProblems = QStringLiteral("problems");
+    QString m_keyOutput = QStringLiteral("output");
+    QString m_keyTasks = QStringLiteral("tasks");
 
     int m_lastBottomTab = -1; // last tab raised by the user, used to restore on Ctrl+J
     QAction *m_toggleBottomAct = nullptr;
 
     QMenu *m_perspectivesMenu = nullptr;
+    QAction *m_centreEditorAct = nullptr;
+    QAction *m_centreSplitAct = nullptr;
+    QAction *m_centreChatAct = nullptr;
+    QString m_centreMode;
+    QList<int> m_centreSplitSizes; // remembered horizontal split for restore
 
     // Top toolbar + status-bar widgets
     QWidget *m_breadcrumbWidget = nullptr; // hosts clickable segment buttons

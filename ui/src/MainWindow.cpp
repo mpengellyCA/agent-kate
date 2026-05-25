@@ -149,63 +149,63 @@ void MainWindow::setupUi()
     m_leftBar = new SideBar(KMultiTabBar::Left, this);
     m_rightBar = new SideBar(KMultiTabBar::Right, this);
     m_bottomBar = new SideBar(KMultiTabBar::Bottom, this);
+    for (SideBar *bar : { m_leftBar, m_rightBar, m_bottomBar }) {
+        connect(bar, &SideBar::tabContextMenuRequested, this,
+                [this, bar](int id, const QPoint &pos) {
+                    showPanelContextMenu(bar, id, pos);
+                });
+    }
 
-    m_leftRosterId = m_leftBar->addPanel(
-        QIcon::fromTheme(QStringLiteral("system-users")),
-        i18n("Projects && Agents"), m_agent->roster());
-    m_leftFilesId = m_leftBar->addPanel(
-        QIcon::fromTheme(QStringLiteral("folder")),
-        i18n("Files"), m_tree);
-    m_leftOutlineId = m_leftBar->addPanel(
-        QIcon::fromTheme(QStringLiteral("code-context")),
-        i18n("Outline"), outline);
-    m_leftSearchId = m_leftBar->addPanel(
-        QIcon::fromTheme(QStringLiteral("search")),
-        i18n("Search"),
-        new StubPanel(i18n("Search"),
-                      i18n("Cross-project symbol and full-text search lands here."), this));
+    registerPanel(m_keyRoster, QIcon::fromTheme(QStringLiteral("system-users")),
+                  i18n("Projects && Agents"), m_agent->roster(),
+                  QStringLiteral("left"));
+    registerPanel(m_keyFiles, QIcon::fromTheme(QStringLiteral("folder")),
+                  i18n("Files"), m_tree, QStringLiteral("left"));
+    registerPanel(m_keyOutline, QIcon::fromTheme(QStringLiteral("code-context")),
+                  i18n("Outline"), outline, QStringLiteral("left"));
+    registerPanel(m_keySearch, QIcon::fromTheme(QStringLiteral("search")),
+                  i18n("Search"),
+                  new StubPanel(i18n("Search"),
+                                i18n("Cross-project symbol and full-text search lands here."),
+                                this),
+                  QStringLiteral("left"));
 
-    m_rightWorktreesId = m_rightBar->addPanel(
-        QIcon::fromTheme(QStringLiteral("vcs-branch")),
-        i18n("Worktrees"), m_worktreeDashboard);
-    m_rightGitLogId = m_rightBar->addPanel(
-        QIcon::fromTheme(QStringLiteral("vcs-commit")),
-        i18n("Git Log"), m_logViewer);
-    m_rightCoopId = m_rightBar->addPanel(
-        QIcon::fromTheme(QStringLiteral("im-user")),
-        i18n("Cooperation"),
-        new StubPanel(i18n("Cooperation"),
-                      i18n("Live agent presence and file locks from the Cooperation MCP."),
-                      this));
-    m_rightInspectorId = m_rightBar->addPanel(
-        QIcon::fromTheme(QStringLiteral("view-statistics")),
-        i18n("AI Inspector"),
-        new StubPanel(i18n("AI Inspector"),
-                      i18n("Tool-call timeline and token spend for the active agent."),
-                      this));
+    registerPanel(m_keyWorktrees, QIcon::fromTheme(QStringLiteral("vcs-branch")),
+                  i18n("Worktrees"), m_worktreeDashboard,
+                  QStringLiteral("right"));
+    registerPanel(m_keyGitLog, QIcon::fromTheme(QStringLiteral("vcs-commit")),
+                  i18n("Git Log"), m_logViewer, QStringLiteral("right"));
+    registerPanel(m_keyCoop, QIcon::fromTheme(QStringLiteral("im-user")),
+                  i18n("Cooperation"),
+                  new StubPanel(i18n("Cooperation"),
+                                i18n("Live agent presence and file locks from the Cooperation MCP."),
+                                this),
+                  QStringLiteral("right"));
+    registerPanel(m_keyInspector, QIcon::fromTheme(QStringLiteral("view-statistics")),
+                  i18n("AI Inspector"),
+                  new StubPanel(i18n("AI Inspector"),
+                                i18n("Tool-call timeline and token spend for the active agent."),
+                                this),
+                  QStringLiteral("right"));
 
-    m_bottomTerminalId = m_bottomBar->addPanel(
-        QIcon::fromTheme(QStringLiteral("utilities-terminal")),
-        i18n("Terminal"), m_terminal);
-    m_bottomReferencesId = m_bottomBar->addPanel(
-        QIcon::fromTheme(QStringLiteral("dialog-information")),
-        i18n("References"), references);
-    m_bottomProblemsId = m_bottomBar->addPanel(
-        QIcon::fromTheme(QStringLiteral("dialog-warning")),
-        i18n("Problems"), problems);
+    registerPanel(m_keyTerminal, QIcon::fromTheme(QStringLiteral("utilities-terminal")),
+                  i18n("Terminal"), m_terminal, QStringLiteral("bottom"));
+    registerPanel(m_keyReferences, QIcon::fromTheme(QStringLiteral("dialog-information")),
+                  i18n("References"), references, QStringLiteral("bottom"));
+    registerPanel(m_keyProblems, QIcon::fromTheme(QStringLiteral("dialog-warning")),
+                  i18n("Problems"), problems, QStringLiteral("bottom"));
     auto *coreLogView = new QPlainTextEdit(this);
     coreLogView->setReadOnly(true);
     coreLogView->setMaximumBlockCount(5000);
     coreLogView->setFrameShape(QFrame::NoFrame);
-    m_bottomOutputId = m_bottomBar->addPanel(
-        QIcon::fromTheme(QStringLiteral("utilities-log-viewer")),
-        i18n("Output"), coreLogView);
-    m_bottomTasksId = m_bottomBar->addPanel(
-        QIcon::fromTheme(QStringLiteral("view-task")),
-        i18n("Tasks"),
-        new StubPanel(i18n("Tasks / Hooks"),
-                      i18n("Background tasks, hook runs, and queued work appear here."),
-                      this));
+    registerPanel(m_keyOutput, QIcon::fromTheme(QStringLiteral("utilities-log-viewer")),
+                  i18n("Output"), coreLogView, QStringLiteral("bottom"));
+    registerPanel(m_keyTasks, QIcon::fromTheme(QStringLiteral("view-task")),
+                  i18n("Tasks"),
+                  new StubPanel(i18n("Tasks / Hooks"),
+                                i18n("Background tasks, hook runs, and queued work appear here."),
+                                this),
+                  QStringLiteral("bottom"));
     // Wire the Output panel to drain m_core's coreLog. m_core does not exist
     // yet (setupCore runs after setupUi); defer the connect via a queued
     // single-shot, by which time m_core is constructed.
@@ -264,8 +264,8 @@ void MainWindow::setupUi()
             }
         });
     };
-    wireStrip(m_leftBar, QStringLiteral("leftStrip"), m_leftRosterId);
-    wireStrip(m_rightBar, QStringLiteral("rightStrip"), m_rightWorktreesId);
+    wireStrip(m_leftBar, QStringLiteral("leftStrip"), panelId(m_keyRoster));
+    wireStrip(m_rightBar, QStringLiteral("rightStrip"), panelId(m_keyWorktrees));
     wireStrip(m_bottomBar, QStringLiteral("bottomStrip"), -1);
     m_lastBottomTab = m_bottomBar->raisedId();
 
@@ -275,11 +275,7 @@ void MainWindow::setupUi()
             });
     connect(m_lsp, &LspManager::referencesResolved, references, &ReferencesPanel::setLocations);
     connect(m_lsp, &LspManager::referencesResolved, this,
-            [this](const QList<Location> &) {
-                if (m_bottomBar && m_bottomReferencesId >= 0) {
-                    m_bottomBar->setRaisedId(m_bottomReferencesId);
-                }
-            });
+            [this](const QList<Location> &) { raisePanelByKey(m_keyReferences); });
     connect(references, &ReferencesPanel::activated, this,
             [this](const QString &path, int line) {
                 m_editor->openFile(groupKey(), path, line);
@@ -479,7 +475,7 @@ void MainWindow::setupActions()
             m_bottomBar->setRaisedId(-1);
         } else {
             const int target = m_lastBottomTab >= 0 ? m_lastBottomTab
-                                                    : m_bottomProblemsId;
+                                                    : panelId(m_keyProblems);
             m_bottomBar->setRaisedId(target);
         }
     });
@@ -555,30 +551,20 @@ void MainWindow::setupShellShortcuts()
     bindRaise(m_rightBar,
               QKeyCombination(Qt::ControlModifier | Qt::AltModifier, Qt::Key_0));
 
-    // Ctrl+E — focus editor / collapse agent panel.
+    // Ctrl+E toggles between editor-only and split; Ctrl+Shift+E toggles
+    // between chat-only and split. Both route through applyCentreMode so the
+    // top-toolbar buttons stay in sync.
     auto *focusEditor = new QShortcut(Qt::CTRL | Qt::Key_E, this);
     connect(focusEditor, &QShortcut::activated, this, [this] {
-        if (auto *agent = m_agent ? m_agent->panelStack() : nullptr) {
-            agent->setVisible(!agent->isVisible() ? true : false);
-            if (!agent->isVisible() && m_editor) {
-                m_editor->setFocus();
-                if (auto *v = m_editor->currentView()) {
-                    v->setFocus();
-                }
-            }
-        }
+        applyCentreMode(m_centreMode == QLatin1String("editor")
+                            ? QStringLiteral("split")
+                            : QStringLiteral("editor"));
     });
-    // Ctrl+Shift+E — focus agent panel / collapse editor.
     auto *focusAgent = new QShortcut(Qt::CTRL | Qt::SHIFT | Qt::Key_E, this);
     connect(focusAgent, &QShortcut::activated, this, [this] {
-        if (m_editor) {
-            m_editor->setVisible(!m_editor->isVisible() ? true : false);
-        }
-        if (m_agent) {
-            if (auto *p = m_agent->activePanel()) {
-                p->setFocus();
-            }
-        }
+        applyCentreMode(m_centreMode == QLatin1String("chat")
+                            ? QStringLiteral("split")
+                            : QStringLiteral("chat"));
     });
 }
 
@@ -586,9 +572,6 @@ void MainWindow::setupShellShortcuts()
 // Chat Focus, and Reset — that the hamburger surfaces under "View ▸ Perspective".
 void MainWindow::setupPerspectives()
 {
-    auto *view = menuBar()->findChild<QMenu *>(QString(), Qt::FindDirectChildrenOnly);
-    Q_UNUSED(view);
-    // Build a fresh menu we then insert under the existing &View entry.
     m_perspectivesMenu = new QMenu(i18n("&Perspective"), this);
     auto add = [this](const QString &label, const QString &key,
                       const QKeySequence &shortcut = QKeySequence()) {
@@ -629,13 +612,13 @@ void MainWindow::applyPerspective(const QString &name)
         if (editor) editor->setVisible(true);
         if (agent) agent->setVisible(false);
         if (m_bottomBar) m_bottomBar->setRaisedId(-1);
-        if (m_leftBar && m_leftFilesId >= 0) m_leftBar->setRaisedId(m_leftFilesId);
+        raisePanelByKey(m_keyFiles);
         if (m_rightBar) m_rightBar->setRaisedId(-1);
         if (auto *v = m_editor ? m_editor->currentView() : nullptr) v->setFocus();
     } else if (name == QLatin1String("chat")) {
         if (editor) editor->setVisible(false);
         if (agent) agent->setVisible(true);
-        if (m_leftBar && m_leftRosterId >= 0) m_leftBar->setRaisedId(m_leftRosterId);
+        raisePanelByKey(m_keyRoster);
         if (m_rightBar) m_rightBar->setRaisedId(-1);
         if (m_bottomBar) m_bottomBar->setRaisedId(-1);
         if (m_agent) {
@@ -645,16 +628,13 @@ void MainWindow::applyPerspective(const QString &name)
         if (editor) editor->setVisible(true);
         if (agent) agent->setVisible(true);
         if (m_leftBar) m_leftBar->setRaisedId(-1);
-        if (m_rightBar && m_rightGitLogId >= 0)
-            m_rightBar->setRaisedId(m_rightGitLogId);
-        if (m_bottomBar && m_bottomProblemsId >= 0)
-            m_bottomBar->setRaisedId(m_bottomProblemsId);
+        raisePanelByKey(m_keyGitLog);
+        raisePanelByKey(m_keyProblems);
     } else if (name == QLatin1String("reset")) {
         if (editor) editor->setVisible(true);
         if (agent) agent->setVisible(true);
-        if (m_leftBar && m_leftRosterId >= 0) m_leftBar->setRaisedId(m_leftRosterId);
-        if (m_rightBar && m_rightWorktreesId >= 0)
-            m_rightBar->setRaisedId(m_rightWorktreesId);
+        raisePanelByKey(m_keyRoster);
+        raisePanelByKey(m_keyWorktrees);
         if (m_bottomBar) m_bottomBar->setRaisedId(-1);
         // Restore a 60/40 editor/agent split.
         if (auto *h = m_shell->centreHSplitter()) {
@@ -662,6 +642,260 @@ void MainWindow::applyPerspective(const QString &name)
         }
     }
     statusBar()->showMessage(i18n("Perspective: %1", name), 3000);
+}
+
+SideBar *MainWindow::barByName(const QString &name) const
+{
+    if (name == QLatin1String("left")) return m_leftBar;
+    if (name == QLatin1String("right")) return m_rightBar;
+    if (name == QLatin1String("bottom")) return m_bottomBar;
+    return nullptr;
+}
+
+QString MainWindow::nameForBar(SideBar *bar) const
+{
+    if (bar == m_leftBar) return QStringLiteral("left");
+    if (bar == m_rightBar) return QStringLiteral("right");
+    if (bar == m_bottomBar) return QStringLiteral("bottom");
+    return QString();
+}
+
+int MainWindow::panelId(const QString &key) const
+{
+    return m_panels.value(key).barId;
+}
+
+SideBar *MainWindow::panelBar(const QString &key) const
+{
+    return m_panels.value(key).bar;
+}
+
+void MainWindow::raisePanelByKey(const QString &key)
+{
+    auto it = m_panels.find(key);
+    if (it == m_panels.end()) {
+        return;
+    }
+    // If currently floating, bring the host window forward; otherwise raise
+    // the tab on its current strip.
+    if (it->floatingHost) {
+        it->floatingHost->raise();
+        it->floatingHost->activateWindow();
+        return;
+    }
+    if (it->bar && it->barId >= 0) {
+        it->bar->setRaisedId(it->barId);
+    }
+}
+
+// registerPanel places a panel on its persisted strip (or the supplied
+// default) and records its location so movePanelToStrip can move it later.
+int MainWindow::registerPanel(const QString &key, const QIcon &icon,
+                              const QString &label, QWidget *widget,
+                              const QString &defaultStrip)
+{
+    const QString cfgKey = QStringLiteral("View/panels/%1/strip").arg(key);
+    const QString strip = KSharedConfig::openConfig()->group(QString())
+        .readEntry(cfgKey, defaultStrip);
+
+    PanelInfo info;
+    info.key = key;
+    info.icon = icon;
+    info.label = label;
+    info.widget = widget;
+    info.lastStrip = (strip == QLatin1String("floating")) ? defaultStrip : strip;
+
+    SideBar *bar = barByName(info.lastStrip);
+    if (!bar) bar = barByName(defaultStrip);
+    if (bar) {
+        info.bar = bar;
+        info.barId = bar->addPanel(icon, label, widget);
+    }
+    m_panels.insert(key, info);
+    m_keyByWidget.insert(widget, key);
+
+    if (strip == QLatin1String("floating")) {
+        // Defer the detach so all panels register first.
+        QTimer::singleShot(0, this, [this, key] { detachPanel(key); });
+    }
+    return info.barId;
+}
+
+void MainWindow::movePanelToStrip(const QString &key, const QString &targetStrip)
+{
+    auto it = m_panels.find(key);
+    if (it == m_panels.end()) {
+        return;
+    }
+    SideBar *target = barByName(targetStrip);
+    if (!target) {
+        return;
+    }
+    // Pull from the current host (sidebar or floating window) preserving
+    // the widget's metadata, then re-add to the target strip.
+    QWidget *widget = it->widget;
+    QIcon icon = it->icon;
+    QString label = it->label;
+    if (it->bar) {
+        auto meta = it->bar->takePanel(it->barId);
+        if (meta.widget) {
+            widget = meta.widget;
+            icon = meta.icon;
+            label = meta.label;
+        }
+        it->bar = nullptr;
+        it->barId = -1;
+    }
+    if (it->floatingHost) {
+        // The floating wrapper owned the widget; lift it out before deleting
+        // the host. (deleteLater here would also destroy the widget.)
+        widget->setParent(nullptr);
+        it->floatingHost->deleteLater();
+        it->floatingHost = nullptr;
+    }
+    it->bar = target;
+    it->barId = target->addPanel(icon, label, widget);
+    it->lastStrip = targetStrip;
+    target->setRaisedId(it->barId);
+    KSharedConfig::openConfig()->group(QString())
+        .writeEntry(QStringLiteral("View/panels/%1/strip").arg(key), targetStrip);
+}
+
+void MainWindow::detachPanel(const QString &key)
+{
+    auto it = m_panels.find(key);
+    if (it == m_panels.end() || it->floatingHost) {
+        return;
+    }
+    QWidget *widget = nullptr;
+    QIcon icon = it->icon;
+    QString label = it->label;
+    if (it->bar) {
+        auto meta = it->bar->takePanel(it->barId);
+        widget = meta.widget;
+        if (!icon.isNull()) icon = meta.icon;
+        if (!meta.label.isEmpty()) label = meta.label;
+        it->lastStrip = nameForBar(it->bar);
+        it->bar = nullptr;
+        it->barId = -1;
+    } else {
+        widget = it->widget;
+    }
+    if (!widget) {
+        return;
+    }
+    auto *host = new QWidget(nullptr, Qt::Window);
+    host->setAttribute(Qt::WA_DeleteOnClose, false); // we control teardown
+    host->setWindowTitle(label);
+    host->setWindowIcon(icon);
+    auto *layout = new QVBoxLayout(host);
+    layout->setContentsMargins(0, 0, 0, 0);
+    widget->setParent(host);
+    widget->show();
+    layout->addWidget(widget);
+    host->resize(600, 500);
+    host->show();
+    it->floatingHost = host;
+    // When the user closes the floating window, re-attach to its last strip.
+    host->installEventFilter(this);
+    KSharedConfig::openConfig()->group(QString())
+        .writeEntry(QStringLiteral("View/panels/%1/strip").arg(key),
+                    QStringLiteral("floating"));
+}
+
+void MainWindow::reattachPanel(const QString &key)
+{
+    auto it = m_panels.find(key);
+    if (it == m_panels.end() || !it->floatingHost) {
+        return;
+    }
+    const QString strip = it->lastStrip.isEmpty()
+        ? QStringLiteral("left") : it->lastStrip;
+    QWidget *widget = it->widget;
+    widget->setParent(nullptr);
+    it->floatingHost->removeEventFilter(this);
+    it->floatingHost->deleteLater();
+    it->floatingHost = nullptr;
+    SideBar *bar = barByName(strip);
+    if (bar) {
+        it->bar = bar;
+        it->barId = bar->addPanel(it->icon, it->label, widget);
+        bar->setRaisedId(it->barId);
+    }
+    KSharedConfig::openConfig()->group(QString())
+        .writeEntry(QStringLiteral("View/panels/%1/strip").arg(key), strip);
+}
+
+// showPanelContextMenu pops a context menu next to a right-clicked tab,
+// offering Move-to-other-strip and Detach actions.
+void MainWindow::showPanelContextMenu(SideBar *bar, int id, const QPoint &globalPos)
+{
+    QWidget *widget = bar->panelWidget(id);
+    const QString key = m_keyByWidget.value(widget);
+    if (key.isEmpty()) {
+        return;
+    }
+    QMenu menu(this);
+    auto add = [&](const QString &label, const QString &target) -> QAction * {
+        QAction *a = menu.addAction(label);
+        if (bar == barByName(target)) {
+            a->setEnabled(false);
+        }
+        return a;
+    };
+    QAction *toLeft   = add(i18n("Move to &Left Strip"),   QStringLiteral("left"));
+    QAction *toRight  = add(i18n("Move to &Right Strip"),  QStringLiteral("right"));
+    QAction *toBottom = add(i18n("Move to &Bottom Strip"), QStringLiteral("bottom"));
+    menu.addSeparator();
+    QAction *detach = menu.addAction(i18n("&Detach as Window"));
+    QAction *chosen = menu.exec(globalPos);
+    if (!chosen) return;
+    if (chosen == toLeft)        movePanelToStrip(key, QStringLiteral("left"));
+    else if (chosen == toRight)  movePanelToStrip(key, QStringLiteral("right"));
+    else if (chosen == toBottom) movePanelToStrip(key, QStringLiteral("bottom"));
+    else if (chosen == detach)   detachPanel(key);
+}
+
+void MainWindow::applyCentreMode(const QString &mode)
+{
+    if (!m_shell) {
+        return;
+    }
+    QSplitter *h = m_shell->centreHSplitter();
+    auto *agent = m_agent ? m_agent->panelStack() : nullptr;
+    // Remember the last side-by-side proportions so we can restore them when
+    // the user returns to "split" from one of the single-pane modes.
+    if (m_centreMode == QLatin1String("split") && h && agent && m_editor
+        && m_editor->isVisible() && agent->isVisible()) {
+        m_centreSplitSizes = h->sizes();
+    }
+    m_centreMode = mode;
+    KSharedConfig::openConfig()
+        ->group(QStringLiteral("View"))
+        .writeEntry("centreMode", mode);
+
+    if (mode == QLatin1String("editor")) {
+        if (m_editor) m_editor->setVisible(true);
+        if (agent) agent->setVisible(false);
+        if (m_centreEditorAct) m_centreEditorAct->setChecked(true);
+        if (auto *v = m_editor ? m_editor->currentView() : nullptr) v->setFocus();
+    } else if (mode == QLatin1String("chat")) {
+        if (m_editor) m_editor->setVisible(false);
+        if (agent) agent->setVisible(true);
+        if (m_centreChatAct) m_centreChatAct->setChecked(true);
+        if (m_agent) {
+            if (auto *p = m_agent->activePanel()) p->setFocus();
+        }
+    } else { // "split"
+        if (m_editor) m_editor->setVisible(true);
+        if (agent) agent->setVisible(true);
+        if (m_centreSplitAct) m_centreSplitAct->setChecked(true);
+        if (h && m_centreSplitSizes.size() == h->count()) {
+            h->setSizes(m_centreSplitSizes);
+        } else if (h) {
+            h->setSizes({700, 500});
+        }
+    }
 }
 
 void MainWindow::setupCore()
@@ -796,6 +1030,22 @@ void MainWindow::closeEvent(QCloseEvent *event)
     KMainWindow::closeEvent(event);
 }
 
+// eventFilter watches the floating panel host windows so that closing one
+// re-docks the panel to its last strip instead of orphaning the widget.
+bool MainWindow::eventFilter(QObject *watched, QEvent *event)
+{
+    if (event->type() == QEvent::Close) {
+        for (auto it = m_panels.begin(); it != m_panels.end(); ++it) {
+            if (it->floatingHost == watched) {
+                event->ignore();
+                reattachPanel(it->key);
+                return true;
+            }
+        }
+    }
+    return KMainWindow::eventFilter(watched, event);
+}
+
 // setupHamburger replaces the classic menubar with a Dolphin/Kate-style ☰
 // button that mirrors the menubar's contents. The menubar remains in the
 // tree (so the hamburger has something to mirror) but starts hidden;
@@ -851,6 +1101,33 @@ void MainWindow::setupTopToolbar()
     stretch->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     toolbar->addWidget(stretch);
 
+    // Centre-slab mode toggle: Editor / Split / Chat. The three actions form
+    // an exclusive group so exactly one stays raised; applyCentreMode hides
+    // the inactive halves of the centre split and persists the choice.
+    auto *modeGroup = new QActionGroup(this);
+    modeGroup->setExclusive(true);
+    m_centreEditorAct = new QAction(
+        QIcon::fromTheme(QStringLiteral("document-edit")), i18n("Editor"), this);
+    m_centreSplitAct = new QAction(
+        QIcon::fromTheme(QStringLiteral("view-split-left-right")),
+        i18n("Split"), this);
+    m_centreChatAct = new QAction(
+        QIcon::fromTheme(QStringLiteral("im-user")), i18n("Chat"), this);
+    for (QAction *a : { m_centreEditorAct, m_centreSplitAct, m_centreChatAct }) {
+        a->setCheckable(true);
+        modeGroup->addAction(a);
+        toolbar->addAction(a);
+    }
+    m_centreEditorAct->setToolTip(i18n("Show only the editor (Ctrl+E to toggle)"));
+    m_centreSplitAct->setToolTip(i18n("Show editor and agent side by side"));
+    m_centreChatAct->setToolTip(i18n("Show only the agent chat (Ctrl+Shift+E to toggle)"));
+    connect(m_centreEditorAct, &QAction::triggered, this,
+            [this] { applyCentreMode(QStringLiteral("editor")); });
+    connect(m_centreSplitAct, &QAction::triggered, this,
+            [this] { applyCentreMode(QStringLiteral("split")); });
+    connect(m_centreChatAct, &QAction::triggered, this,
+            [this] { applyCentreMode(QStringLiteral("chat")); });
+
     // Placeholder global-symbol search (wiring lives in Phase 4).
     auto *search = new QLineEdit(toolbar);
     search->setPlaceholderText(i18n("Search…  (Ctrl+T)"));
@@ -868,6 +1145,13 @@ void MainWindow::setupTopToolbar()
 
     connect(m_editor, &EditorArea::currentFileChanged, this,
             &MainWindow::updateBreadcrumb);
+
+    // Restore the persisted centre-slab mode now that the toolbar actions
+    // exist. Defaults to side-by-side.
+    const QString mode = KSharedConfig::openConfig()
+        ->group(QStringLiteral("View"))
+        .readEntry("centreMode", QStringLiteral("split"));
+    applyCentreMode(mode);
 }
 
 void MainWindow::updateBreadcrumb(const QString &path)
@@ -903,9 +1187,7 @@ void MainWindow::updateBreadcrumb(const QString &path)
         connect(btn, &QToolButton::clicked, this, [this, openDir] {
             if (!openDir.isEmpty() && m_tree) {
                 m_tree->setRoot(openDir);
-                if (m_leftBar && m_leftFilesId >= 0) {
-                    m_leftBar->setRaisedId(m_leftFilesId);
-                }
+                raisePanelByKey(m_keyFiles);
             }
         });
         layout->addWidget(btn);

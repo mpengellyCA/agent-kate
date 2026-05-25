@@ -23,6 +23,7 @@ int SideBar::addPanel(const QIcon &icon, const QString &label, QWidget *panel)
     m_bar->appendTab(icon, id, label);
     m_stack->addWidget(panel);
     m_ids.append(id);
+    m_meta.insert(id, PanelMeta{panel, icon, label});
     if (auto *tab = m_bar->tab(id)) {
         tab->setToolTip(label);
         // KMultiTabBarTab is checkable: Qt toggles the raised state before
@@ -36,8 +37,51 @@ int SideBar::addPanel(const QIcon &icon, const QString &label, QWidget *panel)
                 setRaisedId(-1);
             }
         });
+        // Right-click → request a context menu from the host. The tab is a
+        // QToolButton, so customContextMenuRequested gives us tab-local
+        // coordinates that we promote to screen coordinates for the receiver.
+        tab->setContextMenuPolicy(Qt::CustomContextMenu);
+        QWidget *tabWidget = tab;
+        connect(tabWidget, &QWidget::customContextMenuRequested, this,
+                [this, id, tabWidget](const QPoint &pos) {
+                    emit tabContextMenuRequested(id, tabWidget->mapToGlobal(pos));
+                });
     }
     return id;
+}
+
+QWidget *SideBar::panelWidget(int id) const
+{
+    return m_meta.value(id).widget;
+}
+
+QIcon SideBar::panelIcon(int id) const
+{
+    return m_meta.value(id).icon;
+}
+
+QString SideBar::panelLabel(int id) const
+{
+    return m_meta.value(id).label;
+}
+
+SideBar::PanelMeta SideBar::takePanel(int id)
+{
+    if (!m_ids.contains(id)) {
+        return {};
+    }
+    PanelMeta meta = m_meta.take(id);
+    if (m_raised == id) {
+        setRaisedId(-1);
+    }
+    m_ids.removeAll(id);
+    if (meta.widget) {
+        m_stack->removeWidget(meta.widget);
+        meta.widget->setParent(nullptr);
+        meta.widget->hide();
+    }
+    m_bar->removeTab(id);
+    return meta;
 }
 
 void SideBar::setRaisedId(int id)
