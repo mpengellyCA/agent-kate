@@ -2,46 +2,19 @@
 
 #include <KConfigGroup>
 
-#include <QBoxLayout>
 #include <QStackedWidget>
+#include <QWidget>
 
 SideBar::SideBar(KMultiTabBar::KMultiTabBarPosition pos, QWidget *parent)
-    : QWidget(parent)
+    : QObject(parent)
     , m_pos(pos)
+    , m_bar(new KMultiTabBar(pos, parent))
+    , m_stack(new QStackedWidget(parent))
 {
-    m_bar = new KMultiTabBar(pos, this);
     m_bar->setStyle(KMultiTabBar::VSNET);
-    m_stack = new QStackedWidget(this);
-
-    QBoxLayout *layout = nullptr;
-    switch (pos) {
-    case KMultiTabBar::Left:
-        layout = new QHBoxLayout(this);
-        layout->addWidget(m_bar);
-        layout->addWidget(m_stack, 1);
-        break;
-    case KMultiTabBar::Right:
-        layout = new QHBoxLayout(this);
-        layout->addWidget(m_stack, 1);
-        layout->addWidget(m_bar);
-        break;
-    case KMultiTabBar::Top:
-        layout = new QVBoxLayout(this);
-        layout->addWidget(m_bar);
-        layout->addWidget(m_stack, 1);
-        break;
-    case KMultiTabBar::Bottom:
-    default:
-        layout = new QVBoxLayout(this);
-        layout->addWidget(m_stack, 1);
-        layout->addWidget(m_bar);
-        break;
-    }
-    layout->setContentsMargins(0, 0, 0, 0);
-    layout->setSpacing(0);
-
-    m_stack->setVisible(false); // start collapsed; setRaisedId expands it
-    updateCollapsedConstraint();
+    // The panel stack starts collapsed; placing it inside a QSplitter that
+    // honours child visibility makes the splitter handle the resize for us.
+    m_stack->setVisible(false);
 }
 
 int SideBar::addPanel(const QIcon &icon, const QString &label, QWidget *panel)
@@ -82,35 +55,7 @@ void SideBar::setRaisedId(int id)
         m_stack->setCurrentIndex(m_ids.indexOf(id));
         m_stack->setVisible(true);
     }
-    updateCollapsedConstraint();
     emit raisedChanged(id);
-}
-
-void SideBar::updateCollapsedConstraint()
-{
-    // When collapsed, the SideBar shrinks to just the strip so its host
-    // (typically a QDockWidget) follows along. When expanded, constraints
-    // are released so the host's resize handle works normally.
-    const bool horizontal =
-        (m_pos == KMultiTabBar::Bottom || m_pos == KMultiTabBar::Top);
-    if (m_raised < 0) {
-        const int hint = horizontal ? m_bar->sizeHint().height()
-                                    : m_bar->sizeHint().width();
-        if (horizontal) {
-            setMinimumHeight(hint);
-            setMaximumHeight(hint);
-            setMinimumWidth(0);
-            setMaximumWidth(QWIDGETSIZE_MAX);
-        } else {
-            setMinimumWidth(hint);
-            setMaximumWidth(hint);
-            setMinimumHeight(0);
-            setMaximumHeight(QWIDGETSIZE_MAX);
-        }
-    } else {
-        setMinimumSize(0, 0);
-        setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
-    }
 }
 
 void SideBar::setPanelVisible(int id, bool visible)

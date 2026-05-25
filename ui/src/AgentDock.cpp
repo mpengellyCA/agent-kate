@@ -13,18 +13,14 @@
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QStackedWidget>
-#include <QVBoxLayout>
 
 AgentDock::AgentDock(CoreClient *core, QWidget *parent)
-    : QWidget(parent)
+    : QObject(parent)
     , m_core(core)
-    , m_stack(new QStackedWidget(this))
-    , m_roster(new AgentRoster)
+    , m_stack(new QStackedWidget(parent))
+    , m_roster(new AgentRoster(parent))
+    , m_dialogParent(parent)
 {
-    auto *layout = new QVBoxLayout(this);
-    layout->setContentsMargins(0, 0, 0, 0);
-    layout->addWidget(m_stack);
-
     connect(m_roster, &AgentRoster::openProjectRequested, this, &AgentDock::openProjectDialog);
     connect(m_roster, &AgentRoster::newAgentRequested, this, [this](const QString &project) {
         QString p = project;
@@ -89,7 +85,7 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
         // make that explicit before it lands somewhere unexpected (e.g. main).
         if (!e->panel->isIsolated()
             && QMessageBox::warning(
-                   this, QStringLiteral("Commit in the workspace"),
+                   m_dialogParent, QStringLiteral("Commit in the workspace"),
                    QStringLiteral(
                        "This agent runs directly in the workspace, so the commit "
                        "will land on the workspace's current branch — it is not "
@@ -101,7 +97,7 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
         }
         bool ok = false;
         const QString msg = QInputDialog::getText(
-            this, QStringLiteral("Commit agent changes"), QStringLiteral("Commit message:"),
+            m_dialogParent, QStringLiteral("Commit agent changes"), QStringLiteral("Commit message:"),
             QLineEdit::Normal, QStringLiteral("Agent Kate change"), &ok);
         if (!ok) {
             return;
@@ -131,7 +127,7 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
         }
         bool ok = false;
         const QString title = QInputDialog::getText(
-            this, QStringLiteral("Create pull request"), QStringLiteral("Pull request title:"),
+            m_dialogParent, QStringLiteral("Create pull request"), QStringLiteral("Pull request title:"),
             QLineEdit::Normal, QString(), &ok);
         if (!ok) {
             return;
@@ -161,7 +157,7 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
             return;
         }
         if (QMessageBox::question(
-                this, QStringLiteral("Merge into local main"),
+                m_dialogParent, QStringLiteral("Merge into local main"),
                 QStringLiteral(
                     "Merge this agent's branch into your local main branch?\n\n"
                     "Its commits are merged into the workspace locally — nothing "
@@ -178,7 +174,7 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
                              const QString msg =
                                  error.value(QStringLiteral("message")).toString();
                              emit statusMessage(QStringLiteral("Merge failed: %1").arg(msg));
-                             QMessageBox::warning(this,
+                             QMessageBox::warning(m_dialogParent,
                                  QStringLiteral("Merge into local main failed"), msg);
                          } else {
                              const QString branch =
@@ -187,7 +183,7 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
                                  result.value(QStringLiteral("into")).toString();
                              emit statusMessage(QStringLiteral("Merged %1 into %2")
                                  .arg(branch, into));
-                             QMessageBox::information(this,
+                             QMessageBox::information(m_dialogParent,
                                  QStringLiteral("Merge into local main"),
                                  QStringLiteral("Merged %1 into %2.")
                                      .arg(branch, into));
@@ -203,7 +199,7 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
             closeAgent(id);
             return;
         }
-        if (QMessageBox::question(this, QStringLiteral("Discard worktree"),
+        if (QMessageBox::question(m_dialogParent, QStringLiteral("Discard worktree"),
                 QStringLiteral("Discard this agent's worktree and all of its uncommitted "
                                "changes? This cannot be undone."))
             != QMessageBox::Yes) {
@@ -227,10 +223,20 @@ QWidget *AgentDock::roster() const
     return m_roster;
 }
 
+QStackedWidget *AgentDock::panelStack() const
+{
+    return m_stack;
+}
+
+QWidget *AgentDock::activePanel() const
+{
+    return m_stack ? m_stack->currentWidget() : nullptr;
+}
+
 void AgentDock::openProjectDialog()
 {
     const QString dir = QFileDialog::getExistingDirectory(
-        this, QStringLiteral("Open Project Folder"),
+        m_dialogParent, QStringLiteral("Open Project Folder"),
         m_projects.isEmpty() ? QDir::homePath() : m_projects.constLast());
     if (!dir.isEmpty()) {
         addProject(dir);
@@ -304,7 +310,7 @@ QString AgentDock::currentThreadId() const
 AgentPanel *AgentDock::addAgent(const QString &projectPath)
 {
     const int id = ++m_counter;
-    auto *panel = new AgentPanel(m_core, this);
+    auto *panel = new AgentPanel(m_core, m_stack);
     panel->setWorkspace(projectPath);
     m_stack->addWidget(panel);
     m_agents.append(Entry{id, projectPath, panel});
@@ -322,7 +328,7 @@ AgentPanel *AgentDock::addDormantAgent(const QString &project, const QString &th
                                        const QString &title, bool isolated)
 {
     const int id = ++m_counter;
-    auto *panel = new AgentPanel(m_core, this);
+    auto *panel = new AgentPanel(m_core, m_stack);
     panel->setWorkspace(project);
     m_stack->addWidget(panel);
     m_agents.append(Entry{id, project, panel});

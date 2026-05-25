@@ -11,6 +11,7 @@
 #include "TerminalPanel.h"
 #include "WelcomeDialog.h"
 #include "WorktreeDashboard.h"
+#include "shell/ShellLayout.h"
 #include "shell/SideBar.h"
 #include "git/BlameController.h"
 #include "git/GutterController.h"
@@ -31,10 +32,10 @@
 
 #include <QAction>
 #include <QActionGroup>
+#include <QCloseEvent>
 #include <QCoreApplication>
 #include <QDebug>
 #include <QDir>
-#include <QDockWidget>
 #include <QFileInfo>
 #include <QIcon>
 #include <QJsonArray>
@@ -43,6 +44,7 @@
 #include <QMenu>
 #include <QMenuBar>
 #include <QLabel>
+#include <QStackedWidget>
 #include <QStatusBar>
 #include <QTabWidget>
 #include <QTimer>
@@ -103,44 +105,54 @@ void MainWindow::setupUi()
 {
     m_core = new CoreClient(this);
 
-    // Centre: the agent conversation — Agent Kate is agent-first.
+    // AgentDock is a QObject orchestrator: its widgets (the roster and the
+    // panel stack) are placed by ShellLayout into the left strip and the
+    // centre split's right pane respectively.
     m_agent = new AgentDock(m_core, this);
-    setCentralWidget(m_agent);
-
-    // Left: the project → agent roster.
-    auto *rosterDock = new QDockWidget(i18n("Projects & Agents"), this);
-    rosterDock->setObjectName(QStringLiteral("rosterDock"));
-    rosterDock->setWidget(m_agent->roster());
-    addDockWidget(Qt::LeftDockWidgetArea, rosterDock);
-
-    // Right: the active project's file tree above the editor.
-    m_tree = new ProjectTree(this);
-    auto *treeDock = new QDockWidget(i18n("Files"), this);
-    treeDock->setObjectName(QStringLiteral("filesDock"));
-    treeDock->setWidget(m_tree);
-    addDockWidget(Qt::RightDockWidgetArea, treeDock);
 
     m_editor = new EditorArea(this);
-    auto *editorDock = new QDockWidget(i18n("Editor"), this);
-    editorDock->setObjectName(QStringLiteral("editorDock"));
-    editorDock->setWidget(m_editor);
-    addDockWidget(Qt::RightDockWidgetArea, editorDock);
-    splitDockWidget(treeDock, editorDock, Qt::Vertical);
-
-    // Bottom: a single SideBar that hosts the Problems / References /
-    // Terminal panels in a Kate-style activity strip. One panel is raised at
-    // a time; clicking the raised tab collapses the strip's panel area. The
-    // bar itself stays visible so the user can re-raise without using a menu.
+    m_tree = new ProjectTree(this);
     m_lsp = new LspManager(this);
+
     auto *problems = new ProblemsPanel(m_lsp, this);
     auto *references = new ReferencesPanel(this);
+    auto *outline = new OutlinePanel(this);
     m_terminal = new TerminalPanel(this);
+    m_worktreeDashboard = new WorktreeDashboard(m_core, this);
+    m_logViewer = new LogViewer(m_core, this);
+
     connect(problems, &ProblemsPanel::activated, this,
             [this](const QString &path, int line) {
                 m_editor->openFile(groupKey(), path, line);
             });
+    connect(m_worktreeDashboard, &WorktreeDashboard::statusMessage, this,
+            [this](const QString &text) { statusBar()->showMessage(text, 6000); });
 
-    setupBottomStrip();
+    // Three Kate-style activity strips frame the centre. Each SideBar pairs
+    // a KMultiTabBar (placed at the window edge by ShellLayout) with its own
+    // QStackedWidget (placed inside the centre splitter so the panel area
+    // resizes with a draggable handle).
+    m_leftBar = new SideBar(KMultiTabBar::Left, this);
+    m_rightBar = new SideBar(KMultiTabBar::Right, this);
+    m_bottomBar = new SideBar(KMultiTabBar::Bottom, this);
+
+    m_leftRosterId = m_leftBar->addPanel(
+        QIcon::fromTheme(QStringLiteral("system-users")),
+        i18n("Projects && Agents"), m_agent->roster());
+    m_leftFilesId = m_leftBar->addPanel(
+        QIcon::fromTheme(QStringLiteral("folder")),
+        i18n("Files"), m_tree);
+    m_leftOutlineId = m_leftBar->addPanel(
+        QIcon::fromTheme(QStringLiteral("code-context")),
+        i18n("Outline"), outline);
+
+    m_rightWorktreesId = m_rightBar->addPanel(
+        QIcon::fromTheme(QStringLiteral("vcs-branch")),
+        i18n("Worktrees"), m_worktreeDashboard);
+    m_rightGitLogId = m_rightBar->addPanel(
+        QIcon::fromTheme(QStringLiteral("vcs-commit")),
+        i18n("Git Log"), m_logViewer);
+
     m_bottomTerminalId = m_bottomBar->addPanel(
         QIcon::fromTheme(QStringLiteral("utilities-terminal")),
         i18n("Terminal"), m_terminal);
@@ -151,60 +163,56 @@ void MainWindow::setupUi()
         QIcon::fromTheme(QStringLiteral("dialog-warning")),
         i18n("Problems"), problems);
 
-    const KConfigGroup viewCfg =
-        KSharedConfig::openConfig()->group(QStringLiteral("View"));
-    const int initialRaised = viewCfg.readEntry("bottomStrip", -1);
-    if (initialRaised >= 0) {
-        m_bottomBar->setRaisedId(initialRaised);
-        m_lastBottomTab = initialRaised;
+    ShellLayout::Slots shellSlots;
+    shellSlots.leftBar = m_leftBar->tabBar();
+    shellSlots.leftStack = m_leftBar->panelStack();
+    shellSlots.rightBar = m_rightBar->tabBar();
+    shellSlots.rightStack = m_rightBar->panelStack();
+    shellSlots.bottomBar = m_bottomBar->tabBar();
+    shellSlots.bottomStack = m_bottomBar->panelStack();
+    shellSlots.editor = m_editor;
+    shellSlots.agentPanel = m_agent->panelStack();
+    m_shell = new ShellLayout(shellSlots, this);
+    setCentralWidget(m_shell);
+
+    // KMainWindow's autoSaveSettings() blob persists dock geometry. The new
+    // shell stops using addDockWidget for tool panels, so that blob is dead.
+    // Bump the schema once: the first launch on the new shell drops the
+    // stored MainWindow state so KMainWindow falls back to our defaults.
+    KSharedConfig::Ptr cfg = KSharedConfig::openConfig();
+    KConfigGroup viewCfg = cfg->group(QStringLiteral("View"));
+    const int schema = viewCfg.readEntry("schema", 0);
+    if (schema < 2) {
+        cfg->group(QStringLiteral("MainWindow")).deleteGroup();
+        viewCfg.writeEntry("schema", 2);
+        viewCfg.sync();
+        QTimer::singleShot(0, this, [this] {
+            statusBar()->showMessage(
+                i18n("Layout has been reset for the new shell"), 6000);
+        });
     }
-    connect(m_bottomBar, &SideBar::raisedChanged, this, [this](int id) {
-        if (id >= 0) {
-            m_lastBottomTab = id;
-            // Expanding from collapsed leaves the dock at its strip-only
-            // minimum — give the panel area a reasonable default height.
-            if (m_bottomDock && m_bottomDock->height()
-                <= m_bottomBar->tabBar()->sizeHint().height() + 4) {
-                resizeDocks({m_bottomDock}, {280}, Qt::Vertical);
+
+    m_shell->restoreState(viewCfg.group(QStringLiteral("centreSplitter")));
+
+    // Restore + persist the raised tab per strip.
+    auto wireStrip = [this](SideBar *bar, const QString &key, int fallback) {
+        const KConfigGroup g =
+            KSharedConfig::openConfig()->group(QStringLiteral("View"));
+        const int raised = g.readEntry(key, fallback);
+        bar->setRaisedId(raised);
+        connect(bar, &SideBar::raisedChanged, this, [this, key, bar](int id) {
+            KSharedConfig::openConfig()
+                ->group(QStringLiteral("View"))
+                .writeEntry(key, id);
+            if (bar == m_bottomBar && id >= 0) {
+                m_lastBottomTab = id;
             }
-        }
-        KSharedConfig::openConfig()
-            ->group(QStringLiteral("View"))
-            .writeEntry("bottomStrip", id);
-    });
-
-    // Outline panel — the active file's symbols, tabbed with the file tree.
-    auto *outline = new OutlinePanel(this);
-    auto *outlineDock = new QDockWidget(i18n("Outline"), this);
-    outlineDock->setObjectName(QStringLiteral("outlineDock"));
-    outlineDock->setWidget(outline);
-    addDockWidget(Qt::RightDockWidgetArea, outlineDock);
-    tabifyDockWidget(treeDock, outlineDock);
-
-    // Worktree dashboard — every agent's branch / ahead / behind / dirty
-    // count, polled at 1 Hz. Tabbed with the file tree so the right column
-    // doubles as "what are the agents doing to git right now?".
-    m_worktreeDashboard = new WorktreeDashboard(m_core, this);
-    auto *worktreeDock = new QDockWidget(i18n("Worktrees"), this);
-    worktreeDock->setObjectName(QStringLiteral("worktreeDock"));
-    worktreeDock->setWindowIcon(QIcon::fromTheme(QStringLiteral("vcs-branch")));
-    worktreeDock->setWidget(m_worktreeDashboard);
-    addDockWidget(Qt::RightDockWidgetArea, worktreeDock);
-    tabifyDockWidget(treeDock, worktreeDock);
-    treeDock->raise();
-    connect(m_worktreeDashboard, &WorktreeDashboard::statusMessage, this,
-            [this](const QString &text) { statusBar()->showMessage(text, 6000); });
-
-    // Git log viewer — paginated history with lane graph + commit detail pane
-    // for the selected worktree. Tabified alongside the worktree dashboard so
-    // "what's git doing?" lives in one place.
-    m_logViewer = new LogViewer(m_core, this);
-    auto *logDock = new QDockWidget(i18n("Git Log"), this);
-    logDock->setObjectName(QStringLiteral("gitLogDock"));
-    logDock->setWindowIcon(QIcon::fromTheme(QStringLiteral("vcs-commit")));
-    logDock->setWidget(m_logViewer);
-    addDockWidget(Qt::RightDockWidgetArea, logDock);
-    tabifyDockWidget(worktreeDock, logDock);
+        });
+    };
+    wireStrip(m_leftBar, QStringLiteral("leftStrip"), m_leftRosterId);
+    wireStrip(m_rightBar, QStringLiteral("rightStrip"), m_rightWorktreesId);
+    wireStrip(m_bottomBar, QStringLiteral("bottomStrip"), -1);
+    m_lastBottomTab = m_bottomBar->raisedId();
 
     connect(m_lsp, &LspManager::definitionResolved, this,
             [this](const QString &path, int line) {
@@ -231,10 +239,6 @@ void MainWindow::setupUi()
             m_lsp->requestSymbols(path);
         }
     });
-
-    resizeDocks({rosterDock, treeDock}, {270, 480}, Qt::Horizontal);
-    resizeDocks({treeDock, editorDock}, {240, 620}, Qt::Vertical);
-    resizeDocks({m_bottomDock}, {230}, Qt::Vertical);
 
     connect(m_agent, &AgentDock::agentActivated, this, &MainWindow::onAgentActivated);
     connect(m_agent, &AgentDock::projectFocused, this,
@@ -566,20 +570,22 @@ void MainWindow::onSave()
     m_editor->saveCurrent();
 }
 
-// setupBottomStrip installs a Kate-style SideBar across the bottom edge of
-// the window. The three bottom panels share one slot — clicking a tab raises
-// that panel (hiding the others); clicking the raised tab collapses the
-// panel area entirely so the editor reclaims the vertical space. The bar
-// itself stays visible because the host dock's minimum height = strip height.
-void MainWindow::setupBottomStrip()
+// persistShellState writes the centre QSplitter geometry to KConfig.
+void MainWindow::persistShellState()
 {
-    m_bottomBar = new SideBar(KMultiTabBar::Bottom, this);
-    m_bottomDock = new QDockWidget(this);
-    m_bottomDock->setObjectName(QStringLiteral("bottomStripDock"));
-    m_bottomDock->setFeatures(QDockWidget::NoDockWidgetFeatures);
-    m_bottomDock->setTitleBarWidget(new QWidget(m_bottomDock));
-    m_bottomDock->setWidget(m_bottomBar);
-    addDockWidget(Qt::BottomDockWidgetArea, m_bottomDock);
+    if (!m_shell) {
+        return;
+    }
+    KConfigGroup grp = KSharedConfig::openConfig()
+        ->group(QStringLiteral("View"))
+        .group(QStringLiteral("centreSplitter"));
+    m_shell->saveState(grp);
+}
+
+void MainWindow::closeEvent(QCloseEvent *event)
+{
+    persistShellState();
+    KMainWindow::closeEvent(event);
 }
 
 // reloadExtensionServers asks the core for every installed VS Code extension

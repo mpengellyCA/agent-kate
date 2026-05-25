@@ -19,8 +19,8 @@ class TerminalPanel;
 class WorktreeDashboard;
 class LogViewer;
 class SideBar;
+class ShellLayout;
 class QAction;
-class QDockWidget;
 class QLabel;
 
 // MainWindow is the Agent Kate arena shell — a project-aware, agent-centric KDE
@@ -33,6 +33,9 @@ public:
     explicit MainWindow(const QString &openPath = QString(), QWidget *parent = nullptr);
     ~MainWindow() override;
 
+protected:
+    void closeEvent(QCloseEvent *event) override;
+
 private:
     void setupUi();
     void setupActions();
@@ -44,7 +47,7 @@ private:
     QString groupKey() const;
     void pushOpenFilesToCore();
 
-    void setupBottomStrip();
+    void persistShellState();
 
     CoreClient *m_core = nullptr;
     EditorArea *m_editor = nullptr;
@@ -55,11 +58,21 @@ private:
     WorktreeDashboard *m_worktreeDashboard = nullptr;
     LogViewer *m_logViewer = nullptr;
     QLabel *m_gitStatusLabel = nullptr; // status-bar git widget for the active editor
-    QDockWidget *m_bottomDock = nullptr;
+
+    ShellLayout *m_shell = nullptr;
+    SideBar *m_leftBar = nullptr;
+    SideBar *m_rightBar = nullptr;
     SideBar *m_bottomBar = nullptr;
+
+    int m_leftRosterId = -1;
+    int m_leftFilesId = -1;
+    int m_leftOutlineId = -1;
+    int m_rightWorktreesId = -1;
+    int m_rightGitLogId = -1;
     int m_bottomTerminalId = -1;
     int m_bottomReferencesId = -1;
     int m_bottomProblemsId = -1;
+
     int m_lastBottomTab = -1; // last tab raised by the user, used to restore on Ctrl+J
     QAction *m_toggleBottomAct = nullptr;
 

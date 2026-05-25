@@ -1,25 +1,31 @@
 #pragma once
 
 #include <QList>
+#include <QObject>
 #include <QString>
 #include <QStringList>
-#include <QWidget>
 
 class CoreClient;
 class AgentPanel;
 class AgentRoster;
 class QStackedWidget;
+class QWidget;
 
-// AgentDock is the agent-centric workspace. It is the window's central widget —
-// a stack of agent conversations — and it owns the AgentRoster (the project →
-// agent tree placed in the left dock), coordinating many projects at once.
-class AgentDock : public QWidget
+// AgentDock orchestrates the agent-centric workspace: a stack of agent
+// conversation panels plus the AgentRoster (project → agent tree). The shell
+// hosts these widgets in distinct layout slots — the roster on the left
+// sidebar and the panel stack inside the centre split — so AgentDock is a
+// pure QObject that owns the widgets without being placed on screen itself.
+class AgentDock : public QObject
 {
     Q_OBJECT
 public:
     explicit AgentDock(CoreClient *core, QWidget *parent = nullptr);
 
-    QWidget *roster() const; // the project/agent tree, for the left dock
+    QWidget *roster() const; // the project/agent tree, hosted by the left sidebar
+    QStackedWidget *panelStack() const; // the conversation stack, hosted by the centre split
+    QWidget *activePanel() const; // the panel currently on top of the stack
+
     void addProject(const QString &path);
     void openProjectDialog();
 
@@ -64,6 +70,7 @@ private:
     CoreClient *m_core = nullptr;
     QStackedWidget *m_stack = nullptr;
     AgentRoster *m_roster = nullptr;
+    QWidget *m_dialogParent = nullptr; // window-scope parent for modal dialogs
     QList<Entry> m_agents;
     QStringList m_projects;
     int m_counter = 0;

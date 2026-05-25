@@ -32,6 +32,7 @@ add_executable(agentkate
     src/ProjectTree.cpp
     src/RecentProjects.cpp
     src/shell/SideBar.cpp
+    src/shell/ShellLayout.cpp
     src/TerminalPanel.cpp
     src/SessionBrowserDialog.cpp
     src/SkillsDialog.cpp
