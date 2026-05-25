@@ -16,6 +16,7 @@ class EditorArea;
 class ProjectTree;
 class AgentDock;
 class LspManager;
+class SearchPanel;
 class TerminalPanel;
 class WorktreeDashboard;
 class LogViewer;
@@ -82,6 +83,7 @@ private:
     AgentDock *m_agent = nullptr;
     LspManager *m_lsp = nullptr;
     TerminalPanel *m_terminal = nullptr;
+    SearchPanel *m_search = nullptr;
     WorktreeDashboard *m_worktreeDashboard = nullptr;
     LogViewer *m_logViewer = nullptr;
     QLabel *m_gitStatusLabel = nullptr; // status-bar git widget for the active editor

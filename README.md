@@ -25,6 +25,24 @@ Two processes, one repo, connected by a local JSON-RPC bus:
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for detail.
 
+## Screenshots
+
+Editor, agent chat, and git log side-by-side — one agent working in its own worktree:
+
+![Editor, chat, and git log](./assets/screenshots/Screenshot_20260524_232021.png)
+
+Code view with an agent streaming a response in the chat panel:
+
+![Editor and agent chat](./assets/screenshots/Screenshot_20260524_232157.png)
+
+Chat-focused layout with terminals docked at the bottom:
+
+![Chat and terminals](./assets/screenshots/Screenshot_20260524_232237.png)
+
+Project tree, editor, git log, and diff view together:
+
+![Project tree, editor, and diff](./assets/screenshots/Screenshot_20260524_232440.png)
+
 ## Build
 
 Prerequisites (Arch): `qt6-base`, `ktexteditor`, `syntax-highlighting`,

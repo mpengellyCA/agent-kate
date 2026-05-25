@@ -6,6 +6,7 @@
 #include "ProblemsPanel.h"
 #include "ProjectTree.h"
 #include "ReferencesPanel.h"
+#include "SearchPanel.h"
 #include "SessionBrowserDialog.h"
 #include "SkillsDialog.h"
 #include "TerminalPanel.h"
@@ -139,6 +140,15 @@ void MainWindow::setupUi()
             [this](const QString &path, int line) {
                 m_editor->openFile(groupKey(), path, line);
             });
+
+    // Real ripgrep-backed Search panel (replaces the Phase 4 StubPanel). Lives
+    // on the left strip; result activation opens the file in the editor.
+    m_search = new SearchPanel(m_core, this);
+    connect(m_search, &SearchPanel::resultActivated, this,
+            [this](const QString &path, int line) {
+                m_editor->openFile(groupKey(), path, line);
+            });
+
     connect(m_worktreeDashboard, &WorktreeDashboard::statusMessage, this,
             [this](const QString &text) { statusBar()->showMessage(text, 6000); });
 
@@ -163,12 +173,8 @@ void MainWindow::setupUi()
                   i18n("Files"), m_tree, QStringLiteral("left"));
     registerPanel(m_keyOutline, QIcon::fromTheme(QStringLiteral("code-context")),
                   i18n("Outline"), outline, QStringLiteral("left"));
-    registerPanel(m_keySearch, QIcon::fromTheme(QStringLiteral("search")),
-                  i18n("Search"),
-                  new StubPanel(i18n("Search"),
-                                i18n("Cross-project symbol and full-text search lands here."),
-                                this),
-                  QStringLiteral("left"));
+    registerPanel(m_keySearch, QIcon::fromTheme(QStringLiteral("edit-find")),
+                  i18n("Search"), m_search, QStringLiteral("left"));
 
     registerPanel(m_keyWorktrees, QIcon::fromTheme(QStringLiteral("vcs-branch")),
                   i18n("Worktrees"), m_worktreeDashboard,
@@ -478,6 +484,20 @@ void MainWindow::setupActions()
                                                     : panelId(m_keyProblems);
             m_bottomBar->setRaisedId(target);
         }
+    });
+
+    auto *findInProjAct = viewMenu->addAction(
+        QIcon::fromTheme(QStringLiteral("edit-find")),
+        i18n("Find in &Project…"));
+    findInProjAct->setShortcut(Qt::CTRL | Qt::SHIFT | Qt::Key_F);
+    findInProjAct->setToolTip(
+        i18n("Search the active project with filters (case, regex, globs)."));
+    connect(findInProjAct, &QAction::triggered, this, [this] {
+        if (!m_search) {
+            return;
+        }
+        raisePanelByKey(m_keySearch);
+        m_search->focusQuery();
     });
 
     QMenu *codeMenu = menuBar()->addMenu(i18n("&Code"));
@@ -990,6 +1010,9 @@ void MainWindow::onAgentActivated(int agentId, const QString &projectPath)
     m_activeProject = projectPath;
     m_tree->setRoot(projectPath);
     m_terminal->setWorkingDirectory(projectPath);
+    if (m_search) {
+        m_search->setProjectRoot(projectPath);
+    }
     if (m_logViewer) {
         m_logViewer->setActiveSource(projectPath, m_agent->currentThreadId());
     }
