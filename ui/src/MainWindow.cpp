@@ -572,7 +572,24 @@ void MainWindow::setupShellShortcuts()
 // Chat Focus, and Reset — that the hamburger surfaces under "View ▸ Perspective".
 void MainWindow::setupPerspectives()
 {
-    m_perspectivesMenu = new QMenu(i18n("&Perspective"), this);
+    // Find the existing &View menu; the perspectives submenu becomes its
+    // child so destruction order is well-defined. Earlier this menu was
+    // parented to `this`, which (because m_perspectivesMenu was constructed
+    // AFTER the menubar) made the menu die BEFORE the QAction inside View
+    // that referenced it — the View menu's internal action hash would then
+    // visit a dangling child during teardown, hitting Q_ASSERT(numBuckets>0)
+    // inside QHash on shutdown.
+    QMenu *viewMenu = nullptr;
+    for (QAction *a : menuBar()->actions()) {
+        if (a->text() == i18n("&View") && a->menu()) {
+            viewMenu = a->menu();
+            break;
+        }
+    }
+    if (!viewMenu) {
+        return; // no View menu — nothing to attach to
+    }
+    m_perspectivesMenu = new QMenu(i18n("&Perspective"), viewMenu);
     auto add = [this](const QString &label, const QString &key,
                       const QKeySequence &shortcut = QKeySequence()) {
         QAction *act = m_perspectivesMenu->addAction(label);
@@ -590,15 +607,8 @@ void MainWindow::setupPerspectives()
     m_perspectivesMenu->addSeparator();
     add(i18n("&Reset Layout"), QStringLiteral("reset"));
 
-    // Attach the perspectives submenu to the existing &View menu so the
-    // hamburger picks it up automatically.
-    for (QAction *a : menuBar()->actions()) {
-        if (a->text() == i18n("&View") && a->menu()) {
-            a->menu()->addSeparator();
-            a->menu()->addMenu(m_perspectivesMenu);
-            break;
-        }
-    }
+    viewMenu->addSeparator();
+    viewMenu->addMenu(m_perspectivesMenu);
 }
 
 void MainWindow::applyPerspective(const QString &name)
