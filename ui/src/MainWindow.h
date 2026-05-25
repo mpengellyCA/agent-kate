@@ -18,7 +18,7 @@ class LspManager;
 class TerminalPanel;
 class WorktreeDashboard;
 class LogViewer;
-class KMultiTabBar;
+class SideBar;
 class QAction;
 class QDockWidget;
 class QLabel;
@@ -45,9 +45,6 @@ private:
     void pushOpenFilesToCore();
 
     void setupBottomStrip();
-    void showBottomTab(int id);
-    void hideBottomTab(int id);
-    void syncBottomTabFromDock(int id, bool visible);
 
     CoreClient *m_core = nullptr;
     EditorArea *m_editor = nullptr;
@@ -58,12 +55,13 @@ private:
     WorktreeDashboard *m_worktreeDashboard = nullptr;
     LogViewer *m_logViewer = nullptr;
     QLabel *m_gitStatusLabel = nullptr; // status-bar git widget for the active editor
-    QDockWidget *m_problemsDock = nullptr;
-    QDockWidget *m_referencesDock = nullptr;
-    QDockWidget *m_terminalDock = nullptr;
-    QAction *m_toggleBottomAct = nullptr;
-    KMultiTabBar *m_bottomStrip = nullptr;
+    QDockWidget *m_bottomDock = nullptr;
+    SideBar *m_bottomBar = nullptr;
+    int m_bottomTerminalId = -1;
+    int m_bottomReferencesId = -1;
+    int m_bottomProblemsId = -1;
     int m_lastBottomTab = -1; // last tab raised by the user, used to restore on Ctrl+J
+    QAction *m_toggleBottomAct = nullptr;
 
     QHash<KTextEditor::Document *, GutterController *> m_gutters;
     QHash<KTextEditor::Document *, BlameController *> m_blames;

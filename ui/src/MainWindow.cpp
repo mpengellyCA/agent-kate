@@ -11,6 +11,7 @@
 #include "TerminalPanel.h"
 #include "WelcomeDialog.h"
 #include "WorktreeDashboard.h"
+#include "shell/SideBar.h"
 #include "git/BlameController.h"
 #include "git/GutterController.h"
 #include "git/LogViewer.h"
@@ -46,8 +47,6 @@
 #include <QTabWidget>
 #include <QTimer>
 #include <QToolBar>
-
-#include <array>
 
 MainWindow::MainWindow(const QString &openPath, QWidget *parent)
     : KMainWindow(parent)
@@ -128,36 +127,51 @@ void MainWindow::setupUi()
     addDockWidget(Qt::RightDockWidgetArea, editorDock);
     splitDockWidget(treeDock, editorDock, Qt::Vertical);
 
-    // Bottom: the Problems panel, fed by the LSP manager. The three bottom
-    // docks share one slot — only one is visible at a time, driven by the
-    // KMultiTabBar strip below (see setupBottomStrip).
+    // Bottom: a single SideBar that hosts the Problems / References /
+    // Terminal panels in a Kate-style activity strip. One panel is raised at
+    // a time; clicking the raised tab collapses the strip's panel area. The
+    // bar itself stays visible so the user can re-raise without using a menu.
     m_lsp = new LspManager(this);
     auto *problems = new ProblemsPanel(m_lsp, this);
-    m_problemsDock = new QDockWidget(i18n("Problems"), this);
-    m_problemsDock->setObjectName(QStringLiteral("problemsDock"));
-    m_problemsDock->setWindowIcon(QIcon::fromTheme(QStringLiteral("dialog-warning")));
-    m_problemsDock->setWidget(problems);
-    addDockWidget(Qt::BottomDockWidgetArea, m_problemsDock);
+    auto *references = new ReferencesPanel(this);
+    m_terminal = new TerminalPanel(this);
     connect(problems, &ProblemsPanel::activated, this,
             [this](const QString &path, int line) {
                 m_editor->openFile(groupKey(), path, line);
             });
 
-    auto *references = new ReferencesPanel(this);
-    m_referencesDock = new QDockWidget(i18n("References"), this);
-    m_referencesDock->setObjectName(QStringLiteral("referencesDock"));
-    m_referencesDock->setWindowIcon(QIcon::fromTheme(QStringLiteral("dialog-information")));
-    m_referencesDock->setWidget(references);
-    addDockWidget(Qt::BottomDockWidgetArea, m_referencesDock);
-
-    m_terminal = new TerminalPanel(this);
-    m_terminalDock = new QDockWidget(i18n("Terminal"), this);
-    m_terminalDock->setObjectName(QStringLiteral("terminalDock"));
-    m_terminalDock->setWindowIcon(QIcon::fromTheme(QStringLiteral("utilities-terminal")));
-    m_terminalDock->setWidget(m_terminal);
-    addDockWidget(Qt::BottomDockWidgetArea, m_terminalDock);
-
     setupBottomStrip();
+    m_bottomTerminalId = m_bottomBar->addPanel(
+        QIcon::fromTheme(QStringLiteral("utilities-terminal")),
+        i18n("Terminal"), m_terminal);
+    m_bottomReferencesId = m_bottomBar->addPanel(
+        QIcon::fromTheme(QStringLiteral("dialog-information")),
+        i18n("References"), references);
+    m_bottomProblemsId = m_bottomBar->addPanel(
+        QIcon::fromTheme(QStringLiteral("dialog-warning")),
+        i18n("Problems"), problems);
+
+    const KConfigGroup viewCfg =
+        KSharedConfig::openConfig()->group(QStringLiteral("View"));
+    const int initialRaised = viewCfg.readEntry("bottomStrip", -1);
+    if (initialRaised >= 0) {
+        m_bottomBar->setRaisedId(initialRaised);
+        m_lastBottomTab = initialRaised;
+    }
+    connect(m_bottomBar, &SideBar::raisedChanged, this, [this](int id) {
+        if (id >= 0) {
+            m_lastBottomTab = id;
+            // Expanding from collapsed leaves the dock at its strip-only
+            // minimum — give the panel area a reasonable default height.
+            if (m_bottomDock && m_bottomDock->height()
+                <= m_bottomBar->tabBar()->sizeHint().height() + 4) {
+                resizeDocks({m_bottomDock}, {280}, Qt::Vertical);
+            }
+        }
+        KSharedConfig::openConfig()
+            ->group(QStringLiteral("View"))
+            .writeEntry("bottomStrip", id);
+    });
 
     // Outline panel — the active file's symbols, tabbed with the file tree.
     auto *outline = new OutlinePanel(this);
@@ -198,7 +212,11 @@ void MainWindow::setupUi()
             });
     connect(m_lsp, &LspManager::referencesResolved, references, &ReferencesPanel::setLocations);
     connect(m_lsp, &LspManager::referencesResolved, this,
-            [this](const QList<Location> &) { showBottomTab(1); });
+            [this](const QList<Location> &) {
+                if (m_bottomBar && m_bottomReferencesId >= 0) {
+                    m_bottomBar->setRaisedId(m_bottomReferencesId);
+                }
+            });
     connect(references, &ReferencesPanel::activated, this,
             [this](const QString &path, int line) {
                 m_editor->openFile(groupKey(), path, line);
@@ -216,7 +234,7 @@ void MainWindow::setupUi()
 
     resizeDocks({rosterDock, treeDock}, {270, 480}, Qt::Horizontal);
     resizeDocks({treeDock, editorDock}, {240, 620}, Qt::Vertical);
-    resizeDocks({m_problemsDock}, {230}, Qt::Vertical);
+    resizeDocks({m_bottomDock}, {230}, Qt::Vertical);
 
     connect(m_agent, &AgentDock::agentActivated, this, &MainWindow::onAgentActivated);
     connect(m_agent, &AgentDock::projectFocused, this,
@@ -395,14 +413,15 @@ void MainWindow::setupActions()
     m_toggleBottomAct->setToolTip(
         i18n("Show or hide the Terminal / References / Problems strip."));
     connect(m_toggleBottomAct, &QAction::triggered, this, [this] {
-        const bool anyVisible = m_problemsDock->isVisible()
-            || m_referencesDock->isVisible() || m_terminalDock->isVisible();
-        if (anyVisible) {
-            hideBottomTab(0);
-            hideBottomTab(1);
-            hideBottomTab(2);
+        if (!m_bottomBar) {
+            return;
+        }
+        if (m_bottomBar->raisedId() >= 0) {
+            m_bottomBar->setRaisedId(-1);
         } else {
-            showBottomTab(m_lastBottomTab >= 0 ? m_lastBottomTab : 2);
+            const int target = m_lastBottomTab >= 0 ? m_lastBottomTab
+                                                    : m_bottomProblemsId;
+            m_bottomBar->setRaisedId(target);
         }
     });
 
@@ -547,114 +566,20 @@ void MainWindow::onSave()
     m_editor->saveCurrent();
 }
 
-// setupBottomStrip installs a Kate-style KMultiTabBar across the bottom edge
-// of the window. The three bottom docks are hidden by default; clicking a tab
-// raises that dock (hiding the others) and clicking the raised tab again
-// collapses the row entirely so the editor reclaims the vertical space.
+// setupBottomStrip installs a Kate-style SideBar across the bottom edge of
+// the window. The three bottom panels share one slot — clicking a tab raises
+// that panel (hiding the others); clicking the raised tab collapses the
+// panel area entirely so the editor reclaims the vertical space. The bar
+// itself stays visible because the host dock's minimum height = strip height.
 void MainWindow::setupBottomStrip()
 {
-    auto *bar = addToolBar(i18n("Bottom Panel"));
-    bar->setObjectName(QStringLiteral("bottomStripBar"));
-    bar->setMovable(false);
-    bar->setFloatable(false);
-    bar->setContextMenuPolicy(Qt::PreventContextMenu);
-    addToolBar(Qt::BottomToolBarArea, bar);
-
-    m_bottomStrip = new KMultiTabBar(KMultiTabBar::Bottom, bar);
-    m_bottomStrip->setStyle(KMultiTabBar::VSNET);
-    m_bottomStrip->appendTab(QIcon::fromTheme(QStringLiteral("utilities-terminal")),
-                             0, i18n("Terminal"));
-    m_bottomStrip->appendTab(QIcon::fromTheme(QStringLiteral("dialog-information")),
-                             1, i18n("References"));
-    m_bottomStrip->appendTab(QIcon::fromTheme(QStringLiteral("dialog-warning")),
-                             2, i18n("Problems"));
-    bar->addWidget(m_bottomStrip);
-
-    const std::array<std::pair<int, QDockWidget *>, 3> mapping{{
-        {0, m_terminalDock}, {1, m_referencesDock}, {2, m_problemsDock}}};
-    for (const auto &[id, dock] : mapping) {
-        connect(m_bottomStrip->tab(id), &KMultiTabBarTab::clicked, this, [this, id] {
-            if (m_bottomStrip->isTabRaised(id)) {
-                showBottomTab(id);
-            } else {
-                hideBottomTab(id);
-            }
-        });
-        connect(dock, &QDockWidget::visibilityChanged, this,
-                [this, id](bool visible) { syncBottomTabFromDock(id, visible); });
-    }
-
-    const KConfigGroup cfg =
-        KSharedConfig::openConfig()->group(QStringLiteral("View"));
-    const int initial = cfg.readEntry("bottomTab", -1);
-    m_problemsDock->setVisible(false);
-    m_referencesDock->setVisible(false);
-    m_terminalDock->setVisible(false);
-    if (initial >= 0 && initial <= 2) {
-        showBottomTab(initial);
-    }
-}
-
-void MainWindow::showBottomTab(int id)
-{
-    if (!m_bottomStrip) {
-        return;
-    }
-    QDockWidget *target = id == 0 ? m_terminalDock
-                       : id == 1 ? m_referencesDock
-                       : id == 2 ? m_problemsDock : nullptr;
-    if (!target) {
-        return;
-    }
-    for (int other : {0, 1, 2}) {
-        if (other == id) {
-            continue;
-        }
-        QDockWidget *d = other == 0 ? m_terminalDock
-                       : other == 1 ? m_referencesDock : m_problemsDock;
-        d->setVisible(false);
-        m_bottomStrip->setTab(other, false);
-    }
-    target->setVisible(true);
-    target->raise();
-    m_bottomStrip->setTab(id, true);
-    m_lastBottomTab = id;
-    KSharedConfig::openConfig()
-        ->group(QStringLiteral("View"))
-        .writeEntry("bottomTab", id);
-}
-
-void MainWindow::hideBottomTab(int id)
-{
-    if (!m_bottomStrip) {
-        return;
-    }
-    QDockWidget *target = id == 0 ? m_terminalDock
-                       : id == 1 ? m_referencesDock
-                       : id == 2 ? m_problemsDock : nullptr;
-    if (!target) {
-        return;
-    }
-    target->setVisible(false);
-    m_bottomStrip->setTab(id, false);
-    KSharedConfig::openConfig()
-        ->group(QStringLiteral("View"))
-        .writeEntry("bottomTab", -1);
-}
-
-// syncBottomTabFromDock keeps the strip in sync when the dock's own × button
-// hides it, or when Qt restores dock state on startup.
-void MainWindow::syncBottomTabFromDock(int id, bool visible)
-{
-    if (!m_bottomStrip) {
-        return;
-    }
-    if (m_bottomStrip->isTabRaised(id) != visible) {
-        m_bottomStrip->setTab(id, visible);
-    }
-    if (visible) {
-        m_lastBottomTab = id;
-    }
+    m_bottomBar = new SideBar(KMultiTabBar::Bottom, this);
+    m_bottomDock = new QDockWidget(this);
+    m_bottomDock->setObjectName(QStringLiteral("bottomStripDock"));
+    m_bottomDock->setFeatures(QDockWidget::NoDockWidgetFeatures);
+    m_bottomDock->setTitleBarWidget(new QWidget(m_bottomDock));
+    m_bottomDock->setWidget(m_bottomBar);
+    addDockWidget(Qt::BottomDockWidgetArea, m_bottomDock);
 }
 
 // reloadExtensionServers asks the core for every installed VS Code extension
