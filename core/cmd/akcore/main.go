@@ -25,6 +25,7 @@ import (
 	"agentkate/internal/gitstatus"
 	"agentkate/internal/ipc"
 	"agentkate/internal/permission"
+	"agentkate/internal/search"
 	"agentkate/internal/session"
 	"agentkate/internal/skills"
 	"agentkate/internal/vsix"
@@ -1490,6 +1491,42 @@ func registerHandlers(d handlerDeps) {
 			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
 		}
 		return map[string]any{"patch": patch}, nil
+	})
+
+	// --- code search ----------------------------------------------------------
+	// search.code runs a filtered ripgrep across a project root. The UI calls
+	// it from its global search panel.
+	d.srv.Handle("search.code", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			Query         string   `json:"query"`
+			Root          string   `json:"root"`
+			Regex         bool     `json:"regex"`
+			CaseSensitive bool     `json:"caseSensitive"`
+			WholeWord     bool     `json:"wholeWord"`
+			Includes      []string `json:"includes"`
+			Excludes      []string `json:"excludes"`
+			MaxResults    int      `json:"maxResults"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		if p.Root == "" {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "root required")
+		}
+		res, err := search.Run(search.Options{
+			Query:         p.Query,
+			Root:          p.Root,
+			Regex:         p.Regex,
+			CaseSensitive: p.CaseSensitive,
+			WholeWord:     p.WholeWord,
+			Includes:      p.Includes,
+			Excludes:      p.Excludes,
+			MaxResults:    p.MaxResults,
+		})
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		return res, nil
 	})
 }
 

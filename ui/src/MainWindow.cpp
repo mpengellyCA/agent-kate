@@ -6,6 +6,7 @@
 #include "ProblemsPanel.h"
 #include "ProjectTree.h"
 #include "ReferencesPanel.h"
+#include "SearchPanel.h"
 #include "SessionBrowserDialog.h"
 #include "SkillsDialog.h"
 #include "TerminalPanel.h"
@@ -166,6 +167,21 @@ void MainWindow::setupUi()
     outlineDock->setWidget(outline);
     addDockWidget(Qt::RightDockWidgetArea, outlineDock);
     tabifyDockWidget(treeDock, outlineDock);
+
+    // Search panel — global ripgrep-backed code search with case/regex/word
+    // toggles and include/exclude glob filters. Tabified into the right column
+    // so it sits next to the files / outline / worktrees tabs.
+    m_search = new SearchPanel(m_core, this);
+    m_searchDock = new QDockWidget(i18n("Search"), this);
+    m_searchDock->setObjectName(QStringLiteral("searchDock"));
+    m_searchDock->setWindowIcon(QIcon::fromTheme(QStringLiteral("edit-find")));
+    m_searchDock->setWidget(m_search);
+    addDockWidget(Qt::RightDockWidgetArea, m_searchDock);
+    tabifyDockWidget(treeDock, m_searchDock);
+    connect(m_search, &SearchPanel::resultActivated, this,
+            [this](const QString &path, int line) {
+                m_editor->openFile(groupKey(), path, line);
+            });
 
     // Worktree dashboard — every agent's branch / ahead / behind / dirty
     // count, polled at 1 Hz. Tabbed with the file tree so the right column
@@ -406,6 +422,21 @@ void MainWindow::setupActions()
         }
     });
 
+    auto *findInProjAct = viewMenu->addAction(
+        QIcon::fromTheme(QStringLiteral("edit-find")),
+        i18n("Find in &Project…"));
+    findInProjAct->setShortcut(Qt::CTRL | Qt::SHIFT | Qt::Key_F);
+    findInProjAct->setToolTip(
+        i18n("Search the active project with filters (case, regex, globs)."));
+    connect(findInProjAct, &QAction::triggered, this, [this] {
+        if (!m_searchDock || !m_search) {
+            return;
+        }
+        m_searchDock->setVisible(true);
+        m_searchDock->raise();
+        m_search->focusQuery();
+    });
+
     QMenu *codeMenu = menuBar()->addMenu(i18n("&Code"));
     QAction *defAct = codeMenu->addAction(i18n("Go to &Definition"));
     defAct->setShortcut(Qt::Key_F12);
@@ -515,6 +546,9 @@ void MainWindow::onAgentActivated(int agentId, const QString &projectPath)
     m_activeProject = projectPath;
     m_tree->setRoot(projectPath);
     m_terminal->setWorkingDirectory(projectPath);
+    if (m_search) {
+        m_search->setProjectRoot(projectPath);
+    }
     if (m_logViewer) {
         m_logViewer->setActiveSource(projectPath, m_agent->currentThreadId());
     }
