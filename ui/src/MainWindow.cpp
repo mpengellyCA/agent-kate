@@ -41,6 +41,7 @@
 #include <QDebug>
 #include <QDir>
 #include <QFileInfo>
+#include <QHBoxLayout>
 #include <QIcon>
 #include <QJsonArray>
 #include <QJsonObject>
@@ -57,6 +58,7 @@
 #include <QTabWidget>
 #include <QTimer>
 #include <QToolBar>
+#include <QToolButton>
 
 MainWindow::MainWindow(const QString &openPath, QWidget *parent)
     : KMainWindow(parent)
@@ -71,6 +73,7 @@ MainWindow::MainWindow(const QString &openPath, QWidget *parent)
     setupTopToolbar();
     setupHamburger();
     setupShellShortcuts();
+    setupPerspectives();
     setupCore();
 
     // Resolve the launch argument: a file opens its parent directory as the
@@ -579,6 +582,88 @@ void MainWindow::setupShellShortcuts()
     });
 }
 
+// setupPerspectives adds a small menu of named layout snapshots — Code Focus,
+// Chat Focus, and Reset — that the hamburger surfaces under "View ▸ Perspective".
+void MainWindow::setupPerspectives()
+{
+    auto *view = menuBar()->findChild<QMenu *>(QString(), Qt::FindDirectChildrenOnly);
+    Q_UNUSED(view);
+    // Build a fresh menu we then insert under the existing &View entry.
+    m_perspectivesMenu = new QMenu(i18n("&Perspective"), this);
+    auto add = [this](const QString &label, const QString &key,
+                      const QKeySequence &shortcut = QKeySequence()) {
+        QAction *act = m_perspectivesMenu->addAction(label);
+        if (!shortcut.isEmpty()) {
+            act->setShortcut(shortcut);
+        }
+        connect(act, &QAction::triggered, this, [this, key] { applyPerspective(key); });
+    };
+    add(i18n("&Code Focus"), QStringLiteral("code"),
+        Qt::CTRL | Qt::SHIFT | Qt::Key_1);
+    add(i18n("C&hat Focus"), QStringLiteral("chat"),
+        Qt::CTRL | Qt::SHIFT | Qt::Key_2);
+    add(i18n("&Review"), QStringLiteral("review"),
+        Qt::CTRL | Qt::SHIFT | Qt::Key_3);
+    m_perspectivesMenu->addSeparator();
+    add(i18n("&Reset Layout"), QStringLiteral("reset"));
+
+    // Attach the perspectives submenu to the existing &View menu so the
+    // hamburger picks it up automatically.
+    for (QAction *a : menuBar()->actions()) {
+        if (a->text() == i18n("&View") && a->menu()) {
+            a->menu()->addSeparator();
+            a->menu()->addMenu(m_perspectivesMenu);
+            break;
+        }
+    }
+}
+
+void MainWindow::applyPerspective(const QString &name)
+{
+    if (!m_shell) {
+        return;
+    }
+    auto *agent = m_agent ? m_agent->panelStack() : nullptr;
+    auto *editor = m_editor;
+    if (name == QLatin1String("code")) {
+        if (editor) editor->setVisible(true);
+        if (agent) agent->setVisible(false);
+        if (m_bottomBar) m_bottomBar->setRaisedId(-1);
+        if (m_leftBar && m_leftFilesId >= 0) m_leftBar->setRaisedId(m_leftFilesId);
+        if (m_rightBar) m_rightBar->setRaisedId(-1);
+        if (auto *v = m_editor ? m_editor->currentView() : nullptr) v->setFocus();
+    } else if (name == QLatin1String("chat")) {
+        if (editor) editor->setVisible(false);
+        if (agent) agent->setVisible(true);
+        if (m_leftBar && m_leftRosterId >= 0) m_leftBar->setRaisedId(m_leftRosterId);
+        if (m_rightBar) m_rightBar->setRaisedId(-1);
+        if (m_bottomBar) m_bottomBar->setRaisedId(-1);
+        if (m_agent) {
+            if (auto *p = m_agent->activePanel()) p->setFocus();
+        }
+    } else if (name == QLatin1String("review")) {
+        if (editor) editor->setVisible(true);
+        if (agent) agent->setVisible(true);
+        if (m_leftBar) m_leftBar->setRaisedId(-1);
+        if (m_rightBar && m_rightGitLogId >= 0)
+            m_rightBar->setRaisedId(m_rightGitLogId);
+        if (m_bottomBar && m_bottomProblemsId >= 0)
+            m_bottomBar->setRaisedId(m_bottomProblemsId);
+    } else if (name == QLatin1String("reset")) {
+        if (editor) editor->setVisible(true);
+        if (agent) agent->setVisible(true);
+        if (m_leftBar && m_leftRosterId >= 0) m_leftBar->setRaisedId(m_leftRosterId);
+        if (m_rightBar && m_rightWorktreesId >= 0)
+            m_rightBar->setRaisedId(m_rightWorktreesId);
+        if (m_bottomBar) m_bottomBar->setRaisedId(-1);
+        // Restore a 60/40 editor/agent split.
+        if (auto *h = m_shell->centreHSplitter()) {
+            h->setSizes({700, 500});
+        }
+    }
+    statusBar()->showMessage(i18n("Perspective: %1", name), 3000);
+}
+
 void MainWindow::setupCore()
 {
     // The status bar is the landing spot for transient agent feedback —
@@ -752,11 +837,15 @@ void MainWindow::setupTopToolbar()
     toolbar->setContextMenuPolicy(Qt::PreventContextMenu);
     addToolBar(Qt::TopToolBarArea, toolbar);
 
-    m_breadcrumbLabel = new QLabel(toolbar);
-    m_breadcrumbLabel->setContentsMargins(8, 0, 8, 0);
+    m_breadcrumbWidget = new QWidget(toolbar);
+    auto *crumbLayout = new QHBoxLayout(m_breadcrumbWidget);
+    crumbLayout->setContentsMargins(8, 0, 8, 0);
+    crumbLayout->setSpacing(2);
+    m_breadcrumbLabel = new QLabel(m_breadcrumbWidget);
     m_breadcrumbLabel->setTextFormat(Qt::PlainText);
-    m_breadcrumbLabel->setMinimumWidth(120);
-    toolbar->addWidget(m_breadcrumbLabel);
+    crumbLayout->addWidget(m_breadcrumbLabel);
+    crumbLayout->addStretch();
+    toolbar->addWidget(m_breadcrumbWidget);
 
     auto *stretch = new QWidget(toolbar);
     stretch->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
@@ -783,21 +872,67 @@ void MainWindow::setupTopToolbar()
 
 void MainWindow::updateBreadcrumb(const QString &path)
 {
-    if (!m_breadcrumbLabel) {
+    if (!m_breadcrumbWidget) {
         return;
     }
-    if (path.isEmpty() || m_activeProject.isEmpty()) {
-        m_breadcrumbLabel->setText(m_activeProject.isEmpty()
-            ? QString() : QDir(m_activeProject).dirName());
+    // Rebuild the segment row each refresh — cheap, and the segments aren't
+    // styled per-segment so a churn here is invisible to the user.
+    auto *layout = static_cast<QHBoxLayout *>(m_breadcrumbWidget->layout());
+    if (!layout) {
         return;
     }
-    const QString project = QDir(m_activeProject).dirName();
-    const QString rel = QDir(m_activeProject).relativeFilePath(path);
-    QString crumb = project;
-    for (const QString &seg : rel.split(QLatin1Char('/'), Qt::SkipEmptyParts)) {
-        crumb += QStringLiteral("  ›  ") + seg;
+    while (auto *item = layout->takeAt(0)) {
+        if (auto *w = item->widget()) {
+            w->deleteLater();
+        }
+        delete item;
     }
-    m_breadcrumbLabel->setText(crumb);
+    m_breadcrumbLabel = nullptr;
+
+    auto addLabel = [&](const QString &text) {
+        auto *lbl = new QLabel(text, m_breadcrumbWidget);
+        lbl->setForegroundRole(QPalette::PlaceholderText);
+        layout->addWidget(lbl);
+    };
+    auto addSegment = [&](const QString &text, const QString &openDir) {
+        auto *btn = new QToolButton(m_breadcrumbWidget);
+        btn->setText(text);
+        btn->setAutoRaise(true);
+        btn->setToolButtonStyle(Qt::ToolButtonTextOnly);
+        btn->setCursor(Qt::PointingHandCursor);
+        connect(btn, &QToolButton::clicked, this, [this, openDir] {
+            if (!openDir.isEmpty() && m_tree) {
+                m_tree->setRoot(openDir);
+                if (m_leftBar && m_leftFilesId >= 0) {
+                    m_leftBar->setRaisedId(m_leftFilesId);
+                }
+            }
+        });
+        layout->addWidget(btn);
+    };
+
+    if (m_activeProject.isEmpty()) {
+        layout->addStretch();
+        return;
+    }
+    addSegment(QDir(m_activeProject).dirName(), m_activeProject);
+    if (!path.isEmpty()) {
+        const QString rel = QDir(m_activeProject).relativeFilePath(path);
+        const QStringList segs = rel.split(QLatin1Char('/'), Qt::SkipEmptyParts);
+        QString accumulated = m_activeProject;
+        for (int i = 0; i < segs.size(); ++i) {
+            addLabel(QStringLiteral("›"));
+            accumulated = QDir(accumulated).filePath(segs[i]);
+            // Only intermediate segments open a directory; the final segment
+            // is the file itself, so its click just navigates the tree to
+            // its parent directory.
+            const QString openDir = (i == segs.size() - 1)
+                ? QFileInfo(accumulated).absolutePath()
+                : accumulated;
+            addSegment(segs[i], openDir);
+        }
+    }
+    layout->addStretch();
 }
 
 void MainWindow::updateAgentBadge()

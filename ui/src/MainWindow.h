@@ -43,7 +43,9 @@ private:
     void setupHamburger();
     void setupTopToolbar();
     void setupShellShortcuts();
+    void setupPerspectives();
     void setupCore();
+    void applyPerspective(const QString &name);
     void updateCursorStatus();
     void updateBreadcrumb(const QString &path);
     void updateAgentBadge();
@@ -88,8 +90,11 @@ private:
     int m_lastBottomTab = -1; // last tab raised by the user, used to restore on Ctrl+J
     QAction *m_toggleBottomAct = nullptr;
 
+    QMenu *m_perspectivesMenu = nullptr;
+
     // Top toolbar + status-bar widgets
-    QLabel *m_breadcrumbLabel = nullptr;
+    QWidget *m_breadcrumbWidget = nullptr; // hosts clickable segment buttons
+    QLabel *m_breadcrumbLabel = nullptr;   // fallback when no file is open
     QLabel *m_agentBadge = nullptr;       // top-toolbar agent chip
     QLabel *m_cursorPosLabel = nullptr;   // status bar: Ln 42 Col 17
     QLabel *m_modeLabel = nullptr;        // status bar: UTF-8 LF C++
