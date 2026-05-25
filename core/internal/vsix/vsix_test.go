@@ -171,6 +171,94 @@ func TestIntelephenseRegistry(t *testing.T) {
 	}
 }
 
+func TestHeuristicFindsTailwindStyleServer(t *testing.T) {
+	dir := t.TempDir()
+	// A Tailwind-style layout: activation bundle in dist/extension.js spawns
+	// dist/tailwindServer.js. The basename doesn't match server.js exactly,
+	// so detection has to come from the main-script scan.
+	writeExtension(t, dir, `{
+		"name":"vscode-tailwindcss","version":"0.14.0","main":"dist/extension.js",
+		"contributes":{"languages":[{"id":"tailwindcss","extensions":[".css"]}]}
+	}`, map[string]string{
+		"dist/extension.js":      `const serverModule = "./tailwindServer.js"; require(serverModule);`,
+		"dist/tailwindServer.js": "//server",
+	})
+
+	ext, err := load("bradlc.vscode-tailwindcss", dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if ext.Server == nil {
+		t.Fatal("expected a recipe via main-scan or basename suffix match")
+	}
+	if !strings.HasSuffix(ext.Server.Args[0], "tailwindServer.js") {
+		t.Fatalf("recipe args = %v, want tailwindServer.js", ext.Server.Args)
+	}
+}
+
+func TestMainScanRejectsPathTraversal(t *testing.T) {
+	dir := t.TempDir()
+	// A package.json main pointing at ../../etc/passwd must not be honored.
+	writeExtension(t, dir, `{
+		"name":"evil","version":"1.0.0","main":"../../../../../../etc/passwd",
+		"contributes":{"languages":[{"id":"x","extensions":[".x"]}]}
+	}`, nil)
+	// And a literal inside a real main that tries to escape should be ignored.
+	writeExtension(t, dir+"-2", `{
+		"name":"evil2","version":"1.0.0","main":"dist/extension.js",
+		"contributes":{"languages":[{"id":"x","extensions":[".x"]}]}
+	}`, map[string]string{
+		"dist/extension.js": `require("../../../../etc/server.js");`,
+	})
+	for _, d := range []string{dir, dir + "-2"} {
+		ext, err := load("acme.evil", d)
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		if ext.Server != nil {
+			t.Fatalf("traversing main must not yield a recipe, got %+v", ext.Server)
+		}
+	}
+}
+
+func TestMainScanCaps(t *testing.T) {
+	// An oversized main bundle still gets scanned (we read up to the cap)
+	// but does not exhaust memory. We assert detection still works when the
+	// server string sits inside the first cap-bytes window.
+	dir := t.TempDir()
+	prefix := `var x = "./dist/realServer.js"; ` // server reference up front
+	padding := strings.Repeat("x", 1<<20)         // 1 MiB of filler
+	writeExtension(t, dir, `{
+		"name":"big","version":"1.0.0","main":"dist/extension.js",
+		"contributes":{"languages":[{"id":"x","extensions":[".x"]}]}
+	}`, map[string]string{
+		"dist/extension.js": prefix + padding,
+		"dist/realServer.js": "//s",
+	})
+	ext, err := load("acme.big", dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if ext.Server == nil || !strings.HasSuffix(ext.Server.Args[0], "realServer.js") {
+		t.Fatalf("expected realServer.js recipe, got %+v", ext.Server)
+	}
+}
+
+func TestCatalogLoads(t *testing.T) {
+	c := Catalog()
+	if len(c) == 0 {
+		t.Fatal("embedded catalog is empty")
+	}
+	for _, e := range c {
+		if e.ID == "" || e.DisplayName == "" {
+			t.Fatalf("catalog entry missing fields: %+v", e)
+		}
+		if !strings.Contains(e.ID, ".") {
+			t.Fatalf("catalog id %q must be publisher.name", e.ID)
+		}
+	}
+}
+
 func TestNoRecipeForNonLanguageExtension(t *testing.T) {
 	dir := t.TempDir()
 	writeExtension(t, dir, `{"name":"theme","version":"1.0.0"}`, nil)
