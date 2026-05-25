@@ -25,10 +25,13 @@
 #include <KAboutData>
 #include <KMultiTabBar>
 #include <KConfigGroup>
+#include <KHamburgerMenu>
 #include <KHelpMenu>
 #include <KLocalizedString>
 #include <KSharedConfig>
 #include <KStandardAction>
+#include <KToggleAction>
+#include <KToolBar>
 
 #include <QAction>
 #include <QActionGroup>
@@ -44,6 +47,7 @@
 #include <QMenu>
 #include <QMenuBar>
 #include <QLabel>
+#include <QLineEdit>
 #include <QStackedWidget>
 #include <QStatusBar>
 #include <QTabWidget>
@@ -60,6 +64,8 @@ MainWindow::MainWindow(const QString &openPath, QWidget *parent)
 
     setupUi();
     setupActions();
+    setupTopToolbar();
+    setupHamburger();
     setupCore();
 
     // Resolve the launch argument: a file opens its parent directory as the
@@ -483,24 +489,41 @@ void MainWindow::setupCore()
         statusBar()->showMessage(text, 8000);
     });
 
-    // Permanent git status widget on the right of the status bar. Populated
-    // by the active editor's GutterController as it polls the core.
+    // Cursor / mode / git / agent labels live as permanent status-bar widgets
+    // so they survive the transient showMessage timeouts the agent uses for
+    // toasts. Layout (left → right): git · Ln/Col · mode · agent.
     m_gitStatusLabel = new QLabel(this);
     m_gitStatusLabel->setContentsMargins(8, 0, 8, 0);
     m_gitStatusLabel->setStyleSheet(QStringLiteral("color: palette(mid);"));
     statusBar()->addPermanentWidget(m_gitStatusLabel);
 
+    m_cursorPosLabel = new QLabel(this);
+    m_cursorPosLabel->setContentsMargins(8, 0, 8, 0);
+    statusBar()->addPermanentWidget(m_cursorPosLabel);
+
+    m_modeLabel = new QLabel(this);
+    m_modeLabel->setContentsMargins(8, 0, 8, 0);
+    statusBar()->addPermanentWidget(m_modeLabel);
+
+    m_agentStatusLabel = new QLabel(this);
+    m_agentStatusLabel->setContentsMargins(8, 0, 8, 0);
+    statusBar()->addPermanentWidget(m_agentStatusLabel);
+
     connect(m_editor, &EditorArea::currentFileChanged, this, [this](const QString &path) {
         m_activeFilePath = path;
-        if (!m_gitStatusLabel) {
-            return;
+        if (m_gitStatusLabel) {
+            if (path.isEmpty()) {
+                m_gitStatusLabel->clear();
+            } else {
+                m_gitStatusLabel->setText(QStringLiteral("⎇ …"));
+            }
         }
-        if (path.isEmpty()) {
-            m_gitStatusLabel->clear();
-        } else {
-            m_gitStatusLabel->setText(QStringLiteral("⎇ …"));
-        }
+        updateCursorStatus();
     });
+    connect(m_agent, &AgentDock::agentActivated, this,
+            [this](int, const QString &) { updateAgentBadge(); });
+    updateAgentBadge();
+    updateCursorStatus();
 
     connect(m_core, &CoreClient::coreLog, this,
             [](const QString &line) { qInfo().noquote() << "[akcore]" << line; });
@@ -586,6 +609,153 @@ void MainWindow::closeEvent(QCloseEvent *event)
 {
     persistShellState();
     KMainWindow::closeEvent(event);
+}
+
+// setupHamburger replaces the classic menubar with a Dolphin/Kate-style ☰
+// button that mirrors the menubar's contents. The menubar remains in the
+// tree (so the hamburger has something to mirror) but starts hidden;
+// Ctrl+M toggles it for users who want the classic look.
+void MainWindow::setupHamburger()
+{
+    KToggleAction *showMenubarAct = KStandardAction::showMenubar(
+        this, [this](bool on) {
+            menuBar()->setVisible(on);
+            KSharedConfig::openConfig()
+                ->group(QStringLiteral("View"))
+                .writeEntry("menubar", on);
+        }, this);
+    showMenubarAct->setShortcut(Qt::CTRL | Qt::Key_M);
+
+    const bool wantMenubar = KSharedConfig::openConfig()
+        ->group(QStringLiteral("View"))
+        .readEntry("menubar", false);
+    menuBar()->setVisible(wantMenubar);
+    showMenubarAct->setChecked(wantMenubar);
+
+    auto *toolbar = toolBar(QStringLiteral("topToolbar"));
+    auto *hamburger = new KHamburgerMenu(this);
+    hamburger->setMenuBar(menuBar());
+    hamburger->setShowMenuBarAction(showMenubarAct);
+    toolbar->addAction(hamburger);
+    hamburger->hideActionsOf(toolbar);
+}
+
+// setupTopToolbar adds a thin toolbar with the breadcrumb, a placeholder
+// global-search field, and an agent badge. The hamburger button is added
+// by setupHamburger() and must run after this so the toolbar exists.
+void MainWindow::setupTopToolbar()
+{
+    auto *toolbar = toolBar(QStringLiteral("topToolbar"));
+    toolbar->setMovable(false);
+    toolbar->setFloatable(false);
+    toolbar->setIconSize(QSize(16, 16));
+    toolbar->setContextMenuPolicy(Qt::PreventContextMenu);
+    addToolBar(Qt::TopToolBarArea, toolbar);
+
+    m_breadcrumbLabel = new QLabel(toolbar);
+    m_breadcrumbLabel->setContentsMargins(8, 0, 8, 0);
+    m_breadcrumbLabel->setTextFormat(Qt::PlainText);
+    m_breadcrumbLabel->setMinimumWidth(120);
+    toolbar->addWidget(m_breadcrumbLabel);
+
+    auto *stretch = new QWidget(toolbar);
+    stretch->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    toolbar->addWidget(stretch);
+
+    // Placeholder global-symbol search (wiring lives in Phase 4).
+    auto *search = new QLineEdit(toolbar);
+    search->setPlaceholderText(i18n("Search…  (Ctrl+T)"));
+    search->setClearButtonEnabled(true);
+    search->addAction(QIcon::fromTheme(QStringLiteral("search")),
+                      QLineEdit::LeadingPosition);
+    search->setFixedWidth(260);
+    search->setEnabled(false); // disabled until Phase 4 wires global symbol search
+    toolbar->addWidget(search);
+
+    m_agentBadge = new QLabel(toolbar);
+    m_agentBadge->setContentsMargins(8, 2, 8, 2);
+    m_agentBadge->setTextFormat(Qt::PlainText);
+    toolbar->addWidget(m_agentBadge);
+
+    connect(m_editor, &EditorArea::currentFileChanged, this,
+            &MainWindow::updateBreadcrumb);
+}
+
+void MainWindow::updateBreadcrumb(const QString &path)
+{
+    if (!m_breadcrumbLabel) {
+        return;
+    }
+    if (path.isEmpty() || m_activeProject.isEmpty()) {
+        m_breadcrumbLabel->setText(m_activeProject.isEmpty()
+            ? QString() : QDir(m_activeProject).dirName());
+        return;
+    }
+    const QString project = QDir(m_activeProject).dirName();
+    const QString rel = QDir(m_activeProject).relativeFilePath(path);
+    QString crumb = project;
+    for (const QString &seg : rel.split(QLatin1Char('/'), Qt::SkipEmptyParts)) {
+        crumb += QStringLiteral("  ›  ") + seg;
+    }
+    m_breadcrumbLabel->setText(crumb);
+}
+
+void MainWindow::updateAgentBadge()
+{
+    if (m_agentBadge) {
+        const QString tid = m_agent ? m_agent->currentThreadId() : QString();
+        m_agentBadge->setText(tid.isEmpty()
+            ? i18n("no active agent")
+            : i18n("agent: %1", tid));
+    }
+    if (m_agentStatusLabel) {
+        const QString tid = m_agent ? m_agent->currentThreadId() : QString();
+        m_agentStatusLabel->setText(tid.isEmpty()
+            ? i18n("· no agent")
+            : QStringLiteral("● ") + tid);
+    }
+}
+
+void MainWindow::updateCursorStatus()
+{
+    KTextEditor::View *view = m_editor ? m_editor->currentView() : nullptr;
+    if (view != m_observedView) {
+        if (m_observedView) {
+            disconnect(m_observedView, nullptr, this, nullptr);
+        }
+        m_observedView = view;
+        if (view) {
+            connect(view, &KTextEditor::View::cursorPositionChanged, this,
+                    [this](KTextEditor::View *, const KTextEditor::Cursor &) {
+                        updateCursorStatus();
+                    });
+            connect(view, &QObject::destroyed, this, [this](QObject *o) {
+                if (m_observedView == o) {
+                    m_observedView = nullptr;
+                    updateCursorStatus();
+                }
+            });
+        }
+    }
+    if (!view) {
+        if (m_cursorPosLabel) m_cursorPosLabel->clear();
+        if (m_modeLabel) m_modeLabel->clear();
+        return;
+    }
+    const auto cursor = view->cursorPosition();
+    if (m_cursorPosLabel) {
+        m_cursorPosLabel->setText(
+            i18n("Ln %1, Col %2", cursor.line() + 1, cursor.column() + 1));
+    }
+    if (m_modeLabel) {
+        KTextEditor::Document *doc = view->document();
+        const QString enc = doc->encoding().isEmpty()
+            ? QStringLiteral("UTF-8") : doc->encoding();
+        const QString mode = doc->mode();
+        m_modeLabel->setText(mode.isEmpty()
+            ? enc
+            : QStringLiteral("%1 · %2").arg(enc, mode));
+    }
 }
 
 // reloadExtensionServers asks the core for every installed VS Code extension

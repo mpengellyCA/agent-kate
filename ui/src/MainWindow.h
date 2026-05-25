@@ -6,6 +6,7 @@
 
 namespace KTextEditor {
 class Document;
+class View;
 }
 class GutterController;
 class BlameController;
@@ -39,7 +40,12 @@ protected:
 private:
     void setupUi();
     void setupActions();
+    void setupHamburger();
+    void setupTopToolbar();
     void setupCore();
+    void updateCursorStatus();
+    void updateBreadcrumb(const QString &path);
+    void updateAgentBadge();
     void onSave();
     void reloadExtensionServers();
     void onAgentActivated(int agentId, const QString &projectPath);
@@ -75,6 +81,14 @@ private:
 
     int m_lastBottomTab = -1; // last tab raised by the user, used to restore on Ctrl+J
     QAction *m_toggleBottomAct = nullptr;
+
+    // Top toolbar + status-bar widgets
+    QLabel *m_breadcrumbLabel = nullptr;
+    QLabel *m_agentBadge = nullptr;       // top-toolbar agent chip
+    QLabel *m_cursorPosLabel = nullptr;   // status bar: Ln 42 Col 17
+    QLabel *m_modeLabel = nullptr;        // status bar: UTF-8 LF C++
+    QLabel *m_agentStatusLabel = nullptr; // status bar (rightmost): agent name + dot
+    KTextEditor::View *m_observedView = nullptr; // currently wired-for-cursor
 
     QHash<KTextEditor::Document *, GutterController *> m_gutters;
     QHash<KTextEditor::Document *, BlameController *> m_blames;
