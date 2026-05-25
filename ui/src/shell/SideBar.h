@@ -33,6 +33,8 @@ public:
     bool isPanelVisible(int id) const;
     int  raisedId() const;       // -1 when the strip is collapsed
     void setRaisedId(int id);    // -1 collapses the panel area
+    int  panelCount() const { return m_ids.size(); }
+    int  panelIdAt(int index) const; // -1 if index is out of range
 
     void saveState(KConfigGroup &grp) const;
     void restoreState(const KConfigGroup &grp);

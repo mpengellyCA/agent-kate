@@ -13,6 +13,7 @@
 #include "WorktreeDashboard.h"
 #include "shell/ShellLayout.h"
 #include "shell/SideBar.h"
+#include "shell/StubPanel.h"
 #include "git/BlameController.h"
 #include "git/GutterController.h"
 #include "git/LogViewer.h"
@@ -48,6 +49,9 @@
 #include <QMenuBar>
 #include <QLabel>
 #include <QLineEdit>
+#include <QPlainTextEdit>
+#include <QShortcut>
+#include <QSplitter>
 #include <QStackedWidget>
 #include <QStatusBar>
 #include <QTabWidget>
@@ -66,6 +70,7 @@ MainWindow::MainWindow(const QString &openPath, QWidget *parent)
     setupActions();
     setupTopToolbar();
     setupHamburger();
+    setupShellShortcuts();
     setupCore();
 
     // Resolve the launch argument: a file opens its parent directory as the
@@ -151,6 +156,11 @@ void MainWindow::setupUi()
     m_leftOutlineId = m_leftBar->addPanel(
         QIcon::fromTheme(QStringLiteral("code-context")),
         i18n("Outline"), outline);
+    m_leftSearchId = m_leftBar->addPanel(
+        QIcon::fromTheme(QStringLiteral("search")),
+        i18n("Search"),
+        new StubPanel(i18n("Search"),
+                      i18n("Cross-project symbol and full-text search lands here."), this));
 
     m_rightWorktreesId = m_rightBar->addPanel(
         QIcon::fromTheme(QStringLiteral("vcs-branch")),
@@ -158,6 +168,18 @@ void MainWindow::setupUi()
     m_rightGitLogId = m_rightBar->addPanel(
         QIcon::fromTheme(QStringLiteral("vcs-commit")),
         i18n("Git Log"), m_logViewer);
+    m_rightCoopId = m_rightBar->addPanel(
+        QIcon::fromTheme(QStringLiteral("im-user")),
+        i18n("Cooperation"),
+        new StubPanel(i18n("Cooperation"),
+                      i18n("Live agent presence and file locks from the Cooperation MCP."),
+                      this));
+    m_rightInspectorId = m_rightBar->addPanel(
+        QIcon::fromTheme(QStringLiteral("view-statistics")),
+        i18n("AI Inspector"),
+        new StubPanel(i18n("AI Inspector"),
+                      i18n("Tool-call timeline and token spend for the active agent."),
+                      this));
 
     m_bottomTerminalId = m_bottomBar->addPanel(
         QIcon::fromTheme(QStringLiteral("utilities-terminal")),
@@ -168,6 +190,30 @@ void MainWindow::setupUi()
     m_bottomProblemsId = m_bottomBar->addPanel(
         QIcon::fromTheme(QStringLiteral("dialog-warning")),
         i18n("Problems"), problems);
+    auto *coreLogView = new QPlainTextEdit(this);
+    coreLogView->setReadOnly(true);
+    coreLogView->setMaximumBlockCount(5000);
+    coreLogView->setFrameShape(QFrame::NoFrame);
+    m_bottomOutputId = m_bottomBar->addPanel(
+        QIcon::fromTheme(QStringLiteral("utilities-log-viewer")),
+        i18n("Output"), coreLogView);
+    m_bottomTasksId = m_bottomBar->addPanel(
+        QIcon::fromTheme(QStringLiteral("view-task")),
+        i18n("Tasks"),
+        new StubPanel(i18n("Tasks / Hooks"),
+                      i18n("Background tasks, hook runs, and queued work appear here."),
+                      this));
+    // Wire the Output panel to drain m_core's coreLog. m_core does not exist
+    // yet (setupCore runs after setupUi); defer the connect via a queued
+    // single-shot, by which time m_core is constructed.
+    QTimer::singleShot(0, this, [this, coreLogView] {
+        if (m_core) {
+            connect(m_core, &CoreClient::coreLog, coreLogView,
+                    [coreLogView](const QString &line) {
+                        coreLogView->appendPlainText(line);
+                    });
+        }
+    });
 
     ShellLayout::Slots shellSlots;
     shellSlots.leftBar = m_leftBar->tabBar();
@@ -477,6 +523,60 @@ void MainWindow::setupActions()
 
     auto *helpMenu = new KHelpMenu(this, KAboutData::applicationData());
     menuBar()->addMenu(helpMenu->menu());
+}
+
+// setupShellShortcuts wires the JetBrains-style raise-by-ordinal accelerators
+// for the left/right strips, plus Ctrl+E / Ctrl+Shift+E perspective toggles.
+void MainWindow::setupShellShortcuts()
+{
+    auto bindRaise = [this](SideBar *bar, QKeyCombination base) {
+        for (int i = 0; i < 9; ++i) {
+            const QKeySequence seq(
+                QKeyCombination(base.keyboardModifiers(),
+                                static_cast<Qt::Key>(Qt::Key_1 + i)));
+            auto *sc = new QShortcut(seq, this);
+            connect(sc, &QShortcut::activated, this, [bar, i] {
+                const int id = bar->panelIdAt(i);
+                if (id >= 0) {
+                    bar->setRaisedId(bar->raisedId() == id ? -1 : id);
+                }
+            });
+        }
+        const QKeySequence collapseSeq(
+            QKeyCombination(base.keyboardModifiers(), Qt::Key_0));
+        auto *collapse = new QShortcut(collapseSeq, this);
+        connect(collapse, &QShortcut::activated, this,
+                [bar] { bar->setRaisedId(-1); });
+    };
+    bindRaise(m_leftBar, QKeyCombination(Qt::AltModifier, Qt::Key_0));
+    bindRaise(m_rightBar,
+              QKeyCombination(Qt::ControlModifier | Qt::AltModifier, Qt::Key_0));
+
+    // Ctrl+E — focus editor / collapse agent panel.
+    auto *focusEditor = new QShortcut(Qt::CTRL | Qt::Key_E, this);
+    connect(focusEditor, &QShortcut::activated, this, [this] {
+        if (auto *agent = m_agent ? m_agent->panelStack() : nullptr) {
+            agent->setVisible(!agent->isVisible() ? true : false);
+            if (!agent->isVisible() && m_editor) {
+                m_editor->setFocus();
+                if (auto *v = m_editor->currentView()) {
+                    v->setFocus();
+                }
+            }
+        }
+    });
+    // Ctrl+Shift+E — focus agent panel / collapse editor.
+    auto *focusAgent = new QShortcut(Qt::CTRL | Qt::SHIFT | Qt::Key_E, this);
+    connect(focusAgent, &QShortcut::activated, this, [this] {
+        if (m_editor) {
+            m_editor->setVisible(!m_editor->isVisible() ? true : false);
+        }
+        if (m_agent) {
+            if (auto *p = m_agent->activePanel()) {
+                p->setFocus();
+            }
+        }
+    });
 }
 
 void MainWindow::setupCore()

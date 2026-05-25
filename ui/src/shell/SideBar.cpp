@@ -77,6 +77,14 @@ int SideBar::raisedId() const
     return m_raised;
 }
 
+int SideBar::panelIdAt(int index) const
+{
+    if (index < 0 || index >= m_ids.size()) {
+        return -1;
+    }
+    return m_ids.at(index);
+}
+
 void SideBar::saveState(KConfigGroup &grp) const
 {
     grp.writeEntry("raised", m_raised);

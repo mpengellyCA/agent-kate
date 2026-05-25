@@ -42,6 +42,7 @@ private:
     void setupActions();
     void setupHamburger();
     void setupTopToolbar();
+    void setupShellShortcuts();
     void setupCore();
     void updateCursorStatus();
     void updateBreadcrumb(const QString &path);
@@ -73,11 +74,16 @@ private:
     int m_leftRosterId = -1;
     int m_leftFilesId = -1;
     int m_leftOutlineId = -1;
+    int m_leftSearchId = -1;
     int m_rightWorktreesId = -1;
     int m_rightGitLogId = -1;
+    int m_rightCoopId = -1;
+    int m_rightInspectorId = -1;
     int m_bottomTerminalId = -1;
     int m_bottomReferencesId = -1;
     int m_bottomProblemsId = -1;
+    int m_bottomOutputId = -1;
+    int m_bottomTasksId = -1;
 
     int m_lastBottomTab = -1; // last tab raised by the user, used to restore on Ctrl+J
     QAction *m_toggleBottomAct = nullptr;
