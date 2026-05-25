@@ -22,6 +22,7 @@ class EditorArea : public QWidget
     Q_OBJECT
 public:
     explicit EditorArea(QWidget *parent = nullptr);
+    ~EditorArea() override;
 
     void setActiveGroup(const QString &groupKey);
     void openFile(const QString &groupKey, const QString &path, int line = -1);

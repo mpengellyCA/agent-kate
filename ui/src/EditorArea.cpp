@@ -30,6 +30,26 @@ EditorArea::EditorArea(QWidget *parent)
     layout->addWidget(m_stack);
 }
 
+EditorArea::~EditorArea()
+{
+    // KTextEditor::Document and KTextEditor::View have different parent
+    // chains here — the Document is a QObject child of EditorArea (set when
+    // openFile() called createDocument(this)), while the View is a widget
+    // child of the QTabWidget inside m_stack. Qt destroys QObject children
+    // in reverse insertion order, so documents added at runtime get torn
+    // down BEFORE the long-lived m_stack. The dangling Documents leave their
+    // still-alive Views asserting on a destroyed model inside ~ViewPrivate
+    // (Q_ASSERT(numBuckets > 0) on shutdown). Close every open tab first so
+    // KTextEditor's documented "delete doc destroys its views" path runs
+    // while the QStackedWidget is still intact.
+    const auto groups = m_groups.values();
+    for (QTabWidget *tabs : groups) {
+        while (tabs->count() > 0) {
+            closeTabIn(tabs, 0);
+        }
+    }
+}
+
 QTabWidget *EditorArea::groupTabs(const QString &key, bool create)
 {
     if (const auto it = m_groups.constFind(key); it != m_groups.constEnd()) {
