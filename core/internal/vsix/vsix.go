@@ -31,11 +31,12 @@ type ServerRecipe struct {
 
 // Extension is one installed VS Code extension.
 type Extension struct {
-	ID      string        `json:"id"`      // "publisher.name"
-	Name    string        `json:"name"`    // human-readable display name
-	Version string        `json:"version"` // installed version
-	Dir     string        `json:"dir"`     // unpacked root; contains extension/
-	Server  *ServerRecipe `json:"server"`  // nil when no server could be detected
+	ID         string        `json:"id"`                   // "publisher.name"
+	Name       string        `json:"name"`                 // human-readable display name
+	Version    string        `json:"version"`              // installed version
+	Dir        string        `json:"dir"`                  // unpacked root; contains extension/
+	Server     *ServerRecipe `json:"server"`               // nil when no server could be detected
+	ServerHint string        `json:"serverHint,omitempty"` // user-facing hint about how to enable a server when Server is nil
 }
 
 // versionMarker is written into an extension's cache dir to record which
@@ -164,6 +165,9 @@ func load(id, dir string) (*Extension, error) {
 		Dir:     dir,
 	}
 	ext.Server = resolveRecipe(ext, man)
+	if ext.Server == nil {
+		ext.ServerHint = serverHint(id)
+	}
 	return ext, nil
 }
 

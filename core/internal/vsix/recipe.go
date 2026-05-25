@@ -3,6 +3,7 @@ package vsix
 import (
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -14,6 +15,108 @@ type recipeResolver func(ext *Extension, man *manifest) *ServerRecipe
 // the reliable path; heuristicRecipe is only a fallback for everything else.
 var registry = map[string]recipeResolver{
 	"bmewburn.vscode-intelephense-client": resolveIntelephense,
+	"devsense.phptools-vscode":            resolveDevSensePHP,
+
+	// Extensions that delegate to a language-server binary the user installs
+	// separately. Each recipe looks the binary up on PATH; the matching entry
+	// in externalServerHint() supplies a helpful message when it's missing.
+	"golang.go":                  pathRecipeResolver("gopls", nil, []string{"go"}, []string{".go"}),
+	"rust-lang.rust-analyzer":    pathRecipeResolver("rust-analyzer", nil, []string{"rust"}, []string{".rs"}),
+	"vscode.cpp":                 pathRecipeResolver("clangd", nil, []string{"c", "cpp"}, []string{".c", ".h", ".cc", ".cpp", ".hpp", ".cxx", ".hxx"}),
+	"vscode.typescript":          pathRecipeResolver("typescript-language-server", []string{"--stdio"}, []string{"typescript", "typescriptreact", "javascript", "javascriptreact"}, []string{".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}),
+	"hashicorp.terraform":        pathRecipeResolver("terraform-ls", []string{"serve"}, []string{"terraform"}, []string{".tf", ".tfvars"}),
+	"redhat.vscode-xml":          pathRecipeResolver("lemminx", nil, []string{"xml", "xsl", "xsd", "dtd"}, []string{".xml", ".xsl", ".xsd", ".dtd"}),
+	"redhat.java":                pathRecipeResolver("jdtls", nil, []string{"java"}, []string{".java"}),
+	"ms-azuretools.vscode-docker": pathRecipeResolver("docker-langserver", []string{"--stdio"}, []string{"dockerfile"}, []string{"Dockerfile"}),
+	"charliermarsh.ruff":         pathRecipeResolver("ruff", []string{"server"}, []string{"python"}, []string{".py", ".pyi"}),
+	"ms-python.python":           resolvePython,
+}
+
+// pathRecipeResolver returns a resolver that looks bin up on PATH and produces
+// a ServerRecipe pointing at the absolute path. When bin is missing the
+// resolver returns nil and the UI falls back to the hint in externalServerHint.
+func pathRecipeResolver(bin string, args []string, ids, exts []string) recipeResolver {
+	return func(_ *Extension, _ *manifest) *ServerRecipe {
+		abs, err := exec.LookPath(bin)
+		if err != nil {
+			return nil
+		}
+		return &ServerRecipe{
+			Command:        abs,
+			Args:           args,
+			LanguageIDs:    ids,
+			FileExtensions: exts,
+		}
+	}
+}
+
+// resolvePython tries the Python language servers a user is likely to have on
+// PATH, in order of preference. Pylance is proprietary and is not considered.
+func resolvePython(_ *Extension, _ *manifest) *ServerRecipe {
+	candidates := []struct {
+		bin  string
+		args []string
+	}{
+		{"pyright-langserver", []string{"--stdio"}},
+		{"basedpyright-langserver", []string{"--stdio"}},
+		{"pylsp", nil},
+		{"jedi-language-server", nil},
+	}
+	for _, c := range candidates {
+		abs, err := exec.LookPath(c.bin)
+		if err != nil {
+			continue
+		}
+		return &ServerRecipe{
+			Command:        abs,
+			Args:           c.args,
+			LanguageIDs:    []string{"python"},
+			FileExtensions: []string{".py", ".pyi"},
+		}
+	}
+	return nil
+}
+
+// resolveDevSensePHP launches the PHP Tools language server binary the
+// extension ships under out/server/. The binary name carries a .ls suffix and
+// is platform-specific; the extension picks one at install time.
+func resolveDevSensePHP(ext *Extension, _ *manifest) *ServerRecipe {
+	bin := findShallowestFile(extensionRoot(ext.Dir), "devsense.php.ls")
+	if bin == "" {
+		return nil
+	}
+	info, err := os.Stat(bin)
+	if err != nil || info.Mode()&0o111 == 0 {
+		return nil
+	}
+	return &ServerRecipe{
+		Command:        bin,
+		LanguageIDs:    []string{"php"},
+		FileExtensions: []string{".php"},
+	}
+}
+
+// externalServerHints maps an extension id to a one-line note describing the
+// external binary that would activate language support. The UI shows this when
+// the registry recipe returned nil (typically because the binary is not on
+// PATH).
+var externalServerHints = map[string]string{
+	"golang.go":                   "install gopls (`go install golang.org/x/tools/gopls@latest`) and ensure it is on PATH",
+	"rust-lang.rust-analyzer":     "install rust-analyzer and ensure it is on PATH (rustup component add rust-analyzer)",
+	"vscode.cpp":                  "install clangd and ensure it is on PATH",
+	"vscode.typescript":           "install typescript-language-server (npm i -g typescript typescript-language-server)",
+	"hashicorp.terraform":         "install terraform-ls and ensure it is on PATH",
+	"redhat.vscode-xml":           "install lemminx and ensure it is on PATH",
+	"redhat.java":                 "install jdtls (e.g. via your distro or eclipse.jdt.ls) and ensure it is on PATH",
+	"ms-azuretools.vscode-docker": "install dockerfile-language-server-nodejs (npm i -g dockerfile-language-server-nodejs)",
+	"charliermarsh.ruff":          "install ruff (pipx install ruff) and ensure it is on PATH",
+	"ms-python.python":            "install a Python language server (e.g. pipx install python-lsp-server, or pyright-langserver)",
+}
+
+// serverHint returns the user-facing hint for an extension id, or "" if none
+// applies (most extensions either bundle a server or have no LSP at all).
+func serverHint(extensionID string) string {
+	return externalServerHints[extensionID]
 }
 
 // resolveRecipe finds how to launch an extension's language server: a curated

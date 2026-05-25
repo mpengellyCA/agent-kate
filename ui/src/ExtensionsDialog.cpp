@@ -214,9 +214,13 @@ void ExtensionsDialog::populate(const QJsonArray &extensions)
         const QString version = ext.value(QStringLiteral("version")).toString();
         const QJsonObject server = ext.value(QStringLiteral("server")).toObject();
 
+        const QString hint = ext.value(QStringLiteral("serverHint")).toString();
+
         QString serverLine;
         if (server.isEmpty()) {
-            serverLine = i18n("    no language server detected");
+            serverLine = hint.isEmpty()
+                ? i18n("    no language server detected")
+                : i18n("    no language server detected — %1", hint);
         } else {
             QStringList langs;
             const QJsonArray ids = server.value(QStringLiteral("languageIds")).toArray();

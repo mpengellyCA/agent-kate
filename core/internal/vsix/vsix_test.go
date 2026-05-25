@@ -259,6 +259,52 @@ func TestCatalogLoads(t *testing.T) {
 	}
 }
 
+func TestServerHintForExternalLSP(t *testing.T) {
+	// Go relies on gopls on PATH. Whether or not gopls is actually installed
+	// on the test host, the user-facing hint should be populated when no
+	// recipe is produced.
+	dir := t.TempDir()
+	writeExtension(t, dir, `{
+		"name":"go","version":"0.0.0",
+		"contributes":{"languages":[{"id":"go","extensions":[".go"]}]}
+	}`, nil)
+	ext, err := load("golang.go", dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if ext.Server == nil && ext.ServerHint == "" {
+		t.Fatal("expected either a gopls recipe or a server hint")
+	}
+	if ext.Server == nil && !strings.Contains(ext.ServerHint, "gopls") {
+		t.Fatalf("hint = %q, want a gopls mention", ext.ServerHint)
+	}
+}
+
+func TestDevSensePHPRegistry(t *testing.T) {
+	dir := t.TempDir()
+	writeExtension(t, dir, `{
+		"name":"phptools-vscode","version":"1.0.0",
+		"contributes":{"languages":[{"id":"php","extensions":[".php"]}]}
+	}`, map[string]string{"out/server/devsense.php.ls": "#!/bin/sh\n"})
+	// Mark the bundled server executable, as the real .vsix layout does.
+	if err := os.Chmod(filepath.Join(extensionRoot(dir), "out/server/devsense.php.ls"), 0o755); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	ext, err := load("devsense.phptools-vscode", dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if ext.Server == nil {
+		t.Fatal("expected a devsense recipe pointing at the bundled .ls binary")
+	}
+	if !strings.HasSuffix(ext.Server.Command, "devsense.php.ls") {
+		t.Fatalf("recipe command = %q, want the bundled binary", ext.Server.Command)
+	}
+	if ext.Server.Source != "registry" {
+		t.Fatalf("source = %q, want registry", ext.Server.Source)
+	}
+}
+
 func TestNoRecipeForNonLanguageExtension(t *testing.T) {
 	dir := t.TempDir()
 	writeExtension(t, dir, `{"name":"theme","version":"1.0.0"}`, nil)
