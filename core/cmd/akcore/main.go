@@ -229,6 +229,7 @@ type agentEventParams struct {
 
 type agentStartParams struct {
 	WorkspacePath  string             `json:"workspacePath"`
+	Backend        string             `json:"backend"` // "claude" (default, empty == claude) or "antigravity"
 	Prompt         string             `json:"prompt"`
 	PermissionMode string             `json:"permissionMode"`
 	Effort         string             `json:"effort"`    // claude --effort level; "" = default
@@ -1563,14 +1564,20 @@ func startAgentThread(d handlerDeps, threadID, sessionID string, p agentStartPar
 	d.threads.put(threadID, wt)
 	d.gitCache.Register(wt)
 
-	mcpConfig, err := writeMCPConfig(d.exePath, d.socketPath, threadID, wt.Path)
-	if err != nil {
-		emitLifecycle(d.srv, threadID, "error", "mcp config: "+err.Error(), &wt)
-		return
+	// Antigravity's `agy --print` has no per-process MCP plumbing, so the
+	// Cooperation MCP only applies to the Claude backend.
+	var mcpConfig string
+	if p.Backend != agent.BackendAntigravity {
+		mcpConfig, err = writeMCPConfig(d.exePath, d.socketPath, threadID, wt.Path)
+		if err != nil {
+			emitLifecycle(d.srv, threadID, "error", "mcp config: "+err.Error(), &wt)
+			return
+		}
 	}
 
 	if _, err := d.sup.Start(agent.StartOptions{
 		ID:             threadID,
+		Backend:        p.Backend,
 		WorkDir:        wt.Path,
 		Prompt:         p.Prompt,
 		MCPConfig:      mcpConfig,
@@ -1580,7 +1587,9 @@ func startAgentThread(d handlerDeps, threadID, sessionID string, p agentStartPar
 		Attachments:    p.Attachments,
 		SessionID:      sessionID,
 	}); err != nil {
-		os.Remove(mcpConfig)
+		if mcpConfig != "" {
+			os.Remove(mcpConfig)
+		}
 		emitLifecycle(d.srv, threadID, "error", err.Error(), &wt)
 		return
 	}
@@ -1593,6 +1602,7 @@ func startAgentThread(d handlerDeps, threadID, sessionID string, p agentStartPar
 	}
 	if err := d.sessions.Put(session.Record{
 		ThreadID:       threadID,
+		Backend:        p.Backend,
 		SessionID:      sessionID,
 		Project:        p.WorkspacePath,
 		Worktree:       wt,
@@ -1628,6 +1638,32 @@ func resumeAgentThread(d handlerDeps, rec session.Record) {
 	d.threads.put(rec.ThreadID, rec.Worktree)
 	d.gitCache.Register(rec.Worktree)
 
+	// Antigravity skips the MCP config (agy has no --mcp-config flag) and the
+	// summary-seeding path (no documented prompt-seeding interface). It just
+	// resumes the most-recent agy conversation in the worktree via --continue.
+	if rec.Backend == agent.BackendAntigravity {
+		opts := agent.StartOptions{
+			ID:             rec.ThreadID,
+			Backend:        rec.Backend,
+			WorkDir:        rec.Worktree.Path,
+			PermissionMode: rec.PermissionMode,
+			SessionID:      rec.SessionID,
+			Resume:         true,
+		}
+		if _, err := d.sup.Start(opts); err != nil {
+			emitLifecycle(d.srv, rec.ThreadID, "error", err.Error(), &rec.Worktree)
+			return
+		}
+		_ = d.sessions.Update(rec.ThreadID, func(r *session.Record) {
+			r.Status = session.StatusRunning
+		})
+		d.log.Info("agent thread resumed",
+			"thread", rec.ThreadID, "backend", rec.Backend)
+		emitLifecycle(d.srv, rec.ThreadID, "resumed",
+			"resumed Antigravity conversation", &rec.Worktree)
+		return
+	}
+
 	mcpConfig, err := writeMCPConfig(d.exePath, d.socketPath, rec.ThreadID, rec.Worktree.Path)
 	if err != nil {
 		emitLifecycle(d.srv, rec.ThreadID, "error", "mcp config: "+err.Error(), &rec.Worktree)
@@ -1643,6 +1679,7 @@ func resumeAgentThread(d handlerDeps, rec session.Record) {
 
 	opts := agent.StartOptions{
 		ID:             rec.ThreadID,
+		Backend:        rec.Backend,
 		WorkDir:        rec.Worktree.Path,
 		MCPConfig:      mcpConfig,
 		PermissionMode: rec.PermissionMode,

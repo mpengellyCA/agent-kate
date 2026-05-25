@@ -1,7 +1,11 @@
-// Package agent supervises headless Claude Code processes — the "agent threads"
-// that do the work in Agent Kate's harness. Each thread is one `claude` process
-// run in streaming-JSON mode so its conversation can be observed live and
-// continued with follow-up messages.
+// Package agent supervises headless agent processes — the "agent threads"
+// that do the work in Agent Kate's harness. Each thread is driven by one CLI
+// backend: Claude Code (a long-lived `claude --print` process in streaming-JSON
+// mode) or Google Antigravity (one-shot `agy --print` per turn). The Claude
+// path is the full-featured one — tool cards, per-tool approvals, attachments.
+// The Antigravity path is degraded: it captures the assistant's final reply
+// per turn and synthesises stream-json events around it so the UI renders the
+// conversation uniformly.
 package agent
 
 import (
@@ -26,27 +30,36 @@ import (
 // _lifecycle) so the UI can tell them apart.
 type EventFunc func(threadID string, event json.RawMessage)
 
+// Backend names — one CLI per thread, picked at start time.
+const (
+	BackendClaude      = "claude"
+	BackendAntigravity = "antigravity"
+)
+
 // Supervisor owns the set of running agent threads.
 type Supervisor struct {
-	claudeBin string
-	log       *slog.Logger
-	emit      EventFunc
+	claudeBin      string
+	antigravityBin string
+	log            *slog.Logger
+	emit           EventFunc
 
 	mu      sync.Mutex
 	threads map[string]*Thread
 }
 
 // NewSupervisor creates a supervisor. emit is invoked for every thread event.
-// An empty claudeBin defaults to "claude" (resolved via PATH).
+// Empty claudeBin defaults to "claude"; empty antigravityBin defaults to "agy".
+// Both are resolved via PATH.
 func NewSupervisor(claudeBin string, log *slog.Logger, emit EventFunc) *Supervisor {
 	if claudeBin == "" {
 		claudeBin = "claude"
 	}
 	return &Supervisor{
-		claudeBin: claudeBin,
-		log:       log,
-		emit:      emit,
-		threads:   make(map[string]*Thread),
+		claudeBin:      claudeBin,
+		antigravityBin: "agy",
+		log:            log,
+		emit:           emit,
+		threads:        make(map[string]*Thread),
 	}
 }
 
@@ -63,9 +76,10 @@ type Attachment struct {
 // StartOptions configures a new agent thread.
 type StartOptions struct {
 	ID             string       // thread id; generated if empty
+	Backend        string       // "claude" (default) or "antigravity"
 	WorkDir        string       // working directory for the agent (a workspace or worktree)
 	Prompt         string       // initial user message
-	MCPConfig      string       // optional path to a --mcp-config file
+	MCPConfig      string       // optional path to a --mcp-config file (Claude only)
 	PermissionMode string       // claude --permission-mode; defaults to acceptEdits
 	Effort         string       // claude --effort level; empty leaves Claude Code's default
 	Model          string       // claude --model id; empty leaves Claude Code's default (smoke tests pin Haiku)
@@ -105,10 +119,14 @@ func buildUserContent(text string, attachments []Attachment) []map[string]any {
 	return content
 }
 
-// Thread is one running `claude` process.
+// Thread is one running agent. For the Claude backend it owns a long-lived
+// `claude` process with a stdin pipe. For the Antigravity backend it owns no
+// long-lived process between turns — each Send spawns a fresh `agy --print`
+// and the per-turn process is held in `agyCmd` so Stop can kill it.
 type Thread struct {
 	ID      string
 	WorkDir string
+	backend string // "claude" or "antigravity"
 
 	mu         sync.Mutex
 	cmd        *exec.Cmd
@@ -119,6 +137,12 @@ type Thread struct {
 	usage      *usageMeter // measures per-turn LLM token usage and billed cost
 	alive      bool
 	hotCompact *hotCompact // when non-nil, the next assistant turn is captured for a summary
+
+	// Antigravity-only state. agyCmd is the current --print process (one per
+	// turn); agyHadTurn is set after the first successful send so subsequent
+	// turns pass --continue to keep the same conversation thread.
+	agyCmd     *exec.Cmd
+	agyHadTurn bool
 }
 
 // hotCompact tracks an in-flight Hot-Opus compaction: assistant text is
@@ -152,13 +176,17 @@ func NewThreadID() string {
 
 // Start launches a new agent thread and sends it the initial prompt.
 //
-// The agent is driven through Claude Code's documented headless interface:
-// `claude --print` with stream-json on both stdin and stdout. M1 runs it
-// directly in WorkDir with --permission-mode acceptEdits — file edits are
-// auto-accepted and the Cooperation MCP is allowed, while Bash and network
-// tools stay gated. Every tool call is still surfaced to the UI. M2 will move
-// each thread into its own git worktree and add per-tool approval.
+// The Claude backend is driven through Claude Code's documented headless
+// interface: `claude --print` with stream-json on both stdin and stdout. The
+// Antigravity backend is one-shot per turn — Start just registers the thread
+// and the initial prompt fires through Send, which spawns the first
+// `agy --print`. Either way, file edits are auto-accepted by default and the
+// Cooperation MCP is wired in for Claude; Antigravity skips the MCP path
+// since `agy` exposes no per-process MCP config.
 func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
+	if opts.Backend == BackendAntigravity {
+		return s.startAntigravity(opts)
+	}
 	mode := opts.PermissionMode
 	if mode == "" {
 		mode = "acceptEdits"
@@ -224,6 +252,7 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 	t := &Thread{
 		ID:        id,
 		WorkDir:   opts.WorkDir,
+		backend:   BackendClaude,
 		cmd:       cmd,
 		stdin:     stdin,
 		sessionID: opts.SessionID,
@@ -266,6 +295,9 @@ func (s *Supervisor) Send(threadID, text string, attachments []Attachment) error
 	if t == nil {
 		return fmt.Errorf("unknown thread %q", threadID)
 	}
+	if t.backend == BackendAntigravity {
+		return s.sendAntigravity(t, text, attachments)
+	}
 	msg, err := json.Marshal(map[string]any{
 		"type": "user",
 		"message": map[string]any{
@@ -293,6 +325,9 @@ func (s *Supervisor) Stop(threadID string) error {
 	t := s.thread(threadID)
 	if t == nil {
 		return fmt.Errorf("unknown thread %q", threadID)
+	}
+	if t.backend == BackendAntigravity {
+		return s.stopAntigravity(t)
 	}
 	t.mu.Lock()
 	alive := t.alive

@@ -123,6 +123,7 @@ private:
     QHash<QString, ToolCard *> m_toolCards; // keyed by tool_use id
     WorkingIndicator *m_working = nullptr;
     QPlainTextEdit *m_input = nullptr;
+    QComboBox *m_backendCombo = nullptr;
     QComboBox *m_modeCombo = nullptr;
     QComboBox *m_isolationCombo = nullptr;
     QComboBox *m_effortCombo = nullptr;

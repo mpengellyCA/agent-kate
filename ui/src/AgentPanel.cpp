@@ -420,6 +420,32 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     m_input->setFixedHeight(94);
     m_input->installEventFilter(this); // for the configurable send key
 
+    m_backendCombo = new QComboBox(this);
+    m_backendCombo->addItem(QStringLiteral("Claude Code"), QStringLiteral("claude"));
+    m_backendCombo->addItem(QStringLiteral("Antigravity (agy)"),
+                            QStringLiteral("antigravity"));
+    m_backendCombo->setToolTip(QStringLiteral(
+        "Which CLI drives this agent (fixed once it starts):\n"
+        "• Claude Code — full integration: tool cards, per-tool approvals,\n"
+        "  image attachments, cooperation MCP.\n"
+        "• Antigravity (agy) — degraded one-shot per turn: only the final\n"
+        "  reply is shown, no tool cards, --dangerously-skip-permissions,\n"
+        "  no image attachments. Needs `agy` on PATH."));
+    {
+        const QString saved = KSharedConfig::openConfig()
+                                  ->group(QStringLiteral("Agent"))
+                                  .readEntry("backend", QStringLiteral("claude"));
+        const int savedIdx = m_backendCombo->findData(saved);
+        if (savedIdx >= 0) {
+            m_backendCombo->setCurrentIndex(savedIdx);
+        }
+    }
+    connect(m_backendCombo, &QComboBox::currentIndexChanged, this, [this] {
+        KSharedConfig::openConfig()
+            ->group(QStringLiteral("Agent"))
+            .writeEntry("backend", m_backendCombo->currentData().toString());
+    });
+
     m_modeCombo = new QComboBox(this);
     m_modeCombo->addItem(QStringLiteral("Accept edits"), QStringLiteral("acceptEdits"));
     m_modeCombo->addItem(QStringLiteral("Approve each tool"), QStringLiteral("default"));
@@ -616,6 +642,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
         auto *panel = new QWidget(menu);
         auto *form = new QFormLayout(panel);
         form->setContentsMargins(10, 8, 10, 8);
+        form->addRow(QStringLiteral("Backend"), m_backendCombo);
         form->addRow(QStringLiteral("Permission"), m_modeCombo);
         form->addRow(QStringLiteral("Isolation"), m_isolationCombo);
         form->addRow(QStringLiteral("Effort"), m_effortCombo);
@@ -1065,7 +1092,8 @@ void AgentPanel::refresh()
             actions.first()->setEnabled(running); // "Hot Opus (live thread)"
         }
     }
-    // The permission, isolation and effort modes are fixed once a thread exists.
+    // Backend, permission, isolation and effort are all fixed once a thread exists.
+    m_backendCombo->setEnabled(m_threadId.isEmpty());
     m_modeCombo->setEnabled(m_threadId.isEmpty());
     m_isolationCombo->setEnabled(m_threadId.isEmpty());
     m_effortCombo->setEnabled(m_threadId.isEmpty());
@@ -1245,6 +1273,8 @@ void AgentPanel::onSendClicked()
         m_core->call(QStringLiteral("agent.start"),
                      QJsonObject{{QStringLiteral("workspacePath"), m_workspace},
                                  {QStringLiteral("prompt"), text},
+                                 {QStringLiteral("backend"),
+                                  m_backendCombo->currentData().toString()},
                                  {QStringLiteral("permissionMode"),
                                   m_modeCombo->currentData().toString()},
                                  {QStringLiteral("isolation"),
