@@ -13,6 +13,7 @@
 #include <QInputDialog>
 #include <QKeySequence>
 #include <QLabel>
+#include <QPixmap>
 #include <QListWidget>
 #include <QListWidgetItem>
 #include <QMessageBox>
@@ -36,12 +37,26 @@ WelcomeDialog::WelcomeDialog(QWidget *parent)
     outer->setContentsMargins(24, 24, 24, 18);
     outer->setSpacing(14);
 
+    auto *headerRow = new QHBoxLayout;
+    headerRow->setContentsMargins(0, 0, 0, 0);
+    headerRow->setSpacing(14);
+
+    auto *logo = new QLabel(this);
+    const QPixmap logoPix(QStringLiteral(":/branding/logo.png"));
+    const int logoSize = 72;
+    logo->setPixmap(logoPix.scaled(logoSize, logoSize,
+                                   Qt::KeepAspectRatio,
+                                   Qt::SmoothTransformation));
+    logo->setFixedSize(logoSize, logoSize);
+    headerRow->addWidget(logo, 0, Qt::AlignTop);
+
     auto *header = new QLabel(i18n("<h2 style='margin:0;'>Agent Kate</h2>"
                                    "<p style='margin:2px 0 0 0; color:palette(mid);'>"
                                    "Native multi-agent coding arena</p>"),
                               this);
     header->setTextFormat(Qt::RichText);
-    outer->addWidget(header);
+    headerRow->addWidget(header, 1, Qt::AlignVCenter);
+    outer->addLayout(headerRow);
 
     // "Reopen last project" hero row — the single most likely action.
     auto *heroFrame = new QFrame(this);
