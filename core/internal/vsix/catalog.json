@@ -1,0 +1,92 @@
+[
+  {
+    "id": "bmewburn.vscode-intelephense-client",
+    "displayName": "PHP Intelephense",
+    "summary": "Fast PHP language server with diagnostics, completions and navigation.",
+    "category": "PHP"
+  },
+  {
+    "id": "bradlc.vscode-tailwindcss",
+    "displayName": "Tailwind CSS IntelliSense",
+    "summary": "Class-name completion, hover previews and diagnostics for Tailwind.",
+    "category": "Web"
+  },
+  {
+    "id": "Vue.volar",
+    "displayName": "Vue (Official)",
+    "summary": "Volar language server for Vue 3 single-file components.",
+    "category": "Web"
+  },
+  {
+    "id": "svelte.svelte-vscode",
+    "displayName": "Svelte for VS Code",
+    "summary": "Language server for .svelte components.",
+    "category": "Web"
+  },
+  {
+    "id": "astro-build.astro-vscode",
+    "displayName": "Astro",
+    "summary": "Language server and tooling for Astro.",
+    "category": "Web"
+  },
+  {
+    "id": "rust-lang.rust-analyzer",
+    "displayName": "rust-analyzer",
+    "summary": "Official Rust language server.",
+    "category": "Systems"
+  },
+  {
+    "id": "golang.go",
+    "displayName": "Go",
+    "summary": "Go language support backed by gopls.",
+    "category": "Systems"
+  },
+  {
+    "id": "ms-python.python",
+    "displayName": "Python",
+    "summary": "Python language support (Pylance / Jedi backend).",
+    "category": "Python"
+  },
+  {
+    "id": "charliermarsh.ruff",
+    "displayName": "Ruff",
+    "summary": "Fast Python linter and formatter as a language server.",
+    "category": "Python"
+  },
+  {
+    "id": "redhat.java",
+    "displayName": "Language Support for Java",
+    "summary": "Eclipse JDT-based Java language server.",
+    "category": "JVM"
+  },
+  {
+    "id": "redhat.vscode-yaml",
+    "displayName": "YAML",
+    "summary": "YAML language server with schema validation.",
+    "category": "Config"
+  },
+  {
+    "id": "tamasfe.even-better-toml",
+    "displayName": "Even Better TOML",
+    "summary": "TOML language server with schema support.",
+    "category": "Config"
+  },
+  {
+    "id": "redhat.vscode-xml",
+    "displayName": "XML",
+    "summary": "LemMinX-based XML language server.",
+    "category": "Config"
+  },
+  {
+    "id": "ms-azuretools.vscode-docker",
+    "displayName": "Docker",
+    "summary": "Dockerfile and compose language features.",
+    "category": "Config"
+  },
+  {
+    "id": "hashicorp.terraform",
+    "displayName": "HashiCorp Terraform",
+    "summary": "Official Terraform language server.",
+    "category": "Config"
+  }
+]

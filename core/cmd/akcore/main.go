@@ -939,6 +939,30 @@ func registerHandlers(d handlerDeps) {
 		return map[string]any{"extensions": exts}, nil
 	})
 
+	// vsix.catalog returns the curated list of popular extensions, each
+	// tagged with whether the user already has it installed so the UI can
+	// hide its Install button.
+	d.srv.Handle("vsix.catalog", func(_ context.Context, _ json.RawMessage) (any, error) {
+		installed := map[string]bool{}
+		if list, err := d.extensions.List(); err == nil {
+			for _, e := range list {
+				installed[e.ID] = true
+			}
+		}
+		entries := vsix.Catalog()
+		out := make([]map[string]any, 0, len(entries))
+		for _, e := range entries {
+			out = append(out, map[string]any{
+				"id":          e.ID,
+				"displayName": e.DisplayName,
+				"summary":     e.Summary,
+				"category":    e.Category,
+				"installed":   installed[e.ID],
+			})
+		}
+		return map[string]any{"entries": out}, nil
+	})
+
 	// --- Claude Code skills ------------------------------------------------
 	// skills.listCatalog returns every skill in the central Agent Kate catalog
 	// (XDG_DATA_HOME/agentkate/skills). An empty catalog is fine — the UI

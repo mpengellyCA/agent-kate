@@ -76,6 +76,17 @@ func heuristicRecipe(ext *Extension, man *manifest) *ServerRecipe {
 			FileExtensions: exts,
 		}
 	}
+	// Last resort: ask the activation bundle where its server lives. Many
+	// extensions hide their server under non-canonical names (Tailwind's
+	// dist/tailwindServer.js, etc.) that the basename walk above won't catch.
+	if js := findServerByMainScan(root, man.Main); js != "" {
+		return &ServerRecipe{
+			Command:        "node",
+			Args:           []string{js, "--stdio"},
+			LanguageIDs:    ids,
+			FileExtensions: exts,
+		}
+	}
 	return nil
 }
 
@@ -100,7 +111,16 @@ func findShallowestFile(root, name string) string {
 func findServerScript(root string) string {
 	best, bestDepth := "", 1<<30
 	filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			// node_modules and .git can be enormous in some extensions; the
+			// server we care about sits in the extension's own dist/out.
+			name := d.Name()
+			if name == "node_modules" || name == ".git" {
+				return fs.SkipDir
+			}
 			return nil
 		}
 		name := strings.ToLower(d.Name())
@@ -108,6 +128,7 @@ func findServerScript(root string) string {
 			return nil
 		}
 		if name == "server.js" ||
+			strings.HasSuffix(name, "server.js") ||
 			strings.Contains(name, "language-server") ||
 			strings.Contains(name, "languageserver") {
 			if depth := strings.Count(path, string(os.PathSeparator)); depth < bestDepth {
