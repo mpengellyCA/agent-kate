@@ -25,6 +25,7 @@ add_executable(agentkate
     src/MainWindow.cpp
     src/EditorArea.cpp
     src/DiffView.cpp
+    src/ImageView.cpp
     src/ExtensionsDialog.cpp
     src/ProblemsPanel.cpp
     src/ReferencesPanel.cpp

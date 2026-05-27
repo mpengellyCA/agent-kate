@@ -1,5 +1,6 @@
 #include "EditorArea.h"
 #include "DiffView.h"
+#include "ImageView.h"
 
 #include <KTextEditor/Cursor>
 #include <KTextEditor/Document>
@@ -108,7 +109,8 @@ void EditorArea::openFile(const QString &groupKey, const QString &path, int line
     const QString abs = QFileInfo(path).absoluteFilePath();
 
     for (int i = 0; i < tabs->count(); ++i) {
-        if (auto *view = qobject_cast<KTextEditor::View *>(tabs->widget(i))) {
+        QWidget *w = tabs->widget(i);
+        if (auto *view = qobject_cast<KTextEditor::View *>(w)) {
             if (view->document()->url().toLocalFile() == abs) {
                 tabs->setCurrentIndex(i);
                 m_activeGroup = groupKey;
@@ -118,7 +120,26 @@ void EditorArea::openFile(const QString &groupKey, const QString &path, int line
                 }
                 return;
             }
+        } else if (auto *img = qobject_cast<ImageView *>(w)) {
+            if (img->path() == abs) {
+                tabs->setCurrentIndex(i);
+                m_activeGroup = groupKey;
+                updateVisible();
+                return;
+            }
         }
+    }
+
+    if (ImageView::canDisplay(abs)) {
+        auto *img = new ImageView(abs, tabs);
+        const int idx = tabs->addTab(img, QFileInfo(abs).fileName());
+        tabs->setTabToolTip(idx, abs);
+        tabs->setCurrentWidget(img);
+        m_activeGroup = groupKey;
+        updateVisible();
+        emit openFilesChanged();
+        emitCurrentFile();
+        return;
     }
 
     KTextEditor::Document *doc = m_editor->createDocument(this);
@@ -188,10 +209,15 @@ QStringList EditorArea::openFilePaths() const
     QStringList paths;
     for (QTabWidget *tabs : m_groups) {
         for (int i = 0; i < tabs->count(); ++i) {
-            if (auto *view = qobject_cast<KTextEditor::View *>(tabs->widget(i))) {
+            QWidget *w = tabs->widget(i);
+            if (auto *view = qobject_cast<KTextEditor::View *>(w)) {
                 const QString p = view->document()->url().toLocalFile();
                 if (!p.isEmpty()) {
                     paths << p;
+                }
+            } else if (auto *img = qobject_cast<ImageView *>(w)) {
+                if (!img->path().isEmpty()) {
+                    paths << img->path();
                 }
             }
         }
@@ -221,8 +247,11 @@ void EditorArea::emitCurrentFile()
 {
     QString path;
     if (QTabWidget *tabs = activeTabs()) {
-        if (auto *view = qobject_cast<KTextEditor::View *>(tabs->currentWidget())) {
+        QWidget *w = tabs->currentWidget();
+        if (auto *view = qobject_cast<KTextEditor::View *>(w)) {
             path = view->document()->url().toLocalFile();
+        } else if (auto *img = qobject_cast<ImageView *>(w)) {
+            path = img->path();
         }
     }
     emit currentFileChanged(path);
