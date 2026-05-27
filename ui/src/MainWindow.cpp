@@ -1,5 +1,6 @@
 #include "MainWindow.h"
 #include "AgentDock.h"
+#include "AgentPanel.h"
 #include "EditorArea.h"
 #include "ExtensionsDialog.h"
 #include "OutlinePanel.h"
@@ -307,6 +308,18 @@ void MainWindow::setupUi()
 
     connect(m_tree, &ProjectTree::fileActivated, this,
             [this](const QString &path) { m_editor->openFile(groupKey(), path); });
+    connect(m_tree, &ProjectTree::terminalRequested, this,
+            [this](const QString &dir) {
+                if (m_terminal) {
+                    m_terminal->openTerminalAt(dir);
+                }
+            });
+    connect(m_tree, &ProjectTree::attachToChatRequested, this,
+            [this](const QStringList &paths) {
+                if (auto *panel = qobject_cast<AgentPanel *>(m_agent->activePanel())) {
+                    panel->attachPaths(paths);
+                }
+            });
     connect(m_editor, &EditorArea::openFilesChanged, this, &MainWindow::pushOpenFilesToCore);
     connect(m_editor, &EditorArea::currentFileChanged, this, [this](const QString &path) {
         if (m_core->isConnected()) {

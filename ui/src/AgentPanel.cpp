@@ -10,7 +10,12 @@
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDir>
+#include <QDragEnterEvent>
+#include <QDragMoveEvent>
+#include <QDropEvent>
 #include <QEvent>
+#include <QMimeData>
+#include <QUrl>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -336,6 +341,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     : QWidget(parent)
     , m_core(core)
 {
+    setAcceptDrops(true); // ProjectTree (and external sources) drop file URLs here
     m_header = new QLabel(this);
     m_header->setTextFormat(Qt::RichText);
     m_header->setStyleSheet(
@@ -1281,7 +1287,14 @@ void AgentPanel::onAttachClicked()
     const QStringList paths = QFileDialog::getOpenFileNames(
         this, QStringLiteral("Attach files"),
         m_workspace.isEmpty() ? QDir::homePath() : m_workspace);
+    attachPaths(paths);
+}
 
+void AgentPanel::attachPaths(const QStringList &paths)
+{
+    if (paths.isEmpty()) {
+        return;
+    }
     static const QHash<QString, QString> imageTypes{
         {QStringLiteral("png"), QStringLiteral("image/png")},
         {QStringLiteral("jpg"), QStringLiteral("image/jpeg")},
@@ -1291,16 +1304,26 @@ void AgentPanel::onAttachClicked()
         {QStringLiteral("bmp"), QStringLiteral("image/bmp")}};
 
     for (const QString &path : paths) {
+        const QFileInfo info(path);
+        if (!info.exists() || info.isDir()) {
+            // Directories aren't attachable as a single blob — silently skip.
+            if (info.isDir()) {
+                emit statusMessage(
+                    QStringLiteral("Skipped %1: directories cannot be attached")
+                        .arg(info.fileName()));
+            }
+            continue;
+        }
         QFile file(path);
         if (!file.open(QIODevice::ReadOnly)) {
             emit statusMessage(QStringLiteral("Could not read %1").arg(path));
             continue;
         }
         const QByteArray bytes = file.readAll();
-        const QFileInfo info(path);
         const QString ext = info.suffix().toLower();
 
-        QJsonObject att{{QStringLiteral("name"), info.fileName()}};
+        QJsonObject att{{QStringLiteral("name"), info.fileName()},
+                        {QStringLiteral("path"), info.absoluteFilePath()}};
         if (imageTypes.contains(ext)) {
             if (bytes.size() > 5 * 1024 * 1024) {
                 emit statusMessage(
@@ -1323,6 +1346,38 @@ void AgentPanel::onAttachClicked()
         m_attachments.append(att);
     }
     rebuildAttachChips();
+}
+
+void AgentPanel::dragEnterEvent(QDragEnterEvent *event)
+{
+    if (event->mimeData()->hasUrls()) {
+        event->acceptProposedAction();
+    }
+}
+
+void AgentPanel::dragMoveEvent(QDragMoveEvent *event)
+{
+    if (event->mimeData()->hasUrls()) {
+        event->acceptProposedAction();
+    }
+}
+
+void AgentPanel::dropEvent(QDropEvent *event)
+{
+    if (!event->mimeData()->hasUrls()) {
+        return;
+    }
+    QStringList paths;
+    const auto urls = event->mimeData()->urls();
+    for (const QUrl &u : urls) {
+        if (u.isLocalFile()) {
+            paths << u.toLocalFile();
+        }
+    }
+    if (!paths.isEmpty()) {
+        attachPaths(paths);
+        event->acceptProposedAction();
+    }
 }
 
 void AgentPanel::rebuildAttachChips()

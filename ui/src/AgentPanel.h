@@ -14,6 +14,9 @@ class WorkingIndicator;
 class QAbstractButton;
 class QCheckBox;
 class QComboBox;
+class QDragEnterEvent;
+class QDragMoveEvent;
+class QDropEvent;
 class QEvent;
 class QFrame;
 class QHBoxLayout;
@@ -52,6 +55,10 @@ public:
     // Re-read chat preferences (send key, tool-card visibility) from KConfig.
     void applyChatSettings();
 
+    // Attach a set of local file paths as context for the next message. Used
+    // by drag-and-drop from ProjectTree (and by the Attach… button).
+    void attachPaths(const QStringList &paths);
+
 Q_SIGNALS:
     void statusMessage(const QString &text);
     void titleChanged(const QString &title);
@@ -61,6 +68,9 @@ Q_SIGNALS:
 
 protected:
     bool eventFilter(QObject *obj, QEvent *event) override;
+    void dragEnterEvent(QDragEnterEvent *event) override;
+    void dragMoveEvent(QDragMoveEvent *event) override;
+    void dropEvent(QDropEvent *event) override;
 
 private:
     // One clarifying question currently shown to the human.

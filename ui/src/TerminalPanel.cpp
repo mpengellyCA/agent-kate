@@ -97,13 +97,21 @@ void TerminalPanel::applyVisibility()
 
 void TerminalPanel::newTerminal()
 {
+    openTerminalAt(m_workdir);
+}
+
+void TerminalPanel::openTerminalAt(const QString &dir)
+{
     if (m_konsoleMissing) {
         return;
     }
-    QWidget *session = createSession();
+    const QString cwd = dir.isEmpty() ? m_workdir : dir;
+    QWidget *session = createSession(cwd);
     if (!session) {
         return;
     }
+    // Tab is still owned by the active project for show/hide scoping; only the
+    // initial shell CWD differs from the project root.
     session->setProperty(kProjectProp, m_workdir);
     const int idx = m_tabs->addTab(session, i18n("Terminal %1", ++m_counter));
     // Re-apply visibility so a freshly created tab in a non-active project
@@ -119,7 +127,7 @@ void TerminalPanel::newTerminal()
 
 // createSession builds one tab: a container hosting a fresh Konsole KPart, or a
 // message label if the terminal could not be loaded.
-QWidget *TerminalPanel::createSession()
+QWidget *TerminalPanel::createSession(const QString &cwd)
 {
     auto *container = new QWidget(m_tabs);
     auto *layout = new QVBoxLayout(container);
@@ -150,7 +158,7 @@ QWidget *TerminalPanel::createSession()
     layout->addWidget(part->widget());
 
     if (auto *terminal = qobject_cast<TerminalInterface *>(part)) {
-        terminal->showShellInDir(m_workdir);
+        terminal->showShellInDir(cwd);
     }
     return container;
 }

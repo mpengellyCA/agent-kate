@@ -18,6 +18,7 @@ find_package(KF6 6.0 REQUIRED COMPONENTS
     I18n                # i18n()
     Parts               # KParts — embedding the Konsole terminal
     WidgetsAddons       # KMultiTabBar — Kate-style collapsible side/bottom strip
+    KIO                 # KIO::copy/move/trash, KPropertiesDialog, highlightInFileManager
 )
 
 add_executable(agentkate
@@ -78,6 +79,9 @@ target_link_libraries(agentkate PRIVATE
     KF6::I18n
     KF6::Parts
     KF6::WidgetsAddons
+    KF6::KIOCore
+    KF6::KIOGui
+    KF6::KIOWidgets
 )
 
 # Place the UI binary in the build root so it sits next to akcore; the UI

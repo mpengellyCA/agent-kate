@@ -22,11 +22,16 @@ public:
     // sessions are NOT destroyed — they keep running in the background.
     void setWorkingDirectory(const QString &dir);
 
+    // Open a new tab whose shell starts in the given directory. The tab is
+    // still scoped to the currently active project, so it stays visible only
+    // while that project is active. Used by ProjectTree's "Open Terminal Here".
+    void openTerminalAt(const QString &dir);
+
 public Q_SLOTS:
     void newTerminal();
 
 private:
-    QWidget *createSession();
+    QWidget *createSession(const QString &cwd);
     void applyVisibility();
 
     QTabWidget *m_tabs = nullptr;
