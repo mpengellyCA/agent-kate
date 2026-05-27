@@ -43,6 +43,15 @@ EditorArea::~EditorArea()
     // (Q_ASSERT(numBuckets > 0) on shutdown). Close every open tab first so
     // KTextEditor's documented "delete doc destroys its views" path runs
     // while the QStackedWidget is still intact.
+    //
+    // Block our own signals during teardown: removeTab() inside closeTabIn()
+    // fires QTabBar::currentChanged → our groupTabs lambda → emitCurrentFile
+    // → currentFileChanged. MainWindow listens on that signal and calls
+    // m_lsp->requestSymbols(...), but m_lsp is a sibling child of MainWindow
+    // created after m_editor, so it's already been destroyed by the time we
+    // run — the listener would dereference a dangling pointer. None of the
+    // shutdown listeners need to hear these signals anyway.
+    QSignalBlocker blocker(this);
     const auto groups = m_groups.values();
     for (QTabWidget *tabs : groups) {
         while (tabs->count() > 0) {
