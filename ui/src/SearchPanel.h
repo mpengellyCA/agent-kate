@@ -27,6 +27,12 @@ public:
     // Focus the query field — wired to the global Ctrl+Shift+F action.
     void focusQuery();
 
+    // Drive a search from outside the panel (e.g. the toolbar Search box).
+    // Sets the query text — which triggers the existing debounced RPC path —
+    // so the workspace-scoped root and all toggles are inherited. No-ops on
+    // an empty/whitespace query.
+    void search(const QString &query);
+
 Q_SIGNALS:
     // Emitted when the user activates a result. The host opens the file at
     // the given line in the editor area.
