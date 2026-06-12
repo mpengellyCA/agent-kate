@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Agent Kate developer command — one friendly entry point for everyday tasks.
+#
+#   scripts/ak <command> [options]
+#
+# Commands:
+#   build       Compile the UI + core into ./build (for running from the tree)
+#   run         Build if needed, then launch Agent Kate
+#   package     Build an installable native package from the current source
+#   install     Install system-wide (or upgrade if already installed)
+#   upgrade     Alias for install — rebuilds and upgrades in place
+#   uninstall   Remove an installed Agent Kate
+#   help        Show this help
+#
+# Most commands accept their own options; pass --help to any of them, e.g.
+#   scripts/ak build --release
+#   scripts/ak package --source
+#   scripts/ak install --rebuild
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${HERE}/lib.sh"
+
+usage() {
+    grep '^#' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; 1d'
+}
+
+cmd="${1:-help}"
+[[ $# -gt 0 ]] && shift || true
+
+case "$cmd" in
+    build)              exec "${HERE}/build.sh" "$@" ;;
+    run)                exec "${HERE}/run.sh" "$@" ;;
+    package|pkg)        exec "${HERE}/package.sh" "$@" ;;
+    install|upgrade)    exec "${HERE}/install.sh" "$@" ;;
+    uninstall|remove)   exec "${HERE}/uninstall.sh" "$@" ;;
+    help|-h|--help)     usage ;;
+    *) err "unknown command: ${cmd}"; echo; usage; exit 1 ;;
+esac
