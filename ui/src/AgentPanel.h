@@ -63,6 +63,9 @@ Q_SIGNALS:
     void statusMessage(const QString &text);
     void titleChanged(const QString &title);
     void stateChanged(const QString &dotColorHex);
+    // Human-readable one-line status (isolation / worktree branch / idle), used
+    // as the roster card's subtitle. Tracks the same state as stateChanged.
+    void subtitleChanged(const QString &text);
     void dormantChanged(bool dormant);
     void openDiff(const QString &title, const QString &diffText);
 

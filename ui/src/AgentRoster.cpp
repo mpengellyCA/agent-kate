@@ -1,26 +1,21 @@
 #include "AgentRoster.h"
+#include "AgentCardDelegate.h"
 
 #include <QAction>
-#include <QColor>
 #include <QFont>
 #include <QHBoxLayout>
-#include <QIcon>
 #include <QMenu>
-#include <QPainter>
-#include <QPixmap>
 #include <QPushButton>
 #include <QTreeWidget>
 #include <QTreeWidgetItem>
 #include <QVBoxLayout>
 
 namespace {
-// Project items store their path at Qt::UserRole; agent items store their id
-// at Qt::UserRole, a "dormant" bool at Qt::UserRole + 1, the raw title at
-// Qt::UserRole + 2, and the worktree number (int, 0 = unknown) at
-// Qt::UserRole + 3. Title and number are stored separately so the visible
-// label can be recomposed when either changes.
-constexpr int RoleTitle  = Qt::UserRole + 2;
-constexpr int RoleNumber = Qt::UserRole + 3;
+// Role layout lives in AgentCardDelegate.h (the delegate paints these). The
+// raw title and worktree number are stored separately so the (still-set, for
+// accessibility/tooltips) item text can be recomposed when either changes.
+using AgentRoles::Number;
+using AgentRoles::Title;
 
 QString composeLabel(int number, const QString &title)
 {
@@ -28,19 +23,6 @@ QString composeLabel(int number, const QString &title)
         return QStringLiteral("#%1  %2").arg(number).arg(title);
     }
     return title;
-}
-
-QIcon dotIcon(const QString &hex)
-{
-    QPixmap pm(14, 14);
-    pm.fill(Qt::transparent);
-    QPainter p(&pm);
-    p.setRenderHint(QPainter::Antialiasing);
-    p.setPen(Qt::NoPen);
-    p.setBrush(QColor(hex));
-    p.drawEllipse(2, 2, 10, 10);
-    p.end();
-    return QIcon(pm);
 }
 } // namespace
 
@@ -60,6 +42,10 @@ AgentRoster::AgentRoster(QWidget *parent)
     m_tree->setHeaderHidden(true);
     m_tree->setIndentation(14);
     m_tree->setContextMenuPolicy(Qt::CustomContextMenu);
+    // Agent rows render as tall multi-line cards; project rows stay compact, so
+    // rows are no longer a uniform height.
+    m_tree->setUniformRowHeights(false);
+    m_tree->setItemDelegate(new AgentCardDelegate(m_tree));
 
     connect(m_tree, &QTreeWidget::currentItemChanged, this,
             [this](QTreeWidgetItem *item, QTreeWidgetItem *) {
@@ -81,7 +67,7 @@ AgentRoster::AgentRoster(QWidget *parent)
         QMenu menu(this);
         if (item->parent()) {
             const int id = item->data(0, Qt::UserRole).toInt();
-            const bool dormant = item->data(0, Qt::UserRole + 1).toBool();
+            const bool dormant = item->data(0, AgentRoles::Dormant).toBool();
             QAction *resumeAct = nullptr;
             if (dormant) {
                 resumeAct = menu.addAction(QStringLiteral("Resume agent"));
@@ -155,18 +141,18 @@ void AgentRoster::addAgent(const QString &projectPath, int agentId, const QStrin
     }
     auto *item = new QTreeWidgetItem(project);
     item->setData(0, Qt::UserRole, agentId);
-    item->setData(0, RoleTitle, title);
-    item->setData(0, RoleNumber, 0);
+    item->setData(0, Title, title);
+    item->setData(0, Number, 0);
+    item->setData(0, AgentRoles::Dot, QStringLiteral("#8b91a0"));
     item->setText(0, composeLabel(0, title));
-    item->setIcon(0, dotIcon(QStringLiteral("#8b91a0")));
     project->setExpanded(true);
 }
 
 void AgentRoster::setAgentTitle(int agentId, const QString &title)
 {
     if (QTreeWidgetItem *item = agentItem(agentId)) {
-        item->setData(0, RoleTitle, title);
-        item->setText(0, composeLabel(item->data(0, RoleNumber).toInt(), title));
+        item->setData(0, Title, title);
+        item->setText(0, composeLabel(item->data(0, Number).toInt(), title));
     }
 }
 
@@ -176,27 +162,31 @@ void AgentRoster::setAgentNumber(int agentId, int number)
     if (!item) {
         return;
     }
-    if (item->data(0, RoleNumber).toInt() == number) {
+    if (item->data(0, Number).toInt() == number) {
         return;
     }
-    item->setData(0, RoleNumber, number);
-    item->setText(0, composeLabel(number, item->data(0, RoleTitle).toString()));
+    item->setData(0, Number, number);
+    item->setText(0, composeLabel(number, item->data(0, Title).toString()));
 }
 
 void AgentRoster::setAgentStatus(int agentId, const QString &dotColorHex)
 {
     if (QTreeWidgetItem *item = agentItem(agentId)) {
-        item->setIcon(0, dotIcon(dotColorHex));
+        item->setData(0, AgentRoles::Dot, dotColorHex);
+    }
+}
+
+void AgentRoster::setAgentSubtitle(int agentId, const QString &subtitle)
+{
+    if (QTreeWidgetItem *item = agentItem(agentId)) {
+        item->setData(0, AgentRoles::Subtitle, subtitle);
     }
 }
 
 void AgentRoster::setAgentDormant(int agentId, bool dormant)
 {
     if (QTreeWidgetItem *item = agentItem(agentId)) {
-        item->setData(0, Qt::UserRole + 1, dormant);
-        QFont font = item->font(0);
-        font.setItalic(dormant); // dormant agents read as resumable history
-        item->setFont(0, font);
+        item->setData(0, AgentRoles::Dormant, dormant);
     }
 }
 

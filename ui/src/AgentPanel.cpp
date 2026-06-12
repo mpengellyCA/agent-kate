@@ -1111,6 +1111,7 @@ void AgentPanel::refresh()
     m_header->setText(QStringLiteral("<span style='color:%1'>&#9679;</span>&nbsp;&nbsp;%2")
                           .arg(dot, text.toHtmlEscaped()));
     emit stateChanged(dot);
+    emit subtitleChanged(text);
 }
 
 // --- conversation feed ------------------------------------------------------
