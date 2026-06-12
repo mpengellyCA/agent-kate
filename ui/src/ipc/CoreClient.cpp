@@ -47,8 +47,13 @@ CoreClient::CoreClient(QObject *parent)
 CoreClient::~CoreClient()
 {
     if (m_proc && m_proc->state() != QProcess::NotRunning) {
+        // SIGTERM starts the core's graceful shutdown, which drains any pending
+        // cold-exit compactions before exiting. We MUST out-wait that drain, or
+        // the SIGKILL below cuts the core off mid-compaction and the summary
+        // goes missing. This grace stays a few seconds above the core's
+        // exitCompactCap (akcore main.go); keep the two in sync if either moves.
         m_proc->terminate();
-        if (!m_proc->waitForFinished(2000)) {
+        if (!m_proc->waitForFinished(18000)) {
             m_proc->kill();
             m_proc->waitForFinished(1000);
         }

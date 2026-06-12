@@ -35,6 +35,12 @@ type Supervisor struct {
 
 	mu      sync.Mutex
 	threads map[string]*Thread
+
+	// reapWG tracks every in-flight reap() goroutine. StopAll waits on it so
+	// the caller can be sure every thread's "exited" lifecycle event has been
+	// delivered — and thus every cold-exit compaction has been spawned —
+	// before shutdown proceeds to drain those compactions.
+	reapWG sync.WaitGroup
 }
 
 // NewSupervisor creates a supervisor. emit is invoked for every thread event.
@@ -256,6 +262,7 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 
 	go s.pumpStdout(t, stdout)
 	go s.pumpStderr(t, stderr)
+	s.reapWG.Add(1)
 	go s.reap(t)
 
 	// A fresh thread gets its opening turn now. A resumed thread has no opening
@@ -392,7 +399,13 @@ func (s *Supervisor) Interrupt(threadID string) error {
 	return nil
 }
 
-// StopAll terminates every running thread (used at core shutdown).
+// StopAll terminates every running thread (used at core shutdown) and blocks
+// until each thread's reap() has run to completion. Stop() only closes stdin
+// and schedules a 5s backstop kill, so without this join the process could
+// exit before a thread's "exited" lifecycle event fires — which is exactly
+// what spawns the cold-exit compaction. Waiting here guarantees every such
+// compaction has at least been spawned (and registered with its WaitGroup)
+// before the caller moves on to drain them.
 func (s *Supervisor) StopAll() {
 	s.mu.Lock()
 	ids := make([]string, 0, len(s.threads))
@@ -403,6 +416,7 @@ func (s *Supervisor) StopAll() {
 	for _, id := range ids {
 		_ = s.Stop(id)
 	}
+	s.reapWG.Wait()
 }
 
 func (s *Supervisor) pumpStdout(t *Thread, r io.Reader) {
@@ -533,6 +547,7 @@ func (s *Supervisor) pumpStderr(t *Thread, r io.Reader) {
 }
 
 func (s *Supervisor) reap(t *Thread) {
+	defer s.reapWG.Done()
 	err := t.cmd.Wait()
 
 	t.mu.Lock()
