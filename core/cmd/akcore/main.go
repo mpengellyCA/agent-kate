@@ -1569,6 +1569,11 @@ func startAgentThread(d handlerDeps, threadID, sessionID string, p agentStartPar
 		return
 	}
 
+	// The UI sends a tier token ("opus"/"sonnet"/"haiku"/"fable"/""); resolve
+	// it to a concrete --model id once here and persist that id, so a later
+	// resume replays the exact same model.
+	model := resolveModel(p.Model)
+
 	if _, err := d.sup.Start(agent.StartOptions{
 		ID:             threadID,
 		WorkDir:        wt.Path,
@@ -1576,7 +1581,7 @@ func startAgentThread(d handlerDeps, threadID, sessionID string, p agentStartPar
 		MCPConfig:      mcpConfig,
 		PermissionMode: p.PermissionMode,
 		Effort:         p.Effort,
-		Model:          p.Model,
+		Model:          model,
 		Attachments:    p.Attachments,
 		SessionID:      sessionID,
 	}); err != nil {
@@ -1598,7 +1603,7 @@ func startAgentThread(d handlerDeps, threadID, sessionID string, p agentStartPar
 		Worktree:       wt,
 		PermissionMode: permMode,
 		Effort:         p.Effort,
-		Model:          p.Model,
+		Model:          model,
 		Title:          summarizePrompt(p.Prompt),
 		Created:        time.Now(),
 		Status:         session.StatusRunning,
@@ -1844,18 +1849,45 @@ func runExitCompact(log *slog.Logger, sessions *session.Store, summaries *compac
 		"turns", sum.Turns, "body_bytes", len(sum.Body))
 }
 
+// resolveModel maps a UI-facing tier token ("opus", "sonnet", "haiku",
+// "fable") to the concrete claude --model id we spawn or compact with. It is
+// the single source of truth for the tier→id map, shared by the agent-spawn
+// path (startAgentThread) and the compaction path (resolveCompactModel) so the
+// two never disagree about what "opus" means. An empty or unrecognised token
+// is returned trimmed and unchanged: "" leaves Claude Code on its configured
+// default, and an already-full id (e.g. "claude-opus-4-8") passes through.
+func resolveModel(tier string) string {
+	switch strings.ToLower(strings.TrimSpace(tier)) {
+	case "opus":
+		return "claude-opus-4-8"
+	case "sonnet":
+		return "claude-sonnet-4-6"
+	case "haiku":
+		return "claude-haiku-4-5-20251001"
+	case "fable":
+		return "claude-fable-5"
+	default:
+		return strings.TrimSpace(tier)
+	}
+}
+
 // resolveCompactModel maps the UI-facing model token from the recovery dialog
-// ("opus", "sonnet", "haiku", "local") to the claude --model id we spawn with
-// and the strategy stamp for the resulting summary. Empty or unrecognised
-// tokens fall through to the programmatic compactor, the safe free fallback.
+// ("opus", "sonnet", "haiku", "fable", "local") to the claude --model id we
+// spawn with and the strategy stamp for the resulting summary. The id half is
+// delegated to resolveModel so spawn and compaction share one map. Empty or
+// unrecognised tokens fall through to the programmatic compactor, the safe
+// free fallback.
 func resolveCompactModel(token string) (modelID string, strategy compact.Strategy, isLocal bool) {
 	switch strings.ToLower(strings.TrimSpace(token)) {
 	case "opus":
-		return "claude-opus-4-7", compact.ResumeOpusCold, false
+		return resolveModel("opus"), compact.ResumeOpusCold, false
 	case "sonnet":
-		return "claude-sonnet-4-6", compact.ResumeSonnetCold, false
+		return resolveModel("sonnet"), compact.ResumeSonnetCold, false
 	case "haiku":
-		return "claude-haiku-4-5-20251001", compact.ResumeHaikuCold, false
+		return resolveModel("haiku"), compact.ResumeHaikuCold, false
+	case "fable":
+		// No dedicated Fable strategy bucket; stamp the closest (Sonnet-cold).
+		return resolveModel("fable"), compact.ResumeSonnetCold, false
 	case "local", "":
 		return "", compact.ResumeLocal, true
 	default:

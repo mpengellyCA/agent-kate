@@ -514,6 +514,36 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
             .writeEntry("effort", m_effortCombo->currentData().toString());
     });
 
+    // Model selector. Each item carries a tier token; the core resolves it to a
+    // concrete --model id (its resolveModel is the single source of truth, so
+    // the UI never hard-codes versioned model strings). An empty token passes
+    // no --model flag, leaving Claude Code's configured default. Fixed once the
+    // agent starts, like the other setup combos.
+    m_modelCombo = new QComboBox(this);
+    m_modelCombo->addItem(QStringLiteral("Default model"), QString());
+    m_modelCombo->addItem(QStringLiteral("Opus"), QStringLiteral("opus"));
+    m_modelCombo->addItem(QStringLiteral("Sonnet"), QStringLiteral("sonnet"));
+    m_modelCombo->addItem(QStringLiteral("Haiku"), QStringLiteral("haiku"));
+    m_modelCombo->addItem(QStringLiteral("Fable"), QStringLiteral("fable"));
+    m_modelCombo->setToolTip(QStringLiteral(
+        "Model for this agent, fixed once it starts.\n"
+        "Default model leaves Claude Code's own configured model untouched."));
+    // Sticky: the last choice becomes the default for the next agent.
+    {
+        const QString saved = KSharedConfig::openConfig()
+                                  ->group(QStringLiteral("Agent"))
+                                  .readEntry("model", QString());
+        const int savedIdx = m_modelCombo->findData(saved);
+        if (savedIdx >= 0) {
+            m_modelCombo->setCurrentIndex(savedIdx);
+        }
+    }
+    connect(m_modelCombo, &QComboBox::currentIndexChanged, this, [this] {
+        KSharedConfig::openConfig()
+            ->group(QStringLiteral("Agent"))
+            .writeEntry("model", m_modelCombo->currentData().toString());
+    });
+
     // Compaction strategy. Keeping a thread resumable cheaply needs a
     // condensed summary on disk — otherwise the next resume re-caches the
     // whole transcript. The five options encode (when, model) combos; the
@@ -601,6 +631,15 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     m_attachLayout->addStretch(1);
     m_attachBar->setVisible(false);
 
+    // Queue chip bar — shows follow-ups typed while a turn is in progress.
+    // Hidden until something is queued. Each chip removes its message on click.
+    m_queueBar = new QFrame(this);
+    m_queueLayout = new QHBoxLayout(m_queueBar);
+    m_queueLayout->setContentsMargins(0, 0, 0, 0);
+    m_queueLayout->setSpacing(6);
+    m_queueLayout->addStretch(1);
+    m_queueBar->setVisible(false);
+
     m_attachBtn = new QPushButton(
         QIcon::fromTheme(QStringLiteral("mail-attachment")), QStringLiteral("Attach…"), this);
     m_attachBtn->setCursor(Qt::PointingHandCursor);
@@ -625,6 +664,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
         form->addRow(QStringLiteral("Permission"), m_modeCombo);
         form->addRow(QStringLiteral("Isolation"), m_isolationCombo);
         form->addRow(QStringLiteral("Effort"), m_effortCombo);
+        form->addRow(QStringLiteral("Model"), m_modelCombo);
         auto *action = new QWidgetAction(menu);
         action->setDefaultWidget(panel);
         menu->addAction(action);
@@ -637,7 +677,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     setupBtn->setPopupMode(QToolButton::InstantPopup);
     setupBtn->setCursor(Qt::PointingHandCursor);
     setupBtn->setToolTip(QStringLiteral(
-        "Permission, isolation, and reasoning effort for this agent.\n"
+        "Permission, isolation, reasoning effort, and model for this agent.\n"
         "These are fixed once the agent starts."));
     setupBtn->setMenu(buildSetupMenu());
 
@@ -702,6 +742,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     body->addWidget(m_permBar);
     body->addWidget(m_questionBox);
     body->addWidget(m_promoteBar);
+    body->addWidget(m_queueBar);
     body->addWidget(m_attachBar);
     body->addWidget(m_input);
     body->addLayout(buttons);
@@ -1071,10 +1112,11 @@ void AgentPanel::refresh()
             actions.first()->setEnabled(running); // "Hot Opus (live thread)"
         }
     }
-    // The permission, isolation and effort modes are fixed once a thread exists.
+    // Permission, isolation, effort and model are fixed once a thread exists.
     m_modeCombo->setEnabled(m_threadId.isEmpty());
     m_isolationCombo->setEnabled(m_threadId.isEmpty());
     m_effortCombo->setEnabled(m_threadId.isEmpty());
+    m_modelCombo->setEnabled(m_threadId.isEmpty());
 
     // Offer promotion while a thread runs non-isolated in the workspace.
     m_promoteBar->setVisible(!m_threadId.isEmpty() && !m_isolated && !m_promoting);
@@ -1217,22 +1259,25 @@ void AgentPanel::onSendClicked()
                 QStringLiteral("err"));
         return;
     }
-    m_input->clear();
-
-    QString youLine = text.toHtmlEscaped().replace(QLatin1Char('\n'), QLatin1String("<br>"));
-    if (!m_attachments.isEmpty()) {
-        if (!youLine.isEmpty()) {
-            youLine += QStringLiteral("<br>");
-        }
-        youLine += QStringLiteral("<span style='color:palette(mid)'>&#128206; %1 "
-                                  "attachment(s)</span>")
-                       .arg(m_attachments.size());
+    // A turn is in progress: queue the follow-up instead of sending it now.
+    // The `claude` CLI buffers a second stdin user message until the current
+    // turn ends (verified: it is consumed at the turn boundary, never injected
+    // mid-turn), so sending now would just queue it invisibly inside the CLI.
+    // Holding it here keeps the queue visible and editable. We drain one per
+    // `result`. Mirrors the m_permQueue defer pattern.
+    if (!m_threadId.isEmpty() && !m_idle) {
+        m_input->clear();
+        m_sendQueue.append(QueuedMsg{text, m_attachments});
+        m_attachments = QJsonArray();
+        rebuildAttachChips();
+        rebuildQueueChips();
+        addNote(QStringLiteral("&#128338; queued — sends when the current turn finishes"),
+                QStringLiteral("dim"));
+        refresh();
+        return;
     }
-    addMessageCard(QStringLiteral("You"),
-                   isDark(this) ? QStringLiteral("#7cb7ff") : QStringLiteral("#1a5fb4"),
-                   youLine);
-    m_idle = false;
-    m_working->setActivity(QString()); // a new turn starts in generic mode
+
+    m_input->clear();
 
     // Detach the pending attachments for this message, then clear the bar.
     const QJsonArray attachments = m_attachments;
@@ -1240,6 +1285,10 @@ void AgentPanel::onSendClicked()
     rebuildAttachChips();
 
     if (m_threadId.isEmpty()) {
+        addYouCard(text, attachments);
+        m_idle = false;
+        m_working->setActivity(QString()); // a new turn starts in generic mode
+
         QString title = text.simplified();
         if (title.isEmpty()) {
             title = QStringLiteral("(attachments)");
@@ -1258,6 +1307,8 @@ void AgentPanel::onSendClicked()
                                   m_isolationCombo->currentData().toString()},
                                  {QStringLiteral("effort"),
                                   m_effortCombo->currentData().toString()},
+                                 {QStringLiteral("model"),
+                                  m_modelCombo->currentData().toString()},
                                  {QStringLiteral("attachments"), attachments}},
                      [this](const QJsonObject &result, const QJsonObject &error) {
                          if (!error.isEmpty()) {
@@ -1274,13 +1325,90 @@ void AgentPanel::onSendClicked()
                          pushCompactStrategy();
                          refresh();
                      });
+        refresh();
     } else {
-        m_core->call(QStringLiteral("agent.send"),
-                     QJsonObject{{QStringLiteral("threadId"), m_threadId},
-                                 {QStringLiteral("text"), text},
-                                 {QStringLiteral("attachments"), attachments}});
+        deliverMessage(text, attachments);
     }
+}
+
+// addYouCard renders an outgoing user message as a "You" card in the feed.
+void AgentPanel::addYouCard(const QString &text, const QJsonArray &attachments)
+{
+    QString youLine = text.toHtmlEscaped().replace(QLatin1Char('\n'), QLatin1String("<br>"));
+    if (!attachments.isEmpty()) {
+        if (!youLine.isEmpty()) {
+            youLine += QStringLiteral("<br>");
+        }
+        youLine += QStringLiteral("<span style='color:palette(mid)'>&#128206; %1 "
+                                  "attachment(s)</span>")
+                       .arg(attachments.size());
+    }
+    addMessageCard(QStringLiteral("You"),
+                   isDark(this) ? QStringLiteral("#7cb7ff") : QStringLiteral("#1a5fb4"),
+                   youLine);
+}
+
+// deliverMessage sends a message to the live thread right now: it shows the
+// You card, marks the turn busy, and issues agent.send. Used both for an
+// immediate send and to drain one queued follow-up per turn boundary.
+void AgentPanel::deliverMessage(const QString &text, const QJsonArray &attachments)
+{
+    addYouCard(text, attachments);
+    m_idle = false;
+    m_working->setActivity(QString()); // a new turn starts in generic mode
+    m_core->call(QStringLiteral("agent.send"),
+                 QJsonObject{{QStringLiteral("threadId"), m_threadId},
+                             {QStringLiteral("text"), text},
+                             {QStringLiteral("attachments"), attachments}});
     refresh();
+}
+
+// drainSendQueue fires the next queued follow-up once the thread is idle. It
+// is called on every `result`; sending sets m_idle = false again, so the rest
+// of the queue waits for the following turn boundary — one message per turn.
+void AgentPanel::drainSendQueue()
+{
+    if (m_sendQueue.isEmpty() || m_threadId.isEmpty() || m_dormant || !m_idle) {
+        return;
+    }
+    const QueuedMsg q = m_sendQueue.takeFirst();
+    rebuildQueueChips();
+    deliverMessage(q.text, q.attachments);
+}
+
+// rebuildQueueChips redraws the queued-message chip bar from m_sendQueue.
+// Each chip shows the message (truncated) and removes it on click.
+void AgentPanel::rebuildQueueChips()
+{
+    // Drop existing chip widgets, keeping the trailing stretch.
+    while (m_queueLayout->count() > 1) {
+        QLayoutItem *item = m_queueLayout->takeAt(0);
+        if (QWidget *w = item->widget()) {
+            w->deleteLater();
+        }
+        delete item;
+    }
+    for (int i = 0; i < m_sendQueue.size(); ++i) {
+        QString label = m_sendQueue.at(i).text.simplified();
+        if (label.isEmpty()) {
+            label = QStringLiteral("(attachments)");
+        }
+        if (label.length() > 28) {
+            label = label.left(27) + QChar(0x2026);
+        }
+        auto *chip = new QPushButton(QStringLiteral("⏳ %1   ✕").arg(label), m_queueBar);
+        chip->setCursor(Qt::PointingHandCursor);
+        chip->setToolTip(QStringLiteral("Queued message — click to remove before it sends"));
+        connect(chip, &QPushButton::clicked, this, [this, i] {
+            if (i < m_sendQueue.size()) {
+                m_sendQueue.removeAt(i);
+                rebuildQueueChips();
+                refresh();
+            }
+        });
+        m_queueLayout->insertWidget(m_queueLayout->count() - 1, chip);
+    }
+    m_queueBar->setVisible(!m_sendQueue.isEmpty());
 }
 
 void AgentPanel::onAttachClicked()
@@ -1750,6 +1878,8 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
                 err ? QStringLiteral("err") : QStringLiteral("ok"));
         m_idle = true;
         refresh();
+        // The turn boundary is the moment a queued follow-up can fire.
+        drainSendQueue();
 
     } else if (type == QLatin1String("_stderr")) {
         addNote(ev.value(QStringLiteral("text")).toString().toHtmlEscaped(),
@@ -1796,6 +1926,13 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             m_permQueue.clear();
             m_permBar->setVisible(false);
             m_questionBox->setVisible(false);
+            // Don't fire queued follow-ups into a stopped session.
+            if (!m_sendQueue.isEmpty()) {
+                m_sendQueue.clear();
+                rebuildQueueChips();
+                addNote(QStringLiteral("queued messages cleared — agent stopped"),
+                        QStringLiteral("dim"));
+            }
             // The process is gone but the Claude Code session persists — keep
             // the thread id and mark the agent resumable.
             if (!m_threadId.isEmpty()) {
