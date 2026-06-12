@@ -311,12 +311,14 @@ AgentPanel *AgentDock::addAgent(const QString &projectPath)
 {
     const int id = ++m_counter;
     auto *panel = new AgentPanel(m_core, m_stack);
-    panel->setWorkspace(projectPath);
     m_stack->addWidget(panel);
     m_agents.append(Entry{id, projectPath, panel});
 
     m_roster->addAgent(projectPath, id, QStringLiteral("Agent %1").arg(id));
     wireAgentPanel(id, panel);
+    // Set the workspace after wiring so the panel's first refresh() reaches the
+    // roster — that's what seeds the card's initial status dot and subtitle.
+    panel->setWorkspace(projectPath);
 
     m_roster->setCurrentAgent(id); // activates it via the roster
     return panel;
@@ -348,6 +350,8 @@ void AgentDock::wireAgentPanel(int agentId, AgentPanel *panel)
             [this, agentId](const QString &title) { m_roster->setAgentTitle(agentId, title); });
     connect(panel, &AgentPanel::stateChanged, this,
             [this, agentId](const QString &dot) { m_roster->setAgentStatus(agentId, dot); });
+    connect(panel, &AgentPanel::subtitleChanged, this,
+            [this, agentId](const QString &text) { m_roster->setAgentSubtitle(agentId, text); });
     connect(panel, &AgentPanel::dormantChanged, this,
             [this, agentId](bool dormant) { m_roster->setAgentDormant(agentId, dormant); });
 }

@@ -42,6 +42,7 @@ add_executable(agentkate
     src/SkillsDialog.cpp
     src/WelcomeDialog.cpp
     src/AgentRoster.cpp
+    src/AgentCardDelegate.cpp
     src/AgentDock.cpp
     src/AgentPanel.cpp
     src/WorktreeDashboard.cpp

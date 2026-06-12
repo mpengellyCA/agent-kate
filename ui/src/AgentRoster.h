@@ -19,6 +19,9 @@ public:
     void addAgent(const QString &projectPath, int agentId, const QString &title);
     void setAgentTitle(int agentId, const QString &title);
     void setAgentStatus(int agentId, const QString &dotColorHex);
+    // A muted second line for the agent card (isolation / worktree / idle).
+    // Derived locally in the UI for now — there is no backend description field.
+    void setAgentSubtitle(int agentId, const QString &subtitle);
     // Worktree number (the same #N the WorktreeDashboard shows), so the
     // roster row can be cross-referenced with that table. 0 hides it.
     void setAgentNumber(int agentId, int number);

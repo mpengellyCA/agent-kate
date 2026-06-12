@@ -1,0 +1,36 @@
+// SPDX-License-Identifier: LGPL-2.0-or-later
+// SPDX-FileCopyrightText: 2026 The Agent Kate developers
+
+#pragma once
+
+#include <QStyledItemDelegate>
+#include <Qt>
+
+// Item-data roles shared between AgentRoster (which writes them) and
+// AgentCardDelegate (which paints them). Qt::UserRole holds the agent id (int)
+// for agent rows or the project path (QString) for project rows.
+namespace AgentRoles {
+constexpr int Dormant  = Qt::UserRole + 1; // bool — resumable, drawn dimmed
+constexpr int Title    = Qt::UserRole + 2; // raw title, no "#N" prefix
+constexpr int Number   = Qt::UserRole + 3; // worktree number, 0 = none
+constexpr int Subtitle = Qt::UserRole + 4; // muted second line (derived in UI)
+constexpr int Dot      = Qt::UserRole + 5; // status-dot color, hex string
+} // namespace AgentRoles
+
+// AgentCardDelegate renders agent rows of the roster tree as multi-line cards:
+// a status dot, a bold title with a "#N" worktree badge, and a muted subtitle
+// line below. Project (top-level) rows fall through to the default painting so
+// they keep their plain section-header look. Modeled on RefChipDelegate /
+// LogGraphDelegate — paint() lets the style draw the background/selection, then
+// custom-paints on top using palette roles so it tracks Breeze light/dark.
+class AgentCardDelegate : public QStyledItemDelegate
+{
+    Q_OBJECT
+public:
+    explicit AgentCardDelegate(QObject *parent = nullptr);
+
+    void paint(QPainter *painter, const QStyleOptionViewItem &opt,
+               const QModelIndex &idx) const override;
+    QSize sizeHint(const QStyleOptionViewItem &opt,
+                   const QModelIndex &idx) const override;
+};
