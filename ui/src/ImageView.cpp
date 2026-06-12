@@ -18,6 +18,13 @@ bool ImageView::canDisplay(const QString &path)
         for (const QByteArray &fmt : QImageReader::supportedImageFormats()) {
             set.insert(fmt.toLower());
         }
+        // The qpdf image plugin advertises "pdf" here, which would let this
+        // static raster viewer claim PDFs and show only a flat page 1. Exclude
+        // it so PDFs fall through to KPartView → Okular (multi-page, scroll,
+        // search). Multi-page TIFFs degrade to page 1 the same way, but that's
+        // the long-standing behaviour and QImageReader is still their best
+        // native viewer, so we leave them here.
+        set.remove(QByteArrayLiteral("pdf"));
         return set;
     }();
     const QByteArray suffix = QFileInfo(path).suffix().toLower().toLatin1();

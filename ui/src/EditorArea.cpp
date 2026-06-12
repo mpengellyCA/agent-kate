@@ -1,6 +1,8 @@
 #include "EditorArea.h"
+#include "CsvView.h"
 #include "DiffView.h"
 #include "ImageView.h"
+#include "KPartView.h"
 #include "MarkdownView.h"
 
 #include <KTextEditor/Cursor>
@@ -147,6 +149,20 @@ void EditorArea::openFile(const QString &groupKey, const QString &path, int line
                 updateVisible();
                 return;
             }
+        } else if (auto *csv = qobject_cast<CsvView *>(w)) {
+            if (csv->path() == abs) {
+                tabs->setCurrentIndex(i);
+                m_activeGroup = groupKey;
+                updateVisible();
+                return;
+            }
+        } else if (auto *kpart = qobject_cast<KPartView *>(w)) {
+            if (kpart->path() == abs) {
+                tabs->setCurrentIndex(i);
+                m_activeGroup = groupKey;
+                updateVisible();
+                return;
+            }
         }
     }
 
@@ -171,11 +187,39 @@ void EditorArea::openFile(const QString &groupKey, const QString &path, int line
         return;
     }
 
+    if (CsvView::canDisplay(abs)) {
+        auto *csv = new CsvView(abs, tabs);
+        const int idx = tabs->addTab(csv, QFileInfo(abs).fileName());
+        tabs->setTabToolTip(idx, abs);
+        tabs->setCurrentWidget(csv);
+        m_activeGroup = groupKey;
+        updateVisible();
+        emit openFilesChanged();
+        emitCurrentFile();
+        return;
+    }
+
     if (ImageView::canDisplay(abs)) {
         auto *img = new ImageView(abs, tabs);
         const int idx = tabs->addTab(img, QFileInfo(abs).fileName());
         tabs->setTabToolTip(idx, abs);
         tabs->setCurrentWidget(img);
+        m_activeGroup = groupKey;
+        updateVisible();
+        emit openFilesChanged();
+        emitCurrentFile();
+        return;
+    }
+
+    // Generic KDE viewer part (Okular for PDF/ODF/Office/ePub, Ark for archives,
+    // KFontView for fonts, ...) — whatever the user has installed. Checked after
+    // images so plain rasters stay in ImageView; KPartView::canDisplay already
+    // excludes text/markdown/csv so source files fall through to KTextEditor.
+    if (KPartView::canDisplay(abs)) {
+        auto *kpart = new KPartView(abs, tabs);
+        const int idx = tabs->addTab(kpart, QFileInfo(abs).fileName());
+        tabs->setTabToolTip(idx, abs);
+        tabs->setCurrentWidget(kpart);
         m_activeGroup = groupKey;
         updateVisible();
         emit openFilesChanged();
@@ -270,6 +314,14 @@ QStringList EditorArea::openFilePaths() const
                 if (!img->path().isEmpty()) {
                     paths << img->path();
                 }
+            } else if (auto *csv = qobject_cast<CsvView *>(w)) {
+                if (!csv->path().isEmpty()) {
+                    paths << csv->path();
+                }
+            } else if (auto *kpart = qobject_cast<KPartView *>(w)) {
+                if (!kpart->path().isEmpty()) {
+                    paths << kpart->path();
+                }
             }
         }
     }
@@ -314,6 +366,10 @@ void EditorArea::emitCurrentFile()
             path = md->path();
         } else if (auto *img = qobject_cast<ImageView *>(w)) {
             path = img->path();
+        } else if (auto *csv = qobject_cast<CsvView *>(w)) {
+            path = csv->path();
+        } else if (auto *kpart = qobject_cast<KPartView *>(w)) {
+            path = kpart->path();
         }
     }
     emit currentFileChanged(path);
