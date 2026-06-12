@@ -1,4 +1,4 @@
-#include "MarkdownView.h"
+#include "RichTextView.h"
 
 #include <KConfigGroup>
 #include <KSharedConfig>
@@ -25,11 +25,14 @@
 namespace {
 constexpr int kRenderDebounceMs = 200;
 
-// The persisted (global) last-used mode, so reopening Markdown files keeps the
-// human's preference like the other sticky UI prefs.
-KConfigGroup modeConfig()
+// The persisted (global) last-used mode, so reopening rich-text files keeps the
+// human's preference like the other sticky UI prefs. Markdown and HTML remember
+// their mode independently (a reader may want HTML previewed but Markdown raw).
+KConfigGroup modeConfig(RichTextView::Format format)
 {
-    return KSharedConfig::openConfig()->group(QStringLiteral("MarkdownView"));
+    const QString group = format == RichTextView::Html ? QStringLiteral("HtmlView")
+                                                        : QStringLiteral("RichTextView");
+    return KSharedConfig::openConfig()->group(group);
 }
 
 // markdownToHtml renders Markdown to an HTML fragment, mirroring the helper used
@@ -62,16 +65,24 @@ QSize naturalImageSize(const QString &name, const QString &baseDir)
 }
 } // namespace
 
-bool MarkdownView::canDisplay(const QString &path)
+bool RichTextView::canDisplay(const QString &path)
 {
     const QString suffix = QFileInfo(path).suffix().toLower();
     return suffix == QLatin1String("md") || suffix == QLatin1String("markdown")
-        || suffix == QLatin1String("mdown") || suffix == QLatin1String("mkd");
+        || suffix == QLatin1String("mdown") || suffix == QLatin1String("mkd")
+        || suffix == QLatin1String("html") || suffix == QLatin1String("htm");
 }
 
-MarkdownView::MarkdownView(KTextEditor::Editor *editor, const QString &path, QWidget *parent)
+RichTextView::Format RichTextView::formatFor(const QString &path)
+{
+    const QString suffix = QFileInfo(path).suffix().toLower();
+    return (suffix == QLatin1String("html") || suffix == QLatin1String("htm")) ? Html : Markdown;
+}
+
+RichTextView::RichTextView(KTextEditor::Editor *editor, const QString &path, QWidget *parent)
     : QWidget(parent)
     , m_path(QFileInfo(path).absoluteFilePath())
+    , m_format(formatFor(path))
 {
     // A genuine Kate document, parented to this widget so its lifetime is bound
     // to the tab. EditorArea emits documentOpened/documentClosed for it so LSP,
@@ -113,15 +124,15 @@ MarkdownView::MarkdownView(KTextEditor::Editor *editor, const QString &path, QWi
     m_relayout = new QTimer(this);
     m_relayout->setSingleShot(true);
     m_relayout->setInterval(50);
-    connect(m_relayout, &QTimer::timeout, this, &MarkdownView::constrainImages);
+    connect(m_relayout, &QTimer::timeout, this, &RichTextView::constrainImages);
     m_preview->viewport()->installEventFilter(this);
 
     // Debounced live re-render while typing, like SearchPanel's search debounce.
     m_debounce = new QTimer(this);
     m_debounce->setSingleShot(true);
     m_debounce->setInterval(kRenderDebounceMs);
-    connect(m_debounce, &QTimer::timeout, this, &MarkdownView::render);
-    connect(m_doc, &KTextEditor::Document::textChanged, this, &MarkdownView::scheduleRender);
+    connect(m_debounce, &QTimer::timeout, this, &RichTextView::render);
+    connect(m_doc, &KTextEditor::Document::textChanged, this, &RichTextView::scheduleRender);
 
     // Toolbar: three mutually-exclusive, checkable mode actions.
     auto *toolbar = new QToolBar(this);
@@ -146,7 +157,7 @@ MarkdownView::MarkdownView(KTextEditor::Editor *editor, const QString &path, QWi
     layout->addWidget(toolbar);
     layout->addWidget(m_splitter, 1);
 
-    const int saved = modeConfig().readEntry("mode", static_cast<int>(Preview));
+    const int saved = modeConfig(m_format).readEntry("mode", static_cast<int>(Preview));
     m_mode = static_cast<Mode>(qBound<int>(Raw, saved, Split));
     switch (m_mode) {
     case Raw:
@@ -162,10 +173,10 @@ MarkdownView::MarkdownView(KTextEditor::Editor *editor, const QString &path, QWi
     setMode(m_mode);
 }
 
-void MarkdownView::setMode(Mode mode)
+void RichTextView::setMode(Mode mode)
 {
     m_mode = mode;
-    modeConfig().writeEntry("mode", static_cast<int>(mode));
+    modeConfig(m_format).writeEntry("mode", static_cast<int>(mode));
 
     const bool showEditor = (mode == Raw || mode == Split);
     const bool showPreview = (mode == Preview || mode == Split);
@@ -180,7 +191,7 @@ void MarkdownView::setMode(Mode mode)
     }
 }
 
-void MarkdownView::scheduleRender()
+void RichTextView::scheduleRender()
 {
     m_previewDirty = true;
     // Only spend cycles rendering when the preview pane is actually visible.
@@ -189,14 +200,17 @@ void MarkdownView::scheduleRender()
     }
 }
 
-void MarkdownView::render()
+void RichTextView::render()
 {
-    m_preview->setHtml(markdownToHtml(m_doc->text()));
+    // Markdown is parsed to HTML; an .html file is already HTML, so feed it to
+    // the browser as-is. Either way QTextBrowser renders Qt's rich-text subset.
+    const QString html = m_format == Html ? m_doc->text() : markdownToHtml(m_doc->text());
+    m_preview->setHtml(html);
     constrainImages();
     m_previewDirty = false;
 }
 
-void MarkdownView::constrainImages()
+void RichTextView::constrainImages()
 {
     QTextDocument *doc = m_preview->document();
     // Available content width = viewport minus the document's left+right margins.
@@ -262,7 +276,7 @@ void MarkdownView::constrainImages()
     cur.endEditBlock();
 }
 
-bool MarkdownView::eventFilter(QObject *watched, QEvent *event)
+bool RichTextView::eventFilter(QObject *watched, QEvent *event)
 {
     if (watched == m_preview->viewport() && event->type() == QEvent::Resize) {
         m_relayout->start();

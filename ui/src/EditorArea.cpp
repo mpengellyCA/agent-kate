@@ -3,7 +3,7 @@
 #include "DiffView.h"
 #include "ImageView.h"
 #include "KPartView.h"
-#include "MarkdownView.h"
+#include "RichTextView.h"
 
 #include <KTextEditor/Cursor>
 #include <KTextEditor/Document>
@@ -132,7 +132,7 @@ void EditorArea::openFile(const QString &groupKey, const QString &path, int line
                 }
                 return;
             }
-        } else if (auto *md = qobject_cast<MarkdownView *>(w)) {
+        } else if (auto *md = qobject_cast<RichTextView *>(w)) {
             if (md->path() == abs) {
                 tabs->setCurrentIndex(i);
                 m_activeGroup = groupKey;
@@ -166,12 +166,10 @@ void EditorArea::openFile(const QString &groupKey, const QString &path, int line
         }
     }
 
-    // File-type dispatch, in precedence order. Item 07 (document/media viewing)
-    // slots CSV → KPart → media branches between Markdown and the text fallback;
-    // the ordered shape here is the seam they share: markdown → csv → image →
-    // KPart → media → text.
-    if (MarkdownView::canDisplay(abs)) {
-        auto *md = new MarkdownView(m_editor, abs, tabs);
+    // File-type dispatch, in precedence order. RichTextView claims Markdown and
+    // HTML; the ordered shape is: rich text → csv → image → KPart → text.
+    if (RichTextView::canDisplay(abs)) {
+        auto *md = new RichTextView(m_editor, abs, tabs);
         const int idx = tabs->addTab(md, QFileInfo(abs).fileName());
         tabs->setTabToolTip(idx, abs);
         tabs->setCurrentWidget(md);
@@ -288,7 +286,7 @@ KTextEditor::View *EditorArea::currentView() const
         if (auto *view = qobject_cast<KTextEditor::View *>(w)) {
             return view;
         }
-        if (auto *md = qobject_cast<MarkdownView *>(w)) {
+        if (auto *md = qobject_cast<RichTextView *>(w)) {
             return md->view();
         }
     }
@@ -306,7 +304,7 @@ QStringList EditorArea::openFilePaths() const
                 if (!p.isEmpty()) {
                     paths << p;
                 }
-            } else if (auto *md = qobject_cast<MarkdownView *>(w)) {
+            } else if (auto *md = qobject_cast<RichTextView *>(w)) {
                 if (!md->path().isEmpty()) {
                     paths << md->path();
                 }
@@ -336,7 +334,7 @@ void EditorArea::closeTabIn(QTabWidget *tabs, int index)
         emit documentClosed(doc);
         tabs->removeTab(index);
         delete doc; // also destroys its views
-    } else if (auto *md = qobject_cast<MarkdownView *>(widget)) {
+    } else if (auto *md = qobject_cast<RichTextView *>(widget)) {
         // Owns a real document like a text tab: announce closure, tear the
         // document down first (which destroys its embedded view) — same
         // KTextEditor-safe ordering as the plain-view path — then the host.
@@ -362,7 +360,7 @@ void EditorArea::emitCurrentFile()
         QWidget *w = tabs->currentWidget();
         if (auto *view = qobject_cast<KTextEditor::View *>(w)) {
             path = view->document()->url().toLocalFile();
-        } else if (auto *md = qobject_cast<MarkdownView *>(w)) {
+        } else if (auto *md = qobject_cast<RichTextView *>(w)) {
             path = md->path();
         } else if (auto *img = qobject_cast<ImageView *>(w)) {
             path = img->path();

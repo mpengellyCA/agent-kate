@@ -51,7 +51,7 @@ bool KPartView::canDisplay(const QString &path)
     // EditorArea; never let a generic part claim them. text/markdown and
     // text/csv both inherit text/plain, so this single check also keeps
     // Markdown, CSV and every source file out of Okular (it advertises
-    // text/plain) and routed to KTextEditor/MarkdownView/CsvView instead.
+    // text/plain) and routed to KTextEditor/RichTextView/CsvView instead.
     if (mime.inherits(QStringLiteral("text/plain"))) {
         return false;
     }

@@ -29,7 +29,7 @@ add_executable(agentkate
     src/ImageView.cpp
     src/KPartView.cpp
     src/CsvView.cpp
-    src/MarkdownView.cpp
+    src/RichTextView.cpp
     src/ExtensionsDialog.cpp
     src/ProblemsPanel.cpp
     src/ReferencesPanel.cpp
