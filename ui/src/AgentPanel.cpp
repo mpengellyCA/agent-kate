@@ -1052,6 +1052,10 @@ void AgentPanel::refresh()
                                  : (running ? QStringLiteral("Send")
                                             : QStringLiteral("Start agent")));
     m_stopBtn->setEnabled(running);
+    m_stopBtn->setToolTip((running && !m_idle)
+                              ? QStringLiteral("Interrupt the in-flight response "
+                                               "now (resumable)")
+                              : QStringLiteral("Stop this agent (resumable)"));
     m_diffBtn->setEnabled(running);
     // Compact-now needs a thread on disk (running or dormant). The Hot Opus
     // menu item is the only one that further needs the thread to be live.
@@ -1407,11 +1411,22 @@ void AgentPanel::rebuildAttachChips()
 
 void AgentPanel::onStopClicked()
 {
-    if (m_threadId.isEmpty()) {
+    if (m_threadId.isEmpty() || m_dormant) {
         return;
     }
-    m_core->call(QStringLiteral("agent.stop"),
-                 QJsonObject{{QStringLiteral("threadId"), m_threadId}});
+    // While a turn is in flight (generating, or paused on a tool/permission),
+    // Stop is a hard interrupt: abort the response now so no more tokens are
+    // billed, leaving the session resumable. When idle, it's the graceful
+    // "end this agent" stop.
+    const bool turnInFlight = !m_idle;
+    if (turnInFlight) {
+        addNote(QStringLiteral("&#9209; interrupting…"), QStringLiteral("sys"));
+        m_core->call(QStringLiteral("agent.interrupt"),
+                     QJsonObject{{QStringLiteral("threadId"), m_threadId}});
+    } else {
+        m_core->call(QStringLiteral("agent.stop"),
+                     QJsonObject{{QStringLiteral("threadId"), m_threadId}});
+    }
 }
 
 void AgentPanel::onChangesClicked()
@@ -1790,8 +1805,14 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
                 m_threadId.clear(); // a fresh start failed — back to a blank panel
             }
             refresh();
-        } else if (phase == QLatin1String("exited")) {
-            addNote(QStringLiteral("agent exited: %1").arg(detail), QStringLiteral("dim"));
+        } else if (phase == QLatin1String("exited")
+                   || phase == QLatin1String("interrupted")) {
+            const bool wasInterrupt = phase == QLatin1String("interrupted");
+            addNote(wasInterrupt
+                        ? QStringLiteral("&#9209; stopped (resumable) — send a "
+                                         "follow-up to continue this session")
+                        : QStringLiteral("agent exited: %1").arg(detail),
+                    wasInterrupt ? QStringLiteral("sys") : QStringLiteral("dim"));
             m_idle = false;
             m_permQueue.clear();
             m_permBar->setVisible(false);
