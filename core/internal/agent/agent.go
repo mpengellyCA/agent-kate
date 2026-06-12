@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -110,15 +111,17 @@ type Thread struct {
 	ID      string
 	WorkDir string
 
-	mu         sync.Mutex
-	cmd        *exec.Cmd
-	stdin      io.WriteCloser
-	sessionID  string      // captured from stream-json, for future --resume
-	mcpConfig  string      // temp --mcp-config file to clean up on exit
-	meter      *toolMeter  // measures tool_result sizes for token-cost telemetry
-	usage      *usageMeter // measures per-turn LLM token usage and billed cost
-	alive      bool
-	hotCompact *hotCompact // when non-nil, the next assistant turn is captured for a summary
+	mu          sync.Mutex
+	cmd         *exec.Cmd
+	stdin       io.WriteCloser
+	sessionID   string      // captured from stream-json, for future --resume
+	mcpConfig   string      // temp --mcp-config file to clean up on exit
+	meter       *toolMeter  // measures tool_result sizes for token-cost telemetry
+	usage       *usageMeter // measures per-turn LLM token usage and billed cost
+	alive       bool
+	pgid        int         // process-group id (== leader pid); signalled by Interrupt
+	interrupted bool        // set by Interrupt so reap() reports a user-interrupt
+	hotCompact  *hotCompact // when non-nil, the next assistant turn is captured for a summary
 }
 
 // hotCompact tracks an in-flight Hot-Opus compaction: assistant text is
@@ -203,6 +206,10 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 
 	cmd := exec.Command(s.claudeBin, args...)
 	cmd.Dir = opts.WorkDir
+	// Put the agent in its own process group so Interrupt() can signal the whole
+	// group (claude + any tools / MCP subprocesses it spawns) rather than
+	// orphaning children. The group id equals the leader's pid.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -236,6 +243,8 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 		return nil, fmt.Errorf("start %s: %w", s.claudeBin, err)
 	}
 	t.alive = true
+	// With Setpgid the child is the leader of a new group whose id is its pid.
+	t.pgid = cmd.Process.Pid
 
 	s.mu.Lock()
 	s.threads[t.ID] = t
@@ -309,6 +318,74 @@ func (s *Supervisor) Stop(threadID string) error {
 		stillAlive := t.alive
 		t.mu.Unlock()
 		if stillAlive && proc != nil {
+			_ = proc.Kill()
+		}
+	}()
+	return nil
+}
+
+// Interrupt halts a thread's in-flight turn *immediately* and leaves the
+// session resumable. Unlike Stop — the graceful "finish this turn, then quit"
+// path used by StopAll and panel close — this aborts generation mid-response so
+// no further tokens are billed.
+//
+// Primary path is in-band: it writes Claude Code's stream-json interrupt
+// control_request, then closes stdin so the aborted process exits cleanly.
+// A spike against claude 2.1.172 (see docs/plans/04-stop-agent.md) confirmed the
+// CLI acks the frame and stops generating within ~1ms, then exits ~180ms after
+// stdin close with no signal needed; the persisted session resumes via --resume.
+//
+// Signals are the reliable fallback: if the process is still alive after a short
+// grace, we SIGINT the whole process group (claude + spawned tools), escalating
+// to SIGKILL. reap() reports this as a user-interrupt, not a crash.
+func (s *Supervisor) Interrupt(threadID string) error {
+	t := s.thread(threadID)
+	if t == nil {
+		return fmt.Errorf("unknown thread %q", threadID)
+	}
+	frame, err := json.Marshal(map[string]any{
+		"type":       "control_request",
+		"request_id": "ak-interrupt-" + NewThreadID(),
+		"request":    map[string]any{"subtype": "interrupt"},
+	})
+	if err != nil {
+		return err
+	}
+
+	t.mu.Lock()
+	if !t.alive {
+		t.mu.Unlock()
+		return nil
+	}
+	t.interrupted = true
+	pgid := t.pgid
+	proc := t.cmd.Process
+	// In-band abort, then EOF to let the now-idle process exit cleanly.
+	_, werr := t.stdin.Write(append(frame, '\n'))
+	_ = t.stdin.Close()
+	t.mu.Unlock()
+	if werr != nil {
+		s.log.Warn("interrupt frame write failed; relying on signal backstop",
+			"thread", threadID, "err", werr)
+	}
+
+	// Signal backstop: escalate only if the in-band abort + EOF didn't land.
+	// Much shorter than Stop's 5s grace because the intent here is immediate.
+	go func() {
+		time.Sleep(2 * time.Second)
+		if !s.Running(threadID) {
+			return
+		}
+		if pgid > 0 {
+			_ = syscall.Kill(-pgid, syscall.SIGINT)
+		}
+		time.Sleep(2 * time.Second)
+		if !s.Running(threadID) {
+			return
+		}
+		if pgid > 0 {
+			_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		} else if proc != nil {
 			_ = proc.Kill()
 		}
 	}()
@@ -460,6 +537,7 @@ func (s *Supervisor) reap(t *Thread) {
 
 	t.mu.Lock()
 	t.alive = false
+	interrupted := t.interrupted
 	// Unblock any in-flight Compact waiters: the summary turn isn't coming.
 	if t.hotCompact != nil {
 		t.hotCompact.finish(fmt.Errorf("agent exited before compact completed"))
@@ -478,12 +556,19 @@ func (s *Supervisor) reap(t *Thread) {
 	delete(s.threads, t.ID)
 	s.mu.Unlock()
 
+	// A user interrupt makes claude exit non-zero (aborted_streaming); report it
+	// as an interrupt, not a crash, so the UI shows "stopped (resumable)".
+	phase := "exited"
 	detail := "exited cleanly"
-	if err != nil {
+	switch {
+	case interrupted:
+		phase = "interrupted"
+		detail = "interrupted by user (resumable)"
+	case err != nil:
 		detail = "exited: " + err.Error()
 	}
-	s.log.Info("agent thread ended", "thread", t.ID, "detail", detail)
-	s.emitLifecycle(t.ID, "exited", detail)
+	s.log.Info("agent thread ended", "thread", t.ID, "phase", phase, "detail", detail)
+	s.emitLifecycle(t.ID, phase, detail)
 }
 
 func (s *Supervisor) thread(id string) *Thread {

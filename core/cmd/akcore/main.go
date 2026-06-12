@@ -159,15 +159,19 @@ func runCore() {
 		// mark it dormant so it can be resumed later. If the thread is
 		// configured for a cold-exit compaction strategy, fire it in the
 		// background — Hot-Opus is a separate pre-reap flow.
-		if probe.Type == "_lifecycle" && probe.Phase == "exited" {
+		if probe.Type == "_lifecycle" && (probe.Phase == "exited" || probe.Phase == "interrupted") {
 			coopState.ClearOwner(threadID)
 			_ = sessions.Update(threadID, func(r *session.Record) {
 				r.Status = session.StatusDormant
 			})
-			if rec, ok := sessions.Get(threadID); ok {
-				strat := compact.Strategy(rec.CompactStrategy).Resolve()
-				if strat.RunsOnExit() && strat != compact.ExitOpusHot {
-					go runExitCompact(log, sessions, summaries, rec, strat)
+			// Cold-exit compaction runs only on a normal exit; a user interrupt
+			// is meant to be immediate, so we don't spend a turn summarising it.
+			if probe.Phase == "exited" {
+				if rec, ok := sessions.Get(threadID); ok {
+					strat := compact.Strategy(rec.CompactStrategy).Resolve()
+					if strat.RunsOnExit() && strat != compact.ExitOpusHot {
+						go runExitCompact(log, sessions, summaries, rec, strat)
+					}
 				}
 			}
 		}
@@ -475,6 +479,21 @@ func registerHandlers(d handlerDeps) {
 		// the exit lifecycle handler instead.
 		runHotCompactIfConfigured(d, p.ThreadID)
 		if err := d.sup.Stop(p.ThreadID); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		return map[string]any{"ok": true}, nil
+	})
+
+	// agent.interrupt is the hard-stop counterpart to agent.stop: it aborts the
+	// in-flight turn immediately (no further tokens billed) and leaves the
+	// thread dormant-but-resumable. No hot-compaction here — interrupt is meant
+	// to be instantaneous, and spending a summary turn would defeat the purpose.
+	d.srv.Handle("agent.interrupt", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p agentStopParams
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		if err := d.sup.Interrupt(p.ThreadID); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
 		return map[string]any{"ok": true}, nil
