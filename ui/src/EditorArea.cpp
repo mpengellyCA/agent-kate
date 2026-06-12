@@ -1,6 +1,7 @@
 #include "EditorArea.h"
 #include "DiffView.h"
 #include "ImageView.h"
+#include "MarkdownView.h"
 
 #include <KTextEditor/Cursor>
 #include <KTextEditor/Document>
@@ -129,6 +130,16 @@ void EditorArea::openFile(const QString &groupKey, const QString &path, int line
                 }
                 return;
             }
+        } else if (auto *md = qobject_cast<MarkdownView *>(w)) {
+            if (md->path() == abs) {
+                tabs->setCurrentIndex(i);
+                m_activeGroup = groupKey;
+                updateVisible();
+                if (line >= 0) {
+                    md->view()->setCursorPosition(KTextEditor::Cursor(line, 0));
+                }
+                return;
+            }
         } else if (auto *img = qobject_cast<ImageView *>(w)) {
             if (img->path() == abs) {
                 tabs->setCurrentIndex(i);
@@ -137,6 +148,27 @@ void EditorArea::openFile(const QString &groupKey, const QString &path, int line
                 return;
             }
         }
+    }
+
+    // File-type dispatch, in precedence order. Item 07 (document/media viewing)
+    // slots CSV → KPart → media branches between Markdown and the text fallback;
+    // the ordered shape here is the seam they share: markdown → csv → image →
+    // KPart → media → text.
+    if (MarkdownView::canDisplay(abs)) {
+        auto *md = new MarkdownView(m_editor, abs, tabs);
+        const int idx = tabs->addTab(md, QFileInfo(abs).fileName());
+        tabs->setTabToolTip(idx, abs);
+        tabs->setCurrentWidget(md);
+        m_activeGroup = groupKey;
+        updateVisible();
+        if (line >= 0) {
+            md->view()->setCursorPosition(KTextEditor::Cursor(line, 0));
+        }
+        // A real Kate document backs this tab, so the rest of the app (LSP,
+        // Outline, Problems, Git gutter/blame) must see it open like any other.
+        emit documentOpened(md->document(), abs);
+        emit openFilesChanged();
+        return;
     }
 
     if (ImageView::canDisplay(abs)) {
@@ -195,7 +227,7 @@ bool EditorArea::saveCurrent()
     if (!tabs) {
         return false;
     }
-    auto *view = qobject_cast<KTextEditor::View *>(tabs->currentWidget());
+    KTextEditor::View *view = currentView();
     if (!view) {
         return false;
     }
@@ -208,7 +240,13 @@ bool EditorArea::saveCurrent()
 KTextEditor::View *EditorArea::currentView() const
 {
     if (QTabWidget *tabs = activeTabs()) {
-        return qobject_cast<KTextEditor::View *>(tabs->currentWidget());
+        QWidget *w = tabs->currentWidget();
+        if (auto *view = qobject_cast<KTextEditor::View *>(w)) {
+            return view;
+        }
+        if (auto *md = qobject_cast<MarkdownView *>(w)) {
+            return md->view();
+        }
     }
     return nullptr;
 }
@@ -223,6 +261,10 @@ QStringList EditorArea::openFilePaths() const
                 const QString p = view->document()->url().toLocalFile();
                 if (!p.isEmpty()) {
                     paths << p;
+                }
+            } else if (auto *md = qobject_cast<MarkdownView *>(w)) {
+                if (!md->path().isEmpty()) {
+                    paths << md->path();
                 }
             } else if (auto *img = qobject_cast<ImageView *>(w)) {
                 if (!img->path().isEmpty()) {
@@ -242,6 +284,15 @@ void EditorArea::closeTabIn(QTabWidget *tabs, int index)
         emit documentClosed(doc);
         tabs->removeTab(index);
         delete doc; // also destroys its views
+    } else if (auto *md = qobject_cast<MarkdownView *>(widget)) {
+        // Owns a real document like a text tab: announce closure, tear the
+        // document down first (which destroys its embedded view) — same
+        // KTextEditor-safe ordering as the plain-view path — then the host.
+        KTextEditor::Document *doc = md->document();
+        emit documentClosed(doc);
+        tabs->removeTab(index);
+        delete doc;
+        delete md;
     } else {
         tabs->removeTab(index);
         if (widget) {
@@ -259,6 +310,8 @@ void EditorArea::emitCurrentFile()
         QWidget *w = tabs->currentWidget();
         if (auto *view = qobject_cast<KTextEditor::View *>(w)) {
             path = view->document()->url().toLocalFile();
+        } else if (auto *md = qobject_cast<MarkdownView *>(w)) {
+            path = md->path();
         } else if (auto *img = qobject_cast<ImageView *>(w)) {
             path = img->path();
         }
