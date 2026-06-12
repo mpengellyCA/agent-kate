@@ -26,7 +26,12 @@ makedepends=(
     'go'
     'git'
 )
-optdepends=('git: source control integration')
+optdepends=(
+    'git: source control integration'
+    'okular: view PDF/ePub/DjVu/comic-book and ODF/Office documents in editor tabs'
+    'calligra: render Word/Excel/PowerPoint and ODF documents via Okular'
+    'ark: inspect zip/tar archives in editor tabs'
+)
 source=("$pkgname-$pkgver.tar.gz::https://github.com/mpengelly/AgentKate/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
 

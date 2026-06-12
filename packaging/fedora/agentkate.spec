@@ -29,6 +29,9 @@ BuildRequires:  libappstream-glib
 
 Requires:       konsole
 Recommends:     git
+Recommends:     okular
+Suggests:       calligra
+Suggests:       ark
 
 %description
 Agent Kate combines the Kate text editor with an orchestration core for
