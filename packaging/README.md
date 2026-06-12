@@ -33,6 +33,21 @@ network access for `go mod vendor`).
 
 ## Fedora
 
+The quickest path is the helper script, which vendors Go deps, builds the RPM
+with `rpmbuild`, and installs/upgrades it via `dnf` in one step:
+
+```sh
+sudo dnf install rpm-build cmake ninja-build golang \
+    extra-cmake-modules qt6-qtbase-devel \
+    kf6-ktexteditor-devel kf6-syntax-highlighting-devel kf6-kxmlgui-devel \
+    kf6-kconfigwidgets-devel kf6-kconfig-devel kf6-kcoreaddons-devel \
+    kf6-ki18n-devel kf6-kparts-devel kf6-kwidgetsaddons-devel \
+    desktop-file-utils libappstream-glib
+scripts/ak install            # build the RPM and install/upgrade in place
+```
+
+To build the RPM by hand instead:
+
 ```sh
 # Install build deps
 sudo dnf install rpm-build rpmdevtools cmake ninja-build golang \

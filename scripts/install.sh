@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Install or upgrade Agent Kate system-wide. On Arch this builds a native
-# package (if needed) and installs it with pacman, so it is cleanly tracked
-# and upgraded in place — running this again simply upgrades.
+# Install or upgrade Agent Kate system-wide. On Arch and Fedora this builds a
+# native package (if needed) and installs it with the system package manager,
+# so it is cleanly tracked and upgraded in place — running this again upgrades.
 #
 #   scripts/install.sh             # install, or upgrade if already installed
 #   scripts/install.sh --rebuild   # force a fresh package build first
 #
-# On non-Arch systems it falls back to `cmake --install` from ./build into
+# On other distros it falls back to `cmake --install` from ./build into
 # a prefix (default /usr/local; override with PREFIX=...).
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -33,21 +33,24 @@ if [[ "$(id -u)" -ne 0 ]]; then
     else die "need root (or sudo/doas) to install system-wide"; fi
 fi
 
-if [[ "$FAMILY" == "arch" ]]; then
-    require_cmd pacman
-
-    DIST="${ROOT}/dist"
-    PKG="$(ls -t "${DIST}"/agentkate-"${VERSION}"-*.pkg.tar.* 2>/dev/null | head -n1 || true)"
-
+# Locate a freshly-built package, building one if missing or --rebuild was given.
+# Sets PKG.
+ensure_package() {
+    PKG="$(find_built_package "$FAMILY" "$VERSION")"
     if [[ "$REBUILD" == 1 || -z "$PKG" ]]; then
         step "Building package"
         "${ROOT}/scripts/package.sh"
-        PKG="$(ls -t "${DIST}"/agentkate-"${VERSION}"-*.pkg.tar.* 2>/dev/null | head -n1 || true)"
+        PKG="$(find_built_package "$FAMILY" "$VERSION")"
     else
         info "Using existing package: ${C_BOLD}$(basename "$PKG")${C_RESET}"
         info "(pass ${C_BOLD}--rebuild${C_RESET} to rebuild from current source)"
     fi
     [[ -n "$PKG" ]] || die "no package found to install"
+}
+
+if [[ "$FAMILY" == "arch" ]]; then
+    require_cmd pacman
+    ensure_package
 
     if pacman -Q agentkate >/dev/null 2>&1; then
         local_ver="$(pacman -Q agentkate | awk '{print $2}')"
@@ -64,7 +67,37 @@ if [[ "$FAMILY" == "arch" ]]; then
     exit 0
 fi
 
-# --- non-Arch fallback: cmake --install from ./build ------------------------
+if [[ "$FAMILY" == "fedora" ]]; then
+    require_cmd dnf
+    ensure_package
+
+    # Compare the installed version-release against the package we built so we
+    # can pick the right dnf verb: install/upgrade for a different version, but
+    # reinstall for an identical one (dnf install treats that as a no-op).
+    pkg_nvr="$(rpm -qp --qf '%{VERSION}-%{RELEASE}' "$PKG" 2>/dev/null)"
+    if installed_nvr="$(rpm -q --qf '%{VERSION}-%{RELEASE}' agentkate 2>/dev/null)" \
+        && [[ "$installed_nvr" == "$pkg_nvr" ]]; then
+        step "Reinstalling Agent Kate ${installed_nvr} (already installed)"
+        # `dnf install` is a no-op for the same version, so force a reinstall.
+        $SUDO dnf reinstall -y "$PKG"
+    else
+        if [[ -n "$installed_nvr" ]]; then
+            step "Upgrading Agent Kate (installed: ${installed_nvr})"
+        else
+            step "Installing Agent Kate ${VERSION}"
+        fi
+        # `dnf install` on a local .rpm installs or upgrades in place and pulls
+        # in any missing runtime dependencies from the repos.
+        $SUDO dnf install -y "$PKG"
+    fi
+
+    step "Done"
+    ok "Installed: ${C_BOLD}$(rpm -q agentkate)${C_RESET}"
+    info "Launch from your app menu, run ${C_BOLD}agentkate${C_RESET}, or ${C_BOLD}scripts/ak run${C_RESET}."
+    exit 0
+fi
+
+# --- other distros: cmake --install from ./build ----------------------------
 PREFIX="${PREFIX:-/usr/local}"
 BUILD_DIR="${BUILD_DIR:-build}"
 warn "No native-package installer for distro family '${FAMILY}'."

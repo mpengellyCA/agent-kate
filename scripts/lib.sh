@@ -72,3 +72,38 @@ distro_family() {
         *) printf 'unknown' ;;
     esac
 }
+
+# find_built_package <family> <version> — print the newest matching package
+# already built in dist/ for the given distro family, or nothing if none.
+find_built_package() {
+    local family="$1" version="$2" f
+    case "$family" in
+        arch)
+            ls -t "${ROOT}/dist/"agentkate-"${version}"-*.pkg.tar.* 2>/dev/null \
+                | head -n1 || true ;;
+        fedora)
+            # Skip the -debuginfo/-debugsource sub-packages rpmbuild also emits.
+            for f in $(ls -t "${ROOT}/dist/"agentkate-"${version}"-*.rpm 2>/dev/null); do
+                case "$f" in *debuginfo*|*debugsource*) continue ;; esac
+                printf '%s' "$f"; return
+            done ;;
+    esac
+}
+
+# pkg_install_hint <cmd> — distro-appropriate "how to install <cmd>" hint,
+# translating the command name to the package that provides it where they differ.
+pkg_install_hint() {
+    local cmd="$1" family pkg
+    family="$(distro_family)"
+    case "${family}:${cmd}" in
+        fedora:ninja) pkg="ninja-build" ;;
+        fedora:go)    pkg="golang" ;;
+        *)            pkg="$cmd" ;;
+    esac
+    case "$family" in
+        arch)   printf "Arch: pacman -S %s" "$pkg" ;;
+        fedora) printf "Fedora: dnf install %s" "$pkg" ;;
+        debian) printf "Debian/Ubuntu: apt install %s" "$pkg" ;;
+        *)      printf "Install '%s' with your package manager." "$cmd" ;;
+    esac
+}

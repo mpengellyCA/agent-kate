@@ -30,9 +30,9 @@ done
 cd "$ROOT"
 
 step "Checking build tools"
-require_cmd cmake "Install with your package manager (Arch: pacman -S cmake)."
-require_cmd ninja "Arch: pacman -S ninja"
-require_cmd go    "Arch: pacman -S go"
+require_cmd cmake "$(pkg_install_hint cmake)"
+require_cmd ninja "$(pkg_install_hint ninja)"
+require_cmd go    "$(pkg_install_hint go)"
 require_cmd git
 ok "cmake, ninja, go, git present"
 
