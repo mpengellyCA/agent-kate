@@ -19,6 +19,7 @@ find_package(KF6 6.0 REQUIRED COMPONENTS
     Parts               # KParts — embedding the Konsole terminal
     WidgetsAddons       # KMultiTabBar — Kate-style collapsible side/bottom strip
     KIO                 # KIO::copy/move/trash, KPropertiesDialog, highlightInFileManager
+    Archive             # KZip — native .xlsx (OOXML zip) reading in CsvView
 )
 
 add_executable(agentkate
@@ -29,6 +30,7 @@ add_executable(agentkate
     src/ImageView.cpp
     src/KPartView.cpp
     src/CsvView.cpp
+    src/XlsxReader.cpp
     src/RichTextView.cpp
     src/ExtensionsDialog.cpp
     src/ProblemsPanel.cpp
@@ -86,6 +88,7 @@ target_link_libraries(agentkate PRIVATE
     KF6::KIOCore
     KF6::KIOGui
     KF6::KIOWidgets
+    KF6::Archive
 )
 
 # Place the UI binary in the build root so it sits next to akcore; the UI

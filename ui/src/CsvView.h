@@ -1,5 +1,7 @@
 #pragma once
 
+#include "XlsxReader.h"
+
 #include <QAbstractTableModel>
 #include <QString>
 #include <QStringList>
@@ -20,6 +22,10 @@ public:
     // Parses `path`, auto-detecting ',' vs '\t'. Returns false if unreadable.
     bool load(const QString &path);
 
+    // Populates the model from an already-parsed grid (e.g. one .xlsx sheet),
+    // treating the first record as the header — same shape `load()` produces.
+    void setRecords(QVector<QStringList> records);
+
     int rowCount(const QModelIndex &parent = QModelIndex()) const override;
     int columnCount(const QModelIndex &parent = QModelIndex()) const override;
     QVariant data(const QModelIndex &index, int role = Qt::DisplayRole) const override;
@@ -32,10 +38,11 @@ private:
     int m_columns = 0;
 };
 
-// CsvView renders a CSV/TSV file as a sortable, selectable table inside an
-// editor tab — far more useful than showing the raw delimited text. Read-only.
-// A QSortFilterProxyModel gives click-to-sort columns; the header row is frozen
-// as the table header.
+// CsvView renders a CSV/TSV file — or an .xlsx/.xlsm workbook — as a sortable,
+// selectable table inside an editor tab, far more useful than the raw delimited
+// text or (for xlsx) the zip internals a generic archive part would show.
+// Read-only. A QSortFilterProxyModel gives click-to-sort columns; the header row
+// is frozen as the table header. Multi-sheet workbooks get a sheet selector.
 class CsvView : public QWidget
 {
     Q_OBJECT
@@ -44,10 +51,13 @@ public:
 
     QString path() const { return m_path; }
 
-    // True for .csv / .tsv files (by suffix), so EditorArea routes them here.
+    // True for .csv/.tsv and .xlsx/.xlsm files (by suffix), so EditorArea routes
+    // them here ahead of the generic KPart viewer (which would open .xlsx as a
+    // zip archive in Ark).
     static bool canDisplay(const QString &path);
 
 private:
     QString m_path;
     QTableView *m_table = nullptr;
+    QVector<XlsxSheet> m_sheets; // workbook sheets, kept for the sheet selector
 };

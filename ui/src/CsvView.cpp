@@ -1,7 +1,9 @@
 #include "CsvView.h"
 
+#include <QComboBox>
 #include <QFile>
 #include <QFileInfo>
+#include <QHBoxLayout>
 #include <QHeaderView>
 #include <QLabel>
 #include <QSortFilterProxyModel>
@@ -136,8 +138,12 @@ bool CsvModel::load(const QString &path)
     const QString firstLine = firstBreak < 0 ? text : text.left(firstBreak);
     const QChar delim = detectDelimiter(firstLine);
 
-    QVector<QStringList> records = parseDelimited(text, delim);
+    setRecords(parseDelimited(text, delim));
+    return true;
+}
 
+void CsvModel::setRecords(QVector<QStringList> records)
+{
     beginResetModel();
     m_header.clear();
     m_rows.clear();
@@ -151,7 +157,6 @@ bool CsvModel::load(const QString &path)
         }
     }
     endResetModel();
-    return true;
 }
 
 int CsvModel::rowCount(const QModelIndex &parent) const
@@ -193,7 +198,8 @@ QVariant CsvModel::headerData(int section, Qt::Orientation orientation, int role
 bool CsvView::canDisplay(const QString &path)
 {
     const QString suffix = QFileInfo(path).suffix().toLower();
-    return suffix == QLatin1String("csv") || suffix == QLatin1String("tsv");
+    return suffix == QLatin1String("csv") || suffix == QLatin1String("tsv")
+        || suffix == QLatin1String("xlsx") || suffix == QLatin1String("xlsm");
 }
 
 CsvView::CsvView(const QString &path, QWidget *parent)
@@ -204,7 +210,39 @@ CsvView::CsvView(const QString &path, QWidget *parent)
     layout->setContentsMargins(0, 0, 0, 0);
 
     auto *model = new CsvModel(this);
-    const bool ok = model->load(m_path);
+    const QString suffix = QFileInfo(m_path).suffix().toLower();
+    const bool isWorkbook =
+        suffix == QLatin1String("xlsx") || suffix == QLatin1String("xlsm");
+
+    bool ok = false;
+    if (isWorkbook) {
+        ok = XlsxReader::read(m_path, m_sheets) && !m_sheets.isEmpty();
+        if (ok) {
+            // A multi-sheet workbook gets a selector strip above the table;
+            // switching repopulates the same model with the chosen sheet.
+            if (m_sheets.size() > 1) {
+                auto *bar = new QHBoxLayout;
+                bar->setContentsMargins(4, 4, 4, 0);
+                bar->addWidget(new QLabel(tr("Sheet:"), this));
+                auto *picker = new QComboBox(this);
+                for (const XlsxSheet &sheet : std::as_const(m_sheets)) {
+                    picker->addItem(sheet.name);
+                }
+                connect(picker, &QComboBox::currentIndexChanged, this, [this, model](int i) {
+                    if (i >= 0 && i < m_sheets.size()) {
+                        model->setRecords(m_sheets.at(i).rows);
+                        m_table->resizeColumnsToContents();
+                    }
+                });
+                bar->addWidget(picker);
+                bar->addStretch();
+                layout->addLayout(bar);
+            }
+            model->setRecords(m_sheets.first().rows);
+        }
+    } else {
+        ok = model->load(m_path);
+    }
 
     if (!ok) {
         auto *msg = new QLabel(tr("Could not read %1").arg(QFileInfo(m_path).fileName()), this);
