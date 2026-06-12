@@ -147,6 +147,17 @@ void SearchPanel::focusQuery()
     m_query->selectAll();
 }
 
+void SearchPanel::search(const QString &query)
+{
+    const QString trimmed = query.trimmed();
+    if (trimmed.isEmpty())
+        return;
+    // Setting the text drives textChanged → scheduleSearch() → runSearch(),
+    // reusing the panel's debounce, toggles and workspace-scoped root.
+    m_query->setText(query);
+    m_query->setFocus();
+}
+
 void SearchPanel::scheduleSearch()
 {
     m_debounce->start();

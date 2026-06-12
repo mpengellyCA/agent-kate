@@ -1174,15 +1174,23 @@ void MainWindow::setupTopToolbar()
     connect(m_centreChatAct, &QAction::triggered, this,
             [this] { applyCentreMode(QStringLiteral("chat")); });
 
-    // Placeholder global-symbol search (wiring lives in Phase 4).
-    auto *search = new QLineEdit(toolbar);
-    search->setPlaceholderText(i18n("Search…  (Ctrl+T)"));
-    search->setClearButtonEnabled(true);
-    search->addAction(QIcon::fromTheme(QStringLiteral("search")),
-                      QLineEdit::LeadingPosition);
-    search->setFixedWidth(260);
-    search->setEnabled(false); // disabled until Phase 4 wires global symbol search
-    toolbar->addWidget(search);
+    // Toolbar Search box → drives the ripgrep-backed Search panel. Pressing
+    // Enter reveals the panel and forwards the query into it, so the panel's
+    // debounce, toggles and workspace-scoped root are all inherited.
+    m_toolbarSearch = new QLineEdit(toolbar);
+    m_toolbarSearch->setPlaceholderText(i18n("Search project…  (Ctrl+Shift+F)"));
+    m_toolbarSearch->setClearButtonEnabled(true);
+    m_toolbarSearch->addAction(QIcon::fromTheme(QStringLiteral("search")),
+                               QLineEdit::LeadingPosition);
+    m_toolbarSearch->setFixedWidth(260);
+    connect(m_toolbarSearch, &QLineEdit::returnPressed, this, [this] {
+        const QString q = m_toolbarSearch->text().trimmed();
+        if (q.isEmpty() || !m_search)
+            return;
+        raisePanelByKey(m_keySearch);
+        m_search->search(q);
+    });
+    toolbar->addWidget(m_toolbarSearch);
 
     m_agentBadge = new QLabel(toolbar);
     m_agentBadge->setContentsMargins(8, 2, 8, 2);

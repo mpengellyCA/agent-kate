@@ -24,6 +24,7 @@ class SideBar;
 class ShellLayout;
 class QAction;
 class QLabel;
+class QLineEdit;
 
 // MainWindow is the Agent Kate arena shell — a project-aware, agent-centric KDE
 // main window. The agent roster (left) holds projects and their agents; the
@@ -137,6 +138,7 @@ private:
     // Top toolbar + status-bar widgets
     QWidget *m_breadcrumbWidget = nullptr; // hosts clickable segment buttons
     QLabel *m_breadcrumbLabel = nullptr;   // fallback when no file is open
+    QLineEdit *m_toolbarSearch = nullptr; // top-toolbar Search box → SearchPanel
     QLabel *m_agentBadge = nullptr;       // top-toolbar agent chip
     QLabel *m_cursorPosLabel = nullptr;   // status bar: Ln 42 Col 17
     QLabel *m_modeLabel = nullptr;        // status bar: UTF-8 LF C++
