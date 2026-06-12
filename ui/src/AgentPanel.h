@@ -84,6 +84,16 @@ private:
     };
 
     void onSendClicked();
+    // Append a "You" message card to the feed for the given outgoing message.
+    void addYouCard(const QString &text, const QJsonArray &attachments);
+    // Send a message to the live thread now: adds the You card, marks the turn
+    // busy, and calls agent.send. Assumes a running (non-dormant) thread.
+    void deliverMessage(const QString &text, const QJsonArray &attachments);
+    // Fire the next queued follow-up, if any, once the thread is idle. Called
+    // on every `result` event; sends one message per turn boundary.
+    void drainSendQueue();
+    // Rebuild the "queued messages" chip bar from m_sendQueue.
+    void rebuildQueueChips();
     void onStopClicked();
     void onChangesClicked();
     void onPromoteClicked();
@@ -139,6 +149,7 @@ private:
     QComboBox *m_modeCombo = nullptr;
     QComboBox *m_isolationCombo = nullptr;
     QComboBox *m_effortCombo = nullptr;
+    QComboBox *m_modelCombo = nullptr;
     // Compaction strategy + strip flag — controls how the thread's transcript
     // is condensed to keep resume cost down. Both are sticky to last used.
     QComboBox *m_compactCombo = nullptr;
@@ -165,6 +176,19 @@ private:
     QPushButton *m_permAllow = nullptr;
     QPushButton *m_permDeny = nullptr;
     QList<QJsonObject> m_permQueue;
+
+    // FIFO of follow-up messages typed while a turn was in progress. The
+    // `claude` CLI buffers a second stdin user message until the current turn
+    // ends, so we hold them here and fire one on each `result`. Mirrors the
+    // m_permQueue pattern. Each chip in m_queueBar can be removed before it
+    // fires.
+    struct QueuedMsg {
+        QString text;
+        QJsonArray attachments;
+    };
+    QList<QueuedMsg> m_sendQueue;
+    QFrame *m_queueBar = nullptr;
+    QHBoxLayout *m_queueLayout = nullptr;
 
     // Promote-to-worktree bar, shown while a thread runs non-isolated.
     QFrame *m_promoteBar = nullptr;
