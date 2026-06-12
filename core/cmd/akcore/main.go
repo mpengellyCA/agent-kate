@@ -135,6 +135,16 @@ func runCore() {
 		os.Exit(1)
 	}
 
+	// Cold-exit compactions are spawned from the thread-exit lifecycle event,
+	// which can fire right as the core is shutting down. Track them so the
+	// shutdown path can drain them before the process exits (otherwise the
+	// goroutine is killed mid-compaction and the summary goes missing). The
+	// context is cancelled at the shutdown deadline to kill any straggler
+	// `claude --resume` rather than orphan it.
+	exitCompactCtx, cancelExitCompacts := context.WithCancel(context.Background())
+	defer cancelExitCompacts()
+	coldCompacts := &exitCompactTracker{ctx: exitCompactCtx}
+
 	// The agent supervisor relays every thread event to the UI as a
 	// notification, so the agent panel can render the conversation live.
 	sup := agent.NewSupervisor("", log, func(threadID string, event json.RawMessage) {
@@ -167,7 +177,7 @@ func runCore() {
 			if rec, ok := sessions.Get(threadID); ok {
 				strat := compact.Strategy(rec.CompactStrategy).Resolve()
 				if strat.RunsOnExit() && strat != compact.ExitOpusHot {
-					go runExitCompact(log, sessions, summaries, rec, strat)
+					coldCompacts.spawn(log, sessions, summaries, rec, strat)
 				}
 			}
 		}
@@ -212,7 +222,11 @@ func runCore() {
 	// while the live process is still cache-warm; cold strategies fire from
 	// the exit lifecycle handler after the process terminates.
 	runHotCompactsAtShutdown(deps)
+	// StopAll now blocks until every thread has been reaped, so by the time it
+	// returns every cold-exit compaction has been spawned and registered with
+	// coldCompacts. Drain them (bounded) before we let the process exit.
 	sup.StopAll()
+	coldCompacts.drain(cancelExitCompacts, exitCompactCap, log)
 	if serveErr != nil {
 		log.Error("ipc server stopped", "err", serveErr)
 		os.Exit(1)
@@ -1813,15 +1827,83 @@ func runHotCompactsAtShutdown(d handlerDeps) {
 	wg.Wait()
 }
 
-// runExitCompact performs a cold compaction in the background after an agent
-// exits. Errors are logged but do not block anything — the next resume will
-// either find a usable summary or trigger the recovery dialog in the UI.
-func runExitCompact(log *slog.Logger, sessions *session.Store, summaries *compact.Store,
+// exitCompactCap bounds how long shutdown waits for cold-exit compactions to
+// finish. A cold `claude --resume` usually lands in a few seconds; the cap is
+// a backstop so a hung one cannot wedge quit forever. Kept conservative so a
+// dogfood quit never feels stuck — stragglers are cancelled and logged.
+//
+// IMPORTANT: the UI SIGKILLs the core if it doesn't exit within its own grace
+// window after SIGTERM (CoreClient::~CoreClient, waitForFinished). That grace
+// MUST stay larger than this cap, or the core is killed mid-drain at app quit
+// and the summary goes missing — the very bug this fixes. Keep them in sync.
+const exitCompactCap = 15 * time.Second
+
+// exitCompactTracker owns the in-flight cold-exit compactions so the shutdown
+// path can drain them before the process exits. ctx is shared by every spawned
+// compaction; cancelling it (at the shutdown deadline) kills stragglers.
+type exitCompactTracker struct {
+	wg        sync.WaitGroup
+	ctx       context.Context
+	claudeBin string // injectable for tests; "" resolves to "claude" via PATH
+}
+
+// spawn launches a cold-exit compaction for rec as a tracked background
+// goroutine and returns immediately. The goroutine is registered with the
+// WaitGroup before it starts, so a later drain() reliably blocks on it.
+func (e *exitCompactTracker) spawn(log *slog.Logger, sessions *session.Store,
+	summaries *compact.Store, rec session.Record, strategy compact.Strategy) {
+	e.wg.Add(1)
+	go func() {
+		defer e.wg.Done()
+		runExitCompact(e.ctx, e.claudeBin, log, sessions, summaries, rec, strategy)
+	}()
+}
+
+// drain waits for all spawned cold-exit compactions to finish, bounded by cap.
+// On timeout it cancels stragglers (killing any hung claude) and proceeds, so
+// a wedged compaction can never block quit indefinitely.
+func (e *exitCompactTracker) drain(cancel context.CancelFunc, cap time.Duration, log *slog.Logger) {
+	if waitWithDeadline(&e.wg, cap) {
+		return
+	}
+	log.Warn("exit compactions exceeded shutdown cap; cancelling stragglers", "cap", cap)
+	cancel()
+	// Give cancelled compactions a brief grace period to unwind, but never
+	// block quit on one that ignores cancellation.
+	if !waitWithDeadline(&e.wg, 2*time.Second) {
+		log.Warn("exit compactions still running after cancel; exiting anyway")
+	}
+}
+
+// waitWithDeadline blocks until wg drains or d elapses. Returns true if the
+// WaitGroup drained in time, false on timeout.
+func waitWithDeadline(wg *sync.WaitGroup, d time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		return false
+	}
+}
+
+// runExitCompact performs a cold compaction after an agent exits. Errors are
+// logged but do not block anything — the next resume will either find a usable
+// summary or trigger the recovery dialog in the UI. ctx is the shutdown-scoped
+// context: its cancellation (at the shutdown deadline) aborts a straggling
+// claude rather than orphaning it. An empty claudeBin resolves to "claude".
+func runExitCompact(ctx context.Context, claudeBin string, log *slog.Logger,
+	sessions *session.Store, summaries *compact.Store,
 	rec session.Record, strategy compact.Strategy) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 
 	sum, err := compact.RunLLM(ctx, rec.ThreadID, strategy, compact.LLMOptions{
+		ClaudeBin: claudeBin,
 		WorkDir:   rec.Worktree.Path,
 		SessionID: rec.SessionID,
 		Model:     strategy.Model(),
