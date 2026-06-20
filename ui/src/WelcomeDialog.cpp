@@ -1,10 +1,16 @@
 #include "WelcomeDialog.h"
 #include "RecentProjects.h"
 
+#include <KIO/OpenFileManagerWindowJob>
 #include <KLocalizedString>
 
+#include <QAction>
+#include <QApplication>
+#include <QClipboard>
+#include <QDateTime>
 #include <QDialogButtonBox>
 #include <QDir>
+#include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFrame>
@@ -13,6 +19,7 @@
 #include <QInputDialog>
 #include <QKeySequence>
 #include <QLabel>
+#include <QMenu>
 #include <QPixmap>
 #include <QListWidget>
 #include <QListWidgetItem>
@@ -20,10 +27,70 @@
 #include <QPushButton>
 #include <QShortcut>
 #include <QStandardPaths>
+#include <QUrl>
 #include <QVBoxLayout>
 
 namespace {
 constexpr int kPathRole = Qt::UserRole + 1;
+constexpr int kPinnedRole = Qt::UserRole + 2;
+
+// Cheap, dependency-free branch hint: read <gitdir>/HEAD and parse the
+// "ref: refs/heads/<branch>" line. Handles plain repos (.git is a directory)
+// and worktrees/submodules (.git is a FILE holding "gitdir: <path>"). Returns
+// an empty string for a detached HEAD, an unreadable file, or a non-git folder.
+QString branchHint(const QString &path)
+{
+    const QString dotGit = QDir(path).filePath(QStringLiteral(".git"));
+    const QFileInfo dotGitInfo(dotGit);
+    QString gitDir = dotGit;
+    if (dotGitInfo.isFile()) {
+        // Worktree / submodule: ".git" is a pointer file.
+        QFile ptr(dotGit);
+        if (!ptr.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            return QString();
+        }
+        const QString line = QString::fromUtf8(ptr.readLine()).trimmed();
+        const QString prefix = QStringLiteral("gitdir: ");
+        if (!line.startsWith(prefix)) {
+            return QString();
+        }
+        const QString target = line.mid(prefix.length());
+        gitDir = QDir::isAbsolutePath(target) ? target
+                                              : QDir(path).filePath(target);
+    } else if (!dotGitInfo.isDir()) {
+        return QString();
+    }
+
+    QFile head(QDir(gitDir).filePath(QStringLiteral("HEAD")));
+    if (!head.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        return QString();
+    }
+    const QString line = QString::fromUtf8(head.readLine()).trimmed();
+    const QString prefix = QStringLiteral("ref: refs/heads/");
+    if (line.startsWith(prefix)) {
+        return line.mid(prefix.length());
+    }
+    return QString(); // detached HEAD or unexpected format
+}
+
+// A short, human relative time for the last-opened hint.
+QString relativeOpened(const QDateTime &when)
+{
+    if (!when.isValid()) {
+        return QString();
+    }
+    const qint64 secs = when.toUTC().secsTo(QDateTime::currentDateTimeUtc());
+    if (secs < 60) {
+        return i18n("just now");
+    }
+    if (secs < 3600) {
+        return i18np("%1 minute ago", "%1 minutes ago", int(secs / 60));
+    }
+    if (secs < 86400) {
+        return i18np("%1 hour ago", "%1 hours ago", int(secs / 3600));
+    }
+    return i18np("%1 day ago", "%1 days ago", int(secs / 86400));
+}
 } // namespace
 
 WelcomeDialog::WelcomeDialog(QWidget *parent)
@@ -50,12 +117,16 @@ WelcomeDialog::WelcomeDialog(QWidget *parent)
     logo->setFixedSize(logoSize, logoSize);
     headerRow->addWidget(logo, 0, Qt::AlignTop);
 
-    auto *header = new QLabel(i18n("<h2 style='margin:0;'>Agent Kate</h2>"
-                                   "<p style='margin:2px 0 0 0; color:palette(mid);'>"
-                                   "Native multi-agent coding arena</p>"),
-                              this);
-    header->setTextFormat(Qt::RichText);
-    headerRow->addWidget(header, 1, Qt::AlignVCenter);
+    auto *headerText = new QVBoxLayout;
+    headerText->setSpacing(0);
+    auto *title = new QLabel(i18n("<h2 style='margin:0;'>Agent Kate</h2>"), this);
+    title->setTextFormat(Qt::RichText);
+    auto *subtitle = new QLabel(i18n("Native multi-agent coding arena"), this);
+    subtitle->setForegroundRole(QPalette::PlaceholderText);
+    headerText->addWidget(title);
+    headerText->addWidget(subtitle);
+    headerRow->addLayout(headerText, 1);
+    headerRow->setAlignment(headerText, Qt::AlignVCenter);
     outer->addLayout(headerRow);
 
     // "Reopen last project" hero row — the single most likely action.
@@ -69,7 +140,7 @@ WelcomeDialog::WelcomeDialog(QWidget *parent)
     heroLabel->setTextFormat(Qt::RichText);
     heroLabel->setText(i18n("<b>Continue where you left off</b>"));
     m_lastLabel = new QLabel(this);
-    m_lastLabel->setStyleSheet(QStringLiteral("color: palette(mid);"));
+    m_lastLabel->setForegroundRole(QPalette::PlaceholderText);
     m_lastLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
 
     auto *heroText = new QVBoxLayout;
@@ -94,14 +165,14 @@ WelcomeDialog::WelcomeDialog(QWidget *parent)
     m_list = new QListWidget(this);
     m_list->setAlternatingRowColors(true);
     m_list->setSelectionMode(QAbstractItemView::SingleSelection);
-    m_list->setUniformItemSizes(true);
+    m_list->setUniformItemSizes(false); // pinned header rows differ in height
+    m_list->setContextMenuPolicy(Qt::CustomContextMenu);
     outer->addWidget(m_list, 1);
 
     auto *hint = new QLabel(
-        i18n("<small style='color:palette(mid);'>"
-             "Double-click to open · Delete to remove from the list</small>"),
+        i18n("Double-click to open · Right-click for more · Delete to remove"),
         this);
-    hint->setTextFormat(Qt::RichText);
+    hint->setForegroundRole(QPalette::PlaceholderText);
     outer->addWidget(hint);
 
     // Bottom action bar — "Open folder…", "New project…", and Cancel/Quit.
@@ -123,6 +194,8 @@ WelcomeDialog::WelcomeDialog(QWidget *parent)
     connect(quitButton, &QPushButton::clicked, this, &QDialog::reject);
     connect(m_list, &QListWidget::itemActivated,
             this, &WelcomeDialog::onItemActivated);
+    connect(m_list, &QListWidget::customContextMenuRequested,
+            this, &WelcomeDialog::onContextMenu);
 
     auto *del = new QShortcut(QKeySequence(QKeySequence::Delete), m_list);
     del->setContext(Qt::WidgetShortcut);
@@ -131,9 +204,44 @@ WelcomeDialog::WelcomeDialog(QWidget *parent)
     refreshList();
 }
 
+void WelcomeDialog::addRow(const QString &path, bool pinned)
+{
+    const QFileInfo info(path);
+    const QString name = info.fileName().isEmpty() ? path : info.fileName();
+
+    QStringList tail{path};
+    const QString branch = branchHint(path);
+    if (!branch.isEmpty()) {
+        tail.prepend(QStringLiteral("⌥ %1").arg(branch));
+    }
+    const QString opened = relativeOpened(RecentProjects::lastOpened(path));
+    if (!opened.isEmpty()) {
+        tail.prepend(opened);
+    }
+
+    auto *item = new QListWidgetItem(m_list);
+    item->setText(QStringLiteral("%1\n%2").arg(name, tail.join(QStringLiteral(" · "))));
+    item->setData(kPathRole, path);
+    item->setData(kPinnedRole, pinned);
+
+    const bool exists = info.exists() && info.isDir();
+    if (pinned) {
+        item->setIcon(QIcon::fromTheme(QStringLiteral("emblem-favorite")));
+    } else {
+        item->setIcon(QIcon::fromTheme(
+            exists ? QStringLiteral("folder") : QStringLiteral("folder-remote")));
+    }
+    if (!exists) {
+        item->setToolTip(i18n("This folder no longer exists."));
+    } else {
+        item->setToolTip(path);
+    }
+}
+
 void WelcomeDialog::refreshList()
 {
     const QStringList recents = RecentProjects::load();
+    const QStringList pins = RecentProjects::pinned();
     m_list->clear();
 
     const QString last = recents.isEmpty() ? QString() : recents.constFirst();
@@ -143,28 +251,77 @@ void WelcomeDialog::refreshList()
         m_reopenButton->setEnabled(false);
     } else {
         const QString name = QDir(last).dirName();
-        m_lastLabel->setText(QStringLiteral("%1 — %2").arg(
-            name.isEmpty() ? last : name, last));
+        const QString opened = relativeOpened(RecentProjects::lastOpened(last));
+        const QString display = name.isEmpty() ? last : name;
+        m_lastLabel->setText(opened.isEmpty()
+            ? QStringLiteral("%1 — %2").arg(display, last)
+            : i18n("%1 — %2 · %3", display, last, opened));
         m_reopenButton->setEnabled(true);
     }
 
-    const QIcon folder = QIcon::fromTheme(QStringLiteral("folder"));
-    const QIcon missing = QIcon::fromTheme(QStringLiteral("folder-remote"));
+    // Pinned favourites first, then the remaining recents (skipping any that
+    // are already shown as pins).
+    for (const QString &path : pins) {
+        addRow(path, true);
+    }
     for (const QString &path : recents) {
-        const QFileInfo info(path);
-        const QString name = info.fileName().isEmpty() ? path : info.fileName();
-        auto *item = new QListWidgetItem(m_list);
-        item->setText(QStringLiteral("%1\n%2").arg(name, path));
-        item->setData(kPathRole, path);
-        const bool exists = info.exists() && info.isDir();
-        item->setIcon(exists ? folder : missing);
-        if (!exists) {
-            item->setToolTip(i18n("This folder no longer exists."));
+        if (pins.contains(path)) {
+            continue;
         }
+        addRow(path, false);
     }
     if (m_list->count() > 0) {
         m_list->setCurrentRow(0);
     }
+}
+
+void WelcomeDialog::onContextMenu(const QPoint &pos)
+{
+    QListWidgetItem *item = m_list->itemAt(pos);
+    if (!item) {
+        return;
+    }
+    const QString path = item->data(kPathRole).toString();
+    const bool pinned = item->data(kPinnedRole).toBool();
+
+    QMenu menu(this);
+    QAction *open = menu.addAction(
+        QIcon::fromTheme(QStringLiteral("document-open")), i18n("Open"));
+    connect(open, &QAction::triggered, this, [this, item] { onItemActivated(item); });
+
+    QAction *reveal = menu.addAction(
+        QIcon::fromTheme(QStringLiteral("system-file-manager")),
+        i18n("Open Containing Folder"));
+    connect(reveal, &QAction::triggered, this,
+            [path] { KIO::highlightInFileManager({QUrl::fromLocalFile(path)}); });
+
+    QAction *copy = menu.addAction(
+        QIcon::fromTheme(QStringLiteral("edit-copy")), i18n("Copy Path"));
+    connect(copy, &QAction::triggered, this,
+            [path] { QApplication::clipboard()->setText(path); });
+
+    menu.addSeparator();
+    QAction *pinAct = menu.addAction(
+        QIcon::fromTheme(QStringLiteral("emblem-favorite")),
+        pinned ? i18n("Unpin") : i18n("Pin"));
+    connect(pinAct, &QAction::triggered, this, [this, path, pinned] {
+        if (pinned) {
+            RecentProjects::unpin(path);
+        } else {
+            RecentProjects::pin(path);
+        }
+        refreshList();
+    });
+
+    QAction *remove = menu.addAction(
+        QIcon::fromTheme(QStringLiteral("list-remove")),
+        i18n("Remove from List"));
+    connect(remove, &QAction::triggered, this, [this, path] {
+        RecentProjects::forget(path);
+        refreshList();
+    });
+
+    menu.exec(m_list->viewport()->mapToGlobal(pos));
 }
 
 void WelcomeDialog::reopenLast()

@@ -1,14 +1,22 @@
 #pragma once
 
+#include <QHash>
+#include <QJsonObject>
 #include <QString>
 #include <QStringList>
 #include <QWidget>
 
+class CoreClient;
+class FileFilterProxyModel;
+class GitStatusDelegate;
 class QAction;
 class QFileSystemModel;
 class QLabel;
+class QLineEdit;
 class QModelIndex;
 class QPoint;
+class QStackedWidget;
+class QTimer;
 class QToolButton;
 class QTreeView;
 
@@ -16,15 +24,21 @@ class QTreeView;
 // supports right-click file operations (new, rename, copy/cut/paste, trash,
 // add-to-.gitignore, open-with, open-in-Dolphin, KDE properties, open
 // terminal here), drag-and-drop of files into the chat input, and a few
-// header conveniences (path label, hidden-files toggle, new file/folder).
+// header conveniences (project heading, name filter, hidden-files toggle,
+// sync-with-editor, new file/folder). Entries are decorated with their git
+// status (emblem + tint) sourced from the core's git.snapshot.
 class ProjectTree : public QWidget
 {
     Q_OBJECT
 public:
-    explicit ProjectTree(QWidget *parent = nullptr);
+    explicit ProjectTree(CoreClient *core, QWidget *parent = nullptr);
 
     void setRoot(const QString &path);
     QString root() const { return m_root; }
+
+    // Select, scroll to and expand to a path if it lives under the current
+    // root. No-op for paths outside the tree.
+    void revealPath(const QString &path);
 
 Q_SIGNALS:
     void fileActivated(const QString &path);
@@ -38,8 +52,13 @@ Q_SIGNALS:
 private:
     void onContextMenu(const QPoint &pos);
     void onActivated(const QModelIndex &idx);
-    void onSelectionChanged();
     void setShowHidden(bool show);
+    void applyFilterEffects();
+    void setSyncWithEditor(bool on);
+
+    // Git status decoration.
+    void refreshGitStatus();
+    void scheduleGitRefresh();
 
     // Operations
     void actNewFile(const QString &targetDir);
@@ -59,10 +78,23 @@ private:
     QString currentTargetDir() const; // selection if dir, else parent of selection, else root
     QStringList selectedPaths() const;
     QString repoRootFor(const QString &path) const;
+    // Map a source QFileSystemModel index from a (possibly proxied) view index.
+    QModelIndex sourceIndex(const QModelIndex &viewIndex) const;
+    // Map a source index to the view (proxy) index for selection/scroll.
+    QModelIndex viewIndex(const QModelIndex &srcIndex) const;
 
+    CoreClient *m_core = nullptr;
     QTreeView *m_tree = nullptr;
     QFileSystemModel *m_model = nullptr;
+    FileFilterProxyModel *m_proxy = nullptr;
+    GitStatusDelegate *m_gitDelegate = nullptr;
+    QStackedWidget *m_stack = nullptr;
     QLabel *m_pathLabel = nullptr;
+    QLineEdit *m_filterEdit = nullptr;
     QToolButton *m_hiddenToggle = nullptr;
+    QToolButton *m_syncToggle = nullptr;
+    QTimer *m_filterTimer = nullptr;
+    QTimer *m_gitTimer = nullptr;
     QString m_root;
+    bool m_syncWithEditor = false;
 };
