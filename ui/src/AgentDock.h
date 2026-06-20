@@ -44,6 +44,9 @@ Q_SIGNALS:
     void openDiff(const QString &title, const QString &diffText);
     void agentActivated(int agentId, const QString &projectPath);
     void projectFocused(const QString &projectPath);
+    // Emitted when a project is explicitly CLOSED (not merely switched away
+    // from). Consumers tied to a project — e.g. its terminal tabs — tear down.
+    void projectClosed(const QString &projectPath);
 
 private:
     struct Entry {

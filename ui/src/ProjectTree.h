@@ -30,6 +30,8 @@ Q_SIGNALS:
     void fileActivated(const QString &path);
     // Request the integrated terminal to open a new tab at this directory.
     void terminalRequested(const QString &dir);
+    // Request the integrated terminal to open a tab at `dir` and run `command`.
+    void runCommandRequested(const QString &dir, const QString &command);
     // Request the active chat input to attach these paths as context.
     void attachToChatRequested(const QStringList &paths);
 

@@ -471,6 +471,10 @@ void AgentDock::closeProject(const QString &path)
     }
     m_projects.removeAll(path);
     m_roster->removeProject(path);
+    // The project is gone for good — tell consumers (e.g. its terminal tabs) to
+    // release any per-project resources. This is the one place destroying a
+    // terminal is correct: an explicit close, never a switch.
+    emit projectClosed(path);
     if (m_agents.isEmpty() && !m_projects.isEmpty()) {
         addAgent(m_projects.constFirst());
     }
