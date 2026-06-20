@@ -22,8 +22,12 @@
 #include "ipc/CoreClient.h"
 
 #include <KTextEditor/Document>
+#include <KTextEditor/Range>
 #include <KTextEditor/View>
+#include "lsp/LspActions.h"
+#include "lsp/LspClient.h"
 #include "lsp/LspManager.h"
+#include "lsp/WorkspaceSymbolDialog.h"
 
 #include <KAboutData>
 #include <KMultiTabBar>
@@ -40,11 +44,13 @@
 #include <QActionGroup>
 #include <QCloseEvent>
 #include <QCoreApplication>
+#include <QCursor>
 #include <QDebug>
 #include <QDir>
 #include <QFileInfo>
 #include <QHBoxLayout>
 #include <QIcon>
+#include <QInputDialog>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QKeySequence>
@@ -52,6 +58,7 @@
 #include <QMenuBar>
 #include <QLabel>
 #include <QLineEdit>
+#include <QToolButton>
 #include <QPlainTextEdit>
 #include <QShortcut>
 #include <QSplitter>
@@ -296,7 +303,38 @@ void MainWindow::setupUi()
         if (!path.isEmpty()) {
             m_lsp->requestSymbols(path);
         }
+        updateLspStatus();
     });
+
+    // A workspace edit (rename / code action) touched a file that isn't open.
+    connect(m_lsp, &LspManager::openFileRequested, this,
+            [this](const QString &path, int line) {
+                m_editor->openFile(groupKey(), path, line);
+            });
+    // Code actions arrived — pop the quick-fix menu at the cursor.
+    connect(m_lsp, &LspManager::codeActionsResolved, this,
+            [this](LspClient *client, const QJsonArray &actions) {
+                LspActions::showMenu(m_lsp, client, actions, this, QCursor::pos());
+            });
+    // Rename requested — collect the new name and perform it.
+    connect(m_lsp, &LspManager::renameRequested, this, [this](KTextEditor::View *view) {
+        if (!view) {
+            return;
+        }
+        const KTextEditor::Range word = view->document()->wordRangeAt(view->cursorPosition());
+        const QString current = word.isValid() ? view->document()->text(word) : QString();
+        bool ok = false;
+        const QString name = QInputDialog::getText(
+            this, i18nc("@title:window", "Rename Symbol"), i18n("New name:"),
+            QLineEdit::Normal, current, &ok);
+        if (ok && !name.isEmpty()) {
+            m_lsp->performRename(view, name);
+        }
+    });
+    // Transient LSP status messages and live server-status updates.
+    connect(m_lsp, &LspManager::statusMessage, this,
+            [this](const QString &text) { statusBar()->showMessage(text, 4000); });
+    connect(m_lsp, &LspManager::serverStatusChanged, this, &MainWindow::updateLspStatus);
 
     connect(m_agent, &AgentDock::agentActivated, this, &MainWindow::onAgentActivated);
     connect(m_agent, &AgentDock::projectFocused, this,
@@ -526,6 +564,89 @@ void MainWindow::setupActions()
     connect(refAct, &QAction::triggered, this, [this] {
         if (KTextEditor::View *view = m_editor->currentView()) {
             m_lsp->findReferences(view);
+        }
+    });
+
+    QAction *symbolAct = codeMenu->addAction(QIcon::fromTheme(QStringLiteral("code-context")),
+                                             i18n("Go to &Symbol in Workspace…"));
+    symbolAct->setShortcut(Qt::CTRL | Qt::Key_T);
+    connect(symbolAct, &QAction::triggered, this, [this] {
+        auto *dlg = new WorkspaceSymbolDialog(m_lsp, this);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        connect(dlg, &WorkspaceSymbolDialog::symbolChosen, this,
+                [this](const QString &path, int line) {
+                    m_editor->openFile(groupKey(), path, line);
+                });
+        dlg->show();
+    });
+
+    codeMenu->addSeparator();
+
+    QAction *quickFixAct = codeMenu->addAction(QIcon::fromTheme(QStringLiteral("tools-wizard")),
+                                               i18n("&Quick Fix…"));
+    quickFixAct->setShortcut(Qt::CTRL | Qt::Key_Period);
+    connect(quickFixAct, &QAction::triggered, this, [this] {
+        if (KTextEditor::View *view = m_editor->currentView()) {
+            m_lsp->requestCodeActions(view);
+        }
+    });
+
+    QAction *renameAct = codeMenu->addAction(i18n("Rena&me Symbol"));
+    renameAct->setShortcut(Qt::Key_F2);
+    connect(renameAct, &QAction::triggered, this, [this] {
+        if (KTextEditor::View *view = m_editor->currentView()) {
+            m_lsp->renameSymbol(view);
+        }
+    });
+
+    QAction *formatAct = codeMenu->addAction(i18n("&Format Document"));
+    formatAct->setShortcut(Qt::CTRL | Qt::ALT | Qt::Key_L);
+    connect(formatAct, &QAction::triggered, this, [this] {
+        if (KTextEditor::View *view = m_editor->currentView()) {
+            m_lsp->formatDocument(view);
+        }
+    });
+
+    m_formatOnSave = codeMenu->addAction(i18n("Format on &Save"));
+    m_formatOnSave->setCheckable(true);
+    m_formatOnSave->setChecked(KSharedConfig::openConfig()
+                                   ->group(QStringLiteral("CodeIntelligence"))
+                                   .readEntry("formatOnSave", false));
+    connect(m_formatOnSave, &QAction::toggled, this, [](bool on) {
+        KSharedConfig::openConfig()
+            ->group(QStringLiteral("CodeIntelligence"))
+            .writeEntry("formatOnSave", on);
+    });
+
+    QAction *sigAct = codeMenu->addAction(i18n("Show Signature &Help"));
+    sigAct->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_Space));
+    connect(sigAct, &QAction::triggered, this, [this] {
+        if (KTextEditor::View *view = m_editor->currentView()) {
+            m_lsp->requestSignatureHelp(view);
+        }
+    });
+
+    QAction *nextProbAct = codeMenu->addAction(i18n("&Next Problem"));
+    nextProbAct->setShortcut(Qt::Key_F8);
+    connect(nextProbAct, &QAction::triggered, this, [this] {
+        if (KTextEditor::View *view = m_editor->currentView()) {
+            m_lsp->nextProblem(view);
+        }
+    });
+
+    QAction *prevProbAct = codeMenu->addAction(i18n("&Previous Problem"));
+    prevProbAct->setShortcut(Qt::SHIFT | Qt::Key_F8);
+    connect(prevProbAct, &QAction::triggered, this, [this] {
+        if (KTextEditor::View *view = m_editor->currentView()) {
+            m_lsp->prevProblem(view);
+        }
+    });
+
+    QAction *restartAct = codeMenu->addAction(QIcon::fromTheme(QStringLiteral("view-refresh")),
+                                              i18n("&Restart Language Server"));
+    connect(restartAct, &QAction::triggered, this, [this] {
+        if (!m_activeFilePath.isEmpty()) {
+            m_lsp->restartServersForCurrentFile(m_activeFilePath);
         }
     });
 
@@ -967,6 +1088,20 @@ void MainWindow::setupCore()
     m_modeLabel->setContentsMargins(8, 0, 8, 0);
     statusBar()->addPermanentWidget(m_modeLabel);
 
+    // Language-server status: an icon + text button. Clicking it restarts the
+    // server for the active file. Hidden when no server backs the file.
+    m_lspStatusButton = new QToolButton(this);
+    m_lspStatusButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    m_lspStatusButton->setAutoRaise(true);
+    m_lspStatusButton->setFocusPolicy(Qt::NoFocus);
+    m_lspStatusButton->hide();
+    connect(m_lspStatusButton, &QToolButton::clicked, this, [this] {
+        if (!m_activeFilePath.isEmpty()) {
+            m_lsp->restartServersForCurrentFile(m_activeFilePath);
+        }
+    });
+    statusBar()->addPermanentWidget(m_lspStatusButton);
+
     m_agentStatusLabel = new QLabel(this);
     m_agentStatusLabel->setContentsMargins(8, 0, 8, 0);
     statusBar()->addPermanentWidget(m_agentStatusLabel);
@@ -1055,7 +1190,26 @@ void MainWindow::setTabsByAgent(bool byAgent)
 
 void MainWindow::onSave()
 {
-    m_editor->saveCurrent();
+    KTextEditor::View *view = m_editor->currentView();
+    const bool formatOnSave = m_formatOnSave && m_formatOnSave->isChecked();
+
+    // When format-on-save is on and the active file's server can format, run the
+    // formatter first, then save in the reply. Otherwise save synchronously so
+    // markdown/csv/agent-save and server-less files are untouched.
+    if (view && formatOnSave && m_lsp->canFormat(view)) {
+        const QString path = m_activeFilePath;
+        m_lsp->formatDocument(view, [this, path](bool) {
+            if (m_editor->saveCurrent()) {
+                m_lsp->documentSaved(path);
+            }
+        });
+        return;
+    }
+
+    const QString path = m_activeFilePath;
+    if (m_editor->saveCurrent() && view) {
+        m_lsp->documentSaved(path);
+    }
 }
 
 // persistShellState writes the centre QSplitter geometry to KConfig.
@@ -1329,6 +1483,25 @@ void MainWindow::updateCursorStatus()
     }
 }
 
+// updateLspStatus refreshes the status-bar language-server widget for the file
+// that currently has focus, hiding it when no server backs that file.
+void MainWindow::updateLspStatus()
+{
+    if (!m_lspStatusButton) {
+        return;
+    }
+    QString iconName;
+    const QString text = m_lsp->statusFor(m_activeFilePath, iconName);
+    if (text.isEmpty()) {
+        m_lspStatusButton->hide();
+        return;
+    }
+    m_lspStatusButton->setIcon(QIcon::fromTheme(iconName));
+    m_lspStatusButton->setText(text);
+    m_lspStatusButton->setToolTip(i18n("Click to restart the language server"));
+    m_lspStatusButton->show();
+}
+
 // reloadExtensionServers asks the core for every installed VS Code extension
 // and hands each one's bundled language server to the LSP manager, so files
 // opened afterwards use it. Called on connect and after an install.
@@ -1368,6 +1541,9 @@ void MainWindow::reloadExtensionServers()
                              args,
                              langIds.isEmpty() ? QString() : langIds.first().toString());
                      }
+                     // Apply newly-registered servers to already-open files.
+                     m_lsp->rebindOpenDocuments();
+                     updateLspStatus();
                  });
 }
 

@@ -62,10 +62,13 @@ add_executable(agentkate
     src/git/PRDialog.cpp
     src/git/RefChipDelegate.cpp
     src/ipc/CoreClient.cpp
+    src/lsp/LspActions.cpp
     src/lsp/LspClient.cpp
     src/lsp/LspCompletionModel.cpp
     src/lsp/LspHoverProvider.cpp
     src/lsp/LspManager.cpp
+    src/lsp/LspSignatureHelp.cpp
+    src/lsp/WorkspaceSymbolDialog.cpp
     icons/agentkate.qrc
 )
 

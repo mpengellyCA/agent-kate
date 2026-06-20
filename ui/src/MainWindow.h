@@ -25,6 +25,7 @@ class ShellLayout;
 class QAction;
 class QLabel;
 class QLineEdit;
+class QToolButton;
 
 // MainWindow is the Agent Kate arena shell — a project-aware, agent-centric KDE
 // main window. The agent roster (left) holds projects and their agents; the
@@ -69,6 +70,7 @@ private:
     void updateCursorStatus();
     void updateBreadcrumb(const QString &path);
     void updateAgentBadge();
+    void updateLspStatus();    // refresh the status-bar language-server widget
     void onSave();
     void reloadExtensionServers();
     void onAgentActivated(int agentId, const QString &projectPath);
@@ -142,6 +144,8 @@ private:
     QLabel *m_agentBadge = nullptr;       // top-toolbar agent chip
     QLabel *m_cursorPosLabel = nullptr;   // status bar: Ln 42 Col 17
     QLabel *m_modeLabel = nullptr;        // status bar: UTF-8 LF C++
+    QToolButton *m_lspStatusButton = nullptr; // status bar: language-server state
+    QAction *m_formatOnSave = nullptr;    // Code → Format on Save (KConfig-backed)
     QLabel *m_agentStatusLabel = nullptr; // status bar (rightmost): agent name + dot
     KTextEditor::View *m_observedView = nullptr; // currently wired-for-cursor
 
