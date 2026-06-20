@@ -3,6 +3,7 @@ package skills
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -107,5 +108,48 @@ func TestValidateName(t *testing.T) {
 		if _, err := c.Get(bad); err == nil {
 			t.Errorf("Get(%q) should have errored", bad)
 		}
+	}
+}
+
+func TestCreateAndRead(t *testing.T) {
+	c := New(filepath.Join(t.TempDir(), "catalog"))
+
+	// A description with a colon (a YAML gotcha) must still round-trip.
+	const want = "Run gofmt to tidy Go code: format on save"
+	skill, err := c.Create("format-go", "  Run gofmt to tidy Go code: format on save  ")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if !skill.IsDir || skill.Name != "format-go" {
+		t.Fatalf("created skill = %+v", skill)
+	}
+	if skill.Description != want {
+		t.Fatalf("returned description = %q, want %q", skill.Description, want)
+	}
+
+	// The new skill is discoverable and its frontmatter parses back.
+	got, err := c.Get("format-go")
+	if err != nil {
+		t.Fatalf("Get after Create: %v", err)
+	}
+	if got.Description != want {
+		t.Fatalf("description round-trip = %q, want %q", got.Description, want)
+	}
+
+	content, err := c.ReadContent("format-go")
+	if err != nil {
+		t.Fatalf("ReadContent: %v", err)
+	}
+	if !strings.Contains(content, "format-go") {
+		t.Fatalf("unexpected content: %q", content)
+	}
+
+	// Creating a duplicate is rejected.
+	if _, err := c.Create("format-go", "again"); err == nil {
+		t.Fatal("Create should reject a duplicate name")
+	}
+	// Invalid names are rejected.
+	if _, err := c.Create("../escape", ""); err == nil {
+		t.Fatal("Create should reject an invalid name")
 	}
 }

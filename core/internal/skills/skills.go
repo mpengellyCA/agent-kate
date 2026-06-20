@@ -13,6 +13,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -118,6 +119,90 @@ func (c *Catalog) Get(name string) (Skill, error) {
 		return Skill{Name: name, Description: desc, Path: file, IsDir: false}, nil
 	}
 	return Skill{}, fmt.Errorf("skill %q not found in catalog", name)
+}
+
+// maxSkillContentBytes caps how much of a skill's markdown is read into memory
+// for the detail view, so a pathological file cannot exhaust the daemon.
+const maxSkillContentBytes = 256 * 1024
+
+// ReadContent returns the full markdown of a skill by name — the SKILL.md for
+// a directory skill, or the standalone file for a single-file skill. The
+// content is capped at maxSkillContentBytes; longer files are truncated with a
+// trailing notice rather than read in full.
+func (c *Catalog) ReadContent(name string) (string, error) {
+	skill, err := c.Get(name)
+	if err != nil {
+		return "", err
+	}
+	path := skill.Path
+	if skill.IsDir {
+		path = filepath.Join(skill.Path, "SKILL.md")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	// Read one byte past the cap so we can tell "exactly maxSkillContentBytes"
+	// (not truncated) from "larger than the cap" (truncated).
+	buf := make([]byte, maxSkillContentBytes+1)
+	n, err := io.ReadFull(f, buf)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return "", err
+	}
+	if n > maxSkillContentBytes {
+		return string(buf[:maxSkillContentBytes]) + "\n\n… (truncated)", nil
+	}
+	return string(buf[:n]), nil
+}
+
+// Create scaffolds a new directory skill in the catalog: a directory named
+// <name> containing a SKILL.md with minimal YAML frontmatter. It refuses
+// invalid names and names that already exist (as a directory or single file).
+func (c *Catalog) Create(name, description string) (Skill, error) {
+	if err := validateName(name); err != nil {
+		return Skill{}, err
+	}
+	if err := c.EnsureDir(); err != nil {
+		return Skill{}, err
+	}
+	dir := filepath.Join(c.dir, name)
+	if _, err := os.Stat(dir); err == nil {
+		return Skill{}, fmt.Errorf("skill %q already exists", name)
+	}
+	if _, err := os.Stat(filepath.Join(c.dir, name+".md")); err == nil {
+		return Skill{}, fmt.Errorf("skill %q already exists", name)
+	}
+	// Collapse to a single line; the frontmatter reader is line-based and does
+	// no quote-unescaping, so the value is written bare and kept readable.
+	desc := sanitizeDescription(description)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return Skill{}, err
+	}
+	md := filepath.Join(dir, "SKILL.md")
+	body := fmt.Sprintf("---\nname: %s\ndescription: %s\n---\n\n# %s\n\nDescribe what this skill does and when Claude should use it.\n",
+		name, desc, name)
+	if err := os.WriteFile(md, []byte(body), 0o644); err != nil {
+		// Best effort cleanup so a half-created skill does not linger.
+		_ = os.RemoveAll(dir)
+		return Skill{}, err
+	}
+	return Skill{Name: name, Description: desc, Path: dir, IsDir: true}, nil
+}
+
+// sanitizeDescription collapses whitespace and strips any leading quote so the
+// generated value round-trips through the simple line-based frontmatter reader
+// (which strips matching outer quotes but does not unescape). A colon or hash
+// inside the value is fine — the reader keeps everything after the first
+// "description:" verbatim.
+func sanitizeDescription(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	// A leading or trailing quote pair would be stripped on read; avoid the
+	// surprise by trimming stray wrapping quotes up front.
+	for len(s) >= 2 && (s[0] == '"' || s[0] == '\'') && s[len(s)-1] == s[0] {
+		s = strings.TrimSpace(s[1 : len(s)-1])
+	}
+	return s
 }
 
 // Install symlinks skillName from the catalog into target/.claude/skills.
