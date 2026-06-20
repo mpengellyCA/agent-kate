@@ -622,6 +622,31 @@ func registerHandlers(d handlerDeps) {
 		return map[string]any{"threads": out}, nil
 	})
 
+	// agent.rename persists a user-chosen title for a thread. No worktree or
+	// process is touched — only the session record's Title field is updated, so
+	// the new name survives restart (session.listThreads reads it back).
+	d.srv.Handle("agent.rename", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID string `json:"threadId"`
+			Title    string `json:"title"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		if p.ThreadID == "" || p.Title == "" {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "threadId and title are required")
+		}
+		if _, ok := d.sessions.Get(p.ThreadID); !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		}
+		if err := d.sessions.Update(p.ThreadID, func(r *session.Record) {
+			r.Title = p.Title
+		}); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		return map[string]any{"ok": true}, nil
+	})
+
 	d.srv.Handle("agent.discard", func(_ context.Context, raw json.RawMessage) (any, error) {
 		var p struct {
 			ThreadID string `json:"threadId"`

@@ -44,6 +44,8 @@ Q_SIGNALS:
     void openDiff(const QString &title, const QString &diffText);
     void agentActivated(int agentId, const QString &projectPath);
     void projectFocused(const QString &projectPath);
+    // Routed to MainWindow to focus the Terminal panel at this project path.
+    void openTerminalRequested(const QString &projectPath);
 
 private:
     struct Entry {
@@ -53,9 +55,11 @@ private:
     };
 
     void ensureProject(const QString &path);
-    AgentPanel *addAgent(const QString &projectPath);
+    AgentPanel *addAgent(const QString &projectPath, const QString &model = QString());
     AgentPanel *addDormantAgent(const QString &project, const QString &threadId,
                                 const QString &title, bool isolated);
+    void renameAgent(int agentId);
+    void closeOtherProjects(const QString &keepPath);
     void wireAgentPanel(int agentId, AgentPanel *panel);
     void restoreThreads(const QString &project);
     // Pull git.snapshot and push each thread's worktree Number into the
