@@ -351,6 +351,12 @@ void MainWindow::setupUi()
     connect(m_agent, &AgentDock::agentActivated, this, &MainWindow::onAgentActivated);
     connect(m_agent, &AgentDock::projectFocused, this,
             [this](const QString &path) { m_tree->setRoot(path); });
+    connect(m_agent, &AgentDock::openTerminalRequested, this,
+            [this](const QString &dir) {
+                if (m_terminal && !dir.isEmpty()) {
+                    m_terminal->openTerminalAt(dir);
+                }
+            });
     connect(m_agent, &AgentDock::openDiff, this,
             [this](const QString &title, const QString &diff) {
                 m_editor->openDiff(groupKey(), title, diff);

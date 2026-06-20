@@ -917,6 +917,17 @@ void AgentPanel::setWorkspace(const QString &path)
     refresh();
 }
 
+void AgentPanel::preselectModel(const QString &modelId)
+{
+    if (modelId.isEmpty() || !m_threadId.isEmpty()) {
+        return; // combo is frozen once a thread exists
+    }
+    const int idx = m_modelCombo->findData(modelId);
+    if (idx >= 0) {
+        m_modelCombo->setCurrentIndex(idx);
+    }
+}
+
 void AgentPanel::applyChatSettings()
 {
     const KConfigGroup cfg = KSharedConfig::openConfig()->group(QStringLiteral("Agent"));
@@ -1312,6 +1323,8 @@ void AgentPanel::refresh()
                           .arg(dot, text.toHtmlEscaped()));
     emit stateChanged(dot);
     emit subtitleChanged(text);
+    // Roster card affordance, derived from the same state computed above.
+    emit attentionChanged(running && !m_permQueue.isEmpty());
 }
 
 // --- conversation feed ------------------------------------------------------

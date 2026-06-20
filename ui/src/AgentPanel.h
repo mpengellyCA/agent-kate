@@ -46,6 +46,11 @@ public:
     QString threadId() const { return m_threadId; }
     bool isIsolated() const { return m_isolated; }
 
+    // Pre-pick the start model by its id ("opus", "sonnet", …) before the first
+    // start. No-op once a thread exists (the combo is frozen then) or if the id
+    // isn't an offered choice.
+    void preselectModel(const QString &modelId);
+
     // Bind this panel to a persisted-but-not-running thread; resume() relaunches
     // it through the core's agent.resume.
     void setDormant(const QString &threadId, const QString &title, bool isolated);
@@ -69,6 +74,9 @@ Q_SIGNALS:
     // as the roster card's subtitle. Tracks the same state as stateChanged.
     void subtitleChanged(const QString &text);
     void dormantChanged(bool dormant);
+    // Roster card affordance: attention = a turn is waiting on the user's input
+    // (a permission prompt). The roster paints this as a card marker.
+    void attentionChanged(bool attention);
     void openDiff(const QString &title, const QString &diffText);
 
 protected:
