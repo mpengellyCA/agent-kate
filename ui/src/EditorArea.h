@@ -25,7 +25,8 @@ public:
     ~EditorArea() override;
 
     void setActiveGroup(const QString &groupKey);
-    void openFile(const QString &groupKey, const QString &path, int line = -1);
+    void openFile(const QString &groupKey, const QString &path, int line = -1,
+                  int column = 0);
     void openDiff(const QString &groupKey, const QString &title, const QString &text);
     bool saveCurrent();
     QStringList openFilePaths() const;
