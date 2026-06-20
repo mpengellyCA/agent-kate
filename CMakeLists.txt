@@ -15,13 +15,41 @@ list(APPEND CMAKE_MODULE_PATH ${ECM_MODULE_PATH})
 include(KDEInstallDirs)
 include(ECMInstallIcons)
 
+# --- Derived version: MAJOR.MINOR.<commits-on-main> ------------------------
+# MAJOR.MINOR come from project() above; the patch component is the number of
+# first-parent commits on the current branch, so every commit that lands on
+# main bumps the version automatically. Override with -DAGENTKATE_VERSION=...
+# (packaging passes the version explicitly, since the unpacked source tarball
+# it builds from has no .git directory).
+if(NOT AGENTKATE_VERSION)
+    find_package(Git QUIET)
+    if(GIT_FOUND)
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} rev-list --count --first-parent HEAD
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+            OUTPUT_VARIABLE _ak_commit_count
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET)
+    endif()
+    if(_ak_commit_count)
+        set(AGENTKATE_VERSION "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}.${_ak_commit_count}")
+    else()
+        set(AGENTKATE_VERSION "${PROJECT_VERSION}")
+    endif()
+endif()
+message(STATUS "Agent Kate version: ${AGENTKATE_VERSION}")
+
 # --- Go orchestration core (akcore) ----------------------------------------
 # Built by a custom target that shells out to the Go toolchain. The binary is
-# placed next to the agentkate executable so the UI can spawn it directly.
+# placed next to the agentkate executable so the UI can spawn it directly. The
+# derived version is stamped in via -ldflags so akcore reports the same number
+# the package does. (Quoted as one argument so the space in the -X value
+# survives VERBATIM.)
 find_program(GO_EXECUTABLE go REQUIRED)
 
 add_custom_target(akcore ALL
-    COMMAND ${GO_EXECUTABLE} build -o ${CMAKE_BINARY_DIR}/akcore ./cmd/akcore
+    COMMAND ${GO_EXECUTABLE} build "-ldflags=-X main.version=${AGENTKATE_VERSION}"
+            -o ${CMAKE_BINARY_DIR}/akcore ./cmd/akcore
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/core
     COMMENT "Building akcore (Go orchestration core)"
     VERBATIM

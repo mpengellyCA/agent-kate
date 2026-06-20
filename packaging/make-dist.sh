@@ -6,7 +6,17 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 
-VERSION="${VERSION:-$(awk -F'[ )]' '/^project\(AgentKate VERSION/ {print $3}' CMakeLists.txt)}"
+# Version: MAJOR.MINOR from CMakeLists.txt, patch = first-parent commit count
+# (matches scripts/lib.sh project_version). Override with VERSION=...
+if [[ -z "${VERSION:-}" ]]; then
+    _full="$(awk -F'[ )]' '/^project\(AgentKate VERSION/ {print $3}' CMakeLists.txt)"
+    IFS=. read -r _maj _min _ <<<"$_full"
+    if _cnt="$(git -C "$ROOT" rev-list --count --first-parent HEAD 2>/dev/null)" && [[ -n "$_cnt" ]]; then
+        VERSION="${_maj}.${_min}.${_cnt}"
+    else
+        VERSION="$_full"
+    fi
+fi
 if [[ -z "$VERSION" ]]; then
     echo "could not detect version from CMakeLists.txt" >&2
     exit 1

@@ -33,7 +33,9 @@ import (
 )
 
 // version is the akcore protocol/build version reported in the handshake.
-const version = "0.1.0"
+// The default is overridden at build time via -ldflags "-X main.version=..."
+// (see CMakeLists.txt) so it tracks MAJOR.MINOR.<commits-on-main>.
+var version = "0.1.0"
 
 // defaultSocketPath mirrors the path the UI computes, so a manually launched
 // core and UI still meet. The UI normally passes --socket explicitly.

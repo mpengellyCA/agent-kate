@@ -48,10 +48,22 @@ Project tree, editor, git log, and diff view together:
 Prerequisites (Arch): `qt6-base`, `ktexteditor`, `syntax-highlighting`,
 `extra-cmake-modules`, `cmake`, `ninja`, `go`, plus the `claude` CLI.
 
+The `scripts/ak` helper is the single entry point for everyday tasks (run any
+subcommand with `--help` for options):
+
 ```sh
-scripts/build.sh      # configures and builds both agentkate and akcore
-scripts/run.sh        # launches the app (the UI spawns akcore itself)
+scripts/ak build        # build both agentkate + akcore into ./build
+scripts/ak run          # build if needed, then launch (UI spawns akcore)
+scripts/ak package      # build an installable package from the current tree
+scripts/ak install      # install system-wide, or upgrade in place if present
+scripts/ak uninstall    # remove an installed Agent Kate
 ```
+
+On Arch/CachyOS `package`/`install` produce and install a real pacman package
+(`dist/agentkate-<ver>-<rel>-<arch>.pkg.tar.zst`), so upgrades are tracked and
+reversible — re-running `scripts/ak install` just upgrades. The individual
+scripts (`scripts/build.sh`, `scripts/package.sh`, …) can also be called
+directly. For RPM/DEB recipes see [`packaging/README.md`](packaging/README.md).
 
 ## Status
 
