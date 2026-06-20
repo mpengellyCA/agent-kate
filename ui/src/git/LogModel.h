@@ -70,6 +70,8 @@ public:
     int loadedCount() const { return m_rows.size(); }
 
     QString shaAt(int row) const;
+    QString shortShaAt(int row) const;
+    QString subjectAt(int row) const;
     int rowForSha(const QString &sha) const;
 
     // QAbstractTableModel

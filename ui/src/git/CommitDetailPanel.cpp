@@ -5,13 +5,19 @@
 #include "DiffView.h"
 #include "ipc/CoreClient.h"
 
+#include <KLocalizedString>
+
+#include <QApplication>
+#include <QClipboard>
 #include <QDateTime>
 #include <QFont>
+#include <QIcon>
 #include <QJsonArray>
 #include <QJsonValue>
 #include <QLabel>
 #include <QListWidget>
 #include <QListWidgetItem>
+#include <QMenu>
 #include <QPlainTextEdit>
 #include <QSplitter>
 #include <QVBoxLayout>
@@ -29,7 +35,7 @@ QString statusGlyph(const QString &status)
 QString numstat(int added, int deleted)
 {
     if (added < 0 || deleted < 0) {
-        return QStringLiteral("bin");
+        return i18nc("binary file in a commit's file list", "bin");
     }
     return QStringLiteral("+%1 −%2").arg(added).arg(deleted);
 }
@@ -81,6 +87,11 @@ CommitDetailPanel::CommitDetailPanel(CoreClient *core, QWidget *parent)
     layout->setSpacing(6);
     layout->addWidget(split);
 
+    // Right-click anywhere in the panel to copy this commit's identifiers.
+    setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(this, &QWidget::customContextMenuRequested, this,
+            &CommitDetailPanel::showContextMenu);
+
     clear();
 }
 
@@ -89,8 +100,11 @@ void CommitDetailPanel::clear()
     m_threadId.clear();
     m_repoRoot.clear();
     m_sha.clear();
+    m_shortSha.clear();
+    m_subject.clear();
     ++m_token;
-    m_header->setText(QStringLiteral("<i>Select a commit to see details.</i>"));
+    m_header->setText(QStringLiteral("<i>%1</i>")
+                          .arg(i18n("Select a commit to see details.").toHtmlEscaped()));
     m_body->clear();
     m_files->clear();
     replaceDiff(QString());
@@ -121,8 +135,8 @@ void CommitDetailPanel::setCommit(const QString &threadId, const QString &repoRo
     m_repoRoot = repoRoot;
     m_sha = sha;
     ++m_token;
-    m_header->setText(QStringLiteral("<i>Loading %1…</i>")
-                          .arg(sha.left(8).toHtmlEscaped()));
+    m_header->setText(QStringLiteral("<i>%1</i>")
+                          .arg(i18n("Loading %1…", sha.left(8)).toHtmlEscaped()));
     m_body->clear();
     m_files->clear();
     replaceDiff(QString());
@@ -146,8 +160,9 @@ void CommitDetailPanel::loadDetail()
                      }
                      if (!error.isEmpty()) {
                          m_header->setText(
-                             QStringLiteral("<b>Error:</b> %1")
-                                 .arg(error.value(QStringLiteral("message"))
+                             QStringLiteral("<b>%1</b> %2")
+                                 .arg(i18n("Error:").toHtmlEscaped(),
+                                      error.value(QStringLiteral("message"))
                                           .toString()
                                           .toHtmlEscaped()));
                          return;
@@ -184,6 +199,9 @@ void CommitDetailPanel::applyDetail(const QJsonObject &detail)
     const QString sha = detail.value(QStringLiteral("sha")).toString();
     const QString shortSha = detail.value(QStringLiteral("shortSha")).toString();
     const QString subject = detail.value(QStringLiteral("subject")).toString();
+    // Remember the identifiers for the copy context menu.
+    m_shortSha = shortSha;
+    m_subject = subject;
     const QString author = detail.value(QStringLiteral("author")).toString();
     const QString authorEmail = detail.value(QStringLiteral("authorEmail")).toString();
     const QDateTime when = QDateTime::fromString(
@@ -218,7 +236,9 @@ void CommitDetailPanel::applyDetail(const QJsonObject &detail)
     // Insert a synthetic "All files" entry that drops the path filter so the
     // user can pop back to the full patch after looking at one file.
     {
-        auto *all = new QListWidgetItem(QStringLiteral("All files"), m_files);
+        auto *all = new QListWidgetItem(
+            i18nc("synthetic entry that shows the whole commit diff", "All files"),
+            m_files);
         QFont f = all->font();
         f.setItalic(true);
         all->setFont(f);
@@ -254,8 +274,10 @@ void CommitDetailPanel::replaceDiff(const QString &patch)
         m_diff->deleteLater();
         m_diff = nullptr;
     }
-    const QString shown = patch.isEmpty() ? QStringLiteral("(no diff)") : patch;
-    m_diff = new DiffView(shown, this);
+    m_diff = new DiffView(patch, this);
+    if (patch.isEmpty()) {
+        m_diff->setEmptyMessage(i18n("No changes in this commit."));
+    }
     m_diffSlot->addWidget(m_diff);
 }
 
@@ -269,4 +291,51 @@ void CommitDetailPanel::onFileRowChanged(int row)
         return;
     }
     loadDiff(item->data(Qt::UserRole).toString());
+}
+
+void CommitDetailPanel::showContextMenu(const QPoint &pos)
+{
+    if (m_sha.isEmpty()) {
+        return;
+    }
+    QMenu menu(this);
+    const QIcon copyIcon = QIcon::fromTheme(QStringLiteral("edit-copy"));
+    QAction *copyHash =
+        menu.addAction(copyIcon, i18nc("@action:inmenu", "Copy Commit Hash"));
+    QAction *copyShort =
+        menu.addAction(copyIcon, i18nc("@action:inmenu", "Copy Short Hash"));
+    QAction *copySubject =
+        menu.addAction(copyIcon, i18nc("@action:inmenu", "Copy Subject"));
+    menu.addSeparator();
+    QAction *copyPatch =
+        menu.addAction(copyIcon, i18nc("@action:inmenu", "Copy as Patch"));
+    copyShort->setEnabled(!m_shortSha.isEmpty());
+    copySubject->setEnabled(!m_subject.isEmpty());
+
+    QAction *chosen = menu.exec(mapToGlobal(pos));
+    QClipboard *clip = QApplication::clipboard();
+    if (chosen == copyHash) {
+        clip->setText(m_sha);
+    } else if (chosen == copyShort) {
+        clip->setText(m_shortSha);
+    } else if (chosen == copySubject) {
+        clip->setText(m_subject);
+    } else if (chosen == copyPatch && m_core->isConnected()) {
+        // Full-commit patch via git.commit.diff, scoped to the active source.
+        const int token = m_token;
+        QJsonObject params = sourceParams();
+        params.remove(QStringLiteral("path")); // ensure the whole-commit patch
+        m_core->call(QStringLiteral("git.commit.diff"), params,
+                     [this, token](const QJsonObject &result,
+                                   const QJsonObject &error) {
+                         if (token != m_token || !error.isEmpty()) {
+                             return;
+                         }
+                         const QString patch =
+                             result.value(QStringLiteral("patch")).toString();
+                         if (!patch.isEmpty()) {
+                             QApplication::clipboard()->setText(patch);
+                         }
+                     });
+    }
 }
