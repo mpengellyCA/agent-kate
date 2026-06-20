@@ -1,5 +1,8 @@
 #include "DiffView.h"
 
+#include <KConfigGroup>
+#include <KLocalizedString>
+#include <KSharedConfig>
 #include <KSyntaxHighlighting/AbstractHighlighter>
 #include <KSyntaxHighlighting/Definition>
 #include <KSyntaxHighlighting/Format>
@@ -9,10 +12,15 @@
 
 #include <QComboBox>
 #include <QHBoxLayout>
+#include <QIcon>
 #include <QLabel>
 #include <QPalette>
 #include <QRegularExpression>
+#include <QScrollBar>
+#include <QSplitter>
+#include <QStackedWidget>
 #include <QTextBrowser>
+#include <QToolButton>
 #include <QVBoxLayout>
 
 namespace {
@@ -28,9 +36,26 @@ struct DiffLine {
 // One changed file in the diff.
 struct DiffFile {
     QString path;
+    QString oldPath; // set when the file was renamed
+    bool binary = false;
+    bool renamed = false;
     int added = 0;
     int removed = 0;
     QList<DiffLine> lines;
+};
+
+// Colours used by both the inline and side-by-side renderers. Derived from the
+// active palette so the diff tracks the user's Breeze colour scheme.
+struct DiffPalette {
+    QString addBg;
+    QString delBg;
+    QString hunkBg;
+    QString hunkFg;
+    QString gutterFg;
+    QString headBg;
+    QString addFg;
+    QString delFg;
+    QColor codeBg;
 };
 
 QString escapeHtml(const QString &s)
@@ -106,6 +131,39 @@ QList<DiffFile> parseDiff(const QString &diff)
             cur = &files.last();
             continue;
         }
+        // "Binary files a/foo and b/foo differ" — git's marker for a binary
+        // change. No textual content follows.
+        if (raw.startsWith(QLatin1String("Binary files "))
+            || raw.startsWith(QLatin1String("GIT binary patch"))) {
+            if (!cur) {
+                files.append(DiffFile{});
+                cur = &files.last();
+            }
+            cur->binary = true;
+            continue;
+        }
+        // Rename headers carry the old/new path even when there is no hunk
+        // (a pure rename has zero content lines).
+        if (raw.startsWith(QLatin1String("rename from "))) {
+            if (!cur) {
+                files.append(DiffFile{});
+                cur = &files.last();
+            }
+            cur->renamed = true;
+            cur->oldPath = raw.sliced(12).trimmed(); // len("rename from ")
+            continue;
+        }
+        if (raw.startsWith(QLatin1String("rename to "))) {
+            if (!cur) {
+                files.append(DiffFile{});
+                cur = &files.last();
+            }
+            cur->renamed = true;
+            if (cur->path.isEmpty()) {
+                cur->path = raw.sliced(10).trimmed(); // len("rename to ")
+            }
+            continue;
+        }
         if (raw.startsWith(QLatin1String("+++ "))) {
             QString p = raw.mid(4).trimmed();
             if (p.startsWith(QLatin1String("b/"))) {
@@ -115,10 +173,21 @@ QList<DiffFile> parseDiff(const QString &diff)
                 files.append(DiffFile{});
                 cur = &files.last();
             }
-            cur->path = p;
+            if (p != QLatin1String("/dev/null")) {
+                cur->path = p;
+            }
             continue;
         }
         if (raw.startsWith(QLatin1String("--- "))) {
+            // Capture the old path for the side-by-side header / rename label
+            // when no explicit rename header was present.
+            QString p = raw.mid(4).trimmed();
+            if (p.startsWith(QLatin1String("a/"))) {
+                p = p.mid(2);
+            }
+            if (cur && cur->oldPath.isEmpty() && p != QLatin1String("/dev/null")) {
+                cur->oldPath = p;
+            }
             continue;
         }
         if (raw.startsWith(QLatin1String("@@"))) {
@@ -159,47 +228,48 @@ QString numCell(int n)
     return n >= 0 ? QString::number(n).rightJustified(5) : QStringLiteral("     ");
 }
 
-} // namespace
-
-DiffView::DiffView(const QString &unifiedDiff, QWidget *parent)
-    : QWidget(parent)
+QString fileHeaderHtml(const DiffFile &file, int index, const DiffPalette &c, bool first)
 {
-    const bool dark = palette().color(QPalette::Base).lightness() < 128;
-    const QString addBg    = dark ? QStringLiteral("#16331d") : QStringLiteral("#e6ffec");
-    const QString delBg    = dark ? QStringLiteral("#3a1e1f") : QStringLiteral("#ffebe9");
-    const QString hunkBg   = dark ? QStringLiteral("#1f2733") : QStringLiteral("#ddf4ff");
-    const QString hunkFg   = dark ? QStringLiteral("#7c9cc0") : QStringLiteral("#3b5b7a");
-    const QString gutterFg = dark ? QStringLiteral("#6b7280") : QStringLiteral("#9aa0a8");
-    const QString headBg   = dark ? QStringLiteral("#23272f") : QStringLiteral("#eef0f3");
-    const QString addFg    = dark ? QStringLiteral("#5fd38a") : QStringLiteral("#1a7f37");
-    const QString delFg    = dark ? QStringLiteral("#ff8a80") : QStringLiteral("#c01c28");
+    QString label;
+    if (file.renamed && !file.oldPath.isEmpty() && file.oldPath != file.path) {
+        label = i18nc("renamed file header in a diff, old → new",
+                      "Renamed: %1 → %2",
+                      escapeHtml(file.oldPath), escapeHtml(file.path));
+    } else {
+        label = QStringLiteral("<b>%1</b>")
+                    .arg(escapeHtml(file.path.isEmpty()
+                                        ? i18nc("placeholder for an unnamed file in a diff",
+                                                "(file)")
+                                        : file.path));
+    }
+    return QStringLiteral(
+               "<a name=\"file%1\"></a>"
+               "<div style=\"background-color:%2;padding:7px 10px;margin-top:%3;\">"
+               "%4 &nbsp; <span style=\"color:%5\">+%6</span> "
+               "<span style=\"color:%7\">-%8</span></div>")
+        .arg(QString::number(index), c.headBg,
+             first ? QStringLiteral("0") : QStringLiteral("14px"),
+             label,
+             c.addFg, QString::number(file.added),
+             c.delFg, QString::number(file.removed));
+}
 
-    const QList<DiffFile> files = parseDiff(unifiedDiff);
-
-    KSyntaxHighlighting::Repository &repo = sharedRepository();
-    const KSyntaxHighlighting::Theme theme = repo.defaultTheme(
-        dark ? KSyntaxHighlighting::Repository::DarkTheme
-             : KSyntaxHighlighting::Repository::LightTheme);
-    const QColor codeBg(theme.editorColor(KSyntaxHighlighting::Theme::BackgroundColor));
-
-    int totalAdded = 0;
-    int totalRemoved = 0;
+// Render the full inline body (per-file sections, old+new gutters).
+QString renderInline(const QList<DiffFile> &files, const DiffPalette &c,
+                     KSyntaxHighlighting::Repository &repo,
+                     const KSyntaxHighlighting::Theme &theme)
+{
     QString body;
-
     for (int fi = 0; fi < files.size(); ++fi) {
         const DiffFile &file = files.at(fi);
-        totalAdded += file.added;
-        totalRemoved += file.removed;
+        body += fileHeaderHtml(file, fi, c, fi == 0);
 
-        body += QStringLiteral(
-                    "<a name=\"file%1\"></a>"
-                    "<div style=\"background-color:%2;padding:7px 10px;margin-top:%3;\">"
-                    "<b>%4</b> &nbsp; <span style=\"color:%5\">+%6</span> "
-                    "<span style=\"color:%7\">-%8</span></div>")
-                    .arg(QString::number(fi), headBg, fi == 0 ? QStringLiteral("0") : QStringLiteral("14px"),
-                         escapeHtml(file.path.isEmpty() ? QStringLiteral("(file)") : file.path),
-                         addFg, QString::number(file.added),
-                         delFg, QString::number(file.removed));
+        if (file.binary) {
+            body += QStringLiteral(
+                        "<div style=\"padding:6px 10px;font-style:italic;\">%1</div>")
+                        .arg(escapeHtml(i18n("Binary file — no textual diff")));
+            continue;
+        }
 
         HtmlHighlighter hl;
         hl.setDefinition(repo.definitionForFileName(file.path));
@@ -211,67 +281,246 @@ DiffView::DiffView(const QString &unifiedDiff, QWidget *parent)
                 body += QStringLiteral(
                             "<div style=\"background-color:%1;color:%2;white-space:pre-wrap;"
                             "font-family:monospace;padding:1px 4px;\">%3</div>")
-                            .arg(hunkBg, hunkFg, escapeHtml(line.text));
+                            .arg(c.hunkBg, c.hunkFg, escapeHtml(line.text));
                 continue;
             }
             QString bg = QStringLiteral("transparent");
             QString marker = QStringLiteral(" ");
             if (line.kind == DiffLine::Added) {
-                bg = addBg;
+                bg = c.addBg;
                 marker = QStringLiteral("+");
             } else if (line.kind == DiffLine::Removed) {
-                bg = delBg;
+                bg = c.delBg;
                 marker = QStringLiteral("-");
             }
             body += QStringLiteral(
                         "<div style=\"background-color:%1;white-space:pre-wrap;"
                         "font-family:monospace;padding:0 4px;\">"
                         "<span style=\"color:%2\">%3 %4 </span>%5 %6</div>")
-                        .arg(bg, gutterFg,
+                        .arg(bg, c.gutterFg,
                              escapeHtml(numCell(line.oldNo)), escapeHtml(numCell(line.newNo)),
                              marker, hl.render(line.text));
         }
     }
+    return body;
+}
+
+// Render one side of the split view. side==Removed builds the "old" pane
+// (context + removed lines); side==Added builds the "new" pane (context +
+// added lines). Hunk separators and file headers stay aligned across panes.
+QString renderSide(const QList<DiffFile> &files, const DiffPalette &c,
+                   KSyntaxHighlighting::Repository &repo,
+                   const KSyntaxHighlighting::Theme &theme, DiffLine::Kind side)
+{
+    QString body;
+    for (int fi = 0; fi < files.size(); ++fi) {
+        const DiffFile &file = files.at(fi);
+        body += fileHeaderHtml(file, fi, c, fi == 0);
+
+        if (file.binary) {
+            body += QStringLiteral(
+                        "<div style=\"padding:6px 10px;font-style:italic;\">%1</div>")
+                        .arg(escapeHtml(i18n("Binary file — no textual diff")));
+            continue;
+        }
+
+        HtmlHighlighter hl;
+        hl.setDefinition(repo.definitionForFileName(file.path));
+        hl.setTheme(theme);
+
+        for (const DiffLine &line : file.lines) {
+            if (line.kind == DiffLine::Hunk) {
+                hl.resetState();
+                body += QStringLiteral(
+                            "<div style=\"background-color:%1;color:%2;white-space:pre-wrap;"
+                            "font-family:monospace;padding:1px 4px;\">%3</div>")
+                            .arg(c.hunkBg, c.hunkFg, escapeHtml(line.text));
+                continue;
+            }
+            // Context lines appear on both sides. A change line appears only on
+            // its own side; the opposite side gets a blank filler so rows stay
+            // vertically aligned.
+            const bool isContext = line.kind == DiffLine::Context;
+            const bool mine = isContext || line.kind == side;
+            QString bg = QStringLiteral("transparent");
+            QString marker = QStringLiteral(" ");
+            int no = (side == DiffLine::Removed) ? line.oldNo : line.newNo;
+            QString content;
+            if (mine) {
+                if (line.kind == DiffLine::Added) {
+                    bg = c.addBg;
+                    marker = QStringLiteral("+");
+                } else if (line.kind == DiffLine::Removed) {
+                    bg = c.delBg;
+                    marker = QStringLiteral("-");
+                }
+                content = hl.render(line.text);
+            } else {
+                // Filler row on the opposite side.
+                no = -1;
+                content = QString();
+            }
+            body += QStringLiteral(
+                        "<div style=\"background-color:%1;white-space:pre-wrap;"
+                        "font-family:monospace;padding:0 4px;\">"
+                        "<span style=\"color:%2\">%3 </span>%4 %5</div>")
+                        .arg(bg, c.gutterFg,
+                             escapeHtml(numCell(no)), marker, content);
+        }
+    }
+    return body;
+}
+
+} // namespace
+
+DiffView::DiffView(const QString &unifiedDiff, QWidget *parent)
+    : QWidget(parent)
+    , m_unifiedDiff(unifiedDiff)
+    , m_emptyMessage(i18n("No changes."))
+{
+    // Persisted preference for inline vs side-by-side.
+    const KConfigGroup grp =
+        KSharedConfig::openConfig()->group(QStringLiteral("Git"));
+    m_sideBySide = grp.readEntry("DiffSideBySide", false);
+
+    const QList<DiffFile> files = parseDiff(m_unifiedDiff);
 
     // --- top bar ----------------------------------------------------------
+    const bool dark = palette().color(QPalette::Base).lightness() < 128;
+    const QString addFg = dark ? QStringLiteral("#5fd38a") : QStringLiteral("#1a7f37");
+    const QString delFg = dark ? QStringLiteral("#ff8a80") : QStringLiteral("#c01c28");
+
+    int totalAdded = 0;
+    int totalRemoved = 0;
+    for (const DiffFile &file : files) {
+        totalAdded += file.added;
+        totalRemoved += file.removed;
+    }
+
     auto *summary = new QLabel(this);
-    summary->setText(QStringLiteral("%1 file%2 changed · ")
-                         .arg(files.size())
-                         .arg(files.size() == 1 ? QString() : QStringLiteral("s"))
-                     + QStringLiteral("<span style=\"color:%1\">+%2</span> "
-                                      "<span style=\"color:%3\">-%4</span>")
-                           .arg(addFg, QString::number(totalAdded),
-                                delFg, QString::number(totalRemoved)));
+    summary->setText(
+        i18np("%1 file changed · ", "%1 files changed · ", files.size())
+        + QStringLiteral("<span style=\"color:%1\">+%2</span> "
+                         "<span style=\"color:%3\">-%4</span>")
+              .arg(addFg, QString::number(totalAdded),
+                   delFg, QString::number(totalRemoved)));
     summary->setTextFormat(Qt::RichText);
 
     auto *jump = new QComboBox(this);
     for (const DiffFile &file : files) {
-        jump->addItem(file.path.isEmpty() ? QStringLiteral("(file)") : file.path);
+        jump->addItem(file.path.isEmpty()
+                          ? i18nc("placeholder for an unnamed file in a diff", "(file)")
+                          : file.path);
     }
+
+    m_splitBtn = new QToolButton(this);
+    m_splitBtn->setIcon(QIcon::fromTheme(QStringLiteral("view-split-left-right")));
+    m_splitBtn->setCheckable(true);
+    m_splitBtn->setChecked(m_sideBySide);
+    m_splitBtn->setToolTip(i18n("Toggle side-by-side view"));
+    m_splitBtn->setAutoRaise(true);
 
     auto *topBar = new QHBoxLayout;
     topBar->setContentsMargins(10, 6, 10, 6);
     topBar->addWidget(summary, 1);
-    topBar->addWidget(new QLabel(QStringLiteral("Jump to:"), this));
+    topBar->addWidget(m_splitBtn);
+    topBar->addWidget(new QLabel(i18nc("@label jump-to-file selector", "Jump to:"), this));
     topBar->addWidget(jump);
 
-    auto *browser = new QTextBrowser(this);
-    browser->setOpenExternalLinks(false);
-    browser->setStyleSheet(QStringLiteral("QTextBrowser { background-color:%1; border:none; }")
-                               .arg(codeBg.name()));
-    if (files.isEmpty()) {
-        browser->setHtml(QStringLiteral("<p style=\"padding:16px;\">No changes.</p>"));
-    } else {
-        browser->setHtml(body);
-    }
+    // --- panes ------------------------------------------------------------
+    m_inline = new QTextBrowser(this);
+    m_inline->setOpenExternalLinks(false);
 
-    connect(jump, &QComboBox::activated, this, [browser](int index) {
-        browser->scrollToAnchor(QStringLiteral("file%1").arg(index));
+    auto *splitHost = new QSplitter(Qt::Horizontal, this);
+    m_leftPane = new QTextBrowser(splitHost);
+    m_rightPane = new QTextBrowser(splitHost);
+    m_leftPane->setOpenExternalLinks(false);
+    m_rightPane->setOpenExternalLinks(false);
+    splitHost->addWidget(m_leftPane);
+    splitHost->addWidget(m_rightPane);
+
+    m_stack = new QStackedWidget(this);
+    m_stack->addWidget(m_inline);   // index 0
+    m_stack->addWidget(splitHost);  // index 1
+
+    // Keep the two side-by-side panes scrolled together so changed lines line
+    // up as the user reads down.
+    connect(m_leftPane->verticalScrollBar(), &QScrollBar::valueChanged,
+            m_rightPane->verticalScrollBar(), &QScrollBar::setValue);
+    connect(m_rightPane->verticalScrollBar(), &QScrollBar::valueChanged,
+            m_leftPane->verticalScrollBar(), &QScrollBar::setValue);
+
+    connect(jump, &QComboBox::activated, this, [this](int index) {
+        const QString anchor = QStringLiteral("file%1").arg(index);
+        m_inline->scrollToAnchor(anchor);
+        m_leftPane->scrollToAnchor(anchor);
+        m_rightPane->scrollToAnchor(anchor);
+    });
+
+    connect(m_splitBtn, &QToolButton::toggled, this, [this](bool on) {
+        m_sideBySide = on;
+        KConfigGroup g = KSharedConfig::openConfig()->group(QStringLiteral("Git"));
+        g.writeEntry("DiffSideBySide", on);
+        m_stack->setCurrentIndex(on ? 1 : 0);
     });
 
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(0);
     layout->addLayout(topBar);
-    layout->addWidget(browser, 1);
+    layout->addWidget(m_stack, 1);
+
+    m_stack->setCurrentIndex(m_sideBySide ? 1 : 0);
+    rebuild();
+}
+
+void DiffView::setEmptyMessage(const QString &message)
+{
+    if (message == m_emptyMessage) {
+        return;
+    }
+    m_emptyMessage = message;
+    rebuild();
+}
+
+void DiffView::rebuild()
+{
+    const bool dark = palette().color(QPalette::Base).lightness() < 128;
+    DiffPalette c;
+    c.addBg    = dark ? QStringLiteral("#16331d") : QStringLiteral("#e6ffec");
+    c.delBg    = dark ? QStringLiteral("#3a1e1f") : QStringLiteral("#ffebe9");
+    c.hunkBg   = dark ? QStringLiteral("#1f2733") : QStringLiteral("#ddf4ff");
+    c.hunkFg   = dark ? QStringLiteral("#7c9cc0") : QStringLiteral("#3b5b7a");
+    c.gutterFg = dark ? QStringLiteral("#6b7280") : QStringLiteral("#9aa0a8");
+    c.headBg   = dark ? QStringLiteral("#23272f") : QStringLiteral("#eef0f3");
+    c.addFg    = dark ? QStringLiteral("#5fd38a") : QStringLiteral("#1a7f37");
+    c.delFg    = dark ? QStringLiteral("#ff8a80") : QStringLiteral("#c01c28");
+
+    const QList<DiffFile> files = parseDiff(m_unifiedDiff);
+
+    KSyntaxHighlighting::Repository &repo = sharedRepository();
+    const KSyntaxHighlighting::Theme theme = repo.defaultTheme(
+        dark ? KSyntaxHighlighting::Repository::DarkTheme
+             : KSyntaxHighlighting::Repository::LightTheme);
+    c.codeBg = QColor(theme.editorColor(KSyntaxHighlighting::Theme::BackgroundColor));
+
+    const QString sheet =
+        QStringLiteral("QTextBrowser { background-color:%1; border:none; }")
+            .arg(c.codeBg.name());
+    m_inline->setStyleSheet(sheet);
+    m_leftPane->setStyleSheet(sheet);
+    m_rightPane->setStyleSheet(sheet);
+
+    if (files.isEmpty()) {
+        const QString html = QStringLiteral("<p style=\"padding:16px;\">%1</p>")
+                                 .arg(escapeHtml(m_emptyMessage));
+        m_inline->setHtml(html);
+        m_leftPane->setHtml(html);
+        m_rightPane->setHtml(QString());
+        return;
+    }
+
+    m_inline->setHtml(renderInline(files, c, repo, theme));
+    m_leftPane->setHtml(renderSide(files, c, repo, theme, DiffLine::Removed));
+    m_rightPane->setHtml(renderSide(files, c, repo, theme, DiffLine::Added));
 }

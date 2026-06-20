@@ -69,11 +69,16 @@ void AgentCardDelegate::paint(QPainter *painter, const QStyleOptionViewItem &opt
     style->drawControl(QStyle::CE_ItemViewItem, &styled, painter, styled.widget);
 
     const bool selected = opt.state & QStyle::State_Selected;
+    const bool current  = opt.state & QStyle::State_HasFocus;
     const bool dormant  = idx.data(AgentRoles::Dormant).toBool();
     const QString title    = idx.data(AgentRoles::Title).toString();
     const QString subtitle = idx.data(AgentRoles::Subtitle).toString();
     const int number       = idx.data(AgentRoles::Number).toInt();
     const QString dotHex   = idx.data(AgentRoles::Dot).toString();
+    // A background agent that needs the user's input gets a palette-driven
+    // marker — but only while it isn't the row the user is already looking at.
+    const bool attention = idx.data(AgentRoles::Attention).toBool()
+                           && !selected && !current;
 
     painter->save();
     painter->setRenderHint(QPainter::Antialiasing, true);
@@ -109,11 +114,26 @@ void AgentCardDelegate::paint(QPainter *painter, const QStyleOptionViewItem &opt
     const int textX = r.left() + kDotDiam + kDotGap;
     int titleRight = r.right();
 
+    // "Needs your input" marker, painted at the row's right edge in the
+    // palette Highlight colour so it tracks Breeze and reads as actionable.
+    // Drawn first so the "#N" badge (if any) tucks to its left.
+    if (attention) {
+        const int markD = kDotDiam;
+        const int markX = r.right() - markD;
+        const int markY = titleLine.center().y() - markD / 2 + 1;
+        painter->setPen(Qt::NoPen);
+        painter->setBrush(opt.palette.color(QPalette::Highlight));
+        painter->drawEllipse(markX, markY, markD, markD);
+        titleRight = markX - kBadgeGap;
+    }
+
     // "#N" worktree badge on the right of the title line.
     if (number > 0) {
         const QString badge = QStringLiteral("#%1").arg(number);
         const int bw = fmTitle.horizontalAdvance(badge) + kBadgeHPad * 2;
-        const QRect badgeRect(r.right() - bw, titleLine.top(), bw, titleLine.height());
+        // Anchor to titleRight (the marker's left edge if a marker was drawn,
+        // else the row's right edge) so the two never overlap.
+        const QRect badgeRect(titleRight - bw, titleLine.top(), bw, titleLine.height());
         painter->setPen(Qt::NoPen);
         painter->setBrush(opt.palette.color(selected ? QPalette::Highlight
                                                      : QPalette::AlternateBase));

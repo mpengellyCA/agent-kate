@@ -2,6 +2,7 @@
 
 #include <KMainWindow>
 #include <QHash>
+#include <QSet>
 #include <QString>
 
 namespace KTextEditor {
@@ -25,6 +26,7 @@ class ShellLayout;
 class QAction;
 class QLabel;
 class QLineEdit;
+class QToolButton;
 
 // MainWindow is the Agent Kate arena shell — a project-aware, agent-centric KDE
 // main window. The agent roster (left) holds projects and their agents; the
@@ -69,7 +71,9 @@ private:
     void updateCursorStatus();
     void updateBreadcrumb(const QString &path);
     void updateAgentBadge();
+    void updateLspStatus();    // refresh the status-bar language-server widget
     void onSave();
+    void onSaveAll();
     void reloadExtensionServers();
     void onAgentActivated(int agentId, const QString &projectPath);
     void setTabsByAgent(bool byAgent);
@@ -77,6 +81,11 @@ private:
     void pushOpenFilesToCore();
 
     void persistShellState();
+    // Persist/restore the editor's open tabs per project, so a restart reopens
+    // the files the human was working on. Keyed by project path (agent ids may
+    // be reassigned). m_restoringSession guards the replay from re-persisting.
+    void persistEditorSession();
+    void restoreEditorSession(const QString &projectPath);
 
     CoreClient *m_core = nullptr;
     EditorArea *m_editor = nullptr;
@@ -142,6 +151,8 @@ private:
     QLabel *m_agentBadge = nullptr;       // top-toolbar agent chip
     QLabel *m_cursorPosLabel = nullptr;   // status bar: Ln 42 Col 17
     QLabel *m_modeLabel = nullptr;        // status bar: UTF-8 LF C++
+    QToolButton *m_lspStatusButton = nullptr; // status bar: language-server state
+    QAction *m_formatOnSave = nullptr;    // Code → Format on Save (KConfig-backed)
     QLabel *m_agentStatusLabel = nullptr; // status bar (rightmost): agent name + dot
     KTextEditor::View *m_observedView = nullptr; // currently wired-for-cursor
 
@@ -153,4 +164,10 @@ private:
     QString m_activeProject;
     int m_activeAgentId = -1;
     bool m_tabsByAgent = false; // editor tab grouping: false = project, true = agent
+
+    // Session restore: projects whose saved tabs have already been replayed
+    // (each project restores once per app run), and a guard so the replay's
+    // openFile calls don't re-trigger persistence.
+    QSet<QString> m_restoredSessions;
+    bool m_restoringSession = false;
 };

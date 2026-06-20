@@ -7,14 +7,21 @@
 #include "git/PRDialog.h"
 #include "ipc/CoreClient.h"
 
+#include <KLocalizedString>
+
+#include <QEvent>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QItemSelectionModel>
+#include <QIcon>
 #include <QJsonArray>
 #include <QJsonValue>
+#include <QLabel>
+#include <QMenu>
 #include <QMessageBox>
 #include <QPalette>
 #include <QPushButton>
+#include <QResizeEvent>
 #include <QTableView>
 #include <QVBoxLayout>
 
@@ -50,16 +57,29 @@ QVariant WorktreeModel::data(const QModelIndex &index, int role) const
         case ColAgent:
             return r.number > 0 ? QStringLiteral("#%1").arg(r.number) : QString();
         case ColBranch:
-            return r.branch.isEmpty() ? QStringLiteral("(detached)") : r.branch;
+            return r.branch.isEmpty()
+                       ? i18nc("git branch state", "(detached)")
+                       : r.branch;
         case ColIsolation:
-            return r.isolated ? QStringLiteral("worktree") : QStringLiteral("workspace");
+            return r.isolated
+                       ? i18nc("agent runs in its own git worktree", "worktree")
+                       : i18nc("agent runs directly in the workspace", "workspace");
         case ColAhead:
             return r.ahead;
         case ColBehind:
             return r.behindBase;
+        case ColRemote:
+            // No upstream tracking branch (never pushed) → "local". Otherwise
+            // compact ↑ahead ↓behind against origin/<branch>.
+            if (!r.hasUpstream) {
+                return i18nc("branch has no upstream / has never been pushed",
+                             "local");
+            }
+            return QStringLiteral("↑%1 ↓%2").arg(r.remoteAhead).arg(r.remoteBehind);
         case ColDirty:
             if (r.conflicts) {
-                return QStringLiteral("%1 · conflicts").arg(r.dirty);
+                return i18nc("dirty file count followed by a conflict marker",
+                             "%1 · conflicts", r.dirty);
             }
             return r.dirty;
         case ColPath:
@@ -70,7 +90,16 @@ QVariant WorktreeModel::data(const QModelIndex &index, int role) const
         if (!r.error.isEmpty()) {
             return r.error;
         }
-        return QStringLiteral("thread %1\n%2").arg(r.threadId, r.path);
+        if (index.column() == ColRemote) {
+            if (!r.hasUpstream) {
+                return i18n("No upstream branch — this branch has not been "
+                            "pushed to origin.");
+            }
+            return i18nc("remote tracking tooltip: ahead/behind counts vs origin",
+                         "%1 ahead, %2 behind origin/%3.",
+                         r.remoteAhead, r.remoteBehind, r.branch);
+        }
+        return i18n("thread %1\n%2", r.threadId, r.path);
     }
     if (role == Qt::ForegroundRole && r.conflicts && index.column() == ColDirty) {
         QPalette pal;
@@ -81,6 +110,7 @@ QVariant WorktreeModel::data(const QModelIndex &index, int role) const
         case ColAgent:
         case ColAhead:
         case ColBehind:
+        case ColRemote:
         case ColDirty:
             return int(Qt::AlignRight | Qt::AlignVCenter);
         }
@@ -95,19 +125,22 @@ QVariant WorktreeModel::headerData(int section, Qt::Orientation orientation, int
     }
     switch (section) {
     case ColAgent:
-        return QStringLiteral("Agent");
+        return i18nc("worktree dashboard column", "Agent");
     case ColBranch:
-        return QStringLiteral("Branch");
+        return i18nc("worktree dashboard column", "Branch");
     case ColIsolation:
-        return QStringLiteral("Mode");
+        return i18nc("worktree dashboard column", "Mode");
     case ColAhead:
         return QStringLiteral("↑");
     case ColBehind:
         return QStringLiteral("↓");
+    case ColRemote:
+        return i18nc("worktree dashboard column: state vs origin remote",
+                     "Remote");
     case ColDirty:
-        return QStringLiteral("Dirty");
+        return i18nc("worktree dashboard column", "Dirty");
     case ColPath:
-        return QStringLiteral("Path");
+        return i18nc("worktree dashboard column", "Path");
     }
     return {};
 }
@@ -190,16 +223,40 @@ WorktreeDashboard::WorktreeDashboard(CoreClient *core, QWidget *parent)
     m_view->horizontalHeader()->setSectionResizeMode(
         WorktreeModel::ColBehind, QHeaderView::ResizeToContents);
     m_view->horizontalHeader()->setSectionResizeMode(
+        WorktreeModel::ColRemote, QHeaderView::ResizeToContents);
+    m_view->horizontalHeader()->setSectionResizeMode(
         WorktreeModel::ColDirty, QHeaderView::ResizeToContents);
 
-    m_commitBtn = new QPushButton(QStringLiteral("Commit selected…"), this);
+    // Empty-state overlay: a centred hint shown over the (empty) table when
+    // the active project has no running agents. Parented to the viewport so it
+    // floats above the table area; repositioned on resize via an event filter.
+    m_placeholder = new QLabel(
+        i18n("No agents running in this project yet."), m_view->viewport());
+    m_placeholder->setAlignment(Qt::AlignCenter);
+    m_placeholder->setWordWrap(true);
+    {
+        QPalette pal = m_placeholder->palette();
+        pal.setColor(QPalette::WindowText, pal.color(QPalette::Disabled,
+                                                     QPalette::WindowText));
+        m_placeholder->setPalette(pal);
+    }
+    m_placeholder->hide();
+    m_view->viewport()->installEventFilter(this);
+
+    m_discardBtn = new QPushButton(
+        QIcon::fromTheme(QStringLiteral("edit-clear")),
+        i18nc("@action:button discard uncommitted changes", "Discard changes…"),
+        this);
+    m_discardBtn->setEnabled(false);
+    m_commitBtn = new QPushButton(i18nc("@action:button", "Commit selected…"), this);
     m_commitBtn->setEnabled(false);
-    m_landBtn = new QPushButton(QStringLiteral("Land into main…"), this);
+    m_landBtn = new QPushButton(i18nc("@action:button", "Land into main…"), this);
     m_landBtn->setEnabled(false);
-    m_prBtn = new QPushButton(QStringLiteral("Open PR…"), this);
+    m_prBtn = new QPushButton(i18nc("@action:button", "Open PR…"), this);
     m_prBtn->setEnabled(false);
     auto *toolbar = new QHBoxLayout;
     toolbar->setContentsMargins(6, 4, 6, 4);
+    toolbar->addWidget(m_discardBtn);
     toolbar->addStretch(1);
     toolbar->addWidget(m_commitBtn);
     toolbar->addWidget(m_landBtn);
@@ -224,13 +281,20 @@ WorktreeDashboard::WorktreeDashboard(CoreClient *core, QWidget *parent)
                 const bool merging = r != nullptr && r->isolated && r->ahead > 0;
                 m_landBtn->setEnabled(merging);
                 m_prBtn->setEnabled(merging);
+                // Discard is only meaningful when there are uncommitted changes.
+                m_discardBtn->setEnabled(r != nullptr && r->dirty > 0);
             });
     connect(m_view, &QTableView::doubleClicked, this,
             [this](const QModelIndex &) { openCommitDialog(); });
+    m_view->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_view, &QTableView::customContextMenuRequested, this,
+            &WorktreeDashboard::showRowContextMenu);
     connect(m_commitBtn, &QPushButton::clicked, this,
             &WorktreeDashboard::openCommitDialog);
     connect(m_landBtn, &QPushButton::clicked, this, &WorktreeDashboard::landSelected);
     connect(m_prBtn, &QPushButton::clicked, this, &WorktreeDashboard::openPRDialog);
+    connect(m_discardBtn, &QPushButton::clicked, this,
+            &WorktreeDashboard::discardSelected);
 }
 
 void WorktreeDashboard::setActiveProject(const QString &projectPath)
@@ -261,8 +325,8 @@ void WorktreeDashboard::openPRDialog()
     dlg->setAttribute(Qt::WA_DeleteOnClose);
     connect(dlg, &PRDialog::prOpened, this, [this](const QString &url) {
         emit statusMessage(url.isEmpty()
-                               ? QStringLiteral("PR opened")
-                               : QStringLiteral("PR opened: %1").arg(url));
+                               ? i18n("PR opened")
+                               : i18n("PR opened: %1", url));
         refresh();
     });
     dlg->show();
@@ -277,10 +341,10 @@ void WorktreeDashboard::landSelected()
     const QString threadId = r->threadId;
     const QString branch = r->branch;
     if (QMessageBox::question(
-            this, QStringLiteral("Land into workspace?"),
-            QStringLiteral("Merge <b>%1</b> into the workspace's current branch?"
-                           "<br><br>Conflicts (if any) will open in KDiff3 "
-                           "instead of rolling back.").arg(branch.toHtmlEscaped()),
+            this, i18nc("@title:window", "Land into workspace?"),
+            i18n("Merge <b>%1</b> into the workspace's current branch?"
+                 "<br><br>Conflicts (if any) will open in KDiff3 "
+                 "instead of rolling back.", branch.toHtmlEscaped()),
             QMessageBox::Yes | QMessageBox::No, QMessageBox::No)
         != QMessageBox::Yes) {
         return;
@@ -294,7 +358,7 @@ void WorktreeDashboard::landSelected()
                      m_landBtn->setEnabled(true);
                      if (!error.isEmpty()) {
                          QMessageBox::warning(
-                             this, QStringLiteral("Could not land"),
+                             this, i18nc("@title:window", "Could not land"),
                              error.value(QStringLiteral("message")).toString());
                          return;
                      }
@@ -303,8 +367,7 @@ void WorktreeDashboard::landSelected()
                      const QJsonArray confArr =
                          result.value(QStringLiteral("conflicts")).toArray();
                      if (confArr.isEmpty()) {
-                         emit statusMessage(
-                             QStringLiteral("Merged %1 into %2").arg(branch, into));
+                         emit statusMessage(i18n("Merged %1 into %2", branch, into));
                          refresh();
                          return;
                      }
@@ -318,14 +381,14 @@ void WorktreeDashboard::landSelected()
                      dlg->setAttribute(Qt::WA_DeleteOnClose);
                      connect(dlg, &ConflictDialog::finalized, this,
                              [this, branch](const QString &, const QString &i) {
-                                 emit statusMessage(QStringLiteral("Merged %1 into %2")
-                                                        .arg(branch, i));
+                                 emit statusMessage(
+                                     i18n("Merged %1 into %2", branch, i));
                                  refresh();
                              });
                      connect(dlg, &ConflictDialog::aborted, this,
                              [this](const QString &) {
                                  emit statusMessage(
-                                     QStringLiteral("Merge aborted; workspace restored"));
+                                     i18n("Merge aborted; workspace restored"));
                                  refresh();
                              });
                      dlg->show();
@@ -343,11 +406,125 @@ void WorktreeDashboard::openCommitDialog()
     connect(dlg, &CommitDialog::committed, this,
             [this](const QString &, const QString &branch) {
                 emit statusMessage(branch.isEmpty()
-                                       ? QStringLiteral("Commit successful")
-                                       : QStringLiteral("Committed to %1").arg(branch));
+                                       ? i18n("Commit successful")
+                                       : i18n("Committed to %1", branch));
                 refresh();
             });
     dlg->show();
+}
+
+void WorktreeDashboard::discardSelected()
+{
+    const WorktreeRow *r = selectedRow();
+    if (!r || r->threadId.isEmpty() || r->dirty == 0) {
+        return;
+    }
+    const QString threadId = r->threadId;
+    const QString label = r->number > 0 ? QStringLiteral("#%1").arg(r->number)
+                                        : r->branch;
+    if (QMessageBox::question(
+            this, i18nc("@title:window", "Discard all changes?"),
+            i18np("Permanently discard the 1 uncommitted change in worktree "
+                  "<b>%2</b>?<br><br>This runs <tt>git reset --hard</tt> and "
+                  "<tt>git clean</tt> — it cannot be undone.",
+                  "Permanently discard all %1 uncommitted changes in worktree "
+                  "<b>%2</b>?<br><br>This runs <tt>git reset --hard</tt> and "
+                  "<tt>git clean</tt> — it cannot be undone.",
+                  r->dirty, label.toHtmlEscaped()),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No)
+        != QMessageBox::Yes) {
+        return;
+    }
+    m_discardBtn->setEnabled(false);
+    m_core->call(QStringLiteral("git.discardChanges"),
+                 QJsonObject{{QStringLiteral("threadId"), threadId}},
+                 [this](const QJsonObject &, const QJsonObject &error) {
+                     if (!error.isEmpty()) {
+                         QMessageBox::warning(
+                             this, i18nc("@title:window", "Could not discard changes"),
+                             error.value(QStringLiteral("message")).toString());
+                         return;
+                     }
+                     emit statusMessage(i18n("Discarded uncommitted changes"));
+                     refresh();
+                 });
+}
+
+void WorktreeDashboard::removeSelected()
+{
+    const WorktreeRow *r = selectedRow();
+    if (!r || r->threadId.isEmpty() || !r->isolated) {
+        return;
+    }
+    const QString threadId = r->threadId;
+    const QString label = r->number > 0 ? QStringLiteral("#%1").arg(r->number)
+                                        : r->branch;
+    QString warning =
+        i18n("Remove the isolated worktree and delete branch <b>%1</b>?"
+             "<br><br>The agent thread will be discarded and cannot be resumed.",
+             (r->branch.isEmpty() ? label : r->branch).toHtmlEscaped());
+    if (r->dirty > 0) {
+        warning += QStringLiteral("<br><br><b>")
+                   + i18np("There is 1 uncommitted change that will be lost.",
+                           "There are %1 uncommitted changes that will be lost.",
+                           r->dirty)
+                   + QStringLiteral("</b>");
+    }
+    if (QMessageBox::question(
+            this, i18nc("@title:window", "Remove worktree?"), warning,
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No)
+        != QMessageBox::Yes) {
+        return;
+    }
+    m_core->call(QStringLiteral("git.removeWorktree"),
+                 QJsonObject{{QStringLiteral("threadId"), threadId}},
+                 [this](const QJsonObject &, const QJsonObject &error) {
+                     if (!error.isEmpty()) {
+                         QMessageBox::warning(
+                             this, i18nc("@title:window", "Could not remove worktree"),
+                             error.value(QStringLiteral("message")).toString());
+                         return;
+                     }
+                     emit statusMessage(i18n("Worktree removed"));
+                     refresh();
+                 });
+}
+
+void WorktreeDashboard::showRowContextMenu(const QPoint &pos)
+{
+    const QModelIndex idx = m_view->indexAt(pos);
+    if (!idx.isValid()) {
+        return;
+    }
+    m_view->selectRow(idx.row());
+    const WorktreeRow *r = selectedRow();
+    if (!r) {
+        return;
+    }
+
+    QMenu menu(this);
+    QAction *commitAct = menu.addAction(
+        i18nc("@action:inmenu", "Commit changes…"));
+    commitAct->setEnabled(!r->threadId.isEmpty());
+    menu.addSeparator();
+    QAction *discardAct = menu.addAction(
+        QIcon::fromTheme(QStringLiteral("edit-clear")),
+        i18nc("@action:inmenu", "Discard changes…"));
+    discardAct->setEnabled(r->dirty > 0 && !r->threadId.isEmpty());
+    QAction *removeAct = menu.addAction(
+        QIcon::fromTheme(QStringLiteral("edit-delete")),
+        i18nc("@action:inmenu", "Remove worktree…"));
+    // Only isolated worktrees can be removed (never the shared workspace).
+    removeAct->setEnabled(r->isolated && !r->threadId.isEmpty());
+
+    QAction *chosen = menu.exec(m_view->viewport()->mapToGlobal(pos));
+    if (chosen == commitAct) {
+        openCommitDialog();
+    } else if (chosen == discardAct) {
+        discardSelected();
+    } else if (chosen == removeAct) {
+        removeSelected();
+    }
 }
 
 void WorktreeDashboard::showEvent(QShowEvent *e)
@@ -363,6 +540,27 @@ void WorktreeDashboard::hideEvent(QHideEvent *e)
 {
     QWidget::hideEvent(e);
     m_pollTimer->stop();
+}
+
+bool WorktreeDashboard::eventFilter(QObject *watched, QEvent *event)
+{
+    if (watched == m_view->viewport() && event->type() == QEvent::Resize
+        && m_placeholder) {
+        m_placeholder->resize(m_view->viewport()->size());
+    }
+    return QWidget::eventFilter(watched, event);
+}
+
+void WorktreeDashboard::updatePlaceholder()
+{
+    if (!m_placeholder) {
+        return;
+    }
+    const bool empty = m_model->rowCount() == 0;
+    if (empty) {
+        m_placeholder->resize(m_view->viewport()->size());
+    }
+    m_placeholder->setVisible(empty);
 }
 
 void WorktreeDashboard::refresh()
@@ -401,10 +599,27 @@ void WorktreeDashboard::refresh()
                          r.behindBase = o.value(QStringLiteral("behindBase")).toInt();
                          r.dirty = o.value(QStringLiteral("dirtyCount")).toInt();
                          r.conflicts = o.value(QStringLiteral("hasConflicts")).toBool();
+                         r.hasUpstream =
+                             o.value(QStringLiteral("hasUpstream")).toBool();
+                         r.remoteAhead =
+                             o.value(QStringLiteral("remoteAhead")).toInt();
+                         r.remoteBehind =
+                             o.value(QStringLiteral("remoteBehind")).toInt();
                          r.error = o.value(QStringLiteral("error")).toString();
                          rows.append(r);
                      }
                      m_model->setRows(std::move(rows));
+                     updatePlaceholder();
+                     // Row data (esp. dirty count) may have changed under the
+                     // current selection without the selection model firing —
+                     // refresh the action enablement to match.
+                     const WorktreeRow *sel = selectedRow();
+                     m_commitBtn->setEnabled(sel != nullptr);
+                     const bool merging =
+                         sel != nullptr && sel->isolated && sel->ahead > 0;
+                     m_landBtn->setEnabled(merging);
+                     m_prBtn->setEnabled(merging);
+                     m_discardBtn->setEnabled(sel != nullptr && sel->dirty > 0);
                  });
 }
 

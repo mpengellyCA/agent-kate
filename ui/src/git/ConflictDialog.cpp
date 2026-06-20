@@ -4,6 +4,8 @@
 #include "ConflictDialog.h"
 #include "ipc/CoreClient.h"
 
+#include <KLocalizedString>
+
 #include <QDialogButtonBox>
 #include <QHBoxLayout>
 #include <QJsonArray>
@@ -32,7 +34,7 @@ ConflictDialog::ConflictDialog(CoreClient *core, const QString &threadId,
     , m_into(into)
     , m_pollTimer(new QTimer(this))
 {
-    setWindowTitle(QStringLiteral("Resolve merge conflicts"));
+    setWindowTitle(i18nc("@title:window", "Resolve merge conflicts"));
     resize(560, 460);
 
     m_summary = new QLabel(this);
@@ -45,14 +47,14 @@ ConflictDialog::ConflictDialog(CoreClient *core, const QString &threadId,
         m_files->addItem(path);
     }
 
-    m_openBtn = new QPushButton(QStringLiteral("Resolve in KDiff3"), this);
+    m_openBtn = new QPushButton(i18nc("@action:button", "Resolve in KDiff3"), this);
     m_openBtn->setCursor(Qt::PointingHandCursor);
-    m_finalizeBtn = new QPushButton(QStringLiteral("Finalize merge"), this);
+    m_finalizeBtn = new QPushButton(i18nc("@action:button", "Finalize merge"), this);
     m_finalizeBtn->setCursor(Qt::PointingHandCursor);
     m_finalizeBtn->setEnabled(false);
-    m_abortBtn = new QPushButton(QStringLiteral("Abort merge"), this);
+    m_abortBtn = new QPushButton(i18nc("@action:button", "Abort merge"), this);
     m_abortBtn->setCursor(Qt::PointingHandCursor);
-    m_closeBtn = new QPushButton(QStringLiteral("Close"), this);
+    m_closeBtn = new QPushButton(i18nc("@action:button", "Close"), this);
     m_closeBtn->setCursor(Qt::PointingHandCursor);
 
     auto *buttons = new QHBoxLayout;
@@ -115,29 +117,33 @@ void ConflictDialog::refreshStatus()
                      }
                      if (!merging) {
                          m_summary->setText(
-                             QStringLiteral("<b>The merge is no longer in "
-                                            "progress.</b> Nothing left to do."));
+                             i18n("<b>The merge is no longer in progress.</b> "
+                                  "Nothing left to do."));
                          m_openBtn->setEnabled(false);
                          m_finalizeBtn->setEnabled(false);
                          m_abortBtn->setEnabled(false);
                          return;
                      }
                      const QString into = m_into.isEmpty()
-                         ? QStringLiteral("the workspace") : m_into;
+                         ? i18nc("merge destination when no branch name is known",
+                                 "the workspace")
+                         : m_into;
                      if (conflicts.isEmpty()) {
                          m_summary->setText(
-                             QStringLiteral("All conflicts resolved on <b>%1</b>. "
-                                            "Click <i>Finalize merge</i> to commit.")
-                                 .arg(into.toHtmlEscaped()));
+                             i18n("All conflicts resolved on <b>%1</b>. "
+                                  "Click <i>Finalize merge</i> to commit.",
+                                  into.toHtmlEscaped()));
                          m_finalizeBtn->setEnabled(true);
                          m_openBtn->setEnabled(false);
                      } else {
                          m_summary->setText(
-                             QStringLiteral("<b>%1 unresolved conflict(s)</b> when "
-                                            "merging <b>%2</b> into <b>%3</b>.")
-                                 .arg(conflicts.size())
-                                 .arg(m_branch.toHtmlEscaped(),
-                                      into.toHtmlEscaped()));
+                             i18np("<b>%1 unresolved conflict</b> when merging "
+                                   "<b>%2</b> into <b>%3</b>.",
+                                   "<b>%1 unresolved conflicts</b> when merging "
+                                   "<b>%2</b> into <b>%3</b>.",
+                                   conflicts.size(),
+                                   m_branch.toHtmlEscaped(),
+                                   into.toHtmlEscaped()));
                          m_finalizeBtn->setEnabled(false);
                          m_openBtn->setEnabled(true);
                      }
@@ -154,7 +160,7 @@ void ConflictDialog::onOpenTool()
                      m_openBtn->setEnabled(true);
                      if (!error.isEmpty()) {
                          QMessageBox::warning(
-                             this, QStringLiteral("KDiff3 unavailable"),
+                             this, i18nc("@title:window", "KDiff3 unavailable"),
                              error.value(QStringLiteral("message")).toString());
                      }
                  });
@@ -171,7 +177,7 @@ void ConflictDialog::onFinalize()
                      if (!error.isEmpty()) {
                          m_finalizeBtn->setEnabled(true);
                          QMessageBox::warning(
-                             this, QStringLiteral("Could not finalize merge"),
+                             this, i18nc("@title:window", "Could not finalize merge"),
                              error.value(QStringLiteral("message")).toString());
                          return;
                      }
@@ -183,9 +189,9 @@ void ConflictDialog::onFinalize()
 void ConflictDialog::onAbort()
 {
     if (QMessageBox::question(
-            this, QStringLiteral("Abort merge?"),
-            QStringLiteral("Roll back the in-progress merge and restore the "
-                           "workspace to its pre-merge state?"),
+            this, i18nc("@title:window", "Abort merge?"),
+            i18n("Roll back the in-progress merge and restore the "
+                 "workspace to its pre-merge state?"),
             QMessageBox::Yes | QMessageBox::No, QMessageBox::No)
         != QMessageBox::Yes) {
         return;
@@ -198,7 +204,7 @@ void ConflictDialog::onAbort()
                      if (!error.isEmpty()) {
                          m_abortBtn->setEnabled(true);
                          QMessageBox::warning(
-                             this, QStringLiteral("Could not abort merge"),
+                             this, i18nc("@title:window", "Could not abort merge"),
                              error.value(QStringLiteral("message")).toString());
                          return;
                      }

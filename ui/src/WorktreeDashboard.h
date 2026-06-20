@@ -11,6 +11,7 @@
 #include <QWidget>
 
 class CoreClient;
+class QLabel;
 class QPushButton;
 class QTableView;
 
@@ -26,6 +27,10 @@ struct WorktreeRow {
     int behindBase = 0;
     int dirty = 0;
     bool conflicts = false;
+    // Remote (origin) tracking, computed purely from local refs (no fetch).
+    bool hasUpstream = false;
+    int remoteAhead = 0;
+    int remoteBehind = 0;
     QString error;
 };
 
@@ -41,6 +46,7 @@ public:
         ColIsolation,
         ColAhead,
         ColBehind,
+        ColRemote,
         ColDirty,
         ColPath,
         ColCount,
@@ -80,6 +86,7 @@ Q_SIGNALS:
 protected:
     void showEvent(QShowEvent *e) override;
     void hideEvent(QHideEvent *e) override;
+    bool eventFilter(QObject *watched, QEvent *event) override;
 
 private:
     void refresh();
@@ -87,6 +94,10 @@ private:
     void openCommitDialog();
     void landSelected();
     void openPRDialog();
+    void discardSelected();
+    void removeSelected();
+    void showRowContextMenu(const QPoint &pos);
+    void updatePlaceholder();
     const WorktreeRow *selectedRow() const;
 
     CoreClient *m_core = nullptr;
@@ -96,6 +107,8 @@ private:
     QPushButton *m_commitBtn = nullptr;
     QPushButton *m_landBtn = nullptr;
     QPushButton *m_prBtn = nullptr;
+    QPushButton *m_discardBtn = nullptr;
+    QLabel *m_placeholder = nullptr;
     QString m_activeProject;
     bool m_inFlight = false;
 };

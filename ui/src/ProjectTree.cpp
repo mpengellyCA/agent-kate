@@ -1,11 +1,17 @@
 #include "ProjectTree.h"
 
+#include "FileFilterProxyModel.h"
+#include "GitStatusDelegate.h"
+#include "ipc/CoreClient.h"
+
+#include <KConfigGroup>
 #include <KIO/CopyJob>
 #include <KIO/DeleteOrTrashJob>
 #include <KIO/OpenFileManagerWindowJob>
 #include <KJobWidgets>
 #include <KLocalizedString>
 #include <KPropertiesDialog>
+#include <KSharedConfig>
 
 #include <QAction>
 #include <QApplication>
@@ -15,21 +21,28 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QFileSystemModel>
+#include <QFont>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QIcon>
 #include <QInputDialog>
 #include <QItemSelectionModel>
+#include <QJsonArray>
+#include <QJsonObject>
 #include <QKeySequence>
 #include <QLabel>
+#include <QLineEdit>
 #include <QMenu>
 #include <QMessageBox>
 #include <QMimeData>
+#include <QPointer>
 #include <QProcess>
 #include <QShortcut>
+#include <QStackedWidget>
 #include <QStandardPaths>
 #include <QStringList>
 #include <QTextStream>
+#include <QTimer>
 #include <QToolBar>
 #include <QToolButton>
 #include <QTreeView>
@@ -58,17 +71,47 @@ QList<QUrl> pathsToUrls(const QStringList &paths)
     }
     return urls;
 }
+
+// Fold a gitstatus/status.go status string into the delegate's ordered enum.
+// Order matters: directories roll up to the max() of their children's codes.
+int statusCode(const QString &s)
+{
+    if (s == QLatin1String("conflicted")) {
+        return GitStatusDelegate::Conflicted;
+    }
+    if (s == QLatin1String("deleted")) {
+        return GitStatusDelegate::Deleted;
+    }
+    if (s == QLatin1String("modified")) {
+        return GitStatusDelegate::Modified;
+    }
+    if (s == QLatin1String("renamed")) {
+        return GitStatusDelegate::Renamed;
+    }
+    if (s == QLatin1String("added")) {
+        return GitStatusDelegate::Added;
+    }
+    if (s == QLatin1String("untracked")) {
+        return GitStatusDelegate::Untracked;
+    }
+    return GitStatusDelegate::Clean;
+}
 } // namespace
 
-ProjectTree::ProjectTree(QWidget *parent)
+ProjectTree::ProjectTree(CoreClient *core, QWidget *parent)
     : QWidget(parent)
+    , m_core(core)
     , m_tree(new QTreeView(this))
     , m_model(new QFileSystemModel(this))
 {
     m_model->setReadOnly(false); // allow in-place rename via setData
     m_model->setFilter(QDir::AllEntries | QDir::NoDotAndDotDot); // hidden filtered in by default off
 
-    m_tree->setModel(m_model);
+    // One shared proxy carries the name filter; the git delegate decorates on
+    // top of it. We never stack two proxies on the file system model.
+    m_proxy = new FileFilterProxyModel(m_model, this);
+
+    m_tree->setModel(m_proxy);
     m_tree->setHeaderHidden(true);
     m_tree->setUniformRowHeights(true);
     m_tree->setEditTriggers(QAbstractItemView::EditKeyPressed); // F2 to rename
@@ -77,12 +120,15 @@ ProjectTree::ProjectTree(QWidget *parent)
     m_tree->setDragEnabled(true);
     m_tree->setDragDropMode(QAbstractItemView::DragOnly);
 
+    m_gitDelegate = new GitStatusDelegate(m_model, this);
+    m_tree->setItemDelegateForColumn(0, m_gitDelegate);
+
     for (int col = 1; col < m_model->columnCount(); ++col) {
         m_tree->hideColumn(col);
     }
 
-    // Header: path label + small toolbar (hidden toggle, new file, new folder,
-    // open terminal, open in Dolphin).
+    // Header: project heading + small toolbar (filter, sync, hidden toggle,
+    // new file, new folder, open terminal, open in Dolphin).
     auto *header = new QWidget(this);
     auto *headerLayout = new QHBoxLayout(header);
     headerLayout->setContentsMargins(4, 2, 2, 2);
@@ -91,7 +137,10 @@ ProjectTree::ProjectTree(QWidget *parent)
     m_pathLabel = new QLabel(header);
     m_pathLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
     m_pathLabel->setToolTip(i18n("Workspace root — right-click any item for actions"));
-    m_pathLabel->setStyleSheet(QStringLiteral("color: palette(mid);"));
+    m_pathLabel->setForegroundRole(QPalette::PlaceholderText);
+    QFont headingFont = m_pathLabel->font();
+    headingFont.setBold(true);
+    m_pathLabel->setFont(headingFont);
     m_pathLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     m_pathLabel->setTextFormat(Qt::PlainText);
     headerLayout->addWidget(m_pathLabel, 1);
@@ -105,6 +154,8 @@ ProjectTree::ProjectTree(QWidget *parent)
         return b;
     };
 
+    m_syncToggle = makeBtn(QStringLiteral("go-jump"), i18n("Sync with editor"));
+    m_syncToggle->setCheckable(true);
     auto *newFileBtn = makeBtn(QStringLiteral("document-new"), i18n("New File"));
     auto *newFolderBtn = makeBtn(QStringLiteral("folder-new"), i18n("New Folder"));
     m_hiddenToggle = makeBtn(QStringLiteral("view-hidden"), i18n("Show Hidden Files"));
@@ -112,12 +163,67 @@ ProjectTree::ProjectTree(QWidget *parent)
     auto *terminalBtn = makeBtn(QStringLiteral("utilities-terminal"), i18n("Open Terminal Here"));
     auto *dolphinBtn = makeBtn(QStringLiteral("system-file-manager"), i18n("Open in Dolphin"));
 
+    // Quick-find filter box below the heading row.
+    m_filterEdit = new QLineEdit(this);
+    m_filterEdit->setClearButtonEnabled(true);
+    m_filterEdit->setPlaceholderText(i18n("Filter files…"));
+    m_filterEdit->addAction(QIcon::fromTheme(QStringLiteral("view-filter")),
+                            QLineEdit::LeadingPosition);
+
+    // Tree page lives in a stack so an empty root shows a friendly placeholder.
+    m_stack = new QStackedWidget(this);
+
+    auto *placeholder = new QWidget(m_stack);
+    auto *phLayout = new QVBoxLayout(placeholder);
+    phLayout->setContentsMargins(24, 24, 24, 24);
+    phLayout->addStretch();
+    auto *phIcon = new QLabel(placeholder);
+    phIcon->setPixmap(QIcon::fromTheme(QStringLiteral("folder-open"))
+                          .pixmap(48, 48));
+    phIcon->setAlignment(Qt::AlignCenter);
+    phLayout->addWidget(phIcon);
+    auto *phText = new QLabel(
+        i18n("Select an agent to browse its workspace"), placeholder);
+    phText->setAlignment(Qt::AlignCenter);
+    phText->setWordWrap(true);
+    phText->setForegroundRole(QPalette::PlaceholderText);
+    phLayout->addWidget(phText);
+    phLayout->addStretch();
+
+    m_stack->addWidget(placeholder); // page 0
+    m_stack->addWidget(m_tree);      // page 1
+    m_stack->setCurrentIndex(0);
+
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(0);
     layout->addWidget(header);
-    layout->addWidget(m_tree);
+    layout->addWidget(m_filterEdit);
+    layout->addWidget(m_stack, 1);
 
+    // Debounced filter application.
+    m_filterTimer = new QTimer(this);
+    m_filterTimer->setSingleShot(true);
+    m_filterTimer->setInterval(150);
+    connect(m_filterTimer, &QTimer::timeout, this, [this] {
+        m_proxy->setFilterText(m_filterEdit->text());
+        applyFilterEffects();
+    });
+    connect(m_filterEdit, &QLineEdit::textChanged, this,
+            [this] { m_filterTimer->start(); });
+
+    // Debounced git status refresh, driven by git.invalidated.
+    m_gitTimer = new QTimer(this);
+    m_gitTimer->setSingleShot(true);
+    m_gitTimer->setInterval(150);
+    connect(m_gitTimer, &QTimer::timeout, this, &ProjectTree::refreshGitStatus);
+
+    // Restore the persisted "sync with editor" preference.
+    const KConfigGroup grp = KSharedConfig::openConfig()->group(QLatin1String("Files"));
+    m_syncToggle->setChecked(grp.readEntry("syncWithEditor", false));
+    m_syncWithEditor = m_syncToggle->isChecked();
+
+    connect(m_syncToggle, &QToolButton::toggled, this, &ProjectTree::setSyncWithEditor);
     connect(newFileBtn, &QToolButton::clicked, this,
             [this] { actNewFile(currentTargetDir()); });
     connect(newFolderBtn, &QToolButton::clicked, this,
@@ -130,6 +236,31 @@ ProjectTree::ProjectTree(QWidget *parent)
             selectedPaths().isEmpty() ? m_root : selectedPaths().first();
         actOpenContaining(target);
     });
+
+    // When a folder finishes loading, nudge the viewport so newly-revealed rows
+    // pick up their git decoration. While filtering, re-run auto-expand through
+    // the debounce timer rather than calling expandAll() on every signal — each
+    // expand fetches more dirs, which would otherwise cascade into repeated
+    // full-tree expansions on large repos.
+    connect(m_model, &QFileSystemModel::directoryLoaded, this, [this](const QString &) {
+        if (m_proxy->isFiltering()) {
+            m_filterTimer->start();
+        }
+        m_tree->viewport()->update();
+    });
+
+    if (m_core) {
+        connect(m_core, &CoreClient::notification, this,
+                [this](const QString &method, const QJsonObject &) {
+                    if (method == QLatin1String("git.invalidated")) {
+                        scheduleGitRefresh();
+                    }
+                });
+        // If the tree was rooted before the core finished connecting, pull the
+        // first snapshot as soon as the connection comes up.
+        connect(m_core, &CoreClient::connected, this,
+                &ProjectTree::scheduleGitRefresh);
+    }
 
     connect(m_tree, &QTreeView::activated, this, &ProjectTree::onActivated);
     connect(m_tree, &QTreeView::customContextMenuRequested, this,
@@ -160,9 +291,21 @@ ProjectTree::ProjectTree(QWidget *parent)
 void ProjectTree::setRoot(const QString &path)
 {
     m_root = path;
-    const QModelIndex idx = m_model->setRootPath(path);
-    m_tree->setRootIndex(idx);
-    m_pathLabel->setText(QDir::toNativeSeparators(path));
+    if (path.isEmpty()) {
+        m_pathLabel->clear();
+        m_pathLabel->setToolTip(QString());
+        m_stack->setCurrentIndex(0); // placeholder
+        m_gitDelegate->setStatuses({});
+        return;
+    }
+    const QModelIndex srcIdx = m_model->setRootPath(path);
+    m_tree->setRootIndex(m_proxy->mapFromSource(srcIdx));
+    // Project heading: the folder name in bold, full path on hover.
+    const QString name = QDir(path).dirName();
+    m_pathLabel->setText(name.isEmpty() ? QDir::toNativeSeparators(path) : name);
+    m_pathLabel->setToolTip(QDir::toNativeSeparators(path));
+    m_stack->setCurrentIndex(1); // tree
+    refreshGitStatus();
 }
 
 void ProjectTree::setShowHidden(bool show)
@@ -174,13 +317,159 @@ void ProjectTree::setShowHidden(bool show)
     m_model->setFilter(f);
 }
 
-void ProjectTree::onActivated(const QModelIndex &idx)
+void ProjectTree::applyFilterEffects()
 {
+    if (m_proxy->isFiltering()) {
+        m_tree->expandAll();
+    } else {
+        m_tree->collapseAll();
+        // Keep the root's direct children visible after clearing.
+        m_tree->setRootIndex(m_proxy->mapFromSource(m_model->index(m_root)));
+    }
+}
+
+void ProjectTree::setSyncWithEditor(bool on)
+{
+    m_syncWithEditor = on;
+    KConfigGroup grp = KSharedConfig::openConfig()->group(QLatin1String("Files"));
+    grp.writeEntry("syncWithEditor", on);
+    grp.sync();
+}
+
+QModelIndex ProjectTree::sourceIndex(const QModelIndex &viewIndex) const
+{
+    return m_proxy->mapToSource(viewIndex);
+}
+
+QModelIndex ProjectTree::viewIndex(const QModelIndex &srcIndex) const
+{
+    return m_proxy->mapFromSource(srcIndex);
+}
+
+void ProjectTree::revealPath(const QString &path)
+{
+    // Unconditional: callers decide whether to honour the sync-with-editor
+    // toggle (auto-sync does; the explicit "Reveal in Tree" action does not).
+    if (path.isEmpty() || m_root.isEmpty()) {
+        return;
+    }
+    // Guard against paths outside the current root.
+    const QString cleanRoot = QDir(m_root).absolutePath();
+    const QString cleanPath = QFileInfo(path).absoluteFilePath();
+    if (!cleanPath.startsWith(cleanRoot)) {
+        return;
+    }
+    const QModelIndex src = m_model->index(path);
+    if (!src.isValid()) {
+        // QFileSystemModel lazy-loads; index() may be invalid until the parent
+        // directories are populated. Nudge the model to fetch the chain, then
+        // give up gracefully — directoryLoaded will not re-trigger reveal, but
+        // the common case (file already in a loaded folder) works immediately.
+        m_model->index(QFileInfo(path).absolutePath());
+        return;
+    }
+    const QModelIndex idx = viewIndex(src);
     if (!idx.isValid()) {
         return;
     }
-    if (!m_model->isDir(idx)) {
-        emit fileActivated(m_model->filePath(idx));
+    // Expand ancestors top-down so each level is populated before the next.
+    QList<QModelIndex> ancestors;
+    for (QModelIndex p = idx.parent(); p.isValid(); p = p.parent()) {
+        ancestors.prepend(p);
+    }
+    for (const QModelIndex &p : ancestors) {
+        m_tree->expand(p);
+    }
+    m_tree->setCurrentIndex(idx);
+    m_tree->scrollTo(idx, QAbstractItemView::PositionAtCenter);
+}
+
+void ProjectTree::scheduleGitRefresh()
+{
+    m_gitTimer->start(); // debounce coalesces bursts of git.invalidated
+}
+
+void ProjectTree::refreshGitStatus()
+{
+    if (!m_core || !m_core->isConnected() || m_root.isEmpty()) {
+        return;
+    }
+    const QString activeRoot = QDir(m_root).absolutePath();
+    // CoreClient owns the pending callback and outlives this widget (it is
+    // reparented to the tail of MainWindow's child list to survive shutdown),
+    // so guard against a reply landing after the tree is destroyed.
+    QPointer<ProjectTree> guard(this);
+    m_core->call(
+        QStringLiteral("git.snapshot"), {},
+        [this, guard, activeRoot](const QJsonObject &result, const QJsonObject &error) {
+            if (!guard) {
+                return;
+            }
+            if (!error.isEmpty()) {
+                return;
+            }
+            // The tree may have re-rooted while the call was in flight.
+            if (QDir(m_root).absolutePath() != activeRoot) {
+                return;
+            }
+            const QJsonArray threads =
+                result.value(QStringLiteral("threads")).toArray();
+            QHash<QString, int> map;
+            for (const QJsonValue &v : threads) {
+                const QJsonObject o = v.toObject();
+                // The tree is rooted at the worktree's working directory, which
+                // is the snapshot's `path`. Match that exactly so switching
+                // agents decorates only the active worktree (scoping just like
+                // WorktreeDashboard, but keyed on the dir we actually display).
+                const QString snapPath =
+                    QDir(o.value(QStringLiteral("path")).toString()).absolutePath();
+                if (snapPath != activeRoot) {
+                    continue;
+                }
+                const QJsonArray files =
+                    o.value(QStringLiteral("files")).toArray();
+                for (const QJsonValue &fv : files) {
+                    const QJsonObject f = fv.toObject();
+                    const QString rel = f.value(QStringLiteral("path")).toString();
+                    const int code =
+                        statusCode(f.value(QStringLiteral("status")).toString());
+                    if (rel.isEmpty() || code == GitStatusDelegate::Clean) {
+                        continue;
+                    }
+                    const QString abs =
+                        QDir::cleanPath(activeRoot + QLatin1Char('/') + rel);
+                    map.insert(abs, code);
+                    // Roll the strongest child status up the directory chain,
+                    // stopping before the root itself (the heading carries no
+                    // status emblem).
+                    QString dir = abs;
+                    while (true) {
+                        const int slash = dir.lastIndexOf(QLatin1Char('/'));
+                        if (slash < 0) {
+                            break;
+                        }
+                        dir = dir.left(slash);
+                        if (dir.length() <= activeRoot.length()) {
+                            break; // reached (or passed) the root
+                        }
+                        map.insert(dir, qMax(map.value(dir, 0), code));
+                    }
+                }
+                break; // only one snapshot matches the active worktree
+            }
+            m_gitDelegate->setStatuses(std::move(map));
+            m_tree->viewport()->update();
+        });
+}
+
+void ProjectTree::onActivated(const QModelIndex &idx)
+{
+    const QModelIndex src = sourceIndex(idx);
+    if (!src.isValid()) {
+        return;
+    }
+    if (!m_model->isDir(src)) {
+        emit fileActivated(m_model->filePath(src));
     }
 }
 
@@ -192,7 +481,7 @@ QStringList ProjectTree::selectedPaths() const
         if (i.column() != 0) {
             continue;
         }
-        out << m_model->filePath(i);
+        out << m_model->filePath(sourceIndex(i));
     }
     return out;
 }
@@ -212,7 +501,7 @@ void ProjectTree::onContextMenu(const QPoint &pos)
     const QModelIndex idx = m_tree->indexAt(pos);
     QStringList sel = selectedPaths();
     if (sel.isEmpty() && idx.isValid()) {
-        sel << m_model->filePath(idx);
+        sel << m_model->filePath(sourceIndex(idx));
     }
     const bool hasSel = !sel.isEmpty();
     const QString first = hasSel ? sel.first() : m_root;
@@ -311,6 +600,19 @@ void ProjectTree::onContextMenu(const QPoint &pos)
     connect(termHere, &QAction::triggered, this,
             [this, targetDir] { emit terminalRequested(targetDir); });
 
+    QAction *runHere = menu.addAction(
+        QIcon::fromTheme(QStringLiteral("system-run")), i18n("Run Command Here…"));
+    connect(runHere, &QAction::triggered, this, [this, targetDir] {
+        bool ok = false;
+        const QString command = QInputDialog::getText(
+            this, i18n("Run Command"),
+            i18n("Command to run in %1:", QDir(targetDir).dirName()),
+            QLineEdit::Normal, QString(), &ok);
+        if (ok && !command.isEmpty()) {
+            emit runCommandRequested(targetDir, command);
+        }
+    });
+
     QAction *inDolphin = menu.addAction(
         QIcon::fromTheme(QStringLiteral("system-file-manager")), i18n("Open in Dolphin"));
     connect(inDolphin, &QAction::triggered, this,
@@ -391,7 +693,11 @@ void ProjectTree::actNewFolder(const QString &targetDir)
 
 void ProjectTree::actRename(const QString &path)
 {
-    const QModelIndex idx = m_model->index(path);
+    const QModelIndex src = m_model->index(path);
+    if (!src.isValid()) {
+        return;
+    }
+    const QModelIndex idx = viewIndex(src);
     if (!idx.isValid()) {
         return;
     }
@@ -554,9 +860,4 @@ void ProjectTree::actAddToGitignore(const QStringList &paths)
     for (const QString &line : toAdd) {
         out << line << '\n';
     }
-}
-
-void ProjectTree::onSelectionChanged()
-{
-    // Reserved for future status updates.
 }

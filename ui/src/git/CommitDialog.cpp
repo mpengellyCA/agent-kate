@@ -5,6 +5,8 @@
 #include "DiffView.h"
 #include "ipc/CoreClient.h"
 
+#include <KLocalizedString>
+
 #include <QDialogButtonBox>
 #include <QHBoxLayout>
 #include <QJsonArray>
@@ -40,8 +42,8 @@ CommitDialog::CommitDialog(CoreClient *core, const QString &threadId, const QStr
     , m_branch(branch)
 {
     setWindowTitle(branch.isEmpty()
-                       ? QStringLiteral("Commit changes")
-                       : QStringLiteral("Commit to %1").arg(branch));
+                       ? i18nc("@title:window", "Commit changes")
+                       : i18nc("@title:window", "Commit to %1", branch));
     resize(900, 640);
 
     m_files = new QListWidget(this);
@@ -62,15 +64,15 @@ CommitDialog::CommitDialog(CoreClient *core, const QString &threadId, const QStr
     splitter->setStretchFactor(1, 3);
 
     m_message = new QPlainTextEdit(this);
-    m_message->setPlaceholderText(QStringLiteral("Commit message…"));
+    m_message->setPlaceholderText(i18n("Commit message…"));
     m_message->setFixedHeight(110);
 
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Cancel, this);
-    m_suggestBtn = buttons->addButton(QStringLiteral("Suggest with Sonnet"),
+    m_suggestBtn = buttons->addButton(i18nc("@action:button", "Suggest with Sonnet"),
                                       QDialogButtonBox::ActionRole);
-    m_suggestBtn->setToolTip(QStringLiteral(
+    m_suggestBtn->setToolTip(i18n(
         "Ask Claude Sonnet to draft a commit message for the current diff."));
-    m_commitBtn = buttons->addButton(QStringLiteral("Commit"),
+    m_commitBtn = buttons->addButton(i18nc("@action:button", "Commit"),
                                      QDialogButtonBox::AcceptRole);
     m_commitBtn->setEnabled(false);
     m_cancelBtn = buttons->button(QDialogButtonBox::Cancel);
@@ -83,9 +85,9 @@ CommitDialog::CommitDialog(CoreClient *core, const QString &threadId, const QStr
     layout->setSpacing(10);
     auto *header = new QLabel(
         branch.isEmpty()
-            ? QStringLiteral("Pick the files to include, then write a message.")
-            : QStringLiteral("Pick the files to include on <b>%1</b>, then "
-                             "write a message.").arg(branch.toHtmlEscaped()),
+            ? i18n("Pick the files to include, then write a message.")
+            : i18n("Pick the files to include on <b>%1</b>, then "
+                   "write a message.", branch.toHtmlEscaped()),
         this);
     header->setTextFormat(Qt::RichText);
     layout->addWidget(header);
@@ -170,9 +172,6 @@ void CommitDialog::loadDiff()
                      if (error.isEmpty()) {
                          patch = result.value(QStringLiteral("patch")).toString();
                      }
-                     if (patch.isEmpty()) {
-                         patch = QStringLiteral("(no diff)");
-                     }
                      // Swap in a freshly constructed DiffView. The previous
                      // one (if any) is deleteLatered.
                      if (m_diff) {
@@ -190,9 +189,10 @@ void CommitDialog::onSuggestClicked()
     }
     const QString prevText = m_suggestBtn->text();
     m_suggestBtn->setEnabled(false);
-    m_suggestBtn->setText(QStringLiteral("Drafting…"));
+    m_suggestBtn->setText(i18nc("@action:button while a draft is being generated",
+                                "Drafting…"));
     const QString prevPlaceholder = m_message->placeholderText();
-    m_message->setPlaceholderText(QStringLiteral("Sonnet is drafting a message…"));
+    m_message->setPlaceholderText(i18n("Sonnet is drafting a message…"));
     const QString thread = m_threadId;
     m_core->call(QStringLiteral("git.suggestCommitMessage"),
                  QJsonObject{{QStringLiteral("threadId"), thread}},
@@ -205,9 +205,9 @@ void CommitDialog::onSuggestClicked()
                      m_suggestBtn->setText(prevText);
                      if (!error.isEmpty()) {
                          m_message->setPlaceholderText(
-                             QStringLiteral("Suggestion failed: %1")
-                                 .arg(error.value(QStringLiteral("message"))
-                                          .toString()));
+                             i18n("Suggestion failed: %1",
+                                  error.value(QStringLiteral("message"))
+                                      .toString()));
                          return;
                      }
                      m_message->setPlaceholderText(prevPlaceholder);
@@ -215,8 +215,8 @@ void CommitDialog::onSuggestClicked()
                          result.value(QStringLiteral("message")).toString();
                      if (msg.isEmpty()) {
                          m_message->setPlaceholderText(
-                             QStringLiteral("Sonnet returned no message — "
-                                            "is the diff empty?"));
+                             i18n("Sonnet returned no message — "
+                                  "is the diff empty?"));
                          return;
                      }
                      // Replace whatever is in the editor with the suggestion;
@@ -254,9 +254,9 @@ void CommitDialog::onCommitClicked()
                          m_commitBtn->setEnabled(true);
                          // Show the failure inline rather than crash-closing.
                          m_message->setPlaceholderText(
-                             QStringLiteral("Commit failed: %1")
-                                 .arg(error.value(QStringLiteral("message"))
-                                          .toString()));
+                             i18n("Commit failed: %1",
+                                  error.value(QStringLiteral("message"))
+                                      .toString()));
                          return;
                      }
                      emit committed(thread,

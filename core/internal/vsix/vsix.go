@@ -65,11 +65,23 @@ func DefaultCacheDir() string {
 	return filepath.Join(home, ".cache", "agentkate", "extensions")
 }
 
+// ProgressFunc reports download progress as bytes done out of total. total is
+// 0 when the server sends no Content-Length, signalling an indeterminate
+// download.
+type ProgressFunc func(done, total int64)
+
 // Install downloads the latest version of extensionID ("publisher.name") from
 // Open VSX, unpacks it and detects its language server. A cached copy of the
 // same version is reused. The returned Extension has Server populated when a
 // launch recipe was found.
 func (m *Manager) Install(ctx context.Context, extensionID string) (*Extension, error) {
+	return m.InstallProgress(ctx, extensionID, nil)
+}
+
+// InstallProgress behaves like Install but additionally reports download
+// progress through onProgress (which may be nil). onProgress is only invoked
+// during the network download, not the cache-hit fast path.
+func (m *Manager) InstallProgress(ctx context.Context, extensionID string, onProgress ProgressFunc) (*Extension, error) {
 	namespace, name, err := splitID(extensionID)
 	if err != nil {
 		return nil, err
@@ -100,7 +112,7 @@ func (m *Manager) Install(ctx context.Context, extensionID string) (*Extension, 
 	tmp.Close()
 	defer os.Remove(tmpName)
 
-	if err := downloadFile(ctx, downloadURL, tmpName); err != nil {
+	if err := downloadFile(ctx, downloadURL, tmpName, onProgress); err != nil {
 		return nil, err
 	}
 
@@ -149,6 +161,48 @@ func (m *Manager) List() ([]*Extension, error) {
 // Get returns a single installed extension, or an error if it is not present.
 func (m *Manager) Get(extensionID string) (*Extension, error) {
 	return load(extensionID, filepath.Join(m.cacheDir, extensionID))
+}
+
+// Remove deletes an installed extension from the cache directory. The id is
+// validated with the same splitID guard used on install, and the resolved
+// path is confirmed to live under cacheDir, so a crafted id ("../foo") can
+// never delete anything outside the cache. Removing an extension that is not
+// installed is not an error — the end state is the same.
+func (m *Manager) Remove(extensionID string) error {
+	if _, _, err := splitID(extensionID); err != nil {
+		return err
+	}
+	dir := filepath.Join(m.cacheDir, extensionID)
+	// Defence in depth: even after splitID, confirm the resolved directory is
+	// genuinely inside cacheDir before any RemoveAll.
+	cacheAbs, err := filepath.Abs(m.cacheDir)
+	if err != nil {
+		return err
+	}
+	dirAbs, err := filepath.Abs(dir)
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(cacheAbs, dirAbs)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("refusing to remove %q: resolves outside the extension cache", extensionID)
+	}
+	return os.RemoveAll(dir)
+}
+
+// LatestVersion looks up the newest published version of an installed
+// extension on Open VSX. It is best effort: any error (offline, removed from
+// the registry) is returned so the caller can simply omit the field.
+func (m *Manager) LatestVersion(ctx context.Context, extensionID string) (string, error) {
+	namespace, name, err := splitID(extensionID)
+	if err != nil {
+		return "", err
+	}
+	meta, err := fetchMetadata(ctx, namespace, name)
+	if err != nil {
+		return "", err
+	}
+	return meta.Version, nil
 }
 
 // load reads an unpacked extension directory into an Extension, including its

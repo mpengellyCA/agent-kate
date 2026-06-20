@@ -2,9 +2,19 @@
 #include "ipc/CoreClient.h"
 
 #include <KConfigGroup>
+#include <KLocalizedString>
 #include <KSharedConfig>
 
 #include <QAbstractButton>
+#include <QClipboard>
+#include <QCryptographicHash>
+#include <QGuiApplication>
+#include <QLineEdit>
+#include <QLocale>
+#include <QPixmap>
+#include <QRegularExpression>
+#include <QShortcut>
+#include <QTime>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDialog>
@@ -167,29 +177,54 @@ public:
         : QFrame(parent)
         , m_tool(tool)
         , m_summary(summary)
+        , m_detailText(detail.trimmed())
     {
         setObjectName(QStringLiteral("toolCard"));
         setStyleSheet(QStringLiteral(
             "QFrame#toolCard { border: 1px solid palette(mid); border-radius: 7px; }"
-            "QToolButton { border: none; text-align: left; padding: 5px 8px; }"));
+            "QToolButton#toolHeader { border: none; text-align: left; padding: 5px 8px; }"));
 
         auto *outer = new QVBoxLayout(this);
         outer->setContentsMargins(2, 2, 2, 2);
         outer->setSpacing(0);
 
+        // Header row: the expander button, plus a borderless copy button that
+        // copies the tool's input + result to the clipboard.
+        auto *headerRow = new QHBoxLayout;
+        headerRow->setContentsMargins(0, 0, 0, 0);
+        headerRow->setSpacing(0);
         m_header = new QToolButton(this);
+        m_header->setObjectName(QStringLiteral("toolHeader"));
         m_header->setCheckable(true);
         m_header->setCursor(Qt::PointingHandCursor);
         m_header->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
         updateHeader();
-        outer->addWidget(m_header);
+        headerRow->addWidget(m_header, 1);
+
+        m_copyBtn = new QToolButton(this);
+        m_copyBtn->setAutoRaise(true);
+        m_copyBtn->setIcon(QIcon::fromTheme(QStringLiteral("edit-copy")));
+        m_copyBtn->setCursor(Qt::PointingHandCursor);
+        m_copyBtn->setToolTip(i18n("Copy tool input and output"));
+        connect(m_copyBtn, &QToolButton::clicked, this, [this] {
+            QString out = m_tool;
+            if (!m_detailText.isEmpty()) {
+                out += QStringLiteral("\n\n") + m_detailText;
+            }
+            if (!m_fullResult.isEmpty()) {
+                out += QStringLiteral("\n\n") + m_fullResult;
+            }
+            QGuiApplication::clipboard()->setText(out);
+        });
+        headerRow->addWidget(m_copyBtn);
+        outer->addLayout(headerRow);
 
         m_detail = new QWidget(this);
         auto *dv = new QVBoxLayout(m_detail);
         dv->setContentsMargins(10, 2, 10, 8);
         dv->setSpacing(6);
-        if (!detail.trimmed().isEmpty()) {
-            auto *in = new QLabel(detail.trimmed(), m_detail);
+        if (!m_detailText.isEmpty()) {
+            auto *in = new QLabel(m_detailText, m_detail);
             in->setWordWrap(true);
             in->setTextInteractionFlags(Qt::TextSelectableByMouse);
             in->setStyleSheet(QStringLiteral("font-family: monospace; font-size: small;"));
@@ -203,6 +238,16 @@ public:
         m_result->setForegroundRole(QPalette::WindowText);
         m_result->setVisible(false);
         dv->addWidget(m_result);
+        // "Show full output" expander, hidden until the result is truncated.
+        m_expandBtn = new QToolButton(m_detail);
+        m_expandBtn->setAutoRaise(true);
+        m_expandBtn->setCursor(Qt::PointingHandCursor);
+        m_expandBtn->setVisible(false);
+        connect(m_expandBtn, &QToolButton::clicked, m_expandBtn, [this] {
+            m_result->setText(m_fullResult.isEmpty() ? i18n("(no output)") : m_fullResult);
+            m_expandBtn->setVisible(false);
+        });
+        dv->addWidget(m_expandBtn, 0, Qt::AlignLeft);
         m_detail->setVisible(false);
         outer->addWidget(m_detail);
 
@@ -214,12 +259,24 @@ public:
 
     void setResult(const QString &text)
     {
-        QString t = text.trimmed();
-        if (t.size() > 4000) {
-            t = t.left(4000) + QStringLiteral("\n… (truncated)");
+        m_fullResult = text.trimmed();
+        QString shown = m_fullResult;
+        bool truncated = false;
+        if (shown.size() > 4000) {
+            shown = shown.left(4000);
+            truncated = true;
         }
-        m_result->setText(t.isEmpty() ? QStringLiteral("(no output)") : t);
+        m_result->setText(shown.isEmpty() ? i18n("(no output)") : shown);
         m_result->setVisible(true);
+        if (truncated) {
+            const int moreLines =
+                m_fullResult.mid(4000).count(QLatin1Char('\n')) + 1;
+            m_expandBtn->setText(i18np("Show full output (%1 more line)",
+                                       "Show full output (%1 more lines)", moreLines));
+            m_expandBtn->setVisible(true);
+        } else {
+            m_expandBtn->setVisible(false);
+        }
         m_done = true;
         updateHeader();
     }
@@ -235,10 +292,14 @@ private:
     }
 
     QToolButton *m_header = nullptr;
+    QToolButton *m_copyBtn = nullptr;
+    QToolButton *m_expandBtn = nullptr;
     QWidget *m_detail = nullptr;
     QLabel *m_result = nullptr;
     QString m_tool;
     QString m_summary;
+    QString m_detailText;
+    QString m_fullResult;
     bool m_done = false;
 };
 
@@ -367,11 +428,27 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     QScrollBar *bar = m_feedScroll->verticalScrollBar();
     connect(bar, &QScrollBar::valueChanged, this, [this, bar](int v) {
         m_stickBottom = (v >= bar->maximum() - 48);
+        updateJumpButton();
     });
     connect(bar, &QScrollBar::rangeChanged, this, [this, bar](int, int max) {
         if (m_stickBottom) {
             bar->setValue(max);
         }
+        updateJumpButton();
+    });
+
+    // --- "jump to latest" floating button over the feed viewport -----------
+    m_jumpBtn = new QToolButton(m_feedScroll->viewport());
+    m_jumpBtn->setIcon(QIcon::fromTheme(QStringLiteral("go-down")));
+    m_jumpBtn->setToolTip(i18n("Jump to latest"));
+    m_jumpBtn->setCursor(Qt::PointingHandCursor);
+    m_jumpBtn->setAutoRaise(false);
+    m_jumpBtn->setVisible(false);
+    m_feedScroll->viewport()->installEventFilter(this); // reposition on resize
+    connect(m_jumpBtn, &QToolButton::clicked, this, [this] {
+        m_jumpUnread = false;
+        scrollFeedToBottom();
+        updateJumpButton();
     });
 
     m_working = new WorkingIndicator(this);
@@ -425,6 +502,62 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     m_input = new QPlainTextEdit(this);
     m_input->setFixedHeight(94);
     m_input->installEventFilter(this); // for the configurable send key
+
+    // Debounced draft autosave: persist the composer text so a closed/reopened
+    // panel (or a crash) doesn't lose an unsent message.
+    m_draftTimer = new QTimer(this);
+    m_draftTimer->setSingleShot(true);
+    m_draftTimer->setInterval(400);
+    connect(m_draftTimer, &QTimer::timeout, this, &AgentPanel::saveDraft);
+    connect(m_input, &QPlainTextEdit::textChanged, this,
+            [this] { m_draftTimer->start(); });
+
+    // --- in-conversation find bar (hidden until Ctrl+F) --------------------
+    m_findBar = new QFrame(this);
+    m_findBar->setObjectName(QStringLiteral("findBar"));
+    m_findBar->setVisible(false);
+    m_findEdit = new QLineEdit(m_findBar);
+    m_findEdit->setPlaceholderText(i18n("Find in conversation…"));
+    m_findEdit->setClearButtonEnabled(true);
+    auto *findPrev = new QToolButton(m_findBar);
+    findPrev->setAutoRaise(true);
+    findPrev->setIcon(QIcon::fromTheme(QStringLiteral("go-up")));
+    findPrev->setToolTip(i18n("Previous match"));
+    auto *findNext = new QToolButton(m_findBar);
+    findNext->setAutoRaise(true);
+    findNext->setIcon(QIcon::fromTheme(QStringLiteral("go-down")));
+    findNext->setToolTip(i18n("Next match"));
+    m_findStatus = new QLabel(m_findBar);
+    m_findStatus->setStyleSheet(QStringLiteral("color: palette(mid); font-size: small;"));
+    auto *findClose = new QToolButton(m_findBar);
+    findClose->setAutoRaise(true);
+    findClose->setIcon(QIcon::fromTheme(QStringLiteral("dialog-close")));
+    findClose->setToolTip(i18n("Close find bar"));
+    auto *findLayout = new QHBoxLayout(m_findBar);
+    findLayout->setContentsMargins(6, 4, 6, 4);
+    findLayout->setSpacing(4);
+    findLayout->addWidget(m_findEdit, 1);
+    findLayout->addWidget(m_findStatus);
+    findLayout->addWidget(findPrev);
+    findLayout->addWidget(findNext);
+    findLayout->addWidget(findClose);
+    connect(m_findEdit, &QLineEdit::textChanged, this, [this] { runFind(0); });
+    connect(m_findEdit, &QLineEdit::returnPressed, this, [this] { runFind(1); });
+    connect(findNext, &QToolButton::clicked, this, [this] { runFind(1); });
+    connect(findPrev, &QToolButton::clicked, this, [this] { runFind(-1); });
+    connect(findClose, &QToolButton::clicked, this, [this] { toggleFindBar(); });
+    // Panel-local Find shortcut: scoped to this widget tree so it never
+    // collides with the project-wide SearchPanel Find on the main window.
+    auto *findSc = new QShortcut(QKeySequence::Find, this);
+    findSc->setContext(Qt::WidgetWithChildrenShortcut);
+    connect(findSc, &QShortcut::activated, this, [this] { toggleFindBar(); });
+    auto *escSc = new QShortcut(QKeySequence(Qt::Key_Escape), m_findBar);
+    escSc->setContext(Qt::WidgetWithChildrenShortcut);
+    connect(escSc, &QShortcut::activated, this, [this] {
+        if (m_findBar->isVisible()) {
+            toggleFindBar();
+        }
+    });
 
     m_modeCombo = new QComboBox(this);
     m_modeCombo->addItem(QStringLiteral("Accept edits"), QStringLiteral("acceptEdits"));
@@ -737,6 +870,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     auto *body = new QVBoxLayout;
     body->setContentsMargins(12, 12, 12, 12);
     body->setSpacing(10);
+    body->addWidget(m_findBar);
     body->addWidget(m_feedScroll, 1);
     body->addWidget(m_working);
     body->addWidget(m_permBar);
@@ -779,7 +913,19 @@ AgentPanel::~AgentPanel()
 void AgentPanel::setWorkspace(const QString &path)
 {
     m_workspace = path;
+    restoreDraft(); // recover an unsent composer draft for this workspace/thread
     refresh();
+}
+
+void AgentPanel::preselectModel(const QString &modelId)
+{
+    if (modelId.isEmpty() || !m_threadId.isEmpty()) {
+        return; // combo is frozen once a thread exists
+    }
+    const int idx = m_modelCombo->findData(modelId);
+    if (idx >= 0) {
+        m_modelCombo->setCurrentIndex(idx);
+    }
 }
 
 void AgentPanel::applyChatSettings()
@@ -800,6 +946,13 @@ void AgentPanel::applyChatSettings()
 
 bool AgentPanel::eventFilter(QObject *obj, QEvent *event)
 {
+    // Keep the floating "jump to latest" button anchored to the bottom-right
+    // of the feed viewport as it resizes.
+    if (m_feedScroll && obj == m_feedScroll->viewport()
+        && event->type() == QEvent::Resize) {
+        positionJumpButton();
+        return QWidget::eventFilter(obj, event);
+    }
     if (obj == m_input && event->type() == QEvent::KeyPress) {
         auto *key = static_cast<QKeyEvent *>(event);
         if (key->key() == Qt::Key_Return || key->key() == Qt::Key_Enter) {
@@ -858,6 +1011,7 @@ void AgentPanel::setDormant(const QString &threadId, const QString &title, bool 
     addNote(QStringLiteral("dormant agent · %1 — Resume to continue.")
                 .arg(title.toHtmlEscaped()),
             QStringLiteral("sys"));
+    restoreDraft(); // any unsent draft for this thread
     emit dormantChanged(true);
     refresh();
 }
@@ -887,9 +1041,14 @@ void AgentPanel::loadTranscript()
                      if (events.isEmpty()) {
                          return;
                      }
+                     // Guard cumulative cost + live timestamps: replayed result
+                     // events must not be counted, and replayed cards carry no
+                     // synthetic send time.
+                     m_replaying = true;
                      for (const QJsonValue &v : events) {
                          renderEvent(v.toObject());
                      }
+                     m_replaying = false;
                      addNote(QStringLiteral("— prior conversation restored —"),
                              QStringLiteral("dim"));
                      scrollFeedToBottom();
@@ -1154,10 +1313,18 @@ void AgentPanel::refresh()
             text = QStringLiteral("Working · %1").arg(where);
         }
     }
+    // Append the running session cost as a quiet suffix once any has accrued.
+    // Kept on the same subtitle so the roster card reflects it too.
+    if (m_sessionCostUsd > 0.0) {
+        text += QStringLiteral(" · $%1")
+                    .arg(QLocale().toString(m_sessionCostUsd, 'f', 4));
+    }
     m_header->setText(QStringLiteral("<span style='color:%1'>&#9679;</span>&nbsp;&nbsp;%2")
                           .arg(dot, text.toHtmlEscaped()));
     emit stateChanged(dot);
     emit subtitleChanged(text);
+    // Roster card affordance, derived from the same state computed above.
+    emit attentionChanged(running && !m_permQueue.isEmpty());
 }
 
 // --- conversation feed ------------------------------------------------------
@@ -1183,7 +1350,8 @@ void AgentPanel::scrollFeedToBottom()
 }
 
 void AgentPanel::addMessageCard(const QString &role, const QString &accentHex,
-                                const QString &bodyHtml)
+                                const QString &bodyHtml, const QString &plainText,
+                                bool replayed)
 {
     auto *card = new QFrame(m_feed);
     card->setObjectName(QStringLiteral("msgCard"));
@@ -1193,10 +1361,25 @@ void AgentPanel::addMessageCard(const QString &role, const QString &accentHex,
     v->setContentsMargins(12, 9, 12, 11);
     v->setSpacing(3);
 
+    // Role row: the accent-coloured role label, a stretch, then a dim
+    // right-aligned timestamp for live cards (omitted on transcript replay,
+    // where the original send time is unknown).
+    auto *roleRow = new QHBoxLayout;
+    roleRow->setContentsMargins(0, 0, 0, 0);
+    roleRow->setSpacing(6);
     auto *roleLabel = new QLabel(role, card);
     roleLabel->setStyleSheet(
         QStringLiteral("color: %1; font-weight: bold;").arg(accentHex));
-    v->addWidget(roleLabel);
+    roleRow->addWidget(roleLabel);
+    roleRow->addStretch(1);
+    if (!replayed) {
+        auto *timeLabel = new QLabel(
+            QLocale().toString(QTime::currentTime(), QLocale::ShortFormat), card);
+        timeLabel->setStyleSheet(
+            QStringLiteral("color: palette(mid); font-size: small;"));
+        roleRow->addWidget(timeLabel);
+    }
+    v->addLayout(roleRow);
 
     auto *bodyLabel = new QLabel(bodyHtml, card);
     bodyLabel->setTextFormat(Qt::RichText);
@@ -1220,7 +1403,52 @@ void AgentPanel::addMessageCard(const QString &role, const QString &accentHex,
     bodyLabel->setAlignment(Qt::AlignLeft | Qt::AlignTop);
     v->addWidget(bodyLabel);
 
+    // Register the body for in-conversation search and highlight restore.
+    if (!plainText.isEmpty()) {
+        m_searchables.append(Searchable{bodyLabel, plainText, bodyHtml, card});
+    }
+
+    // Right-click → copy the whole message, and any fenced code block within it.
+    const QString src = plainText;
+    card->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(card, &QWidget::customContextMenuRequested, card,
+            [this, card, src](const QPoint &pos) {
+                QMenu menu(card);
+                QAction *copyMsg = menu.addAction(
+                    QIcon::fromTheme(QStringLiteral("edit-copy")), i18n("Copy message"));
+                connect(copyMsg, &QAction::triggered, this, [src] {
+                    QGuiApplication::clipboard()->setText(src);
+                });
+                // Extract ```-fenced code spans straight from the Markdown
+                // source (don't parse the rendered HTML).
+                static const QRegularExpression fence(
+                    QStringLiteral("```[^\\n]*\\n(.*?)```"),
+                    QRegularExpression::DotMatchesEverythingOption);
+                QStringList blocks;
+                auto it = fence.globalMatch(src);
+                while (it.hasNext()) {
+                    blocks << it.next().captured(1);
+                }
+                if (!blocks.isEmpty()) {
+                    QAction *copyCode = menu.addAction(
+                        QIcon::fromTheme(QStringLiteral("edit-copy")),
+                        i18np("Copy code block", "Copy %1 code blocks", blocks.size()));
+                    connect(copyCode, &QAction::triggered, this, [blocks] {
+                        QGuiApplication::clipboard()->setText(
+                            blocks.join(QStringLiteral("\n\n")));
+                    });
+                }
+                menu.exec(card->mapToGlobal(pos));
+            });
+
     appendToFeed(card);
+
+    // A fresh card while the user is scrolled up flags unread content on the
+    // jump-to-latest button.
+    if (!m_stickBottom) {
+        m_jumpUnread = true;
+        updateJumpButton();
+    }
 }
 
 void AgentPanel::addNote(const QString &html, const QString &kind)
@@ -1236,6 +1464,194 @@ void AgentPanel::addNote(const QString &html, const QString &kind)
     note->setStyleSheet(QStringLiteral("color: %1; font-size: small; padding: 1px 8px;")
                             .arg(noteColor(kind, isDark(this))));
     appendToFeed(note);
+}
+
+// --- jump-to-latest floating button ----------------------------------------
+
+void AgentPanel::positionJumpButton()
+{
+    if (!m_jumpBtn || !m_feedScroll) {
+        return;
+    }
+    QWidget *vp = m_feedScroll->viewport();
+    const QSize sz = m_jumpBtn->sizeHint();
+    const int margin = 12;
+    m_jumpBtn->move(vp->width() - sz.width() - margin,
+                    vp->height() - sz.height() - margin);
+}
+
+void AgentPanel::updateJumpButton()
+{
+    if (!m_jumpBtn) {
+        return;
+    }
+    const bool show = !m_stickBottom;
+    if (show) {
+        m_jumpBtn->setToolTip(m_jumpUnread ? i18n("Jump to latest — new messages")
+                                           : i18n("Jump to latest"));
+        positionJumpButton();
+        m_jumpBtn->raise();
+    } else {
+        m_jumpUnread = false;
+    }
+    m_jumpBtn->setVisible(show);
+}
+
+// --- draft persistence ------------------------------------------------------
+
+QString AgentPanel::draftKey() const
+{
+    if (!m_threadId.isEmpty()) {
+        return QStringLiteral("draft-") + m_threadId;
+    }
+    if (m_workspace.isEmpty()) {
+        return QString();
+    }
+    // Before a thread exists, scope the draft to the workspace path so it
+    // survives until the agent.start migrates it to draft-<threadId>.
+    const QByteArray h = QCryptographicHash::hash(m_workspace.toUtf8(),
+                                                  QCryptographicHash::Md5);
+    return QStringLiteral("draft-new-") + QString::fromLatin1(h.toHex().left(12));
+}
+
+void AgentPanel::saveDraft()
+{
+    const QString key = draftKey();
+    if (key.isEmpty()) {
+        return;
+    }
+    KConfigGroup cfg = KSharedConfig::openConfig()->group(QStringLiteral("Agent"));
+    const QString text = m_input->toPlainText();
+    if (text.trimmed().isEmpty()) {
+        cfg.deleteEntry(key);
+    } else {
+        cfg.writeEntry(key, text);
+    }
+    cfg.sync();
+}
+
+void AgentPanel::restoreDraft()
+{
+    const QString key = draftKey();
+    if (key.isEmpty()) {
+        return;
+    }
+    const QString saved = KSharedConfig::openConfig()
+                              ->group(QStringLiteral("Agent"))
+                              .readEntry(key, QString());
+    if (!saved.isEmpty() && m_input->toPlainText().trimmed().isEmpty()) {
+        QSignalBlocker blocker(m_input); // restoring isn't an edit to re-persist
+        m_input->setPlainText(saved);
+    }
+}
+
+void AgentPanel::clearDraft()
+{
+    const QString key = draftKey();
+    if (key.isEmpty()) {
+        return;
+    }
+    KConfigGroup cfg = KSharedConfig::openConfig()->group(QStringLiteral("Agent"));
+    cfg.deleteEntry(key);
+    cfg.sync();
+}
+
+// --- in-conversation find ---------------------------------------------------
+
+void AgentPanel::clearFindHighlights()
+{
+    for (const Searchable &s : std::as_const(m_searchables)) {
+        if (s.body) {
+            s.body->setText(s.html);
+        }
+    }
+    m_findHits.clear();
+    m_findIndex = -1;
+}
+
+void AgentPanel::toggleFindBar()
+{
+    if (!m_findBar) {
+        return;
+    }
+    const bool show = !m_findBar->isVisible();
+    m_findBar->setVisible(show);
+    if (show) {
+        m_findEdit->setFocus();
+        m_findEdit->selectAll();
+        runFind(0);
+    } else {
+        clearFindHighlights();
+        if (m_findStatus) {
+            m_findStatus->clear();
+        }
+        m_input->setFocus();
+    }
+}
+
+void AgentPanel::runFind(int direction)
+{
+    if (!m_findBar || !m_findBar->isVisible()) {
+        return;
+    }
+    const QString needle = m_findEdit->text();
+    clearFindHighlights();
+    if (needle.isEmpty()) {
+        if (m_findStatus) {
+            m_findStatus->clear();
+        }
+        return;
+    }
+    // Highlight every match by re-rendering the body with a palette-highlight
+    // span wrapped around each hit (escaping the source first).
+    for (int i = 0; i < m_searchables.size(); ++i) {
+        const Searchable &s = m_searchables.at(i);
+        if (!s.plain.contains(needle, Qt::CaseInsensitive)) {
+            continue;
+        }
+        m_findHits.append(i);
+        if (!s.body) {
+            continue;
+        }
+        QString escaped = s.plain.toHtmlEscaped();
+        const QString escNeedle = needle.toHtmlEscaped();
+        QString out;
+        int from = 0;
+        for (;;) {
+            const int at = escaped.indexOf(escNeedle, from, Qt::CaseInsensitive);
+            if (at < 0) {
+                out += escaped.mid(from);
+                break;
+            }
+            out += escaped.mid(from, at - from);
+            out += QStringLiteral("<span style='background:palette(highlight); "
+                                  "color:palette(highlighted-text)'>")
+                   + escaped.mid(at, escNeedle.length()) + QStringLiteral("</span>");
+            from = at + escNeedle.length();
+        }
+        s.body->setText(out.replace(QLatin1Char('\n'), QStringLiteral("<br>")));
+    }
+    if (m_findHits.isEmpty()) {
+        if (m_findStatus) {
+            m_findStatus->setText(i18n("No matches"));
+        }
+        return;
+    }
+    if (m_findIndex < 0) {
+        m_findIndex = (direction < 0) ? m_findHits.size() - 1 : 0;
+    } else {
+        m_findIndex = (m_findIndex + direction + m_findHits.size()) % m_findHits.size();
+    }
+    const Searchable &cur = m_searchables.at(m_findHits.at(m_findIndex));
+    if (cur.card) {
+        m_stickBottom = false;
+        m_feedScroll->ensureWidgetVisible(cur.card);
+        updateJumpButton();
+    }
+    if (m_findStatus) {
+        m_findStatus->setText(i18nc("current match / total matches", "%1 / %2",
+                                    m_findIndex + 1, m_findHits.size()));
+    }
 }
 
 void AgentPanel::onSendClicked()
@@ -1271,6 +1687,7 @@ void AgentPanel::onSendClicked()
     // `result`. Mirrors the m_permQueue defer pattern.
     if (!m_threadId.isEmpty() && !m_idle) {
         m_input->clear();
+        clearDraft();
         m_sendQueue.append(QueuedMsg{text, m_attachments});
         m_attachments = QJsonArray();
         rebuildAttachChips();
@@ -1282,6 +1699,7 @@ void AgentPanel::onSendClicked()
     }
 
     m_input->clear();
+    clearDraft();
 
     // Detach the pending attachments for this message, then clear the bar.
     const QJsonArray attachments = m_attachments;
@@ -1289,6 +1707,10 @@ void AgentPanel::onSendClicked()
     rebuildAttachChips();
 
     if (m_threadId.isEmpty()) {
+        // A fresh session — start the cost meter from zero.
+        m_sessionCostUsd = 0.0;
+        m_sessionInTokens = 0;
+        m_sessionOutTokens = 0;
         addYouCard(text, attachments);
         m_idle = false;
         m_working->setActivity(QString()); // a new turn starts in generic mode
@@ -1349,7 +1771,7 @@ void AgentPanel::addYouCard(const QString &text, const QJsonArray &attachments)
     }
     addMessageCard(QStringLiteral("You"),
                    isDark(this) ? QStringLiteral("#7cb7ff") : QStringLiteral("#1a5fb4"),
-                   youLine);
+                   youLine, text, m_replaying);
 }
 
 // deliverMessage sends a message to the live thread right now: it shows the
@@ -1524,10 +1946,23 @@ void AgentPanel::rebuildAttachChips()
         delete item;
     }
     for (int i = 0; i < m_attachments.size(); ++i) {
-        const QString name = m_attachments.at(i).toObject().value(QStringLiteral("name")).toString();
+        const QJsonObject att = m_attachments.at(i).toObject();
+        const QString name = att.value(QStringLiteral("name")).toString();
         auto *chip = new QPushButton(QStringLiteral("%1   ✕").arg(name), m_attachBar);
         chip->setCursor(Qt::PointingHandCursor);
-        chip->setToolTip(QStringLiteral("Remove attachment"));
+        chip->setToolTip(i18n("Remove attachment"));
+        // For image attachments, decode the stored base64 into a small preview
+        // icon so the chip shows a thumbnail rather than just the filename.
+        if (att.value(QStringLiteral("kind")).toString() == QLatin1String("image")) {
+            const QByteArray raw = QByteArray::fromBase64(
+                att.value(QStringLiteral("dataB64")).toString().toLatin1());
+            QPixmap pm;
+            if (pm.loadFromData(raw)) {
+                chip->setIcon(QIcon(pm.scaled(28, 28, Qt::KeepAspectRatio,
+                                              Qt::SmoothTransformation)));
+                chip->setIconSize(QSize(28, 28));
+            }
+        }
         connect(chip, &QPushButton::clicked, this, [this, i] {
             m_attachments.removeAt(i);
             rebuildAttachChips();
@@ -1841,7 +2276,7 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
                     addMessageCard(QStringLiteral("Agent Kate"),
                                    isDark(this) ? QStringLiteral("#5fd3bf")
                                                 : QStringLiteral("#1a7f6b"),
-                                   markdownToHtml(t));
+                                   markdownToHtml(t), t, m_replaying);
                     m_working->setActivity(QString()); // text → generic reasoning
                 }
             } else if (bt == QLatin1String("tool_use")) {
@@ -1888,9 +2323,51 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
 
     } else if (type == QLatin1String("result")) {
         const bool err = ev.value(QStringLiteral("is_error")).toBool();
-        addNote(err ? QStringLiteral("✗ turn ended with an error")
-                    : QStringLiteral("✓ turn complete"),
-                err ? QStringLiteral("err") : QStringLiteral("ok"));
+        // The result event carries the turn's usage + billed cost verbatim from
+        // the `claude` CLI (field names match the Anthropic Messages API). Show
+        // a compact per-turn line and fold it into the running session totals.
+        const QJsonObject usage = ev.value(QStringLiteral("usage")).toObject();
+        const qlonglong inTok = usage.value(QStringLiteral("input_tokens")).toVariant().toLongLong();
+        const qlonglong outTok = usage.value(QStringLiteral("output_tokens")).toVariant().toLongLong();
+        const qlonglong cacheRead =
+            usage.value(QStringLiteral("cache_read_input_tokens")).toVariant().toLongLong();
+        const qlonglong cacheCreate =
+            usage.value(QStringLiteral("cache_creation_input_tokens")).toVariant().toLongLong();
+        const double costUsd = ev.value(QStringLiteral("total_cost_usd")).toDouble();
+        const qlonglong durationMs =
+            ev.value(QStringLiteral("duration_ms")).toVariant().toLongLong();
+        const bool haveUsage = inTok || outTok || cacheRead || cacheCreate || costUsd > 0.0;
+
+        QString head = err ? i18n("turn ended with an error") : i18n("turn complete");
+        if (haveUsage) {
+            const QLocale loc;
+            const qlonglong promptTotal = inTok + cacheRead + cacheCreate;
+            const int cacheHitPct =
+                promptTotal > 0 ? int((cacheRead * 100) / promptTotal) : 0;
+            // e.g. "turn complete · 1,204 in / 318 out · 86% cache hit · $0.0042 · 3.1s"
+            QString line = i18nc("turn-usage summary",
+                                 "%1 · %2 in / %3 out · %4% cache hit",
+                                 head, loc.toString(inTok), loc.toString(outTok),
+                                 cacheHitPct);
+            if (costUsd > 0.0) {
+                line += i18nc("turn cost suffix", " · $%1", loc.toString(costUsd, 'f', 4));
+            }
+            if (durationMs > 0) {
+                line += i18nc("turn duration suffix", " · %1s",
+                              loc.toString(durationMs / 1000.0, 'f', 1));
+            }
+            addNote(line.toHtmlEscaped(), err ? QStringLiteral("err") : QStringLiteral("dim"));
+            // Accumulate session totals — but never while replaying the
+            // transcript, or historical turns would be double-counted.
+            if (!m_replaying) {
+                m_sessionCostUsd += costUsd;
+                m_sessionInTokens += inTok;
+                m_sessionOutTokens += outTok;
+            }
+        } else {
+            addNote(err ? QStringLiteral("✗ ") + head : QStringLiteral("✓ ") + head,
+                    err ? QStringLiteral("err") : QStringLiteral("ok"));
+        }
         m_idle = true;
         refresh();
         // The turn boundary is the moment a queued follow-up can fire.
@@ -1913,6 +2390,11 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             m_branch = ev.value(QStringLiteral("branch")).toString();
             m_dormant = false;
             m_idle = true;
+            // A resumed process bills a fresh session — restart the meter so the
+            // header doesn't show a stale/zero cost as new turns accrue.
+            m_sessionCostUsd = 0.0;
+            m_sessionInTokens = 0;
+            m_sessionOutTokens = 0;
             addNote(detail + QStringLiteral(" · ready for a follow-up"),
                     QStringLiteral("sys"));
             emit dormantChanged(false);

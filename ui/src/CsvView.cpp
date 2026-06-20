@@ -3,6 +3,7 @@
 #include <QComboBox>
 #include <QFile>
 #include <QFileInfo>
+#include <QFileSystemWatcher>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QLabel>
@@ -10,6 +11,7 @@
 #include <QStringConverter>
 #include <QTableView>
 #include <QTextStream>
+#include <QTimer>
 #include <QVBoxLayout>
 
 #include <utility>
@@ -209,7 +211,7 @@ CsvView::CsvView(const QString &path, QWidget *parent)
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
 
-    auto *model = new CsvModel(this);
+    m_model = new CsvModel(this);
     const QString suffix = QFileInfo(m_path).suffix().toLower();
     const bool isWorkbook =
         suffix == QLatin1String("xlsx") || suffix == QLatin1String("xlsm");
@@ -228,9 +230,10 @@ CsvView::CsvView(const QString &path, QWidget *parent)
                 for (const XlsxSheet &sheet : std::as_const(m_sheets)) {
                     picker->addItem(sheet.name);
                 }
-                connect(picker, &QComboBox::currentIndexChanged, this, [this, model](int i) {
+                connect(picker, &QComboBox::currentIndexChanged, this, [this](int i) {
                     if (i >= 0 && i < m_sheets.size()) {
-                        model->setRecords(m_sheets.at(i).rows);
+                        m_currentSheet = i;
+                        m_model->setRecords(m_sheets.at(i).rows);
                         m_table->resizeColumnsToContents();
                     }
                 });
@@ -238,10 +241,10 @@ CsvView::CsvView(const QString &path, QWidget *parent)
                 bar->addStretch();
                 layout->addLayout(bar);
             }
-            model->setRecords(m_sheets.first().rows);
+            m_model->setRecords(m_sheets.first().rows);
         }
     } else {
-        ok = model->load(m_path);
+        ok = m_model->load(m_path);
     }
 
     if (!ok) {
@@ -253,7 +256,7 @@ CsvView::CsvView(const QString &path, QWidget *parent)
     }
 
     auto *proxy = new CsvSortProxy(this);
-    proxy->setSourceModel(model);
+    proxy->setSourceModel(m_model);
 
     m_table = new QTableView(this);
     m_table->setModel(proxy);
@@ -274,6 +277,50 @@ CsvView::CsvView(const QString &path, QWidget *parent)
     m_table->resizeColumnsToContents();
 
     layout->addWidget(m_table);
+
+    // Re-read when an agent rewrites the file on disk. A short debounce
+    // coalesces the burst of events an editor's save can emit, and the path is
+    // re-added each time because many editors save atomically (rename-into-
+    // place), which drops the original inode the watcher was tracking.
+    m_reloadDebounce = new QTimer(this);
+    m_reloadDebounce->setSingleShot(true);
+    m_reloadDebounce->setInterval(150);
+    connect(m_reloadDebounce, &QTimer::timeout, this, &CsvView::reload);
+
+    m_watcher = new QFileSystemWatcher(this);
+    m_watcher->addPath(m_path);
+    connect(m_watcher, &QFileSystemWatcher::fileChanged, this, [this](const QString &) {
+        m_reloadDebounce->start();
+    });
+}
+
+void CsvView::reload()
+{
+    if (!m_model || !m_table) {
+        return;
+    }
+    const QString suffix = QFileInfo(m_path).suffix().toLower();
+    const bool isWorkbook =
+        suffix == QLatin1String("xlsx") || suffix == QLatin1String("xlsm");
+    if (isWorkbook) {
+        QVector<XlsxSheet> sheets;
+        if (XlsxReader::read(m_path, sheets) && !sheets.isEmpty()) {
+            m_sheets = sheets;
+            // Keep showing the same sheet the user had selected, if it still
+            // exists after the rewrite (clamp otherwise).
+            const int sheet = qBound(0, m_currentSheet, m_sheets.size() - 1);
+            m_model->setRecords(m_sheets.at(sheet).rows);
+            m_table->resizeColumnsToContents();
+        }
+    } else if (m_model->load(m_path)) {
+        m_table->resizeColumnsToContents();
+    }
+    // An atomic rewrite replaces the inode, so the watcher silently stops
+    // tracking the file after the first change. Re-add the path if it dropped.
+    if (m_watcher && !m_watcher->files().contains(m_path)
+        && QFileInfo::exists(m_path)) {
+        m_watcher->addPath(m_path);
+    }
 }
 
 #include "CsvView.moc"

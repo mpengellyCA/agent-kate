@@ -14,6 +14,7 @@ find_package(KF6 6.0 REQUIRED COMPONENTS
     XmlGui              # KMainWindow, KHelpMenu
     ConfigWidgets       # KStandardAction
     Config              # KSharedConfig, KConfigGroup (KF6::ConfigCore)
+    Completion          # KHistoryComboBox — search query recall
     CoreAddons          # KAboutData, KPluginFactory
     I18n                # i18n()
     Parts               # KParts — embedding the Konsole terminal
@@ -37,6 +38,8 @@ add_executable(agentkate
     src/ReferencesPanel.cpp
     src/OutlinePanel.cpp
     src/ProjectTree.cpp
+    src/FileFilterProxyModel.cpp
+    src/GitStatusDelegate.cpp
     src/RecentProjects.cpp
     src/shell/SideBar.cpp
     src/shell/ShellLayout.cpp
@@ -62,10 +65,13 @@ add_executable(agentkate
     src/git/PRDialog.cpp
     src/git/RefChipDelegate.cpp
     src/ipc/CoreClient.cpp
+    src/lsp/LspActions.cpp
     src/lsp/LspClient.cpp
     src/lsp/LspCompletionModel.cpp
     src/lsp/LspHoverProvider.cpp
     src/lsp/LspManager.cpp
+    src/lsp/LspSignatureHelp.cpp
+    src/lsp/WorkspaceSymbolDialog.cpp
     icons/agentkate.qrc
 )
 
@@ -81,6 +87,7 @@ target_link_libraries(agentkate PRIVATE
     KF6::XmlGui
     KF6::ConfigWidgets
     KF6::ConfigCore
+    KF6::Completion
     KF6::CoreAddons
     KF6::I18n
     KF6::Parts

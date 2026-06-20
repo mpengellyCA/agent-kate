@@ -21,10 +21,12 @@ class QEvent;
 class QFrame;
 class QHBoxLayout;
 class QLabel;
+class QLineEdit;
 class QMenu;
 class QPlainTextEdit;
 class QPushButton;
 class QScrollArea;
+class QTimer;
 class QToolButton;
 class QVBoxLayout;
 
@@ -43,6 +45,11 @@ public:
     void setWorkspace(const QString &path);
     QString threadId() const { return m_threadId; }
     bool isIsolated() const { return m_isolated; }
+
+    // Pre-pick the start model by its id ("opus", "sonnet", …) before the first
+    // start. No-op once a thread exists (the combo is frozen then) or if the id
+    // isn't an offered choice.
+    void preselectModel(const QString &modelId);
 
     // Bind this panel to a persisted-but-not-running thread; resume() relaunches
     // it through the core's agent.resume.
@@ -67,6 +74,9 @@ Q_SIGNALS:
     // as the roster card's subtitle. Tracks the same state as stateChanged.
     void subtitleChanged(const QString &text);
     void dormantChanged(bool dormant);
+    // Roster card affordance: attention = a turn is waiting on the user's input
+    // (a permission prompt). The roster paints this as a card marker.
+    void attentionChanged(bool attention);
     void openDiff(const QString &title, const QString &diffText);
 
 protected:
@@ -124,10 +134,31 @@ private:
 
     // The conversation feed.
     void appendToFeed(QWidget *entry);
+    // addMessageCard renders one role-tagged card. `plainText` is the raw
+    // (Markdown / plain) source kept for copy + search; pass empty when none.
+    // `replayed` cards (transcript restore) carry no live timestamp.
     void addMessageCard(const QString &role, const QString &accentHex,
-                        const QString &bodyHtml);
+                        const QString &bodyHtml, const QString &plainText = QString(),
+                        bool replayed = false);
     void addNote(const QString &html, const QString &kind);
     void scrollFeedToBottom();
+
+    // Jump-to-latest floating button: reposition over the feed viewport and
+    // toggle visibility based on the sticky-bottom state.
+    void positionJumpButton();
+    void updateJumpButton();
+
+    // Draft persistence (KConfig "Agent" group, draft-<id>): save on edit,
+    // restore when (re)bound to a workspace/thread, clear on send.
+    QString draftKey() const;
+    void saveDraft();
+    void restoreDraft();
+    void clearDraft();
+
+    // In-conversation find bar.
+    void toggleFindBar();
+    void runFind(int direction); // -1 prev, +1 next, 0 re-run from current
+    void clearFindHighlights();
 
     CoreClient *m_core = nullptr;
     QString m_workspace;
@@ -137,13 +168,44 @@ private:
     bool m_idle = false;      // turn finished, awaiting a follow-up
     bool m_dormant = false;   // has a thread id, but no live process — resumable
     bool m_promoting = false; // a promote-to-worktree is in flight
+    bool m_replaying = false; // inside loadTranscript() — don't double-count cost
+
+    // Running per-session usage totals, accumulated from each `result` event's
+    // top-level usage block. Surfaced as a compact suffix on the header
+    // subtitle. Reset on a fresh start and on resume.
+    double m_sessionCostUsd = 0.0;
+    qlonglong m_sessionInTokens = 0;
+    qlonglong m_sessionOutTokens = 0;
 
     QLabel *m_header = nullptr;
     QScrollArea *m_feedScroll = nullptr;
     QWidget *m_feed = nullptr;
     QVBoxLayout *m_feedLayout = nullptr;
     bool m_stickBottom = true; // auto-scroll until the user scrolls upward
+    // Floating "jump to latest" button over the feed viewport, shown when the
+    // feed is scrolled up away from the bottom.
+    QToolButton *m_jumpBtn = nullptr;
+    bool m_jumpUnread = false; // a card arrived while detached from the bottom
     QHash<QString, ToolCard *> m_toolCards; // keyed by tool_use id
+
+    // Debounced draft autosave for the composer.
+    QTimer *m_draftTimer = nullptr;
+
+    // In-conversation find bar (hidden by default; toggled with Ctrl+F).
+    QFrame *m_findBar = nullptr;
+    QLineEdit *m_findEdit = nullptr;
+    QLabel *m_findStatus = nullptr;
+    // Registry of searchable message bodies: the body QLabel, its plain-text
+    // source, and the original (un-highlighted) HTML to restore.
+    struct Searchable {
+        QLabel *body = nullptr;
+        QString plain;
+        QString html;
+        QWidget *card = nullptr;
+    };
+    QList<Searchable> m_searchables;
+    QList<int> m_findHits; // indices into m_searchables that currently match
+    int m_findIndex = -1;
     WorkingIndicator *m_working = nullptr;
     QPlainTextEdit *m_input = nullptr;
     QComboBox *m_modeCombo = nullptr;

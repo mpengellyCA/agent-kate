@@ -4,6 +4,8 @@
 #include "PRDialog.h"
 #include "ipc/CoreClient.h"
 
+#include <KLocalizedString>
+
 #include <QCheckBox>
 #include <QDialogButtonBox>
 #include <QHBoxLayout>
@@ -21,25 +23,25 @@ PRDialog::PRDialog(CoreClient *core, const QString &threadId, const QString &bra
     , m_branch(branch)
 {
     setWindowTitle(branch.isEmpty()
-                       ? QStringLiteral("Open a pull request")
-                       : QStringLiteral("Open PR from %1").arg(branch));
+                       ? i18nc("@title:window", "Open a pull request")
+                       : i18nc("@title:window", "Open PR from %1", branch));
     resize(640, 560);
 
     m_title = new QLineEdit(this);
-    m_title->setPlaceholderText(QStringLiteral("PR title"));
+    m_title->setPlaceholderText(i18n("PR title"));
 
     m_body = new QPlainTextEdit(this);
-    m_body->setPlaceholderText(QStringLiteral("PR body (Markdown)"));
+    m_body->setPlaceholderText(i18n("PR body (Markdown)"));
 
-    m_draft = new QCheckBox(QStringLiteral("Open as draft"), this);
+    m_draft = new QCheckBox(i18n("Open as draft"), this);
 
     m_status = new QLabel(this);
     m_status->setWordWrap(true);
-    m_status->setStyleSheet(QStringLiteral("color: palette(mid); font-size: small;"));
-    m_status->setText(QStringLiteral("Loading draft from commit history…"));
+    m_status->setStyleSheet(QStringLiteral("color: palette(mid);"));
+    m_status->setText(i18n("Loading draft from commit history…"));
 
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Cancel, this);
-    m_createBtn = buttons->addButton(QStringLiteral("Create PR"),
+    m_createBtn = buttons->addButton(i18nc("@action:button", "Create PR"),
                                      QDialogButtonBox::AcceptRole);
     m_createBtn->setEnabled(false); // re-enabled once the draft has loaded
     m_cancelBtn = buttons->button(QDialogButtonBox::Cancel);
@@ -48,7 +50,7 @@ PRDialog::PRDialog(CoreClient *core, const QString &threadId, const QString &bra
 
     auto *titleRow = new QHBoxLayout;
     titleRow->setContentsMargins(0, 0, 0, 0);
-    titleRow->addWidget(new QLabel(QStringLiteral("Title:"), this));
+    titleRow->addWidget(new QLabel(i18nc("@label:textbox", "Title:"), this));
     titleRow->addWidget(m_title, 1);
 
     auto *layout = new QVBoxLayout(this);
@@ -66,7 +68,7 @@ PRDialog::PRDialog(CoreClient *core, const QString &threadId, const QString &bra
 void PRDialog::loadDraft()
 {
     if (!m_core->isConnected()) {
-        m_status->setText(QStringLiteral("Not connected to the core."));
+        m_status->setText(i18n("Not connected to the core."));
         return;
     }
     const QString thread = m_threadId;
@@ -78,16 +80,16 @@ void PRDialog::loadDraft()
                      }
                      if (!error.isEmpty()) {
                          m_status->setText(
-                             QStringLiteral("Could not draft a PR: %1")
-                                 .arg(error.value(QStringLiteral("message")).toString()));
+                             i18n("Could not draft a PR: %1",
+                                  error.value(QStringLiteral("message")).toString()));
                          return;
                      }
                      m_title->setText(result.value(QStringLiteral("title")).toString());
                      m_body->setPlainText(
                          result.value(QStringLiteral("body")).toString());
                      m_status->setText(
-                         QStringLiteral("Draft generated from commit history — "
-                                        "edit freely before creating."));
+                         i18n("Draft generated from commit history — "
+                              "edit freely before creating."));
                      m_createBtn->setEnabled(true);
                      m_title->setFocus();
                      m_title->selectAll();
@@ -98,12 +100,12 @@ void PRDialog::onCreateClicked()
 {
     const QString title = m_title->text().trimmed();
     if (title.isEmpty()) {
-        m_status->setText(QStringLiteral("A title is required."));
+        m_status->setText(i18n("A title is required."));
         m_title->setFocus();
         return;
     }
     m_createBtn->setEnabled(false);
-    m_status->setText(QStringLiteral("Pushing branch and creating PR…"));
+    m_status->setText(i18n("Pushing branch and creating PR…"));
     const QString thread = m_threadId;
     m_core->call(QStringLiteral("git.openPR"),
                  QJsonObject{{QStringLiteral("threadId"), thread},
@@ -114,9 +116,9 @@ void PRDialog::onCreateClicked()
                      if (!error.isEmpty()) {
                          m_createBtn->setEnabled(true);
                          m_status->setText(
-                             QStringLiteral("Failed: %1")
-                                 .arg(error.value(QStringLiteral("message"))
-                                          .toString()));
+                             i18n("Failed: %1",
+                                  error.value(QStringLiteral("message"))
+                                      .toString()));
                          return;
                      }
                      emit prOpened(result.value(QStringLiteral("url")).toString());

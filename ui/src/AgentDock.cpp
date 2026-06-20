@@ -14,6 +14,8 @@
 #include <QMessageBox>
 #include <QStackedWidget>
 
+#include <KLocalizedString>
+
 AgentDock::AgentDock(CoreClient *core, QWidget *parent)
     : QObject(parent)
     , m_core(core)
@@ -31,8 +33,32 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
             addAgent(p);
         }
     });
+    connect(m_roster, &AgentRoster::newAgentWithModelRequested, this,
+            [this](const QString &project, const QString &model) {
+                QString p = project;
+                if (p.isEmpty() && !m_projects.isEmpty()) {
+                    p = m_projects.constLast();
+                }
+                if (!p.isEmpty()) {
+                    addAgent(p, model);
+                }
+            });
     connect(m_roster, &AgentRoster::closeProjectRequested, this, &AgentDock::closeProject);
+    connect(m_roster, &AgentRoster::closeOtherProjectsRequested, this,
+            &AgentDock::closeOtherProjects);
+    connect(m_roster, &AgentRoster::openTerminalRequested, this,
+            &AgentDock::openTerminalRequested); // routed to MainWindow
+    connect(m_roster, &AgentRoster::renameRequested, this, &AgentDock::renameAgent);
     connect(m_roster, &AgentRoster::projectFocused, this, &AgentDock::projectFocused);
+
+    // Seed the "+ New Agent" model dropdown. Ids must match AgentPanel's combo.
+    m_roster->setModelChoices({
+        {QString(), i18n("Default model")},
+        {QStringLiteral("opus"), i18n("Opus")},
+        {QStringLiteral("sonnet"), i18n("Sonnet")},
+        {QStringLiteral("haiku"), i18n("Haiku")},
+        {QStringLiteral("fable"), i18n("Fable")},
+    });
     connect(m_roster, &AgentRoster::agentActivated, this, [this](int id) {
         if (Entry *e = entryById(id)) {
             m_stack->setCurrentWidget(e->panel);
@@ -78,15 +104,15 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
     connect(m_roster, &AgentRoster::commitRequested, this, [this](int id) {
         Entry *e = entryById(id);
         if (!e || e->panel->threadId().isEmpty()) {
-            emit statusMessage(QStringLiteral("Start the agent before committing"));
+            emit statusMessage(i18n("Start the agent before committing"));
             return;
         }
         // A non-isolated agent commits onto the workspace's current branch —
         // make that explicit before it lands somewhere unexpected (e.g. main).
         if (!e->panel->isIsolated()
             && QMessageBox::warning(
-                   m_dialogParent, QStringLiteral("Commit in the workspace"),
-                   QStringLiteral(
+                   m_dialogParent, i18n("Commit in the workspace"),
+                   i18n(
                        "This agent runs directly in the workspace, so the commit "
                        "will land on the workspace's current branch — it is not "
                        "isolated.\n\nPromote the agent to a worktree first to keep "
@@ -97,8 +123,8 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
         }
         bool ok = false;
         const QString msg = QInputDialog::getText(
-            m_dialogParent, QStringLiteral("Commit agent changes"), QStringLiteral("Commit message:"),
-            QLineEdit::Normal, QStringLiteral("Agent Kate change"), &ok);
+            m_dialogParent, i18n("Commit agent changes"), i18n("Commit message:"),
+            QLineEdit::Normal, i18n("Agent Kate change"), &ok);
         if (!ok) {
             return;
         }
@@ -107,27 +133,27 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
                                  {QStringLiteral("message"), msg}},
                      [this](const QJsonObject &result, const QJsonObject &error) {
                          if (!error.isEmpty()) {
-                             emit statusMessage(QStringLiteral("Commit failed: %1")
-                                 .arg(error.value(QStringLiteral("message")).toString()));
+                             emit statusMessage(i18n("Commit failed: %1",
+                                 error.value(QStringLiteral("message")).toString()));
                          } else {
                              const QString branch =
                                  result.value(QStringLiteral("branch")).toString();
                              emit statusMessage(
                                  branch.isEmpty()
-                                     ? QStringLiteral("Committed the agent's changes")
-                                     : QStringLiteral("Committed to %1").arg(branch));
+                                     ? i18n("Committed the agent's changes")
+                                     : i18n("Committed to %1", branch));
                          }
                      });
     });
     connect(m_roster, &AgentRoster::prRequested, this, [this](int id) {
         Entry *e = entryById(id);
         if (!e || e->panel->threadId().isEmpty()) {
-            emit statusMessage(QStringLiteral("Start the agent before opening a PR"));
+            emit statusMessage(i18n("Start the agent before opening a PR"));
             return;
         }
         bool ok = false;
         const QString title = QInputDialog::getText(
-            m_dialogParent, QStringLiteral("Create pull request"), QStringLiteral("Pull request title:"),
+            m_dialogParent, i18n("Create pull request"), i18n("Pull request title:"),
             QLineEdit::Normal, QString(), &ok);
         if (!ok) {
             return;
@@ -137,28 +163,28 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
                                  {QStringLiteral("title"), title}},
                      [this](const QJsonObject &result, const QJsonObject &error) {
                          if (!error.isEmpty()) {
-                             emit statusMessage(QStringLiteral("Pull request failed: %1")
-                                 .arg(error.value(QStringLiteral("message")).toString()));
+                             emit statusMessage(i18n("Pull request failed: %1",
+                                 error.value(QStringLiteral("message")).toString()));
                          } else {
-                             emit statusMessage(QStringLiteral("Pull request opened: %1")
-                                 .arg(result.value(QStringLiteral("url")).toString()));
+                             emit statusMessage(i18n("Pull request opened: %1",
+                                 result.value(QStringLiteral("url")).toString()));
                          }
                      });
     });
     connect(m_roster, &AgentRoster::landRequested, this, [this](int id) {
         Entry *e = entryById(id);
         if (!e || e->panel->threadId().isEmpty()) {
-            emit statusMessage(QStringLiteral("Start the agent before merging its work"));
+            emit statusMessage(i18n("Start the agent before merging its work"));
             return;
         }
         if (!e->panel->isIsolated()) {
-            emit statusMessage(QStringLiteral(
+            emit statusMessage(i18n(
                 "This agent runs in the workspace — it has no branch to merge"));
             return;
         }
         if (QMessageBox::question(
-                m_dialogParent, QStringLiteral("Merge into local main"),
-                QStringLiteral(
+                m_dialogParent, i18n("Merge into local main"),
+                i18n(
                     "Merge this agent's branch into your local main branch?\n\n"
                     "Its commits are merged into the workspace locally — nothing "
                     "is pushed to GitHub."))
@@ -173,20 +199,18 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
                          if (!error.isEmpty()) {
                              const QString msg =
                                  error.value(QStringLiteral("message")).toString();
-                             emit statusMessage(QStringLiteral("Merge failed: %1").arg(msg));
+                             emit statusMessage(i18n("Merge failed: %1", msg));
                              QMessageBox::warning(m_dialogParent,
-                                 QStringLiteral("Merge into local main failed"), msg);
+                                 i18n("Merge into local main failed"), msg);
                          } else {
                              const QString branch =
                                  result.value(QStringLiteral("branch")).toString();
                              const QString into =
                                  result.value(QStringLiteral("into")).toString();
-                             emit statusMessage(QStringLiteral("Merged %1 into %2")
-                                 .arg(branch, into));
+                             emit statusMessage(i18n("Merged %1 into %2", branch, into));
                              QMessageBox::information(m_dialogParent,
-                                 QStringLiteral("Merge into local main"),
-                                 QStringLiteral("Merged %1 into %2.")
-                                     .arg(branch, into));
+                                 i18n("Merge into local main"),
+                                 i18n("Merged %1 into %2.", branch, into));
                          }
                      });
     });
@@ -199,9 +223,9 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
             closeAgent(id);
             return;
         }
-        if (QMessageBox::question(m_dialogParent, QStringLiteral("Discard worktree"),
-                QStringLiteral("Discard this agent's worktree and all of its uncommitted "
-                               "changes? This cannot be undone."))
+        if (QMessageBox::question(m_dialogParent, i18n("Discard worktree"),
+                i18n("Discard this agent's worktree and all of its uncommitted "
+                     "changes? This cannot be undone."))
             != QMessageBox::Yes) {
             return;
         }
@@ -209,10 +233,10 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
                      QJsonObject{{QStringLiteral("threadId"), e->panel->threadId()}},
                      [this](const QJsonObject &, const QJsonObject &error) {
                          if (!error.isEmpty()) {
-                             emit statusMessage(QStringLiteral("Discard failed: %1")
-                                 .arg(error.value(QStringLiteral("message")).toString()));
+                             emit statusMessage(i18n("Discard failed: %1",
+                                 error.value(QStringLiteral("message")).toString()));
                          } else {
-                             emit statusMessage(QStringLiteral("Discarded the agent's worktree"));
+                             emit statusMessage(i18n("Discarded the agent's worktree"));
                          }
                      });
     });
@@ -236,7 +260,7 @@ QWidget *AgentDock::activePanel() const
 void AgentDock::openProjectDialog()
 {
     const QString dir = QFileDialog::getExistingDirectory(
-        m_dialogParent, QStringLiteral("Open Project Folder"),
+        m_dialogParent, i18n("Open Project Folder"),
         m_projects.isEmpty() ? QDir::homePath() : m_projects.constLast());
     if (!dir.isEmpty()) {
         addProject(dir);
@@ -275,7 +299,7 @@ void AgentDock::attachSession(const QString &project, const QString &threadId,
     for (const Entry &e : m_agents) {
         if (e.panel->threadId() == threadId) {
             m_roster->setCurrentAgent(e.id);
-            emit statusMessage(QStringLiteral("That session is already attached"));
+            emit statusMessage(i18n("That session is already attached"));
             return;
         }
     }
@@ -307,15 +331,17 @@ QString AgentDock::currentThreadId() const
     return {};
 }
 
-AgentPanel *AgentDock::addAgent(const QString &projectPath)
+AgentPanel *AgentDock::addAgent(const QString &projectPath, const QString &model)
 {
     const int id = ++m_counter;
     auto *panel = new AgentPanel(m_core, m_stack);
     m_stack->addWidget(panel);
     m_agents.append(Entry{id, projectPath, panel});
 
-    m_roster->addAgent(projectPath, id, QStringLiteral("Agent %1").arg(id));
+    m_roster->addAgent(projectPath, id, i18n("Agent %1", id));
     wireAgentPanel(id, panel);
+    // Apply a pre-picked model before the first start (the combo is still free).
+    panel->preselectModel(model);
     // Set the workspace after wiring so the panel's first refresh() reaches the
     // roster — that's what seeds the card's initial status dot and subtitle.
     panel->setWorkspace(projectPath);
@@ -335,8 +361,13 @@ AgentPanel *AgentDock::addDormantAgent(const QString &project, const QString &th
     m_stack->addWidget(panel);
     m_agents.append(Entry{id, project, panel});
 
-    const QString label = title.isEmpty() ? QStringLiteral("Agent %1").arg(id) : title;
+    const QString label = title.isEmpty() ? i18n("Agent %1", id) : title;
     m_roster->addAgent(project, id, label);
+    // A persisted title is authoritative on restore (it may have been renamed)
+    // — pin it so a resumed transcript's auto-derived title can't overwrite it.
+    if (!title.isEmpty()) {
+        m_roster->setAgentTitlePinned(id, title);
+    }
     wireAgentPanel(id, panel);
     panel->setDormant(threadId, label, isolated); // emits dormantChanged
     return panel;
@@ -354,6 +385,8 @@ void AgentDock::wireAgentPanel(int agentId, AgentPanel *panel)
             [this, agentId](const QString &text) { m_roster->setAgentSubtitle(agentId, text); });
     connect(panel, &AgentPanel::dormantChanged, this,
             [this, agentId](bool dormant) { m_roster->setAgentDormant(agentId, dormant); });
+    connect(panel, &AgentPanel::attentionChanged, this,
+            [this, agentId](bool on) { m_roster->setAgentAttention(agentId, on); });
 }
 
 bool AgentDock::hasThread(const QString &threadId) const
@@ -457,7 +490,7 @@ void AgentDock::closeAgent(int agentId)
 void AgentDock::closeProject(const QString &path)
 {
     if (m_projects.size() <= 1) {
-        emit statusMessage(QStringLiteral("Agent Kate keeps at least one project open"));
+        emit statusMessage(i18n("Agent Kate keeps at least one project open"));
         return;
     }
     QList<int> ids;
@@ -471,9 +504,81 @@ void AgentDock::closeProject(const QString &path)
     }
     m_projects.removeAll(path);
     m_roster->removeProject(path);
+    // The project is gone for good — tell consumers (e.g. its terminal tabs) to
+    // release any per-project resources. This is the one place destroying a
+    // terminal is correct: an explicit close, never a switch.
+    emit projectClosed(path);
     if (m_agents.isEmpty() && !m_projects.isEmpty()) {
         addAgent(m_projects.constFirst());
     }
+}
+
+// closeOtherProjects closes every project except keepPath, respecting the
+// keep-at-least-one guard (keepPath is the one we keep, so it always holds).
+void AgentDock::closeOtherProjects(const QString &keepPath)
+{
+    const QStringList others = [&] {
+        QStringList l;
+        for (const QString &p : m_projects) {
+            if (p != keepPath) {
+                l.append(p);
+            }
+        }
+        return l;
+    }();
+    for (const QString &p : others) {
+        closeProject(p); // guard inside keeps the last one if needed
+    }
+}
+
+// renameAgent prompts for a new title, applies it optimistically to the card,
+// and persists it through the agent.rename IPC. On failure the card is
+// restored to its previous title and the user is told why.
+void AgentDock::renameAgent(int agentId)
+{
+    Entry *e = entryById(agentId);
+    if (!e) {
+        return;
+    }
+    bool ok = false;
+    const QString current = m_roster->agentTitle(agentId);
+    const QString title = QInputDialog::getText(
+                              m_dialogParent, i18n("Rename agent"),
+                              i18n("Agent name:"), QLineEdit::Normal, current, &ok)
+                              .trimmed();
+    // Reject an empty rename (and a no-op).
+    if (!ok || title.isEmpty() || title == current) {
+        return;
+    }
+    const QString threadId = e->panel->threadId();
+    const bool wasPinned = m_roster->isAgentTitlePinned(agentId);
+    // Optimistic: show (and pin) the new title now, roll back if the core
+    // rejects it. With no backend thread yet the rename is local-only (still
+    // pinned so the first derived title can't clobber it).
+    m_roster->setAgentTitlePinned(agentId, title);
+    if (threadId.isEmpty()) {
+        return;
+    }
+    m_core->call(QStringLiteral("agent.rename"),
+                 QJsonObject{{QStringLiteral("threadId"), threadId},
+                             {QStringLiteral("title"), title}},
+                 [this, agentId, current, title, wasPinned](const QJsonObject &, const QJsonObject &error) {
+                     if (!error.isEmpty()) {
+                         // Restore the prior title. Only re-pin if the row was
+                         // already user-pinned before this attempt — a failed
+                         // rename must not permanently disable auto-titling on a
+                         // row the user had never pinned.
+                         if (wasPinned) {
+                             m_roster->setAgentTitlePinned(agentId, current);
+                         } else {
+                             m_roster->restoreAgentTitleUnpinned(agentId, current);
+                         }
+                         emit statusMessage(i18n("Rename failed: %1",
+                             error.value(QStringLiteral("message")).toString()));
+                     } else {
+                         emit statusMessage(i18n("Renamed agent to “%1”", title));
+                     }
+                 });
 }
 
 AgentDock::Entry *AgentDock::entryById(int agentId)

@@ -21,9 +21,14 @@
 #include "git/LogViewer.h"
 #include "ipc/CoreClient.h"
 
+#include <KTextEditor/Cursor>
 #include <KTextEditor/Document>
+#include <KTextEditor/Range>
 #include <KTextEditor/View>
+#include "lsp/LspActions.h"
+#include "lsp/LspClient.h"
 #include "lsp/LspManager.h"
+#include "lsp/WorkspaceSymbolDialog.h"
 
 #include <KAboutData>
 #include <KMultiTabBar>
@@ -40,11 +45,13 @@
 #include <QActionGroup>
 #include <QCloseEvent>
 #include <QCoreApplication>
+#include <QCursor>
 #include <QDebug>
 #include <QDir>
 #include <QFileInfo>
 #include <QHBoxLayout>
 #include <QIcon>
+#include <QInputDialog>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QKeySequence>
@@ -52,6 +59,7 @@
 #include <QMenuBar>
 #include <QLabel>
 #include <QLineEdit>
+#include <QToolButton>
 #include <QPlainTextEdit>
 #include <QShortcut>
 #include <QSplitter>
@@ -127,7 +135,7 @@ void MainWindow::setupUi()
     m_agent = new AgentDock(m_core, this);
 
     m_editor = new EditorArea(this);
-    m_tree = new ProjectTree(this);
+    m_tree = new ProjectTree(m_core, this);
     m_lsp = new LspManager(this);
 
     auto *problems = new ProblemsPanel(m_lsp, this);
@@ -146,9 +154,15 @@ void MainWindow::setupUi()
     // on the left strip; result activation opens the file in the editor.
     m_search = new SearchPanel(m_core, this);
     connect(m_search, &SearchPanel::resultActivated, this,
-            [this](const QString &path, int line) {
-                m_editor->openFile(groupKey(), path, line);
+            [this](const QString &path, int line, int column) {
+                m_editor->openFile(groupKey(), path, line, column);
             });
+    // Esc inside the search field returns focus to the active editor view.
+    connect(m_search, &SearchPanel::escapeToEditor, this, [this] {
+        if (KTextEditor::View *view = m_editor->currentView()) {
+            view->setFocus();
+        }
+    });
 
     connect(m_worktreeDashboard, &WorktreeDashboard::statusMessage, this,
             [this](const QString &text) { statusBar()->showMessage(text, 6000); });
@@ -295,15 +309,63 @@ void MainWindow::setupUi()
     connect(m_editor, &EditorArea::currentFileChanged, this, [this](const QString &path) {
         if (!path.isEmpty()) {
             m_lsp->requestSymbols(path);
+            // Sync the file tree selection to the active editor when the user
+            // has opted in via the persisted toggle.
+            if (m_tree->isSyncWithEditor()) {
+                m_tree->revealPath(path);
+            }
+        }
+        updateLspStatus();
+    });
+
+    // A workspace edit (rename / code action) touched a file that isn't open.
+    connect(m_lsp, &LspManager::openFileRequested, this,
+            [this](const QString &path, int line) {
+                m_editor->openFile(groupKey(), path, line);
+            });
+    // Code actions arrived — pop the quick-fix menu at the cursor.
+    connect(m_lsp, &LspManager::codeActionsResolved, this,
+            [this](LspClient *client, const QJsonArray &actions) {
+                LspActions::showMenu(m_lsp, client, actions, this, QCursor::pos());
+            });
+    // Rename requested — collect the new name and perform it.
+    connect(m_lsp, &LspManager::renameRequested, this, [this](KTextEditor::View *view) {
+        if (!view) {
+            return;
+        }
+        const KTextEditor::Range word = view->document()->wordRangeAt(view->cursorPosition());
+        const QString current = word.isValid() ? view->document()->text(word) : QString();
+        bool ok = false;
+        const QString name = QInputDialog::getText(
+            this, i18nc("@title:window", "Rename Symbol"), i18n("New name:"),
+            QLineEdit::Normal, current, &ok);
+        if (ok && !name.isEmpty()) {
+            m_lsp->performRename(view, name);
         }
     });
+    // Transient LSP status messages and live server-status updates.
+    connect(m_lsp, &LspManager::statusMessage, this,
+            [this](const QString &text) { statusBar()->showMessage(text, 4000); });
+    connect(m_lsp, &LspManager::serverStatusChanged, this, &MainWindow::updateLspStatus);
 
     connect(m_agent, &AgentDock::agentActivated, this, &MainWindow::onAgentActivated);
     connect(m_agent, &AgentDock::projectFocused, this,
             [this](const QString &path) { m_tree->setRoot(path); });
+    connect(m_agent, &AgentDock::openTerminalRequested, this,
+            [this](const QString &dir) {
+                if (m_terminal && !dir.isEmpty()) {
+                    m_terminal->openTerminalAt(dir);
+                }
+            });
     connect(m_agent, &AgentDock::openDiff, this,
             [this](const QString &title, const QString &diff) {
                 m_editor->openDiff(groupKey(), title, diff);
+            });
+    connect(m_agent, &AgentDock::projectClosed, this,
+            [this](const QString &path) {
+                if (m_terminal) {
+                    m_terminal->closeProject(path);
+                }
             });
 
     connect(m_tree, &ProjectTree::fileActivated, this,
@@ -311,7 +373,15 @@ void MainWindow::setupUi()
     connect(m_tree, &ProjectTree::terminalRequested, this,
             [this](const QString &dir) {
                 if (m_terminal) {
+                    raisePanelByKey(m_keyTerminal);
                     m_terminal->openTerminalAt(dir);
+                }
+            });
+    connect(m_tree, &ProjectTree::runCommandRequested, this,
+            [this](const QString &dir, const QString &command) {
+                if (m_terminal) {
+                    raisePanelByKey(m_keyTerminal);
+                    m_terminal->runCommandAt(dir, command);
                 }
             });
     connect(m_tree, &ProjectTree::attachToChatRequested, this,
@@ -321,6 +391,13 @@ void MainWindow::setupUi()
                 }
             });
     connect(m_editor, &EditorArea::openFilesChanged, this, &MainWindow::pushOpenFilesToCore);
+    connect(m_editor, &EditorArea::revealInTreeRequested, this,
+            [this](const QString &path) {
+                if (m_tree) {
+                    m_tree->revealPath(path);
+                    raisePanelByKey(m_keyFiles);
+                }
+            });
     connect(m_editor, &EditorArea::currentFileChanged, this, [this](const QString &path) {
         if (m_core->isConnected()) {
             m_core->call(QStringLiteral("coop.setPresence"),
@@ -409,6 +486,14 @@ void MainWindow::setupActions()
 
     QAction *saveAct = KStandardAction::save(this, &MainWindow::onSave, this);
     fileMenu->addAction(saveAct);
+
+    // KStandardAction has no saveAll in this KF6 release; build the equivalent
+    // by hand with the conventional icon and Ctrl+Shift+S shortcut.
+    auto *saveAllAct = new QAction(QIcon::fromTheme(QStringLiteral("document-save-all")),
+                                   i18n("Save A&ll"), this);
+    saveAllAct->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_S));
+    connect(saveAllAct, &QAction::triggered, this, &MainWindow::onSaveAll);
+    fileMenu->addAction(saveAllAct);
 
     fileMenu->addSeparator();
     fileMenu->addAction(KStandardAction::quit(this, &QWidget::close, this));
@@ -513,6 +598,73 @@ void MainWindow::setupActions()
         m_search->focusQuery();
     });
 
+    // F3 / Shift+F3 step through the project-search results, opening each in
+    // turn. Scoped to the SearchPanel (WidgetWithChildrenShortcut) so they never
+    // clash with KTextEditor's own find-next while a code editor has focus.
+    auto *nextMatchAct = new QAction(i18n("Next Search Match"), this);
+    nextMatchAct->setShortcut(Qt::Key_F3);
+    nextMatchAct->setShortcutContext(Qt::WidgetWithChildrenShortcut);
+    connect(nextMatchAct, &QAction::triggered, this, [this] {
+        if (m_search) {
+            m_search->focusNextResult();
+        }
+    });
+    auto *prevMatchAct = new QAction(i18n("Previous Search Match"), this);
+    prevMatchAct->setShortcut(Qt::SHIFT | Qt::Key_F3);
+    prevMatchAct->setShortcutContext(Qt::WidgetWithChildrenShortcut);
+    connect(prevMatchAct, &QAction::triggered, this, [this] {
+        if (m_search) {
+            m_search->focusPrevResult();
+        }
+    });
+    if (m_search) {
+        m_search->addAction(nextMatchAct);
+        m_search->addAction(prevMatchAct);
+    }
+
+    viewMenu->addSeparator();
+    const bool termOk = m_terminal && m_terminal->isAvailable();
+    auto *newTermAct = viewMenu->addAction(
+        QIcon::fromTheme(QStringLiteral("utilities-terminal")), i18n("&New Terminal"));
+    newTermAct->setShortcut(Qt::CTRL | Qt::SHIFT | Qt::Key_T);
+    newTermAct->setEnabled(termOk);
+    connect(newTermAct, &QAction::triggered, this, [this] {
+        if (!m_terminal) {
+            return;
+        }
+        raisePanelByKey(m_keyTerminal);
+        m_terminal->newTerminal();
+    });
+
+    auto *focusTermAct = viewMenu->addAction(i18n("&Focus Terminal"));
+    focusTermAct->setShortcut(Qt::CTRL | Qt::Key_QuoteLeft);
+    focusTermAct->setEnabled(termOk);
+    connect(focusTermAct, &QAction::triggered, this, [this] {
+        if (!m_terminal) {
+            return;
+        }
+        raisePanelByKey(m_keyTerminal);
+        m_terminal->focusActiveTerminal();
+    });
+
+    auto *nextTermAct = viewMenu->addAction(i18n("Next Terminal"));
+    nextTermAct->setShortcut(Qt::CTRL | Qt::Key_PageDown);
+    nextTermAct->setEnabled(termOk);
+    connect(nextTermAct, &QAction::triggered, this, [this] {
+        if (m_terminal) {
+            m_terminal->nextTerminal();
+        }
+    });
+
+    auto *prevTermAct = viewMenu->addAction(i18n("Previous Terminal"));
+    prevTermAct->setShortcut(Qt::CTRL | Qt::Key_PageUp);
+    prevTermAct->setEnabled(termOk);
+    connect(prevTermAct, &QAction::triggered, this, [this] {
+        if (m_terminal) {
+            m_terminal->previousTerminal();
+        }
+    });
+
     QMenu *codeMenu = menuBar()->addMenu(i18n("&Code"));
     QAction *defAct = codeMenu->addAction(i18n("Go to &Definition"));
     defAct->setShortcut(Qt::Key_F12);
@@ -526,6 +678,89 @@ void MainWindow::setupActions()
     connect(refAct, &QAction::triggered, this, [this] {
         if (KTextEditor::View *view = m_editor->currentView()) {
             m_lsp->findReferences(view);
+        }
+    });
+
+    QAction *symbolAct = codeMenu->addAction(QIcon::fromTheme(QStringLiteral("code-context")),
+                                             i18n("Go to &Symbol in Workspace…"));
+    symbolAct->setShortcut(Qt::CTRL | Qt::Key_T);
+    connect(symbolAct, &QAction::triggered, this, [this] {
+        auto *dlg = new WorkspaceSymbolDialog(m_lsp, this);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        connect(dlg, &WorkspaceSymbolDialog::symbolChosen, this,
+                [this](const QString &path, int line) {
+                    m_editor->openFile(groupKey(), path, line);
+                });
+        dlg->show();
+    });
+
+    codeMenu->addSeparator();
+
+    QAction *quickFixAct = codeMenu->addAction(QIcon::fromTheme(QStringLiteral("tools-wizard")),
+                                               i18n("&Quick Fix…"));
+    quickFixAct->setShortcut(Qt::CTRL | Qt::Key_Period);
+    connect(quickFixAct, &QAction::triggered, this, [this] {
+        if (KTextEditor::View *view = m_editor->currentView()) {
+            m_lsp->requestCodeActions(view);
+        }
+    });
+
+    QAction *renameAct = codeMenu->addAction(i18n("Rena&me Symbol"));
+    renameAct->setShortcut(Qt::Key_F2);
+    connect(renameAct, &QAction::triggered, this, [this] {
+        if (KTextEditor::View *view = m_editor->currentView()) {
+            m_lsp->renameSymbol(view);
+        }
+    });
+
+    QAction *formatAct = codeMenu->addAction(i18n("&Format Document"));
+    formatAct->setShortcut(Qt::CTRL | Qt::ALT | Qt::Key_L);
+    connect(formatAct, &QAction::triggered, this, [this] {
+        if (KTextEditor::View *view = m_editor->currentView()) {
+            m_lsp->formatDocument(view);
+        }
+    });
+
+    m_formatOnSave = codeMenu->addAction(i18n("Format on &Save"));
+    m_formatOnSave->setCheckable(true);
+    m_formatOnSave->setChecked(KSharedConfig::openConfig()
+                                   ->group(QStringLiteral("CodeIntelligence"))
+                                   .readEntry("formatOnSave", false));
+    connect(m_formatOnSave, &QAction::toggled, this, [](bool on) {
+        KSharedConfig::openConfig()
+            ->group(QStringLiteral("CodeIntelligence"))
+            .writeEntry("formatOnSave", on);
+    });
+
+    QAction *sigAct = codeMenu->addAction(i18n("Show Signature &Help"));
+    sigAct->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_Space));
+    connect(sigAct, &QAction::triggered, this, [this] {
+        if (KTextEditor::View *view = m_editor->currentView()) {
+            m_lsp->requestSignatureHelp(view);
+        }
+    });
+
+    QAction *nextProbAct = codeMenu->addAction(i18n("&Next Problem"));
+    nextProbAct->setShortcut(Qt::Key_F8);
+    connect(nextProbAct, &QAction::triggered, this, [this] {
+        if (KTextEditor::View *view = m_editor->currentView()) {
+            m_lsp->nextProblem(view);
+        }
+    });
+
+    QAction *prevProbAct = codeMenu->addAction(i18n("&Previous Problem"));
+    prevProbAct->setShortcut(Qt::SHIFT | Qt::Key_F8);
+    connect(prevProbAct, &QAction::triggered, this, [this] {
+        if (KTextEditor::View *view = m_editor->currentView()) {
+            m_lsp->prevProblem(view);
+        }
+    });
+
+    QAction *restartAct = codeMenu->addAction(QIcon::fromTheme(QStringLiteral("view-refresh")),
+                                              i18n("&Restart Language Server"));
+    connect(restartAct, &QAction::triggered, this, [this] {
+        if (!m_activeFilePath.isEmpty()) {
+            m_lsp->restartServersForCurrentFile(m_activeFilePath);
         }
     });
 
@@ -961,11 +1196,48 @@ void MainWindow::setupCore()
 
     m_cursorPosLabel = new QLabel(this);
     m_cursorPosLabel->setContentsMargins(8, 0, 8, 0);
+    m_cursorPosLabel->setToolTip(i18n("Click to go to line"));
+    // Rendered as a link so a click jumps to a line — uses KTextEditor's native
+    // go-to-line action when present, else a simple line-number prompt.
+    m_cursorPosLabel->setTextInteractionFlags(Qt::LinksAccessibleByMouse);
+    connect(m_cursorPosLabel, &QLabel::linkActivated, this, [this](const QString &) {
+        KTextEditor::View *view = m_editor ? m_editor->currentView() : nullptr;
+        if (!view) {
+            return;
+        }
+        if (QAction *gotoAct = view->action("go_to_line")) {
+            gotoAct->trigger();
+            return;
+        }
+        bool ok = false;
+        const int line = QInputDialog::getInt(
+            this, i18n("Go to Line"), i18n("Line:"),
+            view->cursorPosition().line() + 1, 1,
+            view->document()->lines(), 1, &ok);
+        if (ok) {
+            view->setCursorPosition(KTextEditor::Cursor(line - 1, 0));
+            view->setFocus();
+        }
+    });
     statusBar()->addPermanentWidget(m_cursorPosLabel);
 
     m_modeLabel = new QLabel(this);
     m_modeLabel->setContentsMargins(8, 0, 8, 0);
     statusBar()->addPermanentWidget(m_modeLabel);
+
+    // Language-server status: an icon + text button. Clicking it restarts the
+    // server for the active file. Hidden when no server backs the file.
+    m_lspStatusButton = new QToolButton(this);
+    m_lspStatusButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    m_lspStatusButton->setAutoRaise(true);
+    m_lspStatusButton->setFocusPolicy(Qt::NoFocus);
+    m_lspStatusButton->hide();
+    connect(m_lspStatusButton, &QToolButton::clicked, this, [this] {
+        if (!m_activeFilePath.isEmpty()) {
+            m_lsp->restartServersForCurrentFile(m_activeFilePath);
+        }
+    });
+    statusBar()->addPermanentWidget(m_lspStatusButton);
 
     m_agentStatusLabel = new QLabel(this);
     m_agentStatusLabel->setContentsMargins(8, 0, 8, 0);
@@ -1034,6 +1306,8 @@ void MainWindow::onAgentActivated(int agentId, const QString &projectPath)
     }
     setWindowTitle(i18n("Agent Kate — %1", QDir(projectPath).dirName()));
     m_editor->setActiveGroup(groupKey());
+    // Reopen the tabs the human had for this project last run (once per run).
+    restoreEditorSession(projectPath);
 }
 
 QString MainWindow::groupKey() const
@@ -1055,7 +1329,100 @@ void MainWindow::setTabsByAgent(bool byAgent)
 
 void MainWindow::onSave()
 {
-    m_editor->saveCurrent();
+    KTextEditor::View *view = m_editor->currentView();
+    const bool formatOnSave = m_formatOnSave && m_formatOnSave->isChecked();
+
+    // When format-on-save is on and the active file's server can format, run the
+    // formatter first, then save in the reply. Otherwise save synchronously so
+    // markdown/csv/agent-save and server-less files are untouched.
+    if (view && formatOnSave && m_lsp->canFormat(view)) {
+        const QString path = m_activeFilePath;
+        m_lsp->formatDocument(view, [this, path](bool) {
+            if (m_editor->saveCurrent()) {
+                m_lsp->documentSaved(path);
+            }
+        });
+        return;
+    }
+
+    const QString path = m_activeFilePath;
+    if (m_editor->saveCurrent() && view) {
+        m_lsp->documentSaved(path);
+    }
+}
+
+void MainWindow::onSaveAll()
+{
+    m_editor->saveAll();
+}
+
+// persistEditorSession records every editor group's open tabs so the next run
+// can reopen them. Each group is keyed by its own group key (a project path, or
+// "agent-N" when tabs are grouped by agent) — the same key restoreEditorSession
+// reads back — so the working set for *all* open projects survives a quit, not
+// just the active one.
+void MainWindow::persistEditorSession()
+{
+    if (m_restoringSession || !m_editor) {
+        return;
+    }
+    KConfigGroup sessions = KSharedConfig::openConfig()
+                                ->group(QStringLiteral("Editor"))
+                                .group(QStringLiteral("Sessions"));
+    const QStringList keys = m_editor->groupKeys();
+    for (const QString &key : keys) {
+        if (key.isEmpty()) {
+            continue;
+        }
+        KConfigGroup grp = sessions.group(key);
+        grp.writeEntry("openFiles", m_editor->openFilePathsForGroup(key));
+        grp.writeEntry("active", m_editor->currentPathForGroup(key));
+    }
+}
+
+// restoreEditorSession replays the current group's saved tabs once per app run.
+// Skips files that no longer exist, caps the count to keep startup snappy, and
+// guards re-entrant persistence while replaying. Keyed by the active group key
+// (project path or "agent-N"), matching how persistEditorSession wrote it.
+void MainWindow::restoreEditorSession(const QString &projectPath)
+{
+    Q_UNUSED(projectPath);
+    const QString key = groupKey();
+    if (key.isEmpty() || m_restoredSessions.contains(key)) {
+        return;
+    }
+    m_restoredSessions.insert(key);
+
+    const KConfigGroup grp = KSharedConfig::openConfig()
+                                 ->group(QStringLiteral("Editor"))
+                                 .group(QStringLiteral("Sessions"))
+                                 .group(key);
+    const QStringList files = grp.readEntry("openFiles", QStringList());
+    if (files.isEmpty()) {
+        return;
+    }
+    const QString active = grp.readEntry("active", QString());
+
+    // Cap restored tabs so a session with many heavy viewers (PDFs) doesn't
+    // stall startup; the rest stay one click away in the tree.
+    constexpr int kMaxRestore = 20;
+
+    m_restoringSession = true;
+    int opened = 0;
+    for (const QString &path : files) {
+        if (opened >= kMaxRestore) {
+            break;
+        }
+        if (QFileInfo::exists(path)) {
+            m_editor->openFile(key, path);
+            ++opened;
+        }
+    }
+    // Re-activate the previously-focused file if it was restored.
+    if (!active.isEmpty() && QFileInfo::exists(active)) {
+        m_editor->openFile(key, active);
+    }
+    m_restoringSession = false;
 }
 
 // persistShellState writes the centre QSplitter geometry to KConfig.
@@ -1072,7 +1439,18 @@ void MainWindow::persistShellState()
 
 void MainWindow::closeEvent(QCloseEvent *event)
 {
+    // Snapshot the open tabs before any save-prompt closes them, so the session
+    // restores the full working set next run.
+    persistEditorSession();
+    // Prompt to save any modified documents; a cancel aborts the close.
+    if (m_editor && !m_editor->confirmCloseAll()) {
+        event->ignore();
+        return;
+    }
     persistShellState();
+    if (m_terminal) {
+        m_terminal->saveSession();
+    }
     KMainWindow::closeEvent(event);
 }
 
@@ -1315,8 +1693,11 @@ void MainWindow::updateCursorStatus()
     }
     const auto cursor = view->cursorPosition();
     if (m_cursorPosLabel) {
+        // Wrapped in an anchor so the label is clickable (jump to line); the
+        // href payload is unused — the linkActivated handler reads the view.
         m_cursorPosLabel->setText(
-            i18n("Ln %1, Col %2", cursor.line() + 1, cursor.column() + 1));
+            QStringLiteral("<a href=\"#gotoline\" style=\"text-decoration:none\">%1</a>")
+                .arg(i18n("Ln %1, Col %2", cursor.line() + 1, cursor.column() + 1)));
     }
     if (m_modeLabel) {
         KTextEditor::Document *doc = view->document();
@@ -1327,6 +1708,25 @@ void MainWindow::updateCursorStatus()
             ? enc
             : QStringLiteral("%1 · %2").arg(enc, mode));
     }
+}
+
+// updateLspStatus refreshes the status-bar language-server widget for the file
+// that currently has focus, hiding it when no server backs that file.
+void MainWindow::updateLspStatus()
+{
+    if (!m_lspStatusButton) {
+        return;
+    }
+    QString iconName;
+    const QString text = m_lsp->statusFor(m_activeFilePath, iconName);
+    if (text.isEmpty()) {
+        m_lspStatusButton->hide();
+        return;
+    }
+    m_lspStatusButton->setIcon(QIcon::fromTheme(iconName));
+    m_lspStatusButton->setText(text);
+    m_lspStatusButton->setToolTip(i18n("Click to restart the language server"));
+    m_lspStatusButton->show();
 }
 
 // reloadExtensionServers asks the core for every installed VS Code extension
@@ -1368,6 +1768,9 @@ void MainWindow::reloadExtensionServers()
                              args,
                              langIds.isEmpty() ? QString() : langIds.first().toString());
                      }
+                     // Apply newly-registered servers to already-open files.
+                     m_lsp->rebindOpenDocuments();
+                     updateLspStatus();
                  });
 }
 
