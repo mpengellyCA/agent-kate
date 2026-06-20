@@ -1,19 +1,25 @@
 #include "ProblemsPanel.h"
 #include "lsp/LspManager.h"
 
+#include <KLocalizedString>
+
+#include <QAction>
 #include <QFileInfo>
-#include <QListWidget>
-#include <QListWidgetItem>
+#include <QIcon>
+#include <QMap>
+#include <QToolBar>
+#include <QTreeWidget>
+#include <QTreeWidgetItem>
 #include <QVBoxLayout>
 
 namespace {
-QColor severityColor(int severity)
+// Severity → a Breeze theme icon name so problems match the user's scheme.
+QString severityIcon(int severity)
 {
     switch (severity) {
-    case 1:  return QColor(0xe3, 0x6b, 0x5f);
-    case 2:  return QColor(0xe0, 0xa5, 0x3a);
-    case 3:  return QColor(0x6f, 0x9b, 0xd6);
-    default: return QColor(0x8b, 0x91, 0xa0);
+    case 1:  return QStringLiteral("dialog-error");
+    case 2:  return QStringLiteral("dialog-warning");
+    default: return QStringLiteral("dialog-information");
     }
 }
 } // namespace
@@ -21,19 +27,39 @@ QColor severityColor(int severity)
 ProblemsPanel::ProblemsPanel(LspManager *lsp, QWidget *parent)
     : QWidget(parent)
     , m_lsp(lsp)
-    , m_list(new QListWidget(this))
+    , m_tree(new QTreeWidget(this))
 {
-    m_list->setFrameShape(QFrame::NoFrame);
+    m_tree->setFrameShape(QFrame::NoFrame);
+    m_tree->setHeaderHidden(true);
+    m_tree->setIndentation(14);
+
+    auto *toolbar = new QToolBar(this);
+    toolbar->setToolButtonStyle(Qt::ToolButtonIconOnly);
+    toolbar->setIconSize(QSize(16, 16));
+
+    auto addFilter = [&](const QString &iconName, const QString &text) {
+        auto *act = new QAction(QIcon::fromTheme(iconName), text, this);
+        act->setCheckable(true);
+        act->setChecked(true);
+        toolbar->addAction(act);
+        connect(act, &QAction::toggled, this, &ProblemsPanel::rebuild);
+        return act;
+    };
+    m_showErrors = addFilter(QStringLiteral("dialog-error"), i18n("Show errors"));
+    m_showWarnings = addFilter(QStringLiteral("dialog-warning"), i18n("Show warnings"));
+    m_showInfo = addFilter(QStringLiteral("dialog-information"), i18n("Show information"));
 
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
-    layout->addWidget(m_list);
+    layout->setSpacing(0);
+    layout->addWidget(toolbar);
+    layout->addWidget(m_tree);
 
     connect(m_lsp, &LspManager::problemsChanged, this, &ProblemsPanel::rebuild);
-    connect(m_list, &QListWidget::itemActivated, this, [this](QListWidgetItem *item) {
-        const QString path = item->data(Qt::UserRole).toString();
+    connect(m_tree, &QTreeWidget::itemActivated, this, [this](QTreeWidgetItem *item) {
+        const QString path = item->data(0, Qt::UserRole).toString();
         if (!path.isEmpty()) {
-            emit activated(path, item->data(Qt::UserRole + 1).toInt());
+            emit activated(path, item->data(0, Qt::UserRole + 1).toInt());
         }
     });
 
@@ -42,25 +68,46 @@ ProblemsPanel::ProblemsPanel(LspManager *lsp, QWidget *parent)
 
 void ProblemsPanel::rebuild()
 {
-    m_list->clear();
+    m_tree->clear();
     const QList<Problem> problems = m_lsp->problems();
-    if (problems.isEmpty()) {
-        auto *item = new QListWidgetItem(QStringLiteral("No problems detected"));
-        item->setForeground(severityColor(4));
+
+    // Group surviving problems by file.
+    QMap<QString, QList<Problem>> byFile;
+    for (const Problem &p : problems) {
+        const bool keep = (p.severity == 1 && m_showErrors->isChecked())
+                          || (p.severity == 2 && m_showWarnings->isChecked())
+                          || (p.severity >= 3 && m_showInfo->isChecked());
+        if (keep) {
+            byFile[p.path].append(p);
+        }
+    }
+
+    if (byFile.isEmpty()) {
+        auto *item = new QTreeWidgetItem(m_tree);
+        item->setText(0, i18n("No problems detected"));
         item->setFlags(Qt::NoItemFlags);
-        m_list->addItem(item);
         return;
     }
-    for (const Problem &p : problems) {
-        auto *item = new QListWidgetItem(
-            QStringLiteral("%1:%2   %3")
-                .arg(QFileInfo(p.path).fileName())
-                .arg(p.line + 1)
-                .arg(p.message.simplified()));
-        item->setData(Qt::UserRole, p.path);
-        item->setData(Qt::UserRole + 1, p.line);
-        item->setForeground(severityColor(p.severity));
-        item->setToolTip(QStringLiteral("%1:%2").arg(p.path).arg(p.line + 1));
-        m_list->addItem(item);
+
+    for (auto it = byFile.constBegin(); it != byFile.constEnd(); ++it) {
+        auto *header = new QTreeWidgetItem(m_tree);
+        header->setText(0, QStringLiteral("%1  (%2)")
+                               .arg(QFileInfo(it.key()).fileName())
+                               .arg(it.value().size()));
+        header->setIcon(0, QIcon::fromTheme(QStringLiteral("text-x-generic")));
+        header->setToolTip(0, it.key());
+        header->setFlags(Qt::ItemIsEnabled);
+        header->setExpanded(true);
+
+        for (const Problem &p : it.value()) {
+            auto *child = new QTreeWidgetItem(header);
+            child->setText(0, QStringLiteral("%1:  %2")
+                                  .arg(p.line + 1)
+                                  .arg(p.message.simplified()));
+            child->setIcon(0, QIcon::fromTheme(severityIcon(p.severity)));
+            child->setData(0, Qt::UserRole, p.path);
+            child->setData(0, Qt::UserRole + 1, p.line);
+            child->setToolTip(0, QStringLiteral("%1:%2").arg(p.path).arg(p.line + 1));
+        }
     }
 }
