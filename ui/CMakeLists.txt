@@ -14,6 +14,7 @@ find_package(KF6 6.0 REQUIRED COMPONENTS
     XmlGui              # KMainWindow, KHelpMenu
     ConfigWidgets       # KStandardAction
     Config              # KSharedConfig, KConfigGroup (KF6::ConfigCore)
+    Completion          # KHistoryComboBox — search query recall
     CoreAddons          # KAboutData, KPluginFactory
     I18n                # i18n()
     Parts               # KParts — embedding the Konsole terminal
@@ -84,6 +85,7 @@ target_link_libraries(agentkate PRIVATE
     KF6::XmlGui
     KF6::ConfigWidgets
     KF6::ConfigCore
+    KF6::Completion
     KF6::CoreAddons
     KF6::I18n
     KF6::Parts

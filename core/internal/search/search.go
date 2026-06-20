@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os/exec"
+	"strconv"
 	"strings"
 )
 
@@ -25,15 +26,23 @@ type Options struct {
 
 // Match is a single hit inside a file.
 type Match struct {
-	Line    int    `json:"line"`
-	Column  int    `json:"column"`
-	Preview string `json:"preview"`
+	Line   int `json:"line"`
+	Column int `json:"column"` // 1-based start of the matched span
+	// MatchLen is the byte length of the matched span (submatch end - start),
+	// so the UI can highlight exactly the matched text even for regex queries.
+	// 0 when ripgrep reported no submatch.
+	MatchLen int    `json:"matchLen"`
+	Preview  string `json:"preview"`
 }
 
 // FileMatches groups hits by file.
 type FileMatches struct {
 	Path    string  `json:"path"`
 	Matches []Match `json:"matches"`
+	// Capped is true when this file hit ripgrep's per-file --max-count limit,
+	// so more matches exist on disk than are listed here. The UI surfaces this
+	// so the count isn't read as exhaustive.
+	Capped bool `json:"capped"`
 }
 
 // Result is what the IPC handler returns.
@@ -56,7 +65,11 @@ func Run(opts Options) (*Result, error) {
 		limit = 2000
 	}
 
-	args := []string{"--json", "--no-messages", "--max-count=200"}
+	// Per-file match cap. Kept as a named constant so the parser can flag files
+	// that hit it (FileMatches.Capped) rather than silently truncating.
+	const perFileMax = 200
+
+	args := []string{"--json", "--no-messages", "--max-count=" + strconv.Itoa(perFileMax)}
 	if !opts.Regex {
 		args = append(args, "--fixed-strings")
 	}
@@ -118,14 +131,19 @@ func Run(opts Options) (*Result, error) {
 			LineNumber int `json:"line_number"`
 			Submatches []struct {
 				Start int `json:"start"`
+				End   int `json:"end"`
 			} `json:"submatches"`
 		}
 		if err := json.Unmarshal(evt.Data, &m); err != nil {
 			continue
 		}
 		col := 1
+		matchLen := 0
 		if len(m.Submatches) > 0 {
 			col = m.Submatches[0].Start + 1
+			if n := m.Submatches[0].End - m.Submatches[0].Start; n > 0 {
+				matchLen = n
+			}
 		}
 		fm, ok := byPath[m.Path.Text]
 		if !ok {
@@ -134,9 +152,10 @@ func Run(opts Options) (*Result, error) {
 			order = append(order, m.Path.Text)
 		}
 		fm.Matches = append(fm.Matches, Match{
-			Line:    m.LineNumber,
-			Column:  col,
-			Preview: strings.TrimRight(m.Lines.Text, "\n"),
+			Line:     m.LineNumber,
+			Column:   col,
+			MatchLen: matchLen,
+			Preview:  strings.TrimRight(m.Lines.Text, "\n"),
 		})
 		total++
 	}
@@ -149,7 +168,13 @@ func Run(opts Options) (*Result, error) {
 
 	files := make([]FileMatches, 0, len(order))
 	for _, p := range order {
-		files = append(files, *byPath[p])
+		fm := byPath[p]
+		// ripgrep stops at perFileMax matches per file; a file at that exact
+		// count almost certainly has more on disk. Flag it for the UI.
+		if len(fm.Matches) >= perFileMax {
+			fm.Capped = true
+		}
+		files = append(files, *fm)
 	}
 	return &Result{Files: files, Truncated: truncated, Total: total}, nil
 }

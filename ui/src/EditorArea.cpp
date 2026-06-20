@@ -108,8 +108,12 @@ void EditorArea::updateVisible()
     }
 }
 
-void EditorArea::openFile(const QString &groupKey, const QString &path, int line)
+void EditorArea::openFile(const QString &groupKey, const QString &path, int line,
+                          int column)
 {
+    if (column < 0) {
+        column = 0;
+    }
     if (!m_editor) {
         emit statusMessage(QStringLiteral("KTextEditor engine unavailable"));
         return;
@@ -128,7 +132,7 @@ void EditorArea::openFile(const QString &groupKey, const QString &path, int line
                 m_activeGroup = groupKey;
                 updateVisible();
                 if (line >= 0) {
-                    view->setCursorPosition(KTextEditor::Cursor(line, 0));
+                    view->setCursorPosition(KTextEditor::Cursor(line, column));
                 }
                 return;
             }
@@ -138,7 +142,7 @@ void EditorArea::openFile(const QString &groupKey, const QString &path, int line
                 m_activeGroup = groupKey;
                 updateVisible();
                 if (line >= 0) {
-                    md->view()->setCursorPosition(KTextEditor::Cursor(line, 0));
+                    md->view()->setCursorPosition(KTextEditor::Cursor(line, column));
                 }
                 return;
             }
@@ -176,7 +180,7 @@ void EditorArea::openFile(const QString &groupKey, const QString &path, int line
         m_activeGroup = groupKey;
         updateVisible();
         if (line >= 0) {
-            md->view()->setCursorPosition(KTextEditor::Cursor(line, 0));
+            md->view()->setCursorPosition(KTextEditor::Cursor(line, column));
         }
         // A real Kate document backs this tab, so the rest of the app (LSP,
         // Outline, Problems, Git gutter/blame) must see it open like any other.
@@ -243,7 +247,7 @@ void EditorArea::openFile(const QString &groupKey, const QString &path, int line
     m_activeGroup = groupKey;
     updateVisible();
     if (line >= 0) {
-        view->setCursorPosition(KTextEditor::Cursor(line, 0));
+        view->setCursorPosition(KTextEditor::Cursor(line, column));
     }
     emit documentOpened(doc, abs);
     emit openFilesChanged();

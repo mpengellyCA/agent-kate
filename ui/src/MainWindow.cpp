@@ -153,9 +153,15 @@ void MainWindow::setupUi()
     // on the left strip; result activation opens the file in the editor.
     m_search = new SearchPanel(m_core, this);
     connect(m_search, &SearchPanel::resultActivated, this,
-            [this](const QString &path, int line) {
-                m_editor->openFile(groupKey(), path, line);
+            [this](const QString &path, int line, int column) {
+                m_editor->openFile(groupKey(), path, line, column);
             });
+    // Esc inside the search field returns focus to the active editor view.
+    connect(m_search, &SearchPanel::escapeToEditor, this, [this] {
+        if (KTextEditor::View *view = m_editor->currentView()) {
+            view->setFocus();
+        }
+    });
 
     connect(m_worktreeDashboard, &WorktreeDashboard::statusMessage, this,
             [this](const QString &text) { statusBar()->showMessage(text, 6000); });
@@ -550,6 +556,30 @@ void MainWindow::setupActions()
         raisePanelByKey(m_keySearch);
         m_search->focusQuery();
     });
+
+    // F3 / Shift+F3 step through the project-search results, opening each in
+    // turn. Scoped to the SearchPanel (WidgetWithChildrenShortcut) so they never
+    // clash with KTextEditor's own find-next while a code editor has focus.
+    auto *nextMatchAct = new QAction(i18n("Next Search Match"), this);
+    nextMatchAct->setShortcut(Qt::Key_F3);
+    nextMatchAct->setShortcutContext(Qt::WidgetWithChildrenShortcut);
+    connect(nextMatchAct, &QAction::triggered, this, [this] {
+        if (m_search) {
+            m_search->focusNextResult();
+        }
+    });
+    auto *prevMatchAct = new QAction(i18n("Previous Search Match"), this);
+    prevMatchAct->setShortcut(Qt::SHIFT | Qt::Key_F3);
+    prevMatchAct->setShortcutContext(Qt::WidgetWithChildrenShortcut);
+    connect(prevMatchAct, &QAction::triggered, this, [this] {
+        if (m_search) {
+            m_search->focusPrevResult();
+        }
+    });
+    if (m_search) {
+        m_search->addAction(nextMatchAct);
+        m_search->addAction(prevMatchAct);
+    }
 
     QMenu *codeMenu = menuBar()->addMenu(i18n("&Code"));
     QAction *defAct = codeMenu->addAction(i18n("Go to &Definition"));
