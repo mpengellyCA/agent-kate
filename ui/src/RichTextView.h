@@ -11,6 +11,8 @@ class View;
 class QTextBrowser;
 class QSplitter;
 class QTimer;
+class QVBoxLayout;
+class KMessageWidget;
 
 // RichTextView hosts a Markdown *or* HTML file inside an editor tab with three
 // modes:
@@ -60,6 +62,9 @@ protected:
 private:
     void render();
     void scheduleRender();
+    // Show/refresh the "modified on disk" reload banner above the splitter when
+    // the file changed underneath unsaved edits (mirrors EditorArea's policy).
+    void showReloadBanner(int reason);
     // Clamp oversized preview images to the pane width (GitHub's max-width:100%),
     // preserving aspect ratio and never enlarging past the image's natural size.
     void constrainImages();
@@ -70,6 +75,8 @@ private:
     KTextEditor::View *m_view = nullptr;
     QTextBrowser *m_preview = nullptr;
     QSplitter *m_splitter = nullptr;
+    KMessageWidget *m_reloadBanner = nullptr;
+    QVBoxLayout *m_layout = nullptr;
     QTimer *m_debounce = nullptr;
     QTimer *m_relayout = nullptr;
     Mode m_mode = Preview;

@@ -36,9 +36,15 @@ public:
     void setRoot(const QString &path);
     QString root() const { return m_root; }
 
-    // Select, scroll to and expand to a path if it lives under the current
-    // root. No-op for paths outside the tree.
+    // Select and scroll the tree to `path` (from a tab's "Reveal in Tree" or a
+    // breadcrumb click), expanding any collapsed ancestors. No-op if the path
+    // is outside the current root. QFileSystemModel populates directories
+    // lazily, so ancestors are expanded top-down to force them in.
     void revealPath(const QString &path);
+
+    // Whether the persisted "sync with editor" toggle is on. Auto-sync callers
+    // gate revealPath() on this; explicit reveal actions ignore it.
+    bool isSyncWithEditor() const { return m_syncWithEditor; }
 
 Q_SIGNALS:
     void fileActivated(const QString &path);

@@ -2,6 +2,7 @@
 
 #include <KMainWindow>
 #include <QHash>
+#include <QSet>
 #include <QString>
 
 namespace KTextEditor {
@@ -72,6 +73,7 @@ private:
     void updateAgentBadge();
     void updateLspStatus();    // refresh the status-bar language-server widget
     void onSave();
+    void onSaveAll();
     void reloadExtensionServers();
     void onAgentActivated(int agentId, const QString &projectPath);
     void setTabsByAgent(bool byAgent);
@@ -79,6 +81,11 @@ private:
     void pushOpenFilesToCore();
 
     void persistShellState();
+    // Persist/restore the editor's open tabs per project, so a restart reopens
+    // the files the human was working on. Keyed by project path (agent ids may
+    // be reassigned). m_restoringSession guards the replay from re-persisting.
+    void persistEditorSession();
+    void restoreEditorSession(const QString &projectPath);
 
     CoreClient *m_core = nullptr;
     EditorArea *m_editor = nullptr;
@@ -157,4 +164,10 @@ private:
     QString m_activeProject;
     int m_activeAgentId = -1;
     bool m_tabsByAgent = false; // editor tab grouping: false = project, true = agent
+
+    // Session restore: projects whose saved tabs have already been replayed
+    // (each project restores once per app run), and a guard so the replay's
+    // openFile calls don't re-trigger persistence.
+    QSet<QString> m_restoredSessions;
+    bool m_restoringSession = false;
 };

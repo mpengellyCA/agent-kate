@@ -348,7 +348,9 @@ QModelIndex ProjectTree::viewIndex(const QModelIndex &srcIndex) const
 
 void ProjectTree::revealPath(const QString &path)
 {
-    if (!m_syncWithEditor || path.isEmpty() || m_root.isEmpty()) {
+    // Unconditional: callers decide whether to honour the sync-with-editor
+    // toggle (auto-sync does; the explicit "Reveal in Tree" action does not).
+    if (path.isEmpty() || m_root.isEmpty()) {
         return;
     }
     // Guard against paths outside the current root.

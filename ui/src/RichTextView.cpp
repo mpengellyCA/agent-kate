@@ -1,16 +1,20 @@
 #include "RichTextView.h"
 
 #include <KConfigGroup>
+#include <KLocalizedString>
+#include <KMessageWidget>
 #include <KSharedConfig>
 #include <KTextEditor/Document>
 #include <KTextEditor/Editor>
 #include <KTextEditor/View>
 
+#include <QAction>
 #include <QActionGroup>
 #include <QDesktopServices>
 #include <QDir>
 #include <QEvent>
 #include <QFileInfo>
+#include <QIcon>
 #include <QImageReader>
 #include <QSplitter>
 #include <QTextBlock>
@@ -88,14 +92,20 @@ RichTextView::RichTextView(KTextEditor::Editor *editor, const QString &path, QWi
     // to the tab. EditorArea emits documentOpened/documentClosed for it so LSP,
     // Outline and Git see the file like any other text document.
     m_doc = editor->createDocument(this);
-    // Agents edit files on disk; reload silently rather than nagging the human
-    // (same policy as EditorArea's plain-text path).
+    // Agents edit files on disk. Reload silently when the human has no unsaved
+    // edits; otherwise surface a banner rather than discarding their work (same
+    // policy as EditorArea's plain-text path).
     connect(m_doc, &KTextEditor::Document::modifiedOnDisk, this,
             [this](KTextEditor::Document *, bool,
                    KTextEditor::Document::ModifiedOnDiskReason reason) {
-                if (reason != KTextEditor::Document::OnDiskUnmodified && !m_doc->isModified()) {
-                    m_doc->documentReload();
+                if (reason == KTextEditor::Document::OnDiskUnmodified) {
+                    return;
                 }
+                if (!m_doc->isModified()) {
+                    m_doc->documentReload();
+                    return;
+                }
+                showReloadBanner(static_cast<int>(reason));
             });
     m_doc->openUrl(QUrl::fromLocalFile(m_path));
 
@@ -151,11 +161,11 @@ RichTextView::RichTextView(KTextEditor::Editor *editor, const QString &path, QWi
     auto *previewAction = addMode(tr("Preview"), Preview);
     auto *splitAction = addMode(tr("Split"), Split);
 
-    auto *layout = new QVBoxLayout(this);
-    layout->setContentsMargins(0, 0, 0, 0);
-    layout->setSpacing(0);
-    layout->addWidget(toolbar);
-    layout->addWidget(m_splitter, 1);
+    m_layout = new QVBoxLayout(this);
+    m_layout->setContentsMargins(0, 0, 0, 0);
+    m_layout->setSpacing(0);
+    m_layout->addWidget(toolbar);
+    m_layout->addWidget(m_splitter, 1);
 
     const int saved = modeConfig(m_format).readEntry("mode", static_cast<int>(Preview));
     m_mode = static_cast<Mode>(qBound<int>(Raw, saved, Split));
@@ -198,6 +208,51 @@ void RichTextView::scheduleRender()
     if (m_preview->isVisible()) {
         m_debounce->start();
     }
+}
+
+void RichTextView::showReloadBanner(int reason)
+{
+    if (!m_reloadBanner) {
+        m_reloadBanner = new KMessageWidget(this);
+        m_reloadBanner->setMessageType(KMessageWidget::Warning);
+        m_reloadBanner->setCloseButtonVisible(true);
+        m_reloadBanner->setWordWrap(true);
+        auto *reloadAct = new QAction(QIcon::fromTheme(QStringLiteral("view-refresh")),
+                                      i18n("Reload"), m_reloadBanner);
+        connect(reloadAct, &QAction::triggered, m_doc,
+                [this] { m_doc->documentReload(); });
+        auto *keepAct = new QAction(i18n("Keep My Version"), m_reloadBanner);
+        connect(keepAct, &QAction::triggered, m_reloadBanner,
+                [this] { m_reloadBanner->animatedHide(); });
+        m_reloadBanner->addAction(reloadAct);
+        m_reloadBanner->addAction(keepAct);
+        // Hide on reload success (a clean buffer after a successful reload).
+        connect(m_doc, &KTextEditor::Document::modifiedChanged, m_reloadBanner, [this] {
+            if (!m_doc->isModified()) {
+                m_reloadBanner->animatedHide();
+            }
+        });
+        // Sit above the splitter (index 1: after the toolbar at index 0).
+        m_layout->insertWidget(1, m_reloadBanner);
+    }
+    QString text;
+    switch (static_cast<KTextEditor::Document::ModifiedOnDiskReason>(reason)) {
+    case KTextEditor::Document::OnDiskDeleted:
+        text = i18n("This file was deleted on disk, but you have unsaved "
+                    "changes. Keep your version or discard it?");
+        break;
+    case KTextEditor::Document::OnDiskCreated:
+        text = i18n("This file was created on disk while you have unsaved "
+                    "changes. Reload it or keep your version?");
+        break;
+    default:
+        text = i18n("This file was modified on disk (likely by an agent) and "
+                    "you have unsaved changes. Reload to take the new version, "
+                    "or keep yours.");
+        break;
+    }
+    m_reloadBanner->setText(text);
+    m_reloadBanner->animatedShow();
 }
 
 void RichTextView::render()

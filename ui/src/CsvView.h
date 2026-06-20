@@ -8,7 +8,9 @@
 #include <QVector>
 #include <QWidget>
 
+class QFileSystemWatcher;
 class QTableView;
+class QTimer;
 
 // Read-only table model backing CsvView. The file's first record is treated as
 // the column header; the parsed grid is held in memory (fine for typical CSVs).
@@ -57,7 +59,15 @@ public:
     static bool canDisplay(const QString &path);
 
 private:
+    // (Re)load the file into the model and resize columns. Used on construction
+    // and when the on-disk file changes (an agent rewrote it).
+    void reload();
+
     QString m_path;
     QTableView *m_table = nullptr;
+    CsvModel *m_model = nullptr;
     QVector<XlsxSheet> m_sheets; // workbook sheets, kept for the sheet selector
+    int m_currentSheet = 0;      // selected workbook sheet, preserved across reloads
+    QFileSystemWatcher *m_watcher = nullptr;
+    QTimer *m_reloadDebounce = nullptr;
 };
