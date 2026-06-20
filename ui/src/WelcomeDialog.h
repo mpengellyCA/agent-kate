@@ -33,6 +33,8 @@ private:
     void accept(const QString &path);
     void onItemActivated(QListWidgetItem *item);
     void onRemoveCurrent();
+    void onContextMenu(const QPoint &pos);
+    void addRow(const QString &path, bool pinned);
 
     QString m_selected;
     QLabel *m_lastLabel = nullptr;

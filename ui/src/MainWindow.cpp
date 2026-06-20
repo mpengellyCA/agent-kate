@@ -127,7 +127,7 @@ void MainWindow::setupUi()
     m_agent = new AgentDock(m_core, this);
 
     m_editor = new EditorArea(this);
-    m_tree = new ProjectTree(this);
+    m_tree = new ProjectTree(m_core, this);
     m_lsp = new LspManager(this);
 
     auto *problems = new ProblemsPanel(m_lsp, this);
@@ -295,6 +295,9 @@ void MainWindow::setupUi()
     connect(m_editor, &EditorArea::currentFileChanged, this, [this](const QString &path) {
         if (!path.isEmpty()) {
             m_lsp->requestSymbols(path);
+            // Sync the file tree selection to the active editor when the user
+            // has opted in (the tree itself honours its persisted toggle).
+            m_tree->revealPath(path);
         }
     });
 

@@ -37,6 +37,8 @@ add_executable(agentkate
     src/ReferencesPanel.cpp
     src/OutlinePanel.cpp
     src/ProjectTree.cpp
+    src/FileFilterProxyModel.cpp
+    src/GitStatusDelegate.cpp
     src/RecentProjects.cpp
     src/shell/SideBar.cpp
     src/shell/ShellLayout.cpp
