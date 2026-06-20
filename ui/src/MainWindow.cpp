@@ -21,6 +21,7 @@
 #include "git/LogViewer.h"
 #include "ipc/CoreClient.h"
 
+#include <KTextEditor/Cursor>
 #include <KTextEditor/Document>
 #include <KTextEditor/View>
 #include "lsp/LspManager.h"
@@ -45,6 +46,7 @@
 #include <QFileInfo>
 #include <QHBoxLayout>
 #include <QIcon>
+#include <QInputDialog>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QKeySequence>
@@ -321,6 +323,13 @@ void MainWindow::setupUi()
                 }
             });
     connect(m_editor, &EditorArea::openFilesChanged, this, &MainWindow::pushOpenFilesToCore);
+    connect(m_editor, &EditorArea::revealInTreeRequested, this,
+            [this](const QString &path) {
+                if (m_tree) {
+                    m_tree->revealPath(path);
+                    raisePanelByKey(m_keyFiles);
+                }
+            });
     connect(m_editor, &EditorArea::currentFileChanged, this, [this](const QString &path) {
         if (m_core->isConnected()) {
             m_core->call(QStringLiteral("coop.setPresence"),
@@ -409,6 +418,14 @@ void MainWindow::setupActions()
 
     QAction *saveAct = KStandardAction::save(this, &MainWindow::onSave, this);
     fileMenu->addAction(saveAct);
+
+    // KStandardAction has no saveAll in this KF6 release; build the equivalent
+    // by hand with the conventional icon and Ctrl+Shift+S shortcut.
+    auto *saveAllAct = new QAction(QIcon::fromTheme(QStringLiteral("document-save-all")),
+                                   i18n("Save A&ll"), this);
+    saveAllAct->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_S));
+    connect(saveAllAct, &QAction::triggered, this, &MainWindow::onSaveAll);
+    fileMenu->addAction(saveAllAct);
 
     fileMenu->addSeparator();
     fileMenu->addAction(KStandardAction::quit(this, &QWidget::close, this));
@@ -961,6 +978,29 @@ void MainWindow::setupCore()
 
     m_cursorPosLabel = new QLabel(this);
     m_cursorPosLabel->setContentsMargins(8, 0, 8, 0);
+    m_cursorPosLabel->setToolTip(i18n("Click to go to line"));
+    // Rendered as a link so a click jumps to a line — uses KTextEditor's native
+    // go-to-line action when present, else a simple line-number prompt.
+    m_cursorPosLabel->setTextInteractionFlags(Qt::LinksAccessibleByMouse);
+    connect(m_cursorPosLabel, &QLabel::linkActivated, this, [this](const QString &) {
+        KTextEditor::View *view = m_editor ? m_editor->currentView() : nullptr;
+        if (!view) {
+            return;
+        }
+        if (QAction *gotoAct = view->action("go_to_line")) {
+            gotoAct->trigger();
+            return;
+        }
+        bool ok = false;
+        const int line = QInputDialog::getInt(
+            this, i18n("Go to Line"), i18n("Line:"),
+            view->cursorPosition().line() + 1, 1,
+            view->document()->lines(), 1, &ok);
+        if (ok) {
+            view->setCursorPosition(KTextEditor::Cursor(line - 1, 0));
+            view->setFocus();
+        }
+    });
     statusBar()->addPermanentWidget(m_cursorPosLabel);
 
     m_modeLabel = new QLabel(this);
@@ -1034,6 +1074,8 @@ void MainWindow::onAgentActivated(int agentId, const QString &projectPath)
     }
     setWindowTitle(i18n("Agent Kate — %1", QDir(projectPath).dirName()));
     m_editor->setActiveGroup(groupKey());
+    // Reopen the tabs the human had for this project last run (once per run).
+    restoreEditorSession(projectPath);
 }
 
 QString MainWindow::groupKey() const
@@ -1058,6 +1100,80 @@ void MainWindow::onSave()
     m_editor->saveCurrent();
 }
 
+void MainWindow::onSaveAll()
+{
+    m_editor->saveAll();
+}
+
+// persistEditorSession records every editor group's open tabs so the next run
+// can reopen them. Each group is keyed by its own group key (a project path, or
+// "agent-N" when tabs are grouped by agent) — the same key restoreEditorSession
+// reads back — so the working set for *all* open projects survives a quit, not
+// just the active one.
+void MainWindow::persistEditorSession()
+{
+    if (m_restoringSession || !m_editor) {
+        return;
+    }
+    KConfigGroup sessions = KSharedConfig::openConfig()
+                                ->group(QStringLiteral("Editor"))
+                                .group(QStringLiteral("Sessions"));
+    const QStringList keys = m_editor->groupKeys();
+    for (const QString &key : keys) {
+        if (key.isEmpty()) {
+            continue;
+        }
+        KConfigGroup grp = sessions.group(key);
+        grp.writeEntry("openFiles", m_editor->openFilePathsForGroup(key));
+        grp.writeEntry("active", m_editor->currentPathForGroup(key));
+    }
+}
+
+// restoreEditorSession replays the current group's saved tabs once per app run.
+// Skips files that no longer exist, caps the count to keep startup snappy, and
+// guards re-entrant persistence while replaying. Keyed by the active group key
+// (project path or "agent-N"), matching how persistEditorSession wrote it.
+void MainWindow::restoreEditorSession(const QString &projectPath)
+{
+    Q_UNUSED(projectPath);
+    const QString key = groupKey();
+    if (key.isEmpty() || m_restoredSessions.contains(key)) {
+        return;
+    }
+    m_restoredSessions.insert(key);
+
+    const KConfigGroup grp = KSharedConfig::openConfig()
+                                 ->group(QStringLiteral("Editor"))
+                                 .group(QStringLiteral("Sessions"))
+                                 .group(key);
+    const QStringList files = grp.readEntry("openFiles", QStringList());
+    if (files.isEmpty()) {
+        return;
+    }
+    const QString active = grp.readEntry("active", QString());
+
+    // Cap restored tabs so a session with many heavy viewers (PDFs) doesn't
+    // stall startup; the rest stay one click away in the tree.
+    constexpr int kMaxRestore = 20;
+
+    m_restoringSession = true;
+    int opened = 0;
+    for (const QString &path : files) {
+        if (opened >= kMaxRestore) {
+            break;
+        }
+        if (QFileInfo::exists(path)) {
+            m_editor->openFile(key, path);
+            ++opened;
+        }
+    }
+    // Re-activate the previously-focused file if it was restored.
+    if (!active.isEmpty() && QFileInfo::exists(active)) {
+        m_editor->openFile(key, active);
+    }
+    m_restoringSession = false;
+}
+
 // persistShellState writes the centre QSplitter geometry to KConfig.
 void MainWindow::persistShellState()
 {
@@ -1072,6 +1188,14 @@ void MainWindow::persistShellState()
 
 void MainWindow::closeEvent(QCloseEvent *event)
 {
+    // Snapshot the open tabs before any save-prompt closes them, so the session
+    // restores the full working set next run.
+    persistEditorSession();
+    // Prompt to save any modified documents; a cancel aborts the close.
+    if (m_editor && !m_editor->confirmCloseAll()) {
+        event->ignore();
+        return;
+    }
     persistShellState();
     KMainWindow::closeEvent(event);
 }
@@ -1315,8 +1439,11 @@ void MainWindow::updateCursorStatus()
     }
     const auto cursor = view->cursorPosition();
     if (m_cursorPosLabel) {
+        // Wrapped in an anchor so the label is clickable (jump to line); the
+        // href payload is unused — the linkActivated handler reads the view.
         m_cursorPosLabel->setText(
-            i18n("Ln %1, Col %2", cursor.line() + 1, cursor.column() + 1));
+            QStringLiteral("<a href=\"#gotoline\" style=\"text-decoration:none\">%1</a>")
+                .arg(i18n("Ln %1, Col %2", cursor.line() + 1, cursor.column() + 1)));
     }
     if (m_modeLabel) {
         KTextEditor::Document *doc = view->document();

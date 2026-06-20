@@ -26,6 +26,12 @@ public:
     void setRoot(const QString &path);
     QString root() const { return m_root; }
 
+    // Select and scroll the tree to `path` (from a tab's "Reveal in Tree" or a
+    // breadcrumb click), expanding any collapsed ancestors. No-op if the path
+    // is outside the current root. QFileSystemModel populates directories
+    // lazily, so ancestors are expanded top-down to force them in.
+    void revealPath(const QString &path);
+
 Q_SIGNALS:
     void fileActivated(const QString &path);
     // Request the integrated terminal to open a new tab at this directory.

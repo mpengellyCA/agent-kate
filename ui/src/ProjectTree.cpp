@@ -165,6 +165,45 @@ void ProjectTree::setRoot(const QString &path)
     m_pathLabel->setText(QDir::toNativeSeparators(path));
 }
 
+void ProjectTree::revealPath(const QString &path)
+{
+    if (path.isEmpty() || m_root.isEmpty()) {
+        return;
+    }
+    const QString abs = QFileInfo(path).absoluteFilePath();
+    const QString rootAbs = QFileInfo(m_root).absoluteFilePath();
+    // Guard: only reveal paths inside the current root.
+    if (abs != rootAbs && !abs.startsWith(rootAbs + QLatin1Char('/'))) {
+        return;
+    }
+
+    // QFileSystemModel loads directory contents lazily on expand, so an index
+    // for a deep path may not exist until its ancestors are realised. Walk the
+    // ancestors from the root down, expanding each so the model fetches the
+    // next level before we ask for the target index.
+    const QString rel = QDir(rootAbs).relativeFilePath(abs);
+    const QStringList segs = rel.split(QLatin1Char('/'), Qt::SkipEmptyParts);
+    QString accumulated = rootAbs;
+    for (int i = 0; i < segs.size(); ++i) {
+        accumulated = QDir(accumulated).filePath(segs[i]);
+        const QModelIndex idx = m_model->index(accumulated);
+        if (!idx.isValid()) {
+            return; // path component missing on disk — bail gracefully
+        }
+        // Expand every ancestor directory (not the file itself, the last seg).
+        if (i < segs.size() - 1) {
+            m_tree->expand(idx);
+        }
+    }
+
+    const QModelIndex target = m_model->index(abs);
+    if (!target.isValid()) {
+        return;
+    }
+    m_tree->setCurrentIndex(target);
+    m_tree->scrollTo(target, QAbstractItemView::PositionAtCenter);
+}
+
 void ProjectTree::setShowHidden(bool show)
 {
     QDir::Filters f = QDir::AllEntries | QDir::NoDotAndDotDot;
