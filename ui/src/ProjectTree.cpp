@@ -311,6 +311,19 @@ void ProjectTree::onContextMenu(const QPoint &pos)
     connect(termHere, &QAction::triggered, this,
             [this, targetDir] { emit terminalRequested(targetDir); });
 
+    QAction *runHere = menu.addAction(
+        QIcon::fromTheme(QStringLiteral("system-run")), i18n("Run Command Here…"));
+    connect(runHere, &QAction::triggered, this, [this, targetDir] {
+        bool ok = false;
+        const QString command = QInputDialog::getText(
+            this, i18n("Run Command"),
+            i18n("Command to run in %1:", QDir(targetDir).dirName()),
+            QLineEdit::Normal, QString(), &ok);
+        if (ok && !command.isEmpty()) {
+            emit runCommandRequested(targetDir, command);
+        }
+    });
+
     QAction *inDolphin = menu.addAction(
         QIcon::fromTheme(QStringLiteral("system-file-manager")), i18n("Open in Dolphin"));
     connect(inDolphin, &QAction::triggered, this,

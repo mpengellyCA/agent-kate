@@ -305,13 +305,27 @@ void MainWindow::setupUi()
             [this](const QString &title, const QString &diff) {
                 m_editor->openDiff(groupKey(), title, diff);
             });
+    connect(m_agent, &AgentDock::projectClosed, this,
+            [this](const QString &path) {
+                if (m_terminal) {
+                    m_terminal->closeProject(path);
+                }
+            });
 
     connect(m_tree, &ProjectTree::fileActivated, this,
             [this](const QString &path) { m_editor->openFile(groupKey(), path); });
     connect(m_tree, &ProjectTree::terminalRequested, this,
             [this](const QString &dir) {
                 if (m_terminal) {
+                    raisePanelByKey(m_keyTerminal);
                     m_terminal->openTerminalAt(dir);
+                }
+            });
+    connect(m_tree, &ProjectTree::runCommandRequested, this,
+            [this](const QString &dir, const QString &command) {
+                if (m_terminal) {
+                    raisePanelByKey(m_keyTerminal);
+                    m_terminal->runCommandAt(dir, command);
                 }
             });
     connect(m_tree, &ProjectTree::attachToChatRequested, this,
@@ -511,6 +525,49 @@ void MainWindow::setupActions()
         }
         raisePanelByKey(m_keySearch);
         m_search->focusQuery();
+    });
+
+    viewMenu->addSeparator();
+    const bool termOk = m_terminal && m_terminal->isAvailable();
+    auto *newTermAct = viewMenu->addAction(
+        QIcon::fromTheme(QStringLiteral("utilities-terminal")), i18n("&New Terminal"));
+    newTermAct->setShortcut(Qt::CTRL | Qt::SHIFT | Qt::Key_T);
+    newTermAct->setEnabled(termOk);
+    connect(newTermAct, &QAction::triggered, this, [this] {
+        if (!m_terminal) {
+            return;
+        }
+        raisePanelByKey(m_keyTerminal);
+        m_terminal->newTerminal();
+    });
+
+    auto *focusTermAct = viewMenu->addAction(i18n("&Focus Terminal"));
+    focusTermAct->setShortcut(Qt::CTRL | Qt::Key_QuoteLeft);
+    focusTermAct->setEnabled(termOk);
+    connect(focusTermAct, &QAction::triggered, this, [this] {
+        if (!m_terminal) {
+            return;
+        }
+        raisePanelByKey(m_keyTerminal);
+        m_terminal->focusActiveTerminal();
+    });
+
+    auto *nextTermAct = viewMenu->addAction(i18n("Next Terminal"));
+    nextTermAct->setShortcut(Qt::CTRL | Qt::Key_PageDown);
+    nextTermAct->setEnabled(termOk);
+    connect(nextTermAct, &QAction::triggered, this, [this] {
+        if (m_terminal) {
+            m_terminal->nextTerminal();
+        }
+    });
+
+    auto *prevTermAct = viewMenu->addAction(i18n("Previous Terminal"));
+    prevTermAct->setShortcut(Qt::CTRL | Qt::Key_PageUp);
+    prevTermAct->setEnabled(termOk);
+    connect(prevTermAct, &QAction::triggered, this, [this] {
+        if (m_terminal) {
+            m_terminal->previousTerminal();
+        }
     });
 
     QMenu *codeMenu = menuBar()->addMenu(i18n("&Code"));
@@ -1073,6 +1130,9 @@ void MainWindow::persistShellState()
 void MainWindow::closeEvent(QCloseEvent *event)
 {
     persistShellState();
+    if (m_terminal) {
+        m_terminal->saveSession();
+    }
     KMainWindow::closeEvent(event);
 }
 
