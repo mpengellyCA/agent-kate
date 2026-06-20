@@ -8,6 +8,40 @@ import (
 	"testing"
 )
 
+func TestRemoveGuardsCacheDir(t *testing.T) {
+	cache := t.TempDir()
+	m := NewManager(cache)
+
+	// A real installed extension dir is removable.
+	extDir := filepath.Join(cache, "pub.ext")
+	if err := os.MkdirAll(extDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Remove("pub.ext"); err != nil {
+		t.Fatalf("Remove(pub.ext): %v", err)
+	}
+	if _, err := os.Stat(extDir); !os.IsNotExist(err) {
+		t.Fatal("extension dir should be gone")
+	}
+
+	// Removing an absent extension is not an error.
+	if err := m.Remove("pub.absent"); err != nil {
+		t.Fatalf("Remove(absent) should be a no-op, got %v", err)
+	}
+
+	// A sentinel sibling of the cache dir must survive any crafted id.
+	sentinel := filepath.Join(filepath.Dir(cache), "victim")
+	if err := os.MkdirAll(sentinel, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"../victim", "..", "pub.name/../../victim"} {
+		_ = m.Remove(bad) // an invalid id may error; what matters is the FS
+		if _, err := os.Stat(sentinel); err != nil {
+			t.Fatalf("Remove(%q) escaped the cache and deleted the sentinel", bad)
+		}
+	}
+}
+
 func TestSplitID(t *testing.T) {
 	ns, name, err := splitID("bmewburn.vscode-intelephense-client")
 	if err != nil {

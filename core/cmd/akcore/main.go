@@ -472,6 +472,54 @@ func registerHandlers(d handlerDeps) {
 		return map[string]any{"threadId": threadID, "alreadyAttached": false}, nil
 	})
 
+	// session.preview streams the last few turns of a discovered session's
+	// transcript so the user can confirm what they are about to resume without
+	// attaching it first. The whole file is never read into the reply.
+	d.srv.Handle("session.preview", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			SessionID   string `json:"sessionId"`
+			MaxMessages int    `json:"maxMessages"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		if p.SessionID == "" {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "sessionId is required")
+		}
+		msgs, truncated, err := session.PreviewTranscript(p.SessionID, p.MaxMessages)
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		if msgs == nil {
+			msgs = []session.PreviewMessage{}
+		}
+		return map[string]any{"messages": msgs, "truncated": truncated}, nil
+	})
+
+	// session.forget deletes a discovered session's transcript from disk. It
+	// refuses to act on a session that is attached as an Agent Kate thread —
+	// the user must remove that agent first, so the thread never dangles.
+	d.srv.Handle("session.forget", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			SessionID string `json:"sessionId"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		if p.SessionID == "" {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "sessionId is required")
+		}
+		if _, ok := d.sessions.GetBySession(p.SessionID); ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams,
+				"this session is attached as an agent; remove the agent first")
+		}
+		if err := session.DeleteTranscript(p.SessionID); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		d.log.Info("session forgotten", "session", p.SessionID)
+		return map[string]any{"ok": true}, nil
+	})
+
 	d.srv.Handle("agent.send", func(_ context.Context, raw json.RawMessage) (any, error) {
 		var p agentSendParams
 		if err := json.Unmarshal(raw, &p); err != nil {
@@ -953,7 +1001,27 @@ func registerHandlers(d handlerDeps) {
 		if p.ExtensionID == "" {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "extensionId is required")
 		}
-		ext, err := d.extensions.Install(ctx, p.ExtensionID)
+		// Throttle progress so a fast download cannot flood the socket: emit at
+		// most every 250ms or whenever the fraction advances by >= 1%.
+		var lastEmit time.Time
+		var lastFrac float64
+		ext, err := d.extensions.InstallProgress(ctx, p.ExtensionID, func(done, total int64) {
+			var frac float64
+			if total > 0 {
+				frac = float64(done) / float64(total)
+			}
+			now := time.Now()
+			if now.Sub(lastEmit) < 250*time.Millisecond && frac-lastFrac < 0.01 && frac < 1.0 {
+				return
+			}
+			lastEmit = now
+			lastFrac = frac
+			d.srv.Notify("vsix.installProgress", map[string]any{
+				"extensionId": p.ExtensionID,
+				"fraction":    frac,
+				"indeterminate": total == 0,
+			})
+		})
 		if err != nil {
 			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
 		}
@@ -962,7 +1030,27 @@ func registerHandlers(d handlerDeps) {
 		return ext, nil
 	})
 
-	d.srv.Handle("vsix.list", func(_ context.Context, _ json.RawMessage) (any, error) {
+	// vsix.uninstall deletes an installed extension from the cache. The id is
+	// validated and resolved under the cache dir inside Manager.Remove, so a
+	// crafted id can never delete anything outside it.
+	d.srv.Handle("vsix.uninstall", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ExtensionID string `json:"extensionId"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		if p.ExtensionID == "" {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "extensionId is required")
+		}
+		if err := d.extensions.Remove(p.ExtensionID); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		d.log.Info("extension uninstalled", "id", p.ExtensionID)
+		return map[string]any{"ok": true}, nil
+	})
+
+	d.srv.Handle("vsix.list", func(ctx context.Context, _ json.RawMessage) (any, error) {
 		exts, err := d.extensions.List()
 		if err != nil {
 			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
@@ -970,7 +1058,80 @@ func registerHandlers(d handlerDeps) {
 		if exts == nil {
 			exts = []*vsix.Extension{}
 		}
-		return map[string]any{"extensions": exts}, nil
+		// Enrich each entry with the latest published version so the UI can
+		// flag updates. This is best effort and concurrency-bounded: any
+		// lookup error (offline, removed upstream) simply omits the field and
+		// never fails the list. A short timeout keeps the dialog responsive.
+		out := make([]map[string]any, len(exts))
+		latest := make([]string, len(exts))
+		lctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+		defer cancel()
+		sem := make(chan struct{}, 4)
+		var wg sync.WaitGroup
+		for i, e := range exts {
+			wg.Add(1)
+			go func(i int, id string) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				if v, err := d.extensions.LatestVersion(lctx, id); err == nil {
+					latest[i] = v
+				}
+			}(i, e.ID)
+		}
+		wg.Wait()
+		for i, e := range exts {
+			m := map[string]any{
+				"id":         e.ID,
+				"name":       e.Name,
+				"version":    e.Version,
+				"dir":        e.Dir,
+				"server":     e.Server,
+				"serverHint": e.ServerHint,
+			}
+			if latest[i] != "" {
+				m["latest"] = latest[i]
+				m["updateAvailable"] = latest[i] != e.Version
+			}
+			out[i] = m
+		}
+		return map[string]any{"extensions": out}, nil
+	})
+
+	// vsix.search queries the Open VSX registry. It is network-dependent and
+	// best effort — a failure returns an error the UI surfaces inline rather
+	// than blocking the dialog. Hits already installed are tagged like the
+	// curated catalog so the UI can disable their Install button.
+	d.srv.Handle("vsix.search", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			Query string `json:"query"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		sctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		entries, err := d.extensions.Search(sctx, p.Query)
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		installed := map[string]bool{}
+		if list, err := d.extensions.List(); err == nil {
+			for _, e := range list {
+				installed[e.ID] = true
+			}
+		}
+		out := make([]map[string]any, 0, len(entries))
+		for _, e := range entries {
+			out = append(out, map[string]any{
+				"id":          e.ID,
+				"displayName": e.DisplayName,
+				"summary":     e.Summary,
+				"category":    e.Category,
+				"installed":   installed[e.ID],
+			})
+		}
+		return map[string]any{"entries": out}, nil
 	})
 
 	// vsix.catalog returns the curated list of popular extensions, each
@@ -1057,6 +1218,47 @@ func registerHandlers(d handlerDeps) {
 		}
 		d.log.Info("skill uninstalled", "name", p.Name, "target", p.Target)
 		return map[string]any{"ok": true}, nil
+	})
+
+	// skills.read returns the full markdown of a catalog skill for the detail
+	// pane. Content is capped inside the catalog so a huge file cannot bloat
+	// the reply.
+	d.srv.Handle("skills.read", func(_ context.Context, raw json.RawMessage) (any, error) {
+		if err := d.skills.EnsureDir(); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		var p struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		content, err := d.skills.ReadContent(p.Name)
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		return map[string]any{"content": content}, nil
+	})
+
+	// skills.create scaffolds a new directory skill (SKILL.md + frontmatter) in
+	// the catalog. Invalid or duplicate names are rejected by the catalog.
+	d.srv.Handle("skills.create", func(_ context.Context, raw json.RawMessage) (any, error) {
+		if err := d.skills.EnsureDir(); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		var p struct {
+			Name        string `json:"name"`
+			Description string `json:"description"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		skill, err := d.skills.Create(p.Name, p.Description)
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		d.log.Info("skill created", "name", skill.Name, "path", skill.Path)
+		return skill, nil
 	})
 
 	// --- git status (read-only) -------------------------------------------
