@@ -4,6 +4,7 @@
 #include "GutterController.h"
 #include "ipc/CoreClient.h"
 
+#include <KLocalizedString>
 #include <KTextEditor/Document>
 
 #include <QIcon>
@@ -128,11 +129,11 @@ void GutterController::registerMarkPixmaps()
     m_doc->setMarkIcon(static_cast<KTextEditor::Document::MarkTypes>(kMarkDeleted),
                        QIcon(trianglePixmap(deletedColor(pal))));
     m_doc->setMarkDescription(static_cast<KTextEditor::Document::MarkTypes>(kMarkAdded),
-                              QStringLiteral("Added (vs HEAD)"));
+                              i18nc("git gutter mark", "Added (vs HEAD)"));
     m_doc->setMarkDescription(static_cast<KTextEditor::Document::MarkTypes>(kMarkModified),
-                              QStringLiteral("Modified (vs HEAD)"));
+                              i18nc("git gutter mark", "Modified (vs HEAD)"));
     m_doc->setMarkDescription(static_cast<KTextEditor::Document::MarkTypes>(kMarkDeleted),
-                              QStringLiteral("Deletion (vs HEAD)"));
+                              i18nc("git gutter mark", "Deletion (vs HEAD)"));
 }
 
 void GutterController::scheduleAfterEdit()

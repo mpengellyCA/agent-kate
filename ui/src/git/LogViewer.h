@@ -5,6 +5,7 @@
 
 #include <QHash>
 #include <QJsonObject>
+#include <QPoint>
 #include <QString>
 #include <QWidget>
 
@@ -14,6 +15,7 @@ class LogGraphDelegate;
 class LogModel;
 class QLabel;
 class QPushButton;
+class QStackedWidget;
 class QTableView;
 
 // LogViewer is the visual git history pane for the active agent. It glues
@@ -47,6 +49,11 @@ private:
     void onScrolled(int value);
     void resolveThreadForProject();
     void updateLabel();
+    void showContextMenu(const QPoint &pos);
+    void copySelectedSha(bool shortForm);
+    void copySelectedSubject();
+    void copySelectedAsPatch();
+    void updateEmptyState();
 
     // A log "source" is either an agent worktree (threadId set) or a
     // workspace branch (repoRoot + branch set).
@@ -60,6 +67,8 @@ private:
     QLabel *m_sourceLabel = nullptr;
     QPushButton *m_refreshBtn = nullptr;
     QTableView *m_view = nullptr;
+    QStackedWidget *m_stack = nullptr;
+    QLabel *m_emptyLabel = nullptr;
     LogModel *m_model = nullptr;
     LogGraphDelegate *m_graphDelegate = nullptr;
     CommitDetailPanel *m_detail = nullptr;

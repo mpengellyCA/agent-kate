@@ -4,7 +4,9 @@
 #pragma once
 
 #include <QJsonObject>
+#include <QPoint>
 #include <QString>
+#include <QStringList>
 #include <QVBoxLayout>
 #include <QWidget>
 
@@ -39,6 +41,7 @@ private:
     void applyDetail(const QJsonObject &detail);
     void replaceDiff(const QString &patch);
     void onFileRowChanged(int row);
+    void showContextMenu(const QPoint &pos);
     QJsonObject sourceParams() const;
     bool hasSource() const;
 
@@ -46,6 +49,8 @@ private:
     QString m_threadId;
     QString m_repoRoot;
     QString m_sha;
+    QString m_shortSha;
+    QString m_subject;
     // Bumped on every setCommit() so in-flight replies for a stale commit can
     // be discarded — the user can click through commits faster than RPCs
     // round-trip.

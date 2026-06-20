@@ -30,6 +30,12 @@ type Snapshot struct {
 	BehindBase   int          `json:"behindBase"`   // commits on the workspace's current branch since Base
 	DirtyCount   int          `json:"dirtyCount"`   // tracked changes + untracked + conflicts
 	HasConflicts bool         `json:"hasConflicts"`
+	// Remote (origin) tracking, computed purely from local refs — no fetch.
+	// HasUpstream is false when there is no refs/remotes/origin/<branch> ref
+	// (e.g. the branch was never pushed) or when the comparison failed.
+	HasUpstream  bool         `json:"hasUpstream"`
+	RemoteAhead  int          `json:"remoteAhead"`  // commits on HEAD not on origin/<branch>
+	RemoteBehind int          `json:"remoteBehind"` // commits on origin/<branch> not on HEAD
 	Files        []FileStatus `json:"files"`
 	UpdatedAt    time.Time    `json:"updatedAt"`
 	// Error is set when this snapshot could not be computed; the rest of the
@@ -126,7 +132,59 @@ func computeSnapshot(wt worktree.Worktree) (*Snapshot, error) {
 		}
 	}
 
+	// Remote (origin) ahead/behind, computed purely from the local
+	// remote-tracking ref. Best-effort: any failure leaves HasUpstream false.
+	computeRemoteTracking(repo, snap)
+
 	return snap, nil
+}
+
+// computeRemoteTracking fills HasUpstream / RemoteAhead / RemoteBehind from the
+// local refs/remotes/origin/<branch> ref versus HEAD. It never touches the
+// network — it only reads refs already fetched into the repo. Any error path
+// leaves HasUpstream=false and the counts at zero.
+func computeRemoteTracking(repo *git.Repository, snap *Snapshot) {
+	if snap.Branch == "" || snap.HeadSHA == "" {
+		return
+	}
+	upstreamRef, err := repo.Reference(
+		plumbing.NewRemoteReferenceName("origin", snap.Branch), true)
+	if err != nil {
+		return // no upstream tracking ref — never pushed (or no origin)
+	}
+	headHash := plumbing.NewHash(snap.HeadSHA)
+	upstreamHash := upstreamRef.Hash()
+	if upstreamHash == headHash {
+		// In sync — common case after a push.
+		snap.HasUpstream = true
+		return
+	}
+
+	headCommit, err := repo.CommitObject(headHash)
+	if err != nil {
+		return
+	}
+	upstreamCommit, err := repo.CommitObject(upstreamHash)
+	if err != nil {
+		return
+	}
+	bases, err := headCommit.MergeBase(upstreamCommit)
+	if err != nil || len(bases) == 0 {
+		return
+	}
+	base := bases[0].Hash.String()
+
+	ahead, err := countAncestorsSince(repo, headHash, base)
+	if err != nil {
+		return
+	}
+	behind, err := countAncestorsSince(repo, upstreamHash, base)
+	if err != nil {
+		return
+	}
+	snap.HasUpstream = true
+	snap.RemoteAhead = ahead
+	snap.RemoteBehind = behind
 }
 
 // countAncestorsSince walks from `from` and counts commits strictly newer than

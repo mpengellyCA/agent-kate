@@ -521,3 +521,23 @@ func Remove(wt Worktree) error {
 	_, _ = git(wt.RepoRoot, "branch", "-D", wt.Branch)
 	return nil
 }
+
+// DiscardChanges resets the worktree to HEAD and removes untracked files,
+// scoped strictly to wt.Path (git runs with cmd.Dir = wt.Path, so it can only
+// affect that directory tree). This throws away every uncommitted change —
+// callers MUST confirm with the user first. wt.Path must be a non-empty git
+// working directory.
+func DiscardChanges(wt Worktree) error {
+	if wt.Path == "" {
+		return fmt.Errorf("discard: worktree has no path")
+	}
+	if _, err := git(wt.Path, "reset", "--hard", "HEAD"); err != nil {
+		return err
+	}
+	// -fd removes untracked files and directories; intentionally NOT -x so
+	// ignored files (build artifacts, .env, etc.) are left alone.
+	if _, err := git(wt.Path, "clean", "-fd"); err != nil {
+		return err
+	}
+	return nil
+}

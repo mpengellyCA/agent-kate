@@ -1170,6 +1170,70 @@ func registerHandlers(d handlerDeps) {
 		return res, nil
 	})
 
+	// git.discardChanges throws away every uncommitted change in a thread's
+	// worktree (git reset --hard HEAD + git clean -fd). DESTRUCTIVE: the UI
+	// gates this behind an explicit confirmation. Guard: refuse while the
+	// agent is live, so we never yank files out from under a running session.
+	d.srv.Handle("git.discardChanges", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID string `json:"threadId"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		wt, ok := d.threads.get(p.ThreadID)
+		if !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		}
+		if d.sup.Running(p.ThreadID) {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams,
+				"cannot discard changes while the agent is running — stop it first")
+		}
+		if err := worktree.DiscardChanges(wt); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		d.gitCache.Invalidate(p.ThreadID)
+		d.log.Info("git.discardChanges complete", "thread", p.ThreadID, "path", wt.Path)
+		return map[string]any{"ok": true}, nil
+	})
+
+	// git.removeWorktree deletes an isolated agent worktree and its branch.
+	// DESTRUCTIVE: the UI confirms first. Guards: only isolated worktrees can
+	// be removed (never the shared workspace), and never while the agent is
+	// live.
+	d.srv.Handle("git.removeWorktree", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID string `json:"threadId"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		wt, ok := d.threads.get(p.ThreadID)
+		if !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		}
+		if !wt.Isolated {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams,
+				"this thread runs directly in the workspace and has no worktree to remove")
+		}
+		if d.sup.Running(p.ThreadID) {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams,
+				"cannot remove the worktree while the agent is running — stop it first")
+		}
+		if err := worktree.Remove(wt); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		// The worktree is gone; forget its session + cache entry just like
+		// agent.discard does, and tell every UI client to refresh.
+		_ = d.sessions.Remove(p.ThreadID)
+		_ = d.summaries.Remove(p.ThreadID)
+		d.gitCache.Forget(p.ThreadID)
+		d.srv.Notify("agent.discarded", map[string]any{"threadId": p.ThreadID})
+		d.srv.Notify("git.invalidated", map[string]any{"threadIds": []string{p.ThreadID}})
+		d.log.Info("git.removeWorktree complete", "thread", p.ThreadID, "path", wt.Path)
+		return map[string]any{"ok": true}, nil
+	})
+
 	// git.abortMerge rolls back an in-progress merge in the thread's
 	// workspace, restoring it to pre-merge state.
 	d.srv.Handle("git.abortMerge", func(_ context.Context, raw json.RawMessage) (any, error) {

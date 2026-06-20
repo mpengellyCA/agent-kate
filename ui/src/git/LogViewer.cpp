@@ -9,6 +9,10 @@
 #include "RefChipDelegate.h"
 #include "ipc/CoreClient.h"
 
+#include <KLocalizedString>
+
+#include <QApplication>
+#include <QClipboard>
 #include <QDateTime>
 #include <QHBoxLayout>
 #include <QHeaderView>
@@ -16,10 +20,15 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
+#include <QKeySequence>
 #include <QLabel>
+#include <QMenu>
+#include <QPalette>
 #include <QPushButton>
 #include <QScrollBar>
+#include <QShortcut>
 #include <QSplitter>
+#include <QStackedWidget>
 #include <QStringList>
 #include <QTableView>
 #include <QVBoxLayout>
@@ -31,7 +40,7 @@ LogViewer::LogViewer(CoreClient *core, QWidget *parent)
     m_sourceLabel = new QLabel(this);
     m_sourceLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
 
-    m_refreshBtn = new QPushButton(tr("Refresh"), this);
+    m_refreshBtn = new QPushButton(i18nc("@action:button", "Refresh"), this);
 
     auto *toolbar = new QHBoxLayout;
     toolbar->setContentsMargins(6, 4, 6, 4);
@@ -63,10 +72,35 @@ LogViewer::LogViewer(CoreClient *core, QWidget *parent)
     m_view->setItemDelegateForColumn(LogModel::ColGraph, m_graphDelegate);
     m_view->setItemDelegateForColumn(LogModel::ColSubject, new RefChipDelegate(this));
 
+    // Right-click commit actions (copy hash / subject / patch).
+    m_view->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_view, &QTableView::customContextMenuRequested, this,
+            &LogViewer::showContextMenu);
+    // Ctrl+C on the focused log row copies the full SHA.
+    auto *copySc = new QShortcut(QKeySequence::Copy, m_view);
+    copySc->setContext(Qt::WidgetShortcut);
+    connect(copySc, &QShortcut::activated, this,
+            [this] { copySelectedSha(false); });
+
+    // Empty / loading state overlay swapped in for the table when there is
+    // nothing to show.
+    m_emptyLabel = new QLabel(this);
+    m_emptyLabel->setAlignment(Qt::AlignCenter);
+    m_emptyLabel->setWordWrap(true);
+    {
+        QPalette pal = m_emptyLabel->palette();
+        pal.setColor(QPalette::WindowText,
+                     pal.color(QPalette::Disabled, QPalette::WindowText));
+        m_emptyLabel->setPalette(pal);
+    }
+    m_stack = new QStackedWidget(this);
+    m_stack->addWidget(m_view);       // index 0
+    m_stack->addWidget(m_emptyLabel); // index 1
+
     m_detail = new CommitDetailPanel(m_core, this);
 
     auto *split = new QSplitter(Qt::Vertical, this);
-    split->addWidget(m_view);
+    split->addWidget(m_stack);
     split->addWidget(m_detail);
     split->setStretchFactor(0, 2);
     split->setStretchFactor(1, 3);
@@ -115,13 +149,14 @@ void LogViewer::setActiveSource(const QString &projectPath, const QString &threa
 void LogViewer::updateLabel()
 {
     if (!m_source.threadId.isEmpty()) {
-        m_sourceLabel->setText(tr("Agent worktree · %1").arg(m_source.threadId.left(8)));
+        m_sourceLabel->setText(
+            i18n("Agent worktree · %1", m_source.threadId.left(8)));
     } else if (!m_source.repoRoot.isEmpty()) {
         m_sourceLabel->setText(m_source.branch.isEmpty()
-                                   ? tr("Workspace · (detached)")
-                                   : tr("Workspace · %1").arg(m_source.branch));
+                                   ? i18n("Workspace · (detached)")
+                                   : i18n("Workspace · %1", m_source.branch));
     } else {
-        m_sourceLabel->setText(tr("No project selected"));
+        m_sourceLabel->setText(i18n("No project selected"));
     }
 }
 
@@ -193,8 +228,12 @@ void LogViewer::reloadFromFirstPage()
     m_detail->clear();
     if ((m_source.threadId.isEmpty() && m_source.repoRoot.isEmpty())
         || !m_core->isConnected()) {
+        updateEmptyState();
         return;
     }
+    // Show a loading hint until the first page lands.
+    m_emptyLabel->setText(i18n("Loading history…"));
+    m_stack->setCurrentIndex(1);
     loadNextPage();
 }
 
@@ -233,6 +272,7 @@ void LogViewer::loadNextPage()
                          m_endReached = true;
                      }
                      if (entries.isEmpty()) {
+                         updateEmptyState();
                          return;
                      }
                      QVector<UiLogEntry> page;
@@ -273,6 +313,7 @@ void LogViewer::loadNextPage()
                      m_graphDelegate->setMaxLane(m_model->maxLane());
                      m_view->resizeColumnToContents(LogModel::ColGraph);
                      if (wasEmpty) {
+                         m_stack->setCurrentIndex(0);
                          m_view->selectRow(0);
                      }
                  });
@@ -324,4 +365,111 @@ void LogViewer::onScrolled(int value)
     if (value >= bar->maximum() - rowH * 8) {
         loadNextPage();
     }
+}
+
+void LogViewer::updateEmptyState()
+{
+    // Index 1 shows the QLabel overlay; index 0 shows the table. Only swap to
+    // the "no commits" message once we have genuinely exhausted the history.
+    if (m_model->loadedCount() > 0) {
+        m_stack->setCurrentIndex(0);
+        return;
+    }
+    if (m_source.threadId.isEmpty() && m_source.repoRoot.isEmpty()) {
+        m_emptyLabel->setText(i18n("No project selected."));
+    } else if (m_endReached) {
+        m_emptyLabel->setText(i18n("No commits yet."));
+    } else {
+        m_emptyLabel->setText(i18n("Loading history…"));
+    }
+    m_stack->setCurrentIndex(1);
+}
+
+void LogViewer::showContextMenu(const QPoint &pos)
+{
+    const QModelIndex idx = m_view->indexAt(pos);
+    if (!idx.isValid() || m_model->shaAt(idx.row()).isEmpty()) {
+        return;
+    }
+    // Make sure the row under the cursor is the one the actions operate on.
+    m_view->selectRow(idx.row());
+
+    QMenu menu(this);
+    const QIcon copyIcon = QIcon::fromTheme(QStringLiteral("edit-copy"));
+    QAction *copyHash =
+        menu.addAction(copyIcon, i18nc("@action:inmenu", "Copy Commit Hash"));
+    QAction *copyShort =
+        menu.addAction(copyIcon, i18nc("@action:inmenu", "Copy Short Hash"));
+    QAction *copySubject =
+        menu.addAction(copyIcon, i18nc("@action:inmenu", "Copy Subject"));
+    menu.addSeparator();
+    QAction *copyPatch =
+        menu.addAction(copyIcon, i18nc("@action:inmenu", "Copy as Patch"));
+
+    QAction *chosen = menu.exec(m_view->viewport()->mapToGlobal(pos));
+    if (chosen == copyHash) {
+        copySelectedSha(false);
+    } else if (chosen == copyShort) {
+        copySelectedSha(true);
+    } else if (chosen == copySubject) {
+        copySelectedSubject();
+    } else if (chosen == copyPatch) {
+        copySelectedAsPatch();
+    }
+}
+
+void LogViewer::copySelectedSha(bool shortForm)
+{
+    const QModelIndex idx = m_view->selectionModel()->currentIndex();
+    if (!idx.isValid()) {
+        return;
+    }
+    const QString sha = shortForm ? m_model->shortShaAt(idx.row())
+                                  : m_model->shaAt(idx.row());
+    if (!sha.isEmpty()) {
+        QApplication::clipboard()->setText(sha);
+    }
+}
+
+void LogViewer::copySelectedSubject()
+{
+    const QModelIndex idx = m_view->selectionModel()->currentIndex();
+    if (!idx.isValid()) {
+        return;
+    }
+    const QString subject = m_model->subjectAt(idx.row());
+    if (!subject.isEmpty()) {
+        QApplication::clipboard()->setText(subject);
+    }
+}
+
+void LogViewer::copySelectedAsPatch()
+{
+    const QModelIndex idx = m_view->selectionModel()->currentIndex();
+    if (!idx.isValid()) {
+        return;
+    }
+    const QString sha = m_model->shaAt(idx.row());
+    if (sha.isEmpty() || !m_core->isConnected()) {
+        return;
+    }
+    // Reuse git.commit.diff for the full patch of this commit, scoped to the
+    // active source exactly like CommitDetailPanel::sourceParams().
+    QJsonObject params{{QStringLiteral("sha"), sha}};
+    if (!m_source.threadId.isEmpty()) {
+        params.insert(QStringLiteral("threadId"), m_source.threadId);
+    } else if (!m_source.repoRoot.isEmpty()) {
+        params.insert(QStringLiteral("repoRoot"), m_source.repoRoot);
+    }
+    m_core->call(QStringLiteral("git.commit.diff"), params,
+                 [](const QJsonObject &result, const QJsonObject &error) {
+                     if (!error.isEmpty()) {
+                         return;
+                     }
+                     const QString patch =
+                         result.value(QStringLiteral("patch")).toString();
+                     if (!patch.isEmpty()) {
+                         QApplication::clipboard()->setText(patch);
+                     }
+                 });
 }

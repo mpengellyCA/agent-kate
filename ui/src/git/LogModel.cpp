@@ -3,6 +3,8 @@
 
 #include "LogModel.h"
 
+#include <KLocalizedString>
+
 #include <QLocale>
 #include <QVariant>
 
@@ -53,6 +55,22 @@ QString LogModel::shaAt(int row) const
         return {};
     }
     return m_rows.at(row).sha;
+}
+
+QString LogModel::shortShaAt(int row) const
+{
+    if (row < 0 || row >= m_rows.size()) {
+        return {};
+    }
+    return m_rows.at(row).shortSha;
+}
+
+QString LogModel::subjectAt(int row) const
+{
+    if (row < 0 || row >= m_rows.size()) {
+        return {};
+    }
+    return m_rows.at(row).subject;
 }
 
 int LogModel::rowForSha(const QString &sha) const
@@ -146,10 +164,10 @@ QVariant LogModel::headerData(int section, Qt::Orientation orientation, int role
     }
     switch (section) {
     case ColGraph:    return QString();
-    case ColSubject:  return tr("Subject");
-    case ColAuthor:   return tr("Author");
-    case ColDate:     return tr("Date");
-    case ColShortSha: return tr("Commit");
+    case ColSubject:  return i18nc("git log column", "Subject");
+    case ColAuthor:   return i18nc("git log column", "Author");
+    case ColDate:     return i18nc("git log column", "Date");
+    case ColShortSha: return i18nc("git log column", "Commit");
     default:          return {};
     }
 }
