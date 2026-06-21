@@ -1492,6 +1492,10 @@ void MainWindow::closeEvent(QCloseEvent *event)
     if (m_terminal) {
         m_terminal->saveSession();
     }
+    // Remember the focused agent per project so the next launch lands back in it.
+    if (m_agent) {
+        m_agent->persistLastActiveSessions();
+    }
     KMainWindow::closeEvent(event);
 }
 

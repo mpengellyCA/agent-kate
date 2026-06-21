@@ -20,7 +20,9 @@
 #include <QStackedWidget>
 #include <QVector>
 
+#include <KConfigGroup>
 #include <KLocalizedString>
+#include <KSharedConfig>
 
 AgentDock::AgentDock(CoreClient *core, QWidget *parent)
     : QObject(parent)
@@ -68,6 +70,9 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
     connect(m_roster, &AgentRoster::agentActivated, this, [this](int id) {
         if (Entry *e = entryById(id)) {
             m_stack->setCurrentWidget(e->panel);
+            // Remember where we are so the next launch lands here. No-op for a
+            // blank starter agent (empty thread) — see setLastActiveThread.
+            setLastActiveThread(e->project, e->panel->threadId());
             emit agentActivated(e->id, e->project);
         }
     });
@@ -324,8 +329,13 @@ void AgentDock::addProject(const QString &path)
 {
     const bool wasOpen = m_projects.contains(path);
     ensureProject(path);
+    // Always create a starter agent so the UI is never empty (and as a fallback
+    // if nothing is restored). On a first open we may later jump focus to the
+    // last-active restored session and prune this starter — see restoreThreads.
     addAgent(path);
     if (!wasOpen) {
+        m_pendingFocusProjects.insert(path);
+        m_initialAgentByProject.insert(path, m_agents.constLast().id);
         restoreThreads(path); // bring back this project's dormant threads
     }
 }
@@ -494,7 +504,69 @@ void AgentDock::restoreThreads(const QString &project)
                          }
                      }
                      refreshAgentNumbers();
+                     // First restore for this project: land in the last-active
+                     // session instead of the blank starter agent.
+                     if (m_pendingFocusProjects.remove(project)) {
+                         restoreInitialFocus(project);
+                     }
                  });
+}
+
+void AgentDock::restoreInitialFocus(const QString &project)
+{
+    const int starterId = m_initialAgentByProject.take(project);
+    const QString wantThread = lastActiveThread(project);
+    if (wantThread.isEmpty()) {
+        return; // nothing remembered — keep the fresh starter agent focused
+    }
+    Entry *target = entryByThread(wantThread);
+    if (!target || target->id == starterId) {
+        return; // remembered thread wasn't restored (removed?) — keep starter
+    }
+    // Focus the last-active agent in its dormant state. We deliberately do NOT
+    // resume() it — the user decides when to spend the re-cache cost.
+    m_roster->setCurrentAgent(target->id);
+    // Prune the never-used starter so we land cleanly in the restored session
+    // rather than leaving a stray empty "Agent N" beside it.
+    if (Entry *starter = entryById(starterId)) {
+        if (starter->panel->threadId().isEmpty()) {
+            closeAgent(starterId);
+        }
+    }
+}
+
+void AgentDock::setLastActiveThread(const QString &project, const QString &threadId)
+{
+    // Never clear: activating a blank starter agent (empty thread) must not
+    // erase the remembered real session for this project.
+    if (project.isEmpty() || threadId.isEmpty()) {
+        return;
+    }
+    KSharedConfig::openConfig()
+        ->group(QStringLiteral("Agent"))
+        .group(QStringLiteral("LastActive"))
+        .group(project)
+        .writeEntry(QStringLiteral("threadId"), threadId);
+}
+
+QString AgentDock::lastActiveThread(const QString &project) const
+{
+    return KSharedConfig::openConfig()
+        ->group(QStringLiteral("Agent"))
+        .group(QStringLiteral("LastActive"))
+        .group(project)
+        .readEntry(QStringLiteral("threadId"), QString());
+}
+
+void AgentDock::persistLastActiveSessions()
+{
+    // Capture the focused agent's thread at shutdown — covers a thread that
+    // started while focused and so never fired a fresh activation write.
+    if (auto *w = qobject_cast<AgentPanel *>(m_stack->currentWidget())) {
+        if (Entry *e = entryByPanel(w)) {
+            setLastActiveThread(e->project, e->panel->threadId());
+        }
+    }
 }
 
 void AgentDock::refreshAgentNumbers()
