@@ -78,6 +78,8 @@ Q_SIGNALS:
     void editTagsRequested(int agentId);
     // Run the Sonnet auto-organize pass over a project's agents.
     void autoOrganizeRequested(const QString &projectPath);
+    // Open a Konsole tab rooted at the agent's worktree.
+    void openWorktreeTerminalRequested(int agentId);
 
 protected:
     void resizeEvent(QResizeEvent *event) override;

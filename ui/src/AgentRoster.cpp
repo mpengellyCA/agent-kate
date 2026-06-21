@@ -130,6 +130,14 @@ AgentRoster::AgentRoster(QWidget *parent)
             QAction *renameAct = menu.addAction(
                 QIcon::fromTheme(QStringLiteral("document-edit")), i18n("Rename…"));
             menu.addSeparator();
+            const int number = item->data(0, AgentRoles::Number).toInt();
+            QAction *termAct = menu.addAction(
+                QIcon::fromTheme(QStringLiteral("utilities-terminal")),
+                i18n("Open Terminal in Worktree"));
+            // A worktree exists only once the agent has been assigned a #N and
+            // is not dormant; otherwise there is no directory to open.
+            termAct->setEnabled(number > 0 && !dormant);
+            menu.addSeparator();
             QAction *commitAct = menu.addAction(i18n("Commit changes…"));
             QAction *prAct = menu.addAction(i18n("Create pull request…"));
             QAction *landAct = menu.addAction(i18n("Merge into local main…"));
@@ -183,6 +191,8 @@ AgentRoster::AgentRoster(QWidget *parent)
             }
             if (chosen == resumeAct) {
                 emit resumeRequested(id);
+            } else if (chosen == termAct) {
+                emit openWorktreeTerminalRequested(id);
             } else if (chosen == renameAct) {
                 emit renameRequested(id);
             } else if (chosen == commitAct) {

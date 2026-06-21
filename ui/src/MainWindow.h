@@ -136,6 +136,9 @@ private:
 
     int m_lastBottomTab = -1; // last tab raised by the user, used to restore on Ctrl+J
     QAction *m_toggleBottomAct = nullptr;
+    // Opens a terminal in the active agent's worktree; enabled only while that
+    // agent actually has a worktree directory.
+    QAction *m_openWorktreeTerminalAct = nullptr;
 
     QMenu *m_perspectivesMenu = nullptr;
     QAction *m_centreEditorAct = nullptr;

@@ -72,6 +72,12 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
         }
     });
     connect(m_roster, &AgentRoster::closeRequested, this, &AgentDock::closeAgent);
+    connect(m_roster, &AgentRoster::openWorktreeTerminalRequested, this, [this](int id) {
+        const QString p = worktreePathForAgent(id);
+        if (!p.isEmpty()) {
+            emit openWorktreeTerminalRequested(p);
+        }
+    });
     connect(m_roster, &AgentRoster::resumeRequested, this, [this](int id) {
         if (Entry *e = entryById(id)) {
             m_roster->setCurrentAgent(id);
@@ -363,6 +369,20 @@ QString AgentDock::currentThreadId() const
     return {};
 }
 
+QString AgentDock::worktreePathForAgent(int agentId) const
+{
+    for (const Entry &e : m_agents) {
+        if (e.id == agentId) {
+            const QString tid = e.panel->threadId();
+            if (tid.isEmpty()) {
+                return {};
+            }
+            return m_worktreePathByThread.value(tid);
+        }
+    }
+    return {};
+}
+
 AgentPanel *AgentDock::addAgent(const QString &projectPath, const QString &model)
 {
     const int id = ++m_counter;
@@ -488,6 +508,7 @@ void AgentDock::refreshAgentNumbers()
                          return;
                      }
                      QHash<QString, int> byThread;
+                     m_worktreePathByThread.clear();
                      const QJsonArray threads =
                          result.value(QStringLiteral("threads")).toArray();
                      for (const QJsonValue &v : threads) {
@@ -497,6 +518,10 @@ void AgentDock::refreshAgentNumbers()
                          const int n = o.value(QStringLiteral("number")).toInt();
                          if (!id.isEmpty() && n > 0) {
                              byThread.insert(id, n);
+                         }
+                         const QString p = o.value(QStringLiteral("path")).toString();
+                         if (!id.isEmpty()) {
+                             m_worktreePathByThread.insert(id, p);
                          }
                      }
                      for (const Entry &e : m_agents) {

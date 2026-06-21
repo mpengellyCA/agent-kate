@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QHash>
 #include <QList>
 #include <QObject>
 #include <QString>
@@ -40,6 +41,10 @@ public:
     // threadId of the currently-active agent panel, empty if none / not started.
     QString currentThreadId() const;
 
+    // Worktree directory for the given agent, derived from the last git.snapshot.
+    // Empty if the agent has no worktree yet (not started / not promoted).
+    QString worktreePathForAgent(int agentId) const;
+
 Q_SIGNALS:
     void statusMessage(const QString &text);
     void openDiff(const QString &title, const QString &diffText);
@@ -50,6 +55,9 @@ Q_SIGNALS:
     void projectClosed(const QString &projectPath);
     // Routed to MainWindow to focus the Terminal panel at this project path.
     void openTerminalRequested(const QString &projectPath);
+    // Carries an agent's WORKTREE path (distinct from a project path) so the
+    // shell can open a terminal rooted there.
+    void openWorktreeTerminalRequested(const QString &worktreePath);
 
 private:
     struct Entry {
@@ -91,5 +99,8 @@ private:
     QWidget *m_dialogParent = nullptr; // window-scope parent for modal dialogs
     QList<Entry> m_agents;
     QStringList m_projects;
+    // threadId → worktree path, refreshed from each git.snapshot. Lets the
+    // roster resolve an agent's worktree dir without a fresh RPC round-trip.
+    QHash<QString, QString> m_worktreePathByThread;
     int m_counter = 0;
 };

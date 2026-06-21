@@ -82,6 +82,8 @@ public:
 
 Q_SIGNALS:
     void statusMessage(const QString &text);
+    // Requests a terminal rooted in the given worktree path.
+    void openTerminalRequested(const QString &worktreePath);
 
 protected:
     void showEvent(QShowEvent *e) override;
