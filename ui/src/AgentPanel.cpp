@@ -507,6 +507,10 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     m_input = new QPlainTextEdit(this);
     m_input->setFixedHeight(94);
     m_input->installEventFilter(this); // for the configurable send key
+    // QPlainTextEdit delivers drops to its viewport and would otherwise insert
+    // a dropped file's path as text; filter the viewport so file/attachment
+    // drops attach as context instead (see eventFilter).
+    m_input->viewport()->installEventFilter(this);
 
     // Debounced draft autosave: persist the composer text so a closed/reopened
     // panel (or a crash) doesn't lose an unsent message.
@@ -957,6 +961,37 @@ bool AgentPanel::eventFilter(QObject *obj, QEvent *event)
         && event->type() == QEvent::Resize) {
         positionJumpButton();
         return QWidget::eventFilter(obj, event);
+    }
+    // File/attachment drops onto the chat input must attach as context, not
+    // insert the path as text. The drop is delivered to the input's viewport;
+    // forward acceptable drops to the panel's handlers and consume them, while
+    // letting plain-text drops fall through to normal insertion.
+    if (m_input && obj == m_input->viewport()) {
+        switch (event->type()) {
+        case QEvent::DragEnter:
+            if (canAcceptDrop(static_cast<QDragEnterEvent *>(event)->mimeData())) {
+                dragEnterEvent(static_cast<QDragEnterEvent *>(event));
+                return true;
+            }
+            break;
+        case QEvent::DragMove:
+            if (canAcceptDrop(static_cast<QDragMoveEvent *>(event)->mimeData())) {
+                dragMoveEvent(static_cast<QDragMoveEvent *>(event));
+                return true;
+            }
+            break;
+        case QEvent::DragLeave:
+            dragLeaveEvent(static_cast<QDragLeaveEvent *>(event));
+            break;
+        case QEvent::Drop:
+            if (canAcceptDrop(static_cast<QDropEvent *>(event)->mimeData())) {
+                dropEvent(static_cast<QDropEvent *>(event));
+                return true;
+            }
+            break;
+        default:
+            break;
+        }
     }
     if (obj == m_input && event->type() == QEvent::KeyPress) {
         auto *key = static_cast<QKeyEvent *>(event);
