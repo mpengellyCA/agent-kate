@@ -62,7 +62,9 @@ QString stateLabel(const QString &state)
         return i18n("Orphaned");
     }
     if (state == QLatin1String("recordOnly")) {
-        return i18n("Agent only");
+        // Direct-workspace agents have no worktree; if listed here they aren't
+        // running. "Inactive" reflects that, rather than the kind of cleanup.
+        return i18n("Inactive");
     }
     return state;
 }
@@ -454,7 +456,7 @@ void CleanupDialog::applyResult(const QJsonObject &result)
         cands << c;
     }
     m_model->setCandidates(cands);
-    m_status->setText(i18n("%1 safe · %2 agent-only · %3 to review · %4 orphaned · %5 blocked",
+    m_status->setText(i18n("%1 safe · %2 inactive · %3 to review · %4 orphaned · %5 blocked",
                            safe, recordOnly, review, orphaned, blocked));
 }
 
