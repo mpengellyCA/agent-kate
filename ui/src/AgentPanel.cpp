@@ -21,10 +21,12 @@
 #include <QDialogButtonBox>
 #include <QDir>
 #include <QDragEnterEvent>
+#include <QDragLeaveEvent>
 #include <QDragMoveEvent>
 #include <QDropEvent>
 #include <QEvent>
 #include <QMimeData>
+#include <QSet>
 #include <QUrl>
 #include <QFile>
 #include <QFileDialog>
@@ -55,6 +57,9 @@
 #include <QWidgetAction>
 
 namespace {
+// Custom drag MIME carrying per-hit line ranges, mirrored in SearchPanel.cpp.
+constexpr char kAttachMime[] = "application/x-agentkate-attachment+json";
+
 bool isDark(const QWidget *w)
 {
     return w->palette().color(QPalette::Base).lightness() < 128;
@@ -1858,37 +1863,64 @@ void AgentPanel::attachPaths(const QStringList &paths)
         {QStringLiteral("webp"), QStringLiteral("image/webp")},
         {QStringLiteral("bmp"), QStringLiteral("image/bmp")}};
 
+    // Existing whole-file attachments, keyed by absolute path, for dedup.
+    QSet<QString> existingPaths;
+    for (const QJsonValue &av : std::as_const(m_attachments)) {
+        const QString p = av.toObject().value(QStringLiteral("path")).toString();
+        if (!p.isEmpty()) {
+            existingPaths.insert(p);
+        }
+    }
+
     for (const QString &path : paths) {
         const QFileInfo info(path);
         if (!info.exists() || info.isDir()) {
-            // Directories aren't attachable as a single blob — silently skip.
+            // Directories aren't attachable as a single blob — skip with a note.
             if (info.isDir()) {
                 emit statusMessage(
-                    QStringLiteral("Skipped %1: directories cannot be attached")
-                        .arg(info.fileName()));
+                    i18n("Skipped %1: directories cannot be attached",
+                         info.fileName()));
             }
             continue;
         }
+        const QString abs = info.absoluteFilePath();
+        if (existingPaths.contains(abs)) {
+            continue; // already attached — skip quietly
+        }
         QFile file(path);
         if (!file.open(QIODevice::ReadOnly)) {
-            emit statusMessage(QStringLiteral("Could not read %1").arg(path));
+            emit statusMessage(i18n("Could not read %1", path));
             continue;
         }
         const QByteArray bytes = file.readAll();
         const QString ext = info.suffix().toLower();
 
+        // A path outside the workspace root is allowed (external drops are the
+        // point) but flagged so the chip can hint at it.
+        const bool outside = !m_workspace.isEmpty()
+            && !abs.startsWith(QDir(m_workspace).absolutePath() + QLatin1Char('/'));
+
         QJsonObject att{{QStringLiteral("name"), info.fileName()},
-                        {QStringLiteral("path"), info.absoluteFilePath()}};
+                        {QStringLiteral("path"), abs}};
+        if (outside) {
+            att[QStringLiteral("outside")] = true;
+        }
         if (imageTypes.contains(ext)) {
             if (bytes.size() > 5 * 1024 * 1024) {
                 emit statusMessage(
-                    QStringLiteral("%1 is too large to attach (>5 MB)").arg(info.fileName()));
+                    i18n("%1 is too large to attach (>5 MB)", info.fileName()));
                 continue;
             }
             att[QStringLiteral("kind")] = QStringLiteral("image");
             att[QStringLiteral("mediaType")] = imageTypes.value(ext);
             att[QStringLiteral("dataB64")] = QString::fromLatin1(bytes.toBase64());
         } else {
+            // Binary sniff: a NUL in the first ~8 KB means this isn't text.
+            if (bytes.left(8 * 1024).contains('\0')) {
+                emit statusMessage(
+                    i18n("Skipped %1 — binary file", info.fileName()));
+                continue;
+            }
             QByteArray textBytes = bytes;
             QString suffix;
             if (textBytes.size() > 256 * 1024) {
@@ -1898,41 +1930,180 @@ void AgentPanel::attachPaths(const QStringList &paths)
             att[QStringLiteral("kind")] = QStringLiteral("text");
             att[QStringLiteral("text")] = QString::fromUtf8(textBytes) + suffix;
         }
+        existingPaths.insert(abs);
         m_attachments.append(att);
     }
     rebuildAttachChips();
 }
 
+void AgentPanel::attachItems(const QJsonArray &items)
+{
+    // Names of existing ranged (text-excerpt) attachments, for dedup.
+    QSet<QString> existingNames;
+    for (const QJsonValue &av : std::as_const(m_attachments)) {
+        existingNames.insert(av.toObject().value(QStringLiteral("name")).toString());
+    }
+
+    QStringList wholeFile; // non-ranged items degrade to attachPaths
+    for (const QJsonValue &iv : items) {
+        const QJsonObject it = iv.toObject();
+        const QString path = it.value(QStringLiteral("path")).toString();
+        if (path.isEmpty()) {
+            continue;
+        }
+        if (!it.contains(QStringLiteral("line"))) {
+            wholeFile << path;
+            continue;
+        }
+        const QFileInfo info(path);
+        if (!info.exists() || info.isDir()) {
+            continue;
+        }
+        QFile file(path);
+        if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            emit statusMessage(i18n("Could not read %1", path));
+            continue;
+        }
+        const QByteArray bytes = file.readAll();
+        if (bytes.left(8 * 1024).contains('\0')) {
+            emit statusMessage(i18n("Skipped %1 — binary file", info.fileName()));
+            continue;
+        }
+        const QStringList lines =
+            QString::fromUtf8(bytes).split(QLatin1Char('\n'));
+
+        // line/endLine are 0-based; widen by ~8 lines of context each side.
+        constexpr int kContext = 8;
+        const int line = it.value(QStringLiteral("line")).toInt();
+        const int endLine = it.value(QStringLiteral("endLine")).toInt(line);
+        const int from = qMax(0, line - kContext);
+        const int to = qMin(lines.size() - 1, endLine + kContext);
+        if (from > to) {
+            continue;
+        }
+        QString excerpt;
+        for (int i = from; i <= to; ++i) {
+            excerpt += lines.at(i);
+            excerpt += QLatin1Char('\n');
+        }
+        // The range rides purely in the display name; the core sees plain text.
+        const QString name = QStringLiteral("%1:%2-%3")
+                                 .arg(info.fileName())
+                                 .arg(line + 1)
+                                 .arg(endLine + 1);
+        if (existingNames.contains(name)) {
+            continue;
+        }
+        existingNames.insert(name);
+        m_attachments.append(QJsonObject{
+            {QStringLiteral("kind"), QStringLiteral("text")},
+            {QStringLiteral("name"), name},
+            {QStringLiteral("path"), info.absoluteFilePath()},
+            {QStringLiteral("text"), excerpt},
+        });
+    }
+    rebuildAttachChips();
+    if (!wholeFile.isEmpty()) {
+        attachPaths(wholeFile);
+    }
+}
+
+bool AgentPanel::canAcceptDrop(const QMimeData *mime) const
+{
+    if (!mime) {
+        return false;
+    }
+    if (mime->hasFormat(QLatin1String(kAttachMime))) {
+        return true;
+    }
+    if (mime->hasUrls()) {
+        const auto urls = mime->urls();
+        for (const QUrl &u : urls) {
+            if (u.isLocalFile()) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 void AgentPanel::dragEnterEvent(QDragEnterEvent *event)
 {
-    if (event->mimeData()->hasUrls()) {
+    if (canAcceptDrop(event->mimeData())) {
+        m_dragActive = true;
+        update();
         event->acceptProposedAction();
     }
 }
 
 void AgentPanel::dragMoveEvent(QDragMoveEvent *event)
 {
-    if (event->mimeData()->hasUrls()) {
+    if (canAcceptDrop(event->mimeData())) {
         event->acceptProposedAction();
     }
 }
 
+void AgentPanel::dragLeaveEvent(QDragLeaveEvent *event)
+{
+    m_dragActive = false;
+    update();
+    event->accept();
+}
+
 void AgentPanel::dropEvent(QDropEvent *event)
 {
-    if (!event->mimeData()->hasUrls()) {
+    m_dragActive = false;
+    update();
+
+    const QMimeData *mime = event->mimeData();
+    if (!canAcceptDrop(mime)) {
         return;
     }
-    QStringList paths;
-    const auto urls = event->mimeData()->urls();
-    for (const QUrl &u : urls) {
-        if (u.isLocalFile()) {
-            paths << u.toLocalFile();
+
+    const int before = m_attachments.size();
+    if (mime->hasFormat(QLatin1String(kAttachMime))) {
+        // Ranged payload from the search results — preserves line spans.
+        const QJsonArray items =
+            QJsonDocument::fromJson(mime->data(QLatin1String(kAttachMime)))
+                .array();
+        attachItems(items);
+    } else {
+        QStringList paths;
+        const auto urls = mime->urls();
+        for (const QUrl &u : urls) {
+            if (u.isLocalFile()) {
+                paths << u.toLocalFile();
+            }
         }
-    }
-    if (!paths.isEmpty()) {
         attachPaths(paths);
-        event->acceptProposedAction();
     }
+    event->acceptProposedAction();
+
+    const int added = m_attachments.size() - before;
+    if (added > 0) {
+        emit statusMessage(i18np("Attached %1 item as context",
+                                 "Attached %1 items as context", added));
+    } else {
+        emit statusMessage(i18n("Nothing attached"));
+    }
+}
+
+void AgentPanel::paintEvent(QPaintEvent *event)
+{
+    QWidget::paintEvent(event);
+    if (!m_dragActive) {
+        return;
+    }
+    QPainter p(this);
+    p.setRenderHint(QPainter::Antialiasing);
+    const QColor hl = palette().color(QPalette::Highlight);
+    QPen pen(hl, 2);
+    p.setPen(pen);
+    const QRectF border = rect().adjusted(1, 1, -1, -1);
+    p.drawRoundedRect(border, 8, 8);
+    p.setPen(hl);
+    p.drawText(rect(), Qt::AlignCenter,
+               i18n("Drop files to attach as context"));
 }
 
 void AgentPanel::rebuildAttachChips()
@@ -1950,7 +2121,9 @@ void AgentPanel::rebuildAttachChips()
         const QString name = att.value(QStringLiteral("name")).toString();
         auto *chip = new QPushButton(QStringLiteral("%1   ✕").arg(name), m_attachBar);
         chip->setCursor(Qt::PointingHandCursor);
-        chip->setToolTip(i18n("Remove attachment"));
+        chip->setToolTip(att.value(QStringLiteral("outside")).toBool()
+                             ? i18n("Outside project — click to remove")
+                             : i18n("Remove attachment"));
         // For image attachments, decode the stored base64 into a small preview
         // icon so the chip shows a thumbnail rather than just the filename.
         if (att.value(QStringLiteral("kind")).toString() == QLatin1String("image")) {

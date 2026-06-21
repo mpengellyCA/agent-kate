@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QStringList>
 #include <QWidget>
 
 class CoreClient;
@@ -7,6 +8,7 @@ class KHistoryComboBox;
 class QJsonObject;
 class QLabel;
 class QLineEdit;
+class QPoint;
 class QToolButton;
 class QTreeWidget;
 class QTreeWidgetItem;
@@ -49,6 +51,10 @@ Q_SIGNALS:
     // focus to the active editor view.
     void escapeToEditor();
 
+    // Emitted from the context menu (and available to drops) when the user
+    // wants the selected results' files added to the active chat as context.
+    void attachToChatRequested(const QStringList &paths);
+
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override;
 
@@ -57,6 +63,11 @@ private:
     void scheduleSearch();
     void onReply(const QJsonObject &result, const QJsonObject &error);
     void clearResults();
+    void onContextMenu(const QPoint &pos);
+    // Distinct file paths backing the current selection (whole-file
+    // granularity), falling back to the row under the cursor when nothing is
+    // selected.
+    QStringList selectedResultPaths() const;
     void commitHistory();
     void setBusy(bool busy);
     void stopSearch();

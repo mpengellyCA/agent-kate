@@ -163,6 +163,12 @@ void MainWindow::setupUi()
             view->setFocus();
         }
     });
+    connect(m_search, &SearchPanel::attachToChatRequested, this,
+            [this](const QStringList &paths) {
+                if (auto *panel = qobject_cast<AgentPanel *>(m_agent->activePanel())) {
+                    panel->attachPaths(paths);
+                }
+            });
 
     connect(m_worktreeDashboard, &WorktreeDashboard::statusMessage, this,
             [this](const QString &text) { statusBar()->showMessage(text, 6000); });
