@@ -84,6 +84,83 @@ func (r *threadRegistry) get(id string) (worktree.Worktree, bool) {
 	return w, ok
 }
 
+func (r *threadRegistry) remove(id string) {
+	r.mu.Lock()
+	delete(r.wt, id)
+	r.mu.Unlock()
+}
+
+// analyzeCleanupCandidates classifies every worktree in a project as a removal
+// candidate. It analyses each live snapshot (filtered to the project's repo
+// root) plus synthesises orphaned candidates from session records whose
+// worktree directory no longer exists on disk and which the cache no longer
+// tracks. Pure read.
+func analyzeCleanupCandidates(d handlerDeps, project string) []gitstatus.CleanupCandidate {
+	cands := make([]gitstatus.CleanupCandidate, 0)
+	seen := make(map[string]bool)
+
+	for _, snap := range d.gitCache.Snapshots() {
+		if project != "" && snap.RepoRoot != project {
+			continue
+		}
+		seen[snap.ThreadID] = true
+		wt, ok := d.threads.get(snap.ThreadID)
+		if !ok {
+			// Reconstruct a worktree from the snapshot when the registry has no
+			// entry (e.g. a record re-registered on restart).
+			wt = worktree.Worktree{
+				ThreadID: snap.ThreadID,
+				RepoRoot: snap.RepoRoot,
+				Path:     snap.Path,
+				Branch:   snap.Branch,
+				Base:     snap.Base,
+				Isolated: snap.Isolated,
+				Number:   snap.Number,
+			}
+		}
+		running := d.sup.Running(snap.ThreadID)
+		title, last := "", time.Time{}
+		if rec, ok := d.sessions.Get(snap.ThreadID); ok {
+			title, last = rec.Title, rec.Updated
+		}
+		cands = append(cands, gitstatus.AnalyzeCandidate(wt, snap, running, title, last))
+	}
+
+	// Orphaned: session records the cache no longer tracks whose dir is gone.
+	for _, rec := range d.sessions.List(project) {
+		if seen[rec.ThreadID] {
+			continue
+		}
+		if !rec.Worktree.Isolated {
+			continue // direct-mode threads have no dedicated worktree to clean
+		}
+		running := d.sup.Running(rec.ThreadID)
+		cands = append(cands,
+			gitstatus.AnalyzeCandidate(rec.Worktree, nil, running, rec.Title, rec.Updated))
+	}
+	return cands
+}
+
+// cleanupBlockerReason turns the first blocker code into a human-readable
+// refusal message for the destructive handler.
+func cleanupBlockerReason(blockers []string) string {
+	if len(blockers) == 0 {
+		return "worktree is not removable"
+	}
+	switch blockers[0] {
+	case gitstatus.BlockerRunning:
+		return "the agent is still running — stop it first"
+	case gitstatus.BlockerNotIsolated:
+		return "this is the main workspace, not an isolated worktree"
+	case gitstatus.BlockerDetached:
+		return "the worktree is detached or has no branch"
+	case gitstatus.BlockerSnapshot:
+		return "could not read the worktree's git state"
+	default:
+		return "worktree is not removable (" + blockers[0] + ")"
+	}
+}
+
 func runCore() {
 	socket := flag.String("socket", defaultSocketPath(), "Unix domain socket path for the UI bus")
 	flag.Parse()
@@ -1927,6 +2004,139 @@ func registerHandlers(d handlerDeps) {
 			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
 		}
 		return map[string]any{"patch": patch}, nil
+	})
+
+	// --- worktree cleanup -----------------------------------------------------
+	// SAFETY-CRITICAL. cleanup.analyze is a pure read that classifies every
+	// worktree in a project as safe / review / blocked / orphaned. The verdict
+	// is advisory to the UI; the server RE-DERIVES it in cleanup.archiveAndRemove
+	// before anything destructive happens, so a stale client can never bypass
+	// the gate.
+	d.srv.Handle("cleanup.analyze", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			Project string `json:"project"`
+			Advise  bool   `json:"advise"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+
+		cands := analyzeCleanupCandidates(d, p.Project)
+
+		// Phase 2: optional Sonnet advisory. ADVISORY ONLY — AdviseCleanup
+		// never changes State/Removable; on any LLM error it returns the
+		// candidates unchanged.
+		if p.Advise {
+			cands = gitstatus.AdviseCleanup(ctx, "", "", cands)
+		}
+		if cands == nil {
+			cands = []gitstatus.CleanupCandidate{}
+		}
+		return map[string]any{"candidates": cands}, nil
+	})
+
+	// cleanup.archiveAndRemove is THE destructive path. It NEVER trusts the
+	// client: it re-resolves the worktree, re-runs AnalyzeCandidate, refuses on
+	// any blocker, and refuses on warnings unless confirmDestroy is set. The
+	// record is archived (reversibly, transcript left on disk) BEFORE git is
+	// touched, so a failed Remove still preserves the record.
+	d.srv.Handle("cleanup.archiveAndRemove", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID       string `json:"threadId"`
+			ConfirmDestroy bool   `json:"confirmDestroy"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		if p.ThreadID == "" {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "threadId is required")
+		}
+
+		// 1. Resolve the worktree. Prefer the live registry; fall back to the
+		//    session record (an orphaned thread is not in the registry).
+		wt, ok := d.threads.get(p.ThreadID)
+		rec, recOK := d.sessions.Get(p.ThreadID)
+		if !ok {
+			if !recOK {
+				return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+			}
+			wt = rec.Worktree
+		}
+
+		// 2. RE-RUN the analysis NOW, server-side. The snapshot may be stale or
+		//    absent (orphaned); AnalyzeCandidate handles a nil snapshot.
+		snap, _ := d.gitCache.SnapshotFor(p.ThreadID)
+		running := d.sup.Running(p.ThreadID)
+		title := ""
+		if recOK {
+			title = rec.Title
+		}
+		c := gitstatus.AnalyzeCandidate(wt, snap, running, title, time.Time{})
+
+		// 3. Refuse on ANY blocker — never remove running / non-isolated /
+		//    detached / broken worktrees.
+		if !c.Removable {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams,
+				"refusing to remove: "+cleanupBlockerReason(c.Blockers))
+		}
+		// 4. Refuse on warnings unless the client explicitly confirmed the loss.
+		if len(c.Warnings) > 0 && !p.ConfirmDestroy {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams,
+				"unmerged/uncommitted work present; confirmDestroy required")
+		}
+
+		// 5. Defensive stop — even though "running" is a blocker, guard against
+		//    a process that started between analysis and now.
+		_ = d.sup.Stop(p.ThreadID)
+
+		// 6. Archive the record BEFORE touching git, so a failed Remove leaves
+		//    the record (and transcript) intact and recoverable.
+		if recOK {
+			if err := d.sessions.Archive(p.ThreadID, "cleanup: "+string(c.State)); err != nil {
+				return nil, ipc.Errorf(ipc.CodeInternalError, "archive failed: "+err.Error())
+			}
+		}
+
+		// 7. Remove the worktree (orphaned → Remove falls back to prune + branch -D).
+		if err := worktree.Remove(wt); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+
+		// 8. Drop the rest of the thread's state and notify, mirroring
+		//    agent.discard's teardown.
+		_ = d.summaries.Remove(p.ThreadID)
+		d.gitCache.Forget(p.ThreadID)
+		d.threads.remove(p.ThreadID)
+		d.srv.Notify("agent.discarded", map[string]any{"threadId": p.ThreadID})
+		d.srv.Notify("git.invalidated", map[string]any{"threadId": p.ThreadID})
+
+		d.log.Info("cleanup.archiveAndRemove complete", "thread", p.ThreadID,
+			"state", c.State, "confirmDestroy", p.ConfirmDestroy)
+		return map[string]any{"ok": true, "archived": recOK}, nil
+	})
+
+	// cleanup.listArchived returns archived records newest-first.
+	d.srv.Handle("cleanup.listArchived", func(_ context.Context, _ json.RawMessage) (any, error) {
+		arch := d.sessions.ListArchived()
+		if arch == nil {
+			arch = []session.ArchiveRecord{}
+		}
+		return map[string]any{"archived": arch}, nil
+	})
+
+	// cleanup.restore moves an archived record back as a dormant, non-isolated
+	// thread. Its worktree is gone, so it can only resume in the workspace.
+	d.srv.Handle("cleanup.restore", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID string `json:"threadId"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		if err := d.sessions.Restore(p.ThreadID); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		return map[string]any{"ok": true}, nil
 	})
 
 	// --- code search ----------------------------------------------------------

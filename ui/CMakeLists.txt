@@ -19,6 +19,7 @@ find_package(KF6 6.0 REQUIRED COMPONENTS
     I18n                # i18n()
     Parts               # KParts — embedding the Konsole terminal
     WidgetsAddons       # KMultiTabBar — Kate-style collapsible side/bottom strip
+    ColorScheme         # KColorScheme — native Breeze status-badge colours
     KIO                 # KIO::copy/move/trash, KPropertiesDialog, highlightInFileManager
     Archive             # KZip — native .xlsx (OOXML zip) reading in CsvView
 )
@@ -56,6 +57,7 @@ add_executable(agentkate
     src/AutoOrganizeDialog.cpp
     src/AgentPanel.cpp
     src/WorktreeDashboard.cpp
+    src/CleanupDialog.cpp
     src/git/BlameController.cpp
     src/git/CommitDetailPanel.cpp
     src/git/CommitDialog.cpp
@@ -94,6 +96,7 @@ target_link_libraries(agentkate PRIVATE
     KF6::I18n
     KF6::Parts
     KF6::WidgetsAddons
+    KF6::ColorScheme
     KF6::KIOCore
     KF6::KIOGui
     KF6::KIOWidgets

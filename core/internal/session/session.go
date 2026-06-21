@@ -22,8 +22,9 @@ import (
 
 // Thread status values.
 const (
-	StatusRunning = "running" // a claude process is live for this thread
-	StatusDormant = "dormant" // persisted but not running; resumable
+	StatusRunning  = "running"  // a claude process is live for this thread
+	StatusDormant  = "dormant"  // persisted but not running; resumable
+	StatusArchived = "archived" // moved out of the live roster; reversible
 )
 
 // Record is the persisted metadata for one agent thread — enough to resume it.
@@ -256,6 +257,158 @@ func (s *Store) List(project string) []Record {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Created.After(out[j].Created) })
 	return out
+}
+
+// ArchiveRecord is a Record that has been moved out of the live roster into the
+// archive file. It keeps the entire original Record (so a Restore is lossless)
+// plus when and why it was archived.
+type ArchiveRecord struct {
+	Record
+	ArchivedAt time.Time `json:"archivedAt"`
+	Reason     string    `json:"reason"`
+}
+
+// archivePath returns the sibling archive file beside the live store.
+func (s *Store) archivePath() string {
+	dir := filepath.Dir(s.path)
+	return filepath.Join(dir, "threads-archive.json")
+}
+
+// loadArchive reads the archive file. A missing file is an empty archive, not
+// an error. The caller need not hold s.mu — the archive file is independent of
+// the in-memory live map.
+func (s *Store) loadArchive() ([]ArchiveRecord, error) {
+	b, err := os.ReadFile(s.archivePath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var file struct {
+		Threads []ArchiveRecord `json:"threads"`
+	}
+	if err := json.Unmarshal(b, &file); err != nil {
+		return nil, fmt.Errorf("archive store %s: %w", s.archivePath(), err)
+	}
+	return file.Threads, nil
+}
+
+// writeArchive atomically writes the archive list to disk.
+func (s *Store) writeArchive(list []ArchiveRecord) error {
+	sort.Slice(list, func(i, j int) bool { return list[i].ArchivedAt.After(list[j].ArchivedAt) })
+	b, err := json.MarshalIndent(struct {
+		Threads []ArchiveRecord `json:"threads"`
+	}{list}, "", "  ")
+	if err != nil {
+		return err
+	}
+	path := s.archivePath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// Archive moves a thread out of the live store into the archive file. It is the
+// reversible alternative to Remove: the full Record is preserved and the Claude
+// transcript on disk is intentionally NOT deleted, so the conversation stays
+// recoverable.
+//
+// SAFETY: the archive file is written FIRST and only then is the live record
+// dropped. If the archive write fails, the live record is left intact so the
+// caller (the cleanup handler) never loses the record before git removal.
+func (s *Store) Archive(threadID, reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.recs[threadID]
+	if !ok {
+		return fmt.Errorf("unknown thread %s", threadID)
+	}
+
+	existing, err := s.loadArchive()
+	if err != nil {
+		return err
+	}
+	// Replace any prior archive entry for the same thread (re-archive after a
+	// restore) rather than duplicating it.
+	out := make([]ArchiveRecord, 0, len(existing)+1)
+	for _, a := range existing {
+		if a.ThreadID == threadID {
+			continue
+		}
+		out = append(out, a)
+	}
+	rec.Status = StatusArchived
+	out = append(out, ArchiveRecord{
+		Record:     rec,
+		ArchivedAt: time.Now().UTC(),
+		Reason:     reason,
+	})
+	// Archive file written BEFORE the live record is removed.
+	if err := s.writeArchive(out); err != nil {
+		return err
+	}
+	delete(s.recs, threadID)
+	return s.flush()
+}
+
+// ListArchived returns archived records newest-first.
+func (s *Store) ListArchived() []ArchiveRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	list, err := s.loadArchive()
+	if err != nil {
+		return nil
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].ArchivedAt.After(list[j].ArchivedAt) })
+	if list == nil {
+		return []ArchiveRecord{}
+	}
+	return list
+}
+
+// Restore best-effort moves an archived record back into the live store as a
+// dormant, non-isolated thread (its worktree is gone after cleanup, so it can
+// only be resumed in the workspace). The archive entry is removed once the live
+// record is written.
+func (s *Store) Restore(threadID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	list, err := s.loadArchive()
+	if err != nil {
+		return err
+	}
+	var found *ArchiveRecord
+	remaining := make([]ArchiveRecord, 0, len(list))
+	for i := range list {
+		if list[i].ThreadID == threadID && found == nil {
+			a := list[i]
+			found = &a
+			continue
+		}
+		remaining = append(remaining, list[i])
+	}
+	if found == nil {
+		return fmt.Errorf("no archived thread %s", threadID)
+	}
+	rec := found.Record
+	rec.Status = StatusDormant
+	// The dedicated worktree was removed during cleanup; the thread can only
+	// come back in the workspace itself.
+	rec.Worktree.Isolated = false
+	rec.Worktree.Path = rec.Project
+	rec.Worktree.Branch = ""
+	rec.Updated = time.Now()
+	s.recs[rec.ThreadID] = rec
+	if err := s.flush(); err != nil {
+		return err
+	}
+	return s.writeArchive(remaining)
 }
 
 // NewID returns a fresh random UUID (v4) — a valid `claude --session-id`.
