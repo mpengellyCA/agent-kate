@@ -2295,6 +2295,7 @@ func startAgentThread(d handlerDeps, threadID, sessionID string, p agentStartPar
 	wt.Number = d.sessions.NextNumber(p.WorkspacePath)
 	d.threads.put(threadID, wt)
 	d.gitCache.Register(wt)
+	d.gitCache.Activate(threadID) // an agent is about to run here — watch it live
 
 	mcpConfig, err := writeMCPConfig(d.exePath, d.socketPath, threadID, wt.Path)
 	if err != nil {
@@ -2365,6 +2366,7 @@ func resumeAgentThread(d handlerDeps, rec session.Record) {
 	}
 	d.threads.put(rec.ThreadID, rec.Worktree)
 	d.gitCache.Register(rec.Worktree)
+	d.gitCache.Activate(rec.ThreadID) // resuming — this thread is active again, watch it
 
 	mcpConfig, err := writeMCPConfig(d.exePath, d.socketPath, rec.ThreadID, rec.Worktree.Path)
 	if err != nil {
@@ -2461,6 +2463,7 @@ func promoteAgentThread(d handlerDeps, rec session.Record) {
 	_ = d.sessions.UpdateQuiet(rec.ThreadID, func(r *session.Record) { r.Worktree = iso })
 	d.threads.put(rec.ThreadID, iso)
 	d.gitCache.Register(iso)
+	d.gitCache.Activate(rec.ThreadID) // re-point the watch onto the new isolated worktree
 	d.log.Info("agent thread promoted", "thread", rec.ThreadID, "branch", iso.Branch)
 	emitLifecycle(d.srv, rec.ThreadID, "promoted",
 		"promoted to an isolated worktree on "+iso.Branch, &iso)

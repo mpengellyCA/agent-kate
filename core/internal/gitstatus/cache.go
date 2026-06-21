@@ -165,6 +165,15 @@ func (c *Cache) Close() error {
 // Register tells the cache a thread exists. The cache only serves status for
 // registered threads — that keeps the dashboard view aligned with what the
 // supervisor knows about.
+//
+// Registration deliberately does NOT start the fs watch. At boot every persisted
+// thread across every project is registered so the dashboard can show dormant
+// threads and per-thread RPCs resolve; watching them all would walk and inotify
+// every worktree of every project the user has ever opened, including ones not
+// open now. The watch is started lazily by Activate when a thread actually
+// becomes active. Status for an unwatched thread is still correct — it is
+// computed on demand on the next read (ensureSnapshot recomputes a nil/dirty
+// snapshot); the watch only adds proactive clean→dirty push for a thread in use.
 func (c *Cache) Register(wt worktree.Worktree) {
 	if wt.ThreadID == "" {
 		return
@@ -184,9 +193,35 @@ func (c *Cache) Register(wt worktree.Worktree) {
 		fileBlame: make(map[string]blameCacheLine),
 		dirty:     true,
 	}
-	if c.watcher != nil {
-		c.watcher.Watch(wt.ThreadID, wt.Path)
+}
+
+// Activate starts watching a registered thread's worktree for live updates.
+// Registration alone (boot rehydration) does not watch — a dormant thread in a
+// project the user never reopens must not cost a recursive inotify walk every
+// boot. Watching begins only when a thread becomes active: an agent starts or
+// resumes on it, or the user opens its git detail (diff / log / blame).
+//
+// Idempotent and safe to call from any read path. The first call for a thread
+// hands the recursive walk to a background goroutine so a first git.diff does
+// not block on it; later calls short-circuit on isWatching without spawning
+// anything, so the hot poll path stays free.
+func (c *Cache) Activate(threadID string) {
+	if threadID == "" || c.watcher == nil {
+		return
 	}
+	c.mu.RLock()
+	e, ok := c.entries[threadID]
+	c.mu.RUnlock()
+	if !ok {
+		return
+	}
+	e.mu.Lock()
+	root := e.wt.Path
+	e.mu.Unlock()
+	if root == "" || c.watcher.isWatching(threadID, root) {
+		return
+	}
+	safe.Go("gitstatus.cache.activate", func() { c.watcher.Watch(threadID, root) })
 }
 
 // Forget drops a thread from the cache, called when the thread is removed.
@@ -345,6 +380,7 @@ func (c *Cache) SnapshotFor(threadID string) (*Snapshot, bool) {
 	if !ok {
 		return nil, false
 	}
+	c.Activate(threadID) // a per-thread read means this thread is in use — watch it
 	return c.ensureSnapshot(e), true
 }
 
@@ -359,10 +395,11 @@ func (c *Cache) FindByPath(absPath string) (*Snapshot, string, bool) {
 	}
 	c.mu.RUnlock()
 
-	best, bestRel, bestLen := (*entry)(nil), "", -1
+	best, bestRel, bestLen, bestThread := (*entry)(nil), "", -1, ""
 	for _, e := range entries {
 		e.mu.Lock()
 		root := e.wt.Path
+		thread := e.wt.ThreadID
 		e.mu.Unlock()
 		rel, ok := relativeTo(root, absPath)
 		if !ok {
@@ -371,12 +408,13 @@ func (c *Cache) FindByPath(absPath string) (*Snapshot, string, bool) {
 		// Prefer the most specific match — an isolated worktree path is always
 		// longer than its parent repo root, so this picks the worktree.
 		if len(root) > bestLen {
-			best, bestRel, bestLen = e, rel, len(root)
+			best, bestRel, bestLen, bestThread = e, rel, len(root), thread
 		}
 	}
 	if best == nil {
 		return nil, "", false
 	}
+	c.Activate(bestThread) // the file lives in this thread's worktree — watch it
 	return c.ensureSnapshot(best), bestRel, true
 }
 
@@ -390,6 +428,7 @@ func (c *Cache) HunksFor(threadID, relPath string) ([]Hunk, uint64, bool, error)
 	if !ok {
 		return nil, 0, false, nil
 	}
+	c.Activate(threadID) // gutter/diff for this thread is open — watch it
 	s := c.ensureSnapshot(e)
 	if s == nil {
 		return nil, 0, true, nil
@@ -421,6 +460,7 @@ func (c *Cache) BlameFor(threadID, relPath string) ([]BlameLine, bool, error) {
 	if !ok {
 		return nil, false, nil
 	}
+	c.Activate(threadID) // blame for this thread is open — watch it
 	s := c.ensureSnapshot(e)
 	if s == nil {
 		return nil, true, nil
@@ -462,6 +502,7 @@ func (c *Cache) LogPageFor(threadID string, opts LogOptions) ([]LogEntry, bool, 
 	if !ok {
 		return nil, false, nil
 	}
+	c.Activate(threadID) // the log viewer is open on this thread — watch it
 	s := c.ensureSnapshot(e)
 	if s == nil {
 		return nil, true, nil

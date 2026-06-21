@@ -44,6 +44,16 @@ type watcher struct {
 	// should be invalidated when an event fires inside it.
 	dirOwner map[string]string
 
+	// watchedRoot maps a thread id to the worktree root currently watched for
+	// it, or is absent when the thread is not being watched. Watching is lazy:
+	// a thread is registered with the cache at boot but only enters this map
+	// when it becomes active (an agent runs on it, or the user opens its git
+	// detail). The recorded root lets Watch be idempotent — a repeat call with
+	// the same root is a no-op, so read-path activation can call it freely — and
+	// lets it re-point cleanly when a thread's root changes (e.g. a promote
+	// relocates the worktree).
+	watchedRoot map[string]string
+
 	// invalidate carries thread ids from the inotify read loop to the
 	// dispatch consumer. Buffered so a slow consumer doesn't stall the reader.
 	invalidate chan string
@@ -64,11 +74,12 @@ func newWatcher(log *slog.Logger) (*watcher, error) {
 		return nil, err
 	}
 	return &watcher{
-		fs:         fs,
-		log:        log,
-		dirOwner:   make(map[string]string),
-		invalidate: make(chan string, invalidateQueueSize),
-		pending:    make(map[string]struct{}),
+		fs:          fs,
+		log:         log,
+		dirOwner:    make(map[string]string),
+		watchedRoot: make(map[string]string),
+		invalidate:  make(chan string, invalidateQueueSize),
+		pending:     make(map[string]struct{}),
 	}, nil
 }
 
@@ -99,13 +110,53 @@ func (w *watcher) Close() error {
 // .git — so we add a curated set of watches in there too (HEAD, index, refs,
 // packed-refs, MERGE_HEAD, …). Without this the dashboard stayed stale after
 // any commit that didn't go through the daemon's own git.* RPCs.
+//
+// Idempotent: a repeat call with the same root returns without re-walking, so
+// the read path can call it on every poll to keep an active thread watched. A
+// call with a *different* root (e.g. a promote relocated the worktree) drops the
+// stale tree's watches first, so a thread never holds watches on an old path.
 func (w *watcher) Watch(threadID, root string) {
+	w.mu.Lock()
+	cur, watched := w.watchedRoot[threadID]
+	if watched && cur == root {
+		w.mu.Unlock()
+		return
+	}
+	w.watchedRoot[threadID] = root
+	w.mu.Unlock()
+	if watched {
+		// Root changed: clear the old tree before walking the new one. Keep the
+		// watchedRoot entry (already updated above) so a concurrent activator
+		// still sees this thread as watched.
+		w.removeWatches(threadID)
+	}
+
 	w.addDirRecursive(threadID, root, true)
 	w.addGitMetaWatches(threadID, root)
 }
 
-// Unwatch removes every watch that was added under this thread's root.
+// isWatching reports whether the thread's worktree root is already being
+// watched. It lets the cache skip spawning an activation goroutine on the hot
+// poll path once a thread is live.
+func (w *watcher) isWatching(threadID, root string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.watchedRoot[threadID] == root
+}
+
+// Unwatch removes every watch under this thread's root and forgets that the
+// thread was watched, so a later Watch re-walks from scratch.
 func (w *watcher) Unwatch(threadID string) {
+	w.mu.Lock()
+	delete(w.watchedRoot, threadID)
+	w.mu.Unlock()
+	w.removeWatches(threadID)
+}
+
+// removeWatches drops the dirOwner entries and inotify watches for a thread
+// without touching watchedRoot. Watch uses it to clear a stale tree before
+// re-pointing; Unwatch wraps it to fully forget the thread.
+func (w *watcher) removeWatches(threadID string) {
 	w.mu.Lock()
 	var paths []string
 	for dir, owner := range w.dirOwner {
