@@ -126,13 +126,14 @@ func analyzeCleanupCandidates(d handlerDeps, project string) []gitstatus.Cleanup
 		cands = append(cands, gitstatus.AnalyzeCandidate(wt, snap, running, title, last))
 	}
 
-	// Orphaned: session records the cache no longer tracks whose dir is gone.
+	// Session records the live cache no longer tracks. Two kinds surface here:
+	// orphaned isolated worktrees (dir gone — removal prunes git bookkeeping),
+	// and dormant direct-workspace agents (no live snapshot this session).
+	// AnalyzeCandidate classifies each: the former orphaned, the latter
+	// record-only. Both are removable; the direct ones only archive the session.
 	for _, rec := range d.sessions.List(project) {
 		if seen[rec.ThreadID] {
 			continue
-		}
-		if !rec.Worktree.Isolated {
-			continue // direct-mode threads have no dedicated worktree to clean
 		}
 		running := d.sup.Running(rec.ThreadID)
 		cands = append(cands,

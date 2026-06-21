@@ -29,6 +29,12 @@ const (
 	// CleanupOrphaned — the worktree directory no longer exists on disk, so
 	// removal only prunes leftover git bookkeeping. Safe.
 	CleanupOrphaned CleanupState = "orphaned"
+	// CleanupRecordOnly — a direct-workspace ("not isolated") agent. It owns no
+	// dedicated worktree: it runs in the user's checkout, so there is nothing on
+	// disk to delete. Removal archives only the agent's SESSION (reversibly via
+	// cleanup.restore) to clear a stale thread from the list; the checkout is
+	// left completely untouched. Removable when the agent is not running.
+	CleanupRecordOnly CleanupState = "recordOnly"
 )
 
 // CleanupCandidate is the full, JSON-serialisable analysis of one worktree as a
@@ -112,12 +118,12 @@ func AnalyzeCandidate(wt worktree.Worktree, snap *Snapshot, running bool, title 
 	if running {
 		c.Blockers = append(c.Blockers, BlockerRunning)
 	}
-	if !wt.Isolated {
-		// The main workspace and direct-mode agents are never removable: there
-		// is no dedicated worktree to delete, only the user's checkout.
-		c.Blockers = append(c.Blockers, BlockerNotIsolated)
-	}
-	if wt.Branch == "" {
+	// A missing branch is only a fault for an ISOLATED worktree — a detached
+	// HEAD we refuse to guess about. A direct-workspace agent legitimately has
+	// no branch of its own (it shares the checkout's branch), so this never
+	// applies to it; gating on Isolated is what lets such an agent reach the
+	// record-only removal path below instead of being wrongly flagged detached.
+	if wt.Isolated && wt.Branch == "" {
 		c.Blockers = append(c.Blockers, BlockerDetached)
 	}
 	if snap != nil && snap.Error != "" && dirExists {
@@ -129,6 +135,12 @@ func AnalyzeCandidate(wt worktree.Worktree, snap *Snapshot, running bool, title 
 	if snap != nil {
 		c.Ahead = snap.Ahead
 		c.DirtyCount = snap.DirtyCount
+		// A direct-workspace agent has no branch of its own; borrow the
+		// checkout's current branch (from the snapshot) for display so the row
+		// reads "main" rather than the misleading "(detached)".
+		if c.Branch == "" {
+			c.Branch = snap.Branch
+		}
 	}
 
 	// "Merged into the workspace branch?" — the authoritative test. Only
@@ -170,9 +182,11 @@ func AnalyzeCandidate(wt worktree.Worktree, snap *Snapshot, running bool, title 
 		if c.StashCount > 0 {
 			c.Warnings = append(c.Warnings, WarnHasStash)
 		}
-	} else if c.DirtyCount > 0 {
+	} else if wt.Isolated && c.DirtyCount > 0 {
 		// Even when we can't run the full git query set (e.g. detached), a
-		// dirty tree is still a flag for any path that does reach removal.
+		// dirty tree is still a flag for any isolated path that reaches removal.
+		// Direct-workspace agents are excluded: a dirty checkout is shared work
+		// that archiving the session record cannot lose, so it is not a warning.
 		c.Warnings = append(c.Warnings, WarnDirty)
 	}
 
@@ -181,6 +195,10 @@ func AnalyzeCandidate(wt worktree.Worktree, snap *Snapshot, running bool, title 
 	switch {
 	case !c.Removable:
 		c.State = CleanupBlocked
+	case !wt.Isolated:
+		// Removable, but with no worktree to delete: removal archives only the
+		// agent's session record. Distinct from "safe" so the UI can say so.
+		c.State = CleanupRecordOnly
 	case len(c.Warnings) > 0:
 		c.State = CleanupReview
 	default:
