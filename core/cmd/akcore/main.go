@@ -284,6 +284,53 @@ func runCore() {
 	}
 	registerHandlers(deps)
 
+	// gracefulShutdown runs the ordered teardown: compact live (Hot-Opus)
+	// threads, stop every agent, drain any cold-exit compactions, then close the
+	// file watchers. It is guarded by a sync.Once so the RPC-driven path (which
+	// streams progress to a UI dialog) and the signal/disconnect fallback path
+	// can both call it without doing the work twice.
+	var shutdownOnce sync.Once
+	gracefulShutdown := func(progress shutdownProgressFn) {
+		shutdownOnce.Do(func() {
+			running := 0
+			for _, rec := range sessions.List("") {
+				if sup.Running(rec.ThreadID) {
+					running++
+				}
+			}
+			progress("preparing", "", 0, running)
+			// Hot-Opus compaction runs while the threads are still live and
+			// cache-warm; it emits its own per-agent "compacting" progress.
+			runHotCompactsAtShutdown(deps, progress)
+			progress("stopping", "", 0, running)
+			sup.StopAll()
+			// Cold-exit compactions were spawned from the exit lifecycle as each
+			// thread reaped; drain them (bounded) before we let the process exit.
+			progress("draining", "", 0, 0)
+			coldCompacts.drain(cancelExitCompacts, exitCompactCap, log)
+			progress("watchers", "", 0, 0)
+			_ = gitCache.Close()
+			progress("done", "", 0, running)
+		})
+	}
+
+	// app.shutdown lets the UI request a graceful, observable teardown while the
+	// IPC server is still alive, so it can stream shutdown.progress to a dialog.
+	// When done it cancels the serve context, which exits the process; the
+	// fallback path below then re-invokes gracefulShutdown as a guarded no-op.
+	srv.Handle("app.shutdown", func(_ context.Context, _ json.RawMessage) (any, error) {
+		gracefulShutdown(func(phase, detail string, index, total int) {
+			srv.Notify("shutdown.progress", map[string]any{
+				"phase":  phase,
+				"detail": detail,
+				"index":  index,
+				"total":  total,
+			})
+		})
+		stop()
+		return map[string]any{"ok": true}, nil
+	})
+
 	// Rehydrate the git cache and thread registry with every persisted thread
 	// that still has a worktree on disk, so the dashboard shows dormant threads
 	// after a restart and per-thread RPCs (git.log, git.diff, …) resolve before
@@ -302,15 +349,12 @@ func runCore() {
 	})
 
 	serveErr := srv.Serve(ctx)
-	// Run Hot-Opus compacts in parallel for any thread configured for them
-	// while the live process is still cache-warm; cold strategies fire from
-	// the exit lifecycle handler after the process terminates.
-	runHotCompactsAtShutdown(deps)
-	// StopAll now blocks until every thread has been reaped, so by the time it
-	// returns every cold-exit compaction has been spawned and registered with
-	// coldCompacts. Drain them (bounded) before we let the process exit.
-	sup.StopAll()
-	coldCompacts.drain(cancelExitCompacts, exitCompactCap, log)
+	// Fallback teardown for the paths that don't go through app.shutdown (UI
+	// disconnect, SIGINT/SIGTERM). Guarded by the same sync.Once, so if the UI
+	// already drove a graceful shutdown this is a no-op.
+	gracefulShutdown(func(phase, detail string, index, total int) {
+		log.Info("shutdown progress", "phase", phase, "index", index, "total", total)
+	})
 	if serveErr != nil {
 		log.Error("ipc server stopped", "err", serveErr)
 		os.Exit(1)
@@ -2478,8 +2522,8 @@ func runHotCompactIfConfigured(d handlerDeps, threadID string) {
 // thread configured for it, before the supervisor terminates them all.
 // Each compact has its own 2-minute timeout, so a stuck thread cannot
 // hold up shutdown of the others.
-func runHotCompactsAtShutdown(d handlerDeps) {
-	var wg sync.WaitGroup
+func runHotCompactsAtShutdown(d handlerDeps, progress shutdownProgressFn) {
+	var targets []session.Record
 	for _, rec := range d.sessions.List("") {
 		if !d.sup.Running(rec.ThreadID) {
 			continue
@@ -2487,14 +2531,35 @@ func runHotCompactsAtShutdown(d handlerDeps) {
 		if compact.Strategy(rec.CompactStrategy).Resolve() != compact.ExitOpusHot {
 			continue
 		}
+		targets = append(targets, rec)
+	}
+	total := len(targets)
+	if total == 0 {
+		return
+	}
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	done := 0
+	for _, rec := range targets {
 		wg.Add(1)
-		go func(threadID string) {
+		go func(rec session.Record) {
 			defer wg.Done()
-			runHotCompactIfConfigured(d, threadID)
-		}(rec.ThreadID)
+			runHotCompactIfConfigured(d, rec.ThreadID)
+			// Report completion as each finishes so the shutdown dialog can show
+			// "Compacting context for resume (i of N)".
+			mu.Lock()
+			done++
+			progress("compacting", rec.Title, done, total)
+			mu.Unlock()
+		}(rec)
 	}
 	wg.Wait()
 }
+
+// shutdownProgressFn reports graceful-shutdown progress. phase is a stable code
+// (preparing|compacting|stopping|draining|watchers|done) the UI maps to text;
+// detail is an optional agent title; index/total drive the "(i of N)" counter.
+type shutdownProgressFn func(phase, detail string, index, total int)
 
 // exitCompactCap bounds how long shutdown waits for cold-exit compactions to
 // finish. A cold `claude --resume` usually lands in a few seconds; the cap is

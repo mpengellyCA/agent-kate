@@ -49,6 +49,8 @@ public:
     void setWorkspace(const QString &path);
     QString threadId() const { return m_threadId; }
     bool isIsolated() const { return m_isolated; }
+    // A live agent has a thread and a running process (not dormant/resumable).
+    bool isRunning() const { return !m_threadId.isEmpty() && !m_dormant; }
 
     // Pre-pick the start model by its id ("opus", "sonnet", …) before the first
     // start. No-op once a thread exists (the combo is frozen then) or if the id
@@ -119,6 +121,7 @@ private:
     // Rebuild the "queued messages" chip bar from m_sendQueue.
     void rebuildQueueChips();
     void onStopClicked();
+    void onInterruptClicked();
     void onChangesClicked();
     void onPromoteClicked();
     void onAttachClicked();
@@ -242,6 +245,7 @@ private:
     QMenu *m_compactNowMenu = nullptr;
     QPushButton *m_sendBtn = nullptr;
     QPushButton *m_stopBtn = nullptr;
+    QPushButton *m_interruptBtn = nullptr;
     QPushButton *m_diffBtn = nullptr;
     QPushButton *m_attachBtn = nullptr;
 

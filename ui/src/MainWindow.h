@@ -88,6 +88,9 @@ private:
     void restoreEditorSession(const QString &projectPath);
 
     CoreClient *m_core = nullptr;
+    // Set once the graceful stop-and-compact shutdown has run, so the re-entered
+    // closeEvent takes the normal teardown path instead of re-showing the dialog.
+    bool m_shutdownComplete = false;
     EditorArea *m_editor = nullptr;
     ProjectTree *m_tree = nullptr;
     AgentDock *m_agent = nullptr;

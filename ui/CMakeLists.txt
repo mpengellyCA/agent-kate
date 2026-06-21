@@ -58,6 +58,7 @@ add_executable(agentkate
     src/AgentPanel.cpp
     src/WorktreeDashboard.cpp
     src/CleanupDialog.cpp
+    src/ShutdownDialog.cpp
     src/git/BlameController.cpp
     src/git/CommitDetailPanel.cpp
     src/git/CommitDialog.cpp
