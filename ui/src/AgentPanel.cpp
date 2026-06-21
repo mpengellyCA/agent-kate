@@ -3,6 +3,7 @@
 
 #include <KConfigGroup>
 #include <KLocalizedString>
+#include <KMessageWidget>
 #include <KSharedConfig>
 
 #include <QAbstractButton>
@@ -773,6 +774,15 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     m_attachLayout->addStretch(1);
     m_attachBar->setVisible(false);
 
+    // Inline banner explaining why a dropped/attached file was rejected. More
+    // visible and persistent than a status-bar toast, and dismissable.
+    m_attachNotice = new KMessageWidget(this);
+    m_attachNotice->setMessageType(KMessageWidget::Information);
+    m_attachNotice->setIcon(QIcon::fromTheme(QStringLiteral("dialog-information")));
+    m_attachNotice->setCloseButtonVisible(true);
+    m_attachNotice->setWordWrap(true);
+    m_attachNotice->setVisible(false);
+
     // Queue chip bar — shows follow-ups typed while a turn is in progress.
     // Hidden until something is queued. Each chip removes its message on click.
     m_queueBar = new QFrame(this);
@@ -886,6 +896,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     body->addWidget(m_questionBox);
     body->addWidget(m_promoteBar);
     body->addWidget(m_queueBar);
+    body->addWidget(m_attachNotice);
     body->addWidget(m_attachBar);
     body->addWidget(m_input);
     body->addLayout(buttons);
@@ -1885,11 +1896,24 @@ void AgentPanel::onAttachClicked()
     attachPaths(paths);
 }
 
+void AgentPanel::showAttachNotice(const QString &text)
+{
+    if (!m_attachNotice) {
+        return;
+    }
+    m_attachNotice->setText(text);
+    m_attachNotice->animatedShow();
+}
+
 void AgentPanel::attachPaths(const QStringList &paths)
 {
     if (paths.isEmpty()) {
         return;
     }
+    if (m_attachNotice) {
+        m_attachNotice->hide(); // clear any stale rejection from a prior attempt
+    }
+    QStringList skipped; // human-readable reasons, shown together at the end
     static const QHash<QString, QString> imageTypes{
         {QStringLiteral("png"), QStringLiteral("image/png")},
         {QStringLiteral("jpg"), QStringLiteral("image/jpeg")},
@@ -1912,9 +1936,7 @@ void AgentPanel::attachPaths(const QStringList &paths)
         if (!info.exists() || info.isDir()) {
             // Directories aren't attachable as a single blob — skip with a note.
             if (info.isDir()) {
-                emit statusMessage(
-                    i18n("Skipped %1: directories cannot be attached",
-                         info.fileName()));
+                skipped << i18n("%1 — folders can't be attached", info.fileName());
             }
             continue;
         }
@@ -1924,7 +1946,7 @@ void AgentPanel::attachPaths(const QStringList &paths)
         }
         QFile file(path);
         if (!file.open(QIODevice::ReadOnly)) {
-            emit statusMessage(i18n("Could not read %1", path));
+            skipped << i18n("%1 — could not be read", info.fileName());
             continue;
         }
         const QByteArray bytes = file.readAll();
@@ -1942,8 +1964,8 @@ void AgentPanel::attachPaths(const QStringList &paths)
         }
         if (imageTypes.contains(ext)) {
             if (bytes.size() > 5 * 1024 * 1024) {
-                emit statusMessage(
-                    i18n("%1 is too large to attach (>5 MB)", info.fileName()));
+                skipped << i18n("%1 — image too large to attach (over 5 MB)",
+                                info.fileName());
                 continue;
             }
             att[QStringLiteral("kind")] = QStringLiteral("image");
@@ -1952,8 +1974,8 @@ void AgentPanel::attachPaths(const QStringList &paths)
         } else {
             // Binary sniff: a NUL in the first ~8 KB means this isn't text.
             if (bytes.left(8 * 1024).contains('\0')) {
-                emit statusMessage(
-                    i18n("Skipped %1 — binary file", info.fileName()));
+                skipped << i18n("%1 — binary file, can't be added as text context",
+                                info.fileName());
                 continue;
             }
             QByteArray textBytes = bytes;
@@ -1967,6 +1989,12 @@ void AgentPanel::attachPaths(const QStringList &paths)
         }
         existingPaths.insert(abs);
         m_attachments.append(att);
+    }
+    if (!skipped.isEmpty()) {
+        showAttachNotice(skipped.size() == 1
+                             ? i18n("Couldn't attach %1", skipped.first())
+                             : i18n("Couldn't attach some files:\n• %1",
+                                    skipped.join(QStringLiteral("\n• "))));
     }
     rebuildAttachChips();
 }
@@ -1996,12 +2024,16 @@ void AgentPanel::attachItems(const QJsonArray &items)
         }
         QFile file(path);
         if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-            emit statusMessage(i18n("Could not read %1", path));
+            showAttachNotice(i18n("Couldn't attach %1 — could not be read",
+                                  info.fileName()));
             continue;
         }
         const QByteArray bytes = file.readAll();
         if (bytes.left(8 * 1024).contains('\0')) {
-            emit statusMessage(i18n("Skipped %1 — binary file", info.fileName()));
+            showAttachNotice(
+                i18n("Couldn't attach %1 — binary file, can't be added as "
+                     "text context",
+                     info.fileName()));
             continue;
         }
         const QStringList lines =

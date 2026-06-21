@@ -30,6 +30,7 @@ class QPlainTextEdit;
 class QPushButton;
 class QScrollArea;
 class QTimer;
+class KMessageWidget;
 class QToolButton;
 class QVBoxLayout;
 
@@ -122,6 +123,9 @@ private:
     void onPromoteClicked();
     void onAttachClicked();
     void rebuildAttachChips();
+    // Surface why files were rejected (binary, too large, unreadable) in a
+    // prominent inline banner rather than a transient status-bar message.
+    void showAttachNotice(const QString &text);
     void onNotification(const QString &method, const QJsonObject &params);
     void renderEvent(const QJsonObject &event);
     void onPermissionRequested(const QJsonObject &params);
@@ -244,6 +248,7 @@ private:
     // Pending attachments for the next message (each {kind,name,mediaType,…}).
     QWidget *m_attachBar = nullptr;
     QHBoxLayout *m_attachLayout = nullptr;
+    KMessageWidget *m_attachNotice = nullptr;
     QJsonArray m_attachments;
 
     // Per-tool approval banner and the queue of pending requests.
