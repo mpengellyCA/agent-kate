@@ -99,6 +99,15 @@ BlameController::BlameController(KTextEditor::Document *doc, KTextEditor::View *
                     refresh();
                 }
             });
+    // An agent rewriting this open file triggers a silent documentReload — not a
+    // user save and not a HEAD move — so refresh blame on reload too, otherwise
+    // the annotations track the pre-edit contents.
+    connect(doc, &KTextEditor::Document::reloaded, this,
+            [this](KTextEditor::Document *) {
+                if (m_enabled) {
+                    refresh();
+                }
+            });
     // Blame vs HEAD only changes when HEAD moves (a commit lands / branch
     // switches) or this file is saved — the save is handled by the
     // documentSavedOrUploaded hook above. A plain git.invalidated fires on

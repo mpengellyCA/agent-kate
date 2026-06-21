@@ -230,19 +230,34 @@ type conn struct {
 	closeOnce sync.Once
 }
 
-// enqueue queues f for delivery to this client. It never blocks the caller.
+// enqueue queues f for delivery to this client. It never blocks a shared
+// producer on a slow client.
 //
-// Backpressure policy: if the outbound queue is full (a slow or stuck UI
-// client), we drop the OLDEST queued frame to make room for the newest one
-// rather than stall the shared producers. Notifications are coalescing/
-// best-effort by nature — UI state is re-derived from snapshots — so shedding
-// the most stale frame keeps the client as current as possible. A client that
-// stays full and also trips the writer's deadline is disconnected by writeLoop.
+// Backpressure policy distinguishes the two frame kinds:
+//   - Responses (non-nil ID) are awaited by a blocking Client.Call and MUST be
+//     delivered. They are sent with a guaranteed (blocking) send that only gives
+//     up if the connection is closing; the writer's deadline disconnects a dead
+//     client, which unblocks the send. Responses originate on the per-request
+//     dispatch goroutine, so blocking there delays only that one reply, never the
+//     shared per-agent/fs-watcher producers.
+//   - Notifications (nil ID) are coalescing/best-effort — UI state is re-derived
+//     from snapshots — so when the queue is full we shed the OLDEST notification
+//     to keep the client as current as possible. We NEVER shed a response: if the
+//     head of the queue is a response, we put it back and drop this incoming
+//     notification instead.
 //
-// enqueue is safe to call after the connection has begun closing: the send is
-// guarded by a non-blocking select on done, so there is no send-on-closed-
-// channel panic and no goroutine leak.
+// enqueue is safe to call after the connection has begun closing: every send is
+// guarded by a select on done, so there is no send-on-closed-channel panic and
+// no goroutine leak.
 func (c *conn) enqueue(f *Frame) {
+	if f.ID != nil {
+		// Response: must deliver. Block (bounded by writer drain / deadline).
+		select {
+		case <-c.done:
+		case c.out <- f:
+		}
+		return
+	}
 	for {
 		select {
 		case <-c.done:
@@ -251,12 +266,22 @@ func (c *conn) enqueue(f *Frame) {
 			return
 		default:
 		}
-		// Queue full: discard the oldest superseded frame, then retry.
+		// Queue full: shed the oldest *notification*, then retry.
 		select {
 		case <-c.done:
 			return
-		case <-c.out:
-			c.log.Warn("ipc outbound queue full, dropping oldest frame")
+		case old := <-c.out:
+			if old.ID != nil {
+				// Oldest is a response we must keep. A slot is now free (we just
+				// popped it), so put it back — and drop this incoming
+				// notification instead of the response.
+				select {
+				case <-c.done:
+				case c.out <- old:
+				}
+				return
+			}
+			c.log.Warn("ipc outbound queue full, dropping oldest notification")
 		default:
 			// Drained concurrently between the two selects; loop and retry the
 			// enqueue (which will now usually succeed).

@@ -110,6 +110,14 @@ GutterController::GutterController(KTextEditor::Document *doc, const QString &ab
                 m_pollTimer->stop();
                 m_debounceTimer->stop();
             });
+    // An external rewrite (e.g. an agent edits this open file) triggers a silent
+    // documentReload, which clears KTextEditor's marks. Drop the dedup baseline
+    // so applyHunks cannot suppress the repaint, and re-poll to restore stripes.
+    connect(doc, &KTextEditor::Document::reloaded, this,
+            [this](KTextEditor::Document *) {
+                m_lastHunks = QJsonArray();
+                scheduleRefresh();
+            });
 
     // The fs watcher pushes git.invalidated on every working-tree change. That
     // is the primary refresh trigger — coalesce bursts (e.g. a save touching

@@ -271,11 +271,25 @@ func (w *watcher) readLoop() (closed bool) {
 // closed at Close.
 func (w *watcher) dispatch(c *Cache) {
 	for threadID := range w.invalidate {
-		w.pendMu.Lock()
-		delete(w.pending, threadID)
-		w.pendMu.Unlock()
-		c.Invalidate(threadID)
+		w.invalidateOne(c, threadID)
 	}
+}
+
+// invalidateOne processes a single queued invalidation under a recover, so a
+// panic in one Cache.Invalidate (or a downstream callback) can't kill the
+// dispatch consumer and silently freeze git-status freshness for every thread —
+// matching the read loop's restart-on-panic resilience.
+func (w *watcher) invalidateOne(c *Cache, threadID string) {
+	defer func() {
+		if r := recover(); r != nil {
+			w.log.Error("fs watcher dispatch panic recovered",
+				"thread", threadID, "panic", r)
+		}
+	}()
+	w.pendMu.Lock()
+	delete(w.pending, threadID)
+	w.pendMu.Unlock()
+	c.Invalidate(threadID)
 }
 
 // handleEvent runs on the inotify read loop. It does only cheap, non-blocking

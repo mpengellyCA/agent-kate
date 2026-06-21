@@ -31,8 +31,8 @@ struct UiLogEntry {
     // immutable for a given sha, so they don't need to be compared.
     bool operator==(const UiLogEntry &o) const
     {
-        return sha == o.sha && refs == o.refs && lane == o.lane
-            && lanesIn == o.lanesIn && lanesOut == o.lanesOut;
+        return sha == o.sha && shortSha == o.shortSha && refs == o.refs
+            && lane == o.lane && lanesIn == o.lanesIn && lanesOut == o.lanesOut;
     }
     bool operator!=(const UiLogEntry &o) const { return !(*this == o); }
 };

@@ -176,11 +176,13 @@ func newCoalescer(threadID string, emit EventFunc) *coalescer {
 func (c *coalescer) add(raw json.RawMessage, boundary, dedup bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if dedup {
-		for _, p := range c.pending {
-			if bytes.Equal(p, raw) {
-				return
-			}
+	if dedup && len(c.pending) > 0 {
+		// Drop only when the IMMEDIATELY-PRECEDING buffered event is byte-equal:
+		// that is the exact `claude --verbose` partial-snapshot pattern. Scanning
+		// the whole batch could drop a legitimately-repeated, non-adjacent
+		// identical event.
+		if bytes.Equal(c.pending[len(c.pending)-1], raw) {
+			return
 		}
 	}
 	c.pending = append(c.pending, raw)

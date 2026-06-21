@@ -6,6 +6,7 @@ package gitstatus
 import (
 	"container/heap"
 	"errors"
+	"sort"
 	"strings"
 	"time"
 
@@ -235,6 +236,12 @@ func collectRefs(repo *git.Repository) map[string][]string {
 		out[sha] = append(out[sha], label)
 		return nil
 	})
+	// Deterministic order so an unchanged ref set always serialises identically —
+	// otherwise the UI's order-sensitive UiLogEntry compare sees a spurious change
+	// and repaints the row (defeating the Tier-2 diff suppression).
+	for sha := range out {
+		sort.Strings(out[sha])
+	}
 	return out
 }
 

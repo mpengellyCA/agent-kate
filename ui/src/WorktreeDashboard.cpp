@@ -615,7 +615,13 @@ void WorktreeDashboard::updatePlaceholder()
 
 void WorktreeDashboard::refresh()
 {
-    if (m_inFlight || !m_core->isConnected()) {
+    if (m_inFlight) {
+        // A snapshot is already in flight; remember that fresher data arrived so
+        // we re-issue once the reply lands rather than dropping this invalidation.
+        m_refreshPending = true;
+        return;
+    }
+    if (!m_core->isConnected()) {
         return;
     }
     m_inFlight = true;
@@ -662,7 +668,13 @@ void WorktreeDashboard::refresh()
                      // is dropped here, so applySnapshot() (and thus setRows /
                      // any repaint) runs only on a genuine change.
                      m_snapshot.set(std::move(rows));
-                 });
+                     // Catch up on any invalidation that arrived mid-flight.
+                     if (m_refreshPending) {
+                         m_refreshPending = false;
+                         refresh();
+                     }
+                 },
+                 this);
 }
 
 void WorktreeDashboard::applySnapshot(const QList<WorktreeRow> &rows)

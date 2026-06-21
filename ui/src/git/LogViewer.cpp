@@ -445,7 +445,8 @@ void LogViewer::refreshHead()
             } else if (bar) {
                 bar->setValue(savedScroll);
             }
-        });
+        },
+        this);
 }
 
 void LogViewer::onSelectionChanged()

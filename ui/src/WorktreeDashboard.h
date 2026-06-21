@@ -134,6 +134,10 @@ private:
     QLabel *m_placeholder = nullptr;
     QString m_activeProject;
     bool m_inFlight = false;
+    // Set when refresh() is requested while a git.snapshot is already in flight,
+    // so the dropped invalidation is re-issued once the reply lands instead of
+    // waiting up to a full safety-net poll interval to catch up.
+    bool m_refreshPending = false;
 
     // Canonical snapshot. set() in the git.snapshot reply; an identical
     // payload is dropped here (no subscriber, no setRows, no repaint).
