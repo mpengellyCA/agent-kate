@@ -6,6 +6,7 @@
 #include <KSharedConfig>
 #include <KConfigGroup>
 
+#include <QAction>
 #include <QApplication>
 #include <QDir>
 #include <QEvent>
@@ -14,18 +15,23 @@
 #include <QHeaderView>
 #include <QIcon>
 #include <QJsonArray>
+#include <QJsonDocument>
 #include <QJsonObject>
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMenu>
+#include <QMimeData>
 #include <QPainter>
 #include <QPointer>
 #include <QRegularExpression>
+#include <QSet>
 #include <QStyledItemDelegate>
 #include <QTextLayout>
 #include <QTimer>
 #include <QToolButton>
 #include <QTreeWidget>
+#include <QUrl>
 #include <QVBoxLayout>
 
 namespace {
@@ -34,6 +40,10 @@ constexpr int kMaxResults = 2000;
 constexpr int kMaxHistory = 30;
 constexpr char kConfigGroup[] = "Search";
 constexpr char kConfigKey[] = "history";
+
+// Custom drag MIME carrying per-hit line ranges, mirrored in AgentPanel.cpp.
+// Drops fall back to the standard text/uri-list when this type is absent.
+constexpr char kAttachMime[] = "application/x-agentkate-attachment+json";
 
 // Roles on result rows, beyond the default UserRole (path) and UserRole+1
 // (0-based line). Column is 0-based; HiStart/HiLen address the highlighted
@@ -126,6 +136,56 @@ public:
         painter->restore();
     }
 };
+
+// QTreeWidget's default mimeData() emits an internal-only
+// application/x-qabstractitemmodeldatalist payload, so a drag to another widget
+// carries nothing usable. This subclass supplies both a text/uri-list of the
+// distinct files (for AgentPanel's URL drop path) and a custom JSON payload of
+// per-hit line ranges (so ranged attaches preserve the spanned lines).
+class SearchResultsTree : public QTreeWidget
+{
+public:
+    using QTreeWidget::QTreeWidget;
+
+protected:
+    QMimeData *mimeData(const QList<QTreeWidgetItem *> &items) const override
+    {
+        auto *mime = new QMimeData;
+        QList<QUrl> urls;
+        QSet<QString> seenUrls;
+        QJsonArray hits;
+        for (const QTreeWidgetItem *item : items) {
+            if (!item) {
+                continue;
+            }
+            const QString path = item->data(0, Qt::UserRole).toString();
+            if (path.isEmpty()) {
+                continue;
+            }
+            if (!seenUrls.contains(path)) {
+                seenUrls.insert(path);
+                urls << QUrl::fromLocalFile(path);
+            }
+            QJsonObject hit{{QStringLiteral("path"), path}};
+            // Match rows carry a 0-based line and have a parent; file (parent)
+            // rows do not, and attach whole-file.
+            const QVariant lineVar = item->data(0, Qt::UserRole + 1);
+            if (lineVar.isValid() && item->parent()) {
+                hit[QStringLiteral("line")] = lineVar.toInt();
+                hit[QStringLiteral("endLine")] = lineVar.toInt();
+            }
+            hits.append(hit);
+        }
+        if (!urls.isEmpty()) {
+            mime->setUrls(urls);
+        }
+        if (!hits.isEmpty()) {
+            mime->setData(QLatin1String(kAttachMime),
+                          QJsonDocument(hits).toJson(QJsonDocument::Compact));
+        }
+        return mime;
+    }
+};
 } // namespace
 
 SearchPanel::SearchPanel(CoreClient *core, QWidget *parent)
@@ -192,12 +252,18 @@ SearchPanel::SearchPanel(CoreClient *core, QWidget *parent)
     outer->addLayout(row2);
 
     // Results tree.
-    m_results = new QTreeWidget(this);
+    m_results = new SearchResultsTree(this);
     m_results->setHeaderHidden(true);
     m_results->setUniformRowHeights(true);
     m_results->setRootIsDecorated(true);
     m_results->setAlternatingRowColors(true);
     m_results->setItemDelegate(new HighlightDelegate(m_results));
+    // Drag results out to the chat (or any URL drop target); right-click to
+    // attach the selection as context.
+    m_results->setDragEnabled(true);
+    m_results->setDragDropMode(QAbstractItemView::DragOnly);
+    m_results->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    m_results->setContextMenuPolicy(Qt::CustomContextMenu);
     QFont mono = m_results->font();
     mono.setFamily(QStringLiteral("monospace"));
     mono.setStyleHint(QFont::TypeWriter);
@@ -228,6 +294,9 @@ SearchPanel::SearchPanel(CoreClient *core, QWidget *parent)
 
     connect(m_results, &QTreeWidget::itemActivated, this,
             [this](QTreeWidgetItem *item, int) { activateMatchRow(item); });
+
+    connect(m_results, &QTreeWidget::customContextMenuRequested, this,
+            &SearchPanel::onContextMenu);
 
     setProjectRoot(QString());
 }
@@ -401,6 +470,9 @@ void SearchPanel::onReply(const QJsonObject &result, const QJsonObject &error)
                                .arg(rootDir.relativeFilePath(path), count));
         parent->setToolTip(0, path);
         parent->setFirstColumnSpanned(true);
+        // Carry the file path so selecting/dragging the file row attaches the
+        // whole file; parent rows have no line role, marking them whole-file.
+        parent->setData(0, Qt::UserRole, path);
         for (const QJsonValue &mv : matches) {
             const QJsonObject m = mv.toObject();
             // ripgrep returns 1-indexed line numbers and 1-indexed columns,
@@ -502,4 +574,51 @@ void SearchPanel::focusPrevResult()
         m_results->setCurrentItem(row);
         activateMatchRow(row);
     }
+}
+
+QStringList SearchPanel::selectedResultPaths() const
+{
+    QStringList paths;
+    QSet<QString> seen;
+    auto add = [&](const QTreeWidgetItem *item) {
+        if (!item) {
+            return;
+        }
+        const QString path = item->data(0, Qt::UserRole).toString();
+        if (path.isEmpty() || seen.contains(path)) {
+            return;
+        }
+        seen.insert(path);
+        paths << path;
+    };
+    const auto selected = m_results->selectedItems();
+    for (const QTreeWidgetItem *item : selected) {
+        add(item);
+    }
+    if (paths.isEmpty()) {
+        add(m_results->currentItem());
+    }
+    return paths;
+}
+
+void SearchPanel::onContextMenu(const QPoint &pos)
+{
+    // Anchor the popup on the row under the cursor so a right-click on an
+    // unselected row targets that row.
+    if (QTreeWidgetItem *under = m_results->itemAt(pos)) {
+        if (!under->isSelected()) {
+            m_results->setCurrentItem(under);
+        }
+    }
+    const QStringList paths = selectedResultPaths();
+    if (paths.isEmpty()) {
+        return;
+    }
+    QMenu menu(this);
+    QAction *attach = menu.addAction(
+        QIcon::fromTheme(QStringLiteral("mail-attachment")),
+        i18n("Attach to Chat as Context"));
+    connect(attach, &QAction::triggered, this,
+            [this, paths] { Q_EMIT attachToChatRequested(paths); });
+    menu.exec(m_results->viewport()->mapToGlobal(pos));
 }
