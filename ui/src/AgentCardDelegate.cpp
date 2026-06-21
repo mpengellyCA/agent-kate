@@ -11,6 +11,7 @@
 #include <QModelIndex>
 #include <QPainter>
 #include <QPalette>
+#include <QStringList>
 #include <QStyle>
 
 namespace {
@@ -24,6 +25,19 @@ constexpr int kLineGap = 2;  // gap between title and subtitle lines
 constexpr int kBadgeHPad = 6; // horizontal padding inside the "#N" badge
 constexpr int kBadgeGap  = 6; // gap between title text and the badge
 constexpr int kBadgeRadius = 4;
+constexpr int kChipHPad  = 6; // horizontal padding inside a tag chip
+constexpr int kChipGap   = 4; // gap between adjacent chips
+constexpr int kChipVPad  = 1; // vertical padding inside a chip
+constexpr int kChipRowGap = 3; // gap above the chip row
+
+QFont chipFontFor(const QFont &base)
+{
+    QFont f = base;
+    if (f.pointSizeF() > 0) {
+        f.setPointSizeF(f.pointSizeF() * 0.85);
+    }
+    return f;
+}
 
 QFont titleFontFor(const QFont &base, bool dormant)
 {
@@ -75,6 +89,7 @@ void AgentCardDelegate::paint(QPainter *painter, const QStyleOptionViewItem &opt
     const QString subtitle = idx.data(AgentRoles::Subtitle).toString();
     const int number       = idx.data(AgentRoles::Number).toInt();
     const QString dotHex   = idx.data(AgentRoles::Dot).toString();
+    const QStringList tags = idx.data(AgentRoles::Tags).toStringList();
     // A background agent that needs the user's input gets a palette-driven
     // marker — but only while it isn't the row the user is already looking at.
     const bool attention = idx.data(AgentRoles::Attention).toBool()
@@ -166,6 +181,63 @@ void AgentCardDelegate::paint(QPainter *painter, const QStyleOptionViewItem &opt
                           fmSub.elidedText(subtitle, Qt::ElideRight, subRect.width()));
     }
 
+    // Tag chip row, below the subtitle. Monochrome, palette-only fills so they
+    // track Breeze light/dark — no custom colours. Overflow collapses into a
+    // "+N" chip when the row runs out of width.
+    if (!tags.isEmpty()) {
+        const QFont chipFont = chipFontFor(opt.font);
+        const QFontMetrics fmChip(chipFont);
+        const int chipH = fmChip.height() + kChipVPad * 2;
+        const int chipsTop = subLine.bottom() + kChipRowGap;
+        const QColor chipFill = selected ? opt.palette.color(QPalette::Highlight)
+                                         : opt.palette.color(QPalette::AlternateBase);
+        const QColor chipText = selected ? opt.palette.color(QPalette::HighlightedText)
+                                         : opt.palette.color(QPalette::PlaceholderText);
+        painter->setFont(chipFont);
+        int x = textX;
+        const int rowRight = r.right();
+        for (int i = 0; i < tags.size(); ++i) {
+            const QString tag = tags.at(i);
+            const int remaining = tags.size() - i;
+            const int chipW = fmChip.horizontalAdvance(tag) + kChipHPad * 2;
+            // If this chip won't fit and there is more than one left, draw a
+            // "+N" overflow chip in its place and stop.
+            const bool fits = x + chipW <= rowRight;
+            if (!fits && i > 0) {
+                const QString more = QStringLiteral("+%1").arg(remaining);
+                const int moreW = fmChip.horizontalAdvance(more) + kChipHPad * 2;
+                int mx = x;
+                if (mx + moreW > rowRight) {
+                    mx = rowRight - moreW; // pull it back so it stays visible
+                }
+                const QRect moreRect(mx, chipsTop, moreW, chipH);
+                painter->setPen(Qt::NoPen);
+                if (selected) {
+                    painter->setBrush(Qt::NoBrush);
+                    painter->setPen(chipText);
+                } else {
+                    painter->setBrush(chipFill);
+                }
+                painter->drawRoundedRect(moreRect, kBadgeRadius, kBadgeRadius);
+                painter->setPen(chipText);
+                painter->drawText(moreRect, Qt::AlignCenter, more);
+                break;
+            }
+            const QRect chipRect(x, chipsTop, chipW, chipH);
+            painter->setPen(Qt::NoPen);
+            if (selected) {
+                painter->setBrush(Qt::NoBrush);
+                painter->setPen(chipText);
+            } else {
+                painter->setBrush(chipFill);
+            }
+            painter->drawRoundedRect(chipRect, kBadgeRadius, kBadgeRadius);
+            painter->setPen(chipText);
+            painter->drawText(chipRect, Qt::AlignCenter, tag);
+            x += chipW + kChipGap;
+        }
+    }
+
     painter->restore();
 }
 
@@ -177,7 +249,13 @@ QSize AgentCardDelegate::sizeHint(const QStyleOptionViewItem &opt,
     }
     const QFontMetrics fmTitle(titleFontFor(opt.font, false));
     const QFontMetrics fmSub(subtitleFontFor(opt.font, false));
-    const int h = kPadV * 2 + fmTitle.height() + kLineGap + fmSub.height();
+    int h = kPadV * 2 + fmTitle.height() + kLineGap + fmSub.height();
+    // Tagged rows get an extra chip-row line so the chips don't overlap the
+    // next card. setUniformRowHeights(false) is already set on the tree.
+    if (!idx.data(AgentRoles::Tags).toStringList().isEmpty()) {
+        const QFontMetrics fmChip(chipFontFor(opt.font));
+        h += kChipRowGap + fmChip.height() + kChipVPad * 2;
+    }
     const int w = QStyledItemDelegate::sizeHint(opt, idx).width();
     return {w, h};
 }

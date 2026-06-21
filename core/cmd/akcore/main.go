@@ -667,6 +667,7 @@ func registerHandlers(d handlerDeps) {
 				"updated":  r.Updated,
 				"lastTurn": r.LastTurnAt,
 				"model":    r.Model,
+				"tags":     r.Tags,
 			})
 		}
 		return map[string]any{"threads": out}, nil
@@ -695,6 +696,115 @@ func registerHandlers(d handlerDeps) {
 			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
 		}
 		return map[string]any{"ok": true}, nil
+	})
+
+	// --- tags --------------------------------------------------------------
+	// Roster organization labels. The store is a dumb setter; normalization
+	// (trim, dedupe, cap length/count) happens here so threads.json never
+	// holds malformed tags. Every successful mutation broadcasts
+	// agent.tagsChanged so all roster clients converge.
+
+	// agent.setTags replaces a thread's full tag set.
+	d.srv.Handle("agent.setTags", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID string   `json:"threadId"`
+			Tags     []string `json:"tags"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		if _, ok := d.sessions.Get(p.ThreadID); !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		}
+		tags := normalizeTags(p.Tags)
+		if err := d.sessions.Update(p.ThreadID, func(r *session.Record) {
+			r.Tags = tags
+		}); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		d.srv.Notify("agent.tagsChanged", map[string]any{
+			"threadId": p.ThreadID, "tags": tags})
+		return map[string]any{"ok": true, "tags": tags}, nil
+	})
+
+	// agent.addTag adds one tag to a thread, returning the full normalized set.
+	d.srv.Handle("agent.addTag", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID string `json:"threadId"`
+			Tag      string `json:"tag"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		rec, ok := d.sessions.Get(p.ThreadID)
+		if !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		}
+		tags := normalizeTags(append(append([]string{}, rec.Tags...), p.Tag))
+		if err := d.sessions.Update(p.ThreadID, func(r *session.Record) {
+			r.Tags = tags
+		}); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		d.srv.Notify("agent.tagsChanged", map[string]any{
+			"threadId": p.ThreadID, "tags": tags})
+		return map[string]any{"ok": true, "tags": tags}, nil
+	})
+
+	// agent.removeTag drops one tag (case-insensitive) from a thread.
+	d.srv.Handle("agent.removeTag", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID string `json:"threadId"`
+			Tag      string `json:"tag"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		rec, ok := d.sessions.Get(p.ThreadID)
+		if !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		}
+		drop := strings.ToLower(strings.TrimSpace(p.Tag))
+		kept := make([]string, 0, len(rec.Tags))
+		for _, t := range rec.Tags {
+			if strings.ToLower(strings.TrimSpace(t)) != drop {
+				kept = append(kept, t)
+			}
+		}
+		tags := normalizeTags(kept)
+		if err := d.sessions.Update(p.ThreadID, func(r *session.Record) {
+			r.Tags = tags
+		}); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		d.srv.Notify("agent.tagsChanged", map[string]any{
+			"threadId": p.ThreadID, "tags": tags})
+		return map[string]any{"ok": true, "tags": tags}, nil
+	})
+
+	// agent.suggestTags runs a one-shot Sonnet pass over a project's threads
+	// and returns proposed tag assignments. It is read-only — it applies
+	// nothing; the UI previews the proposals and applies them via setTags.
+	d.srv.Handle("agent.suggestTags", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			Project string `json:"project"`
+		}
+		_ = json.Unmarshal(raw, &p) // project optional → all threads
+		recs := d.sessions.List(p.Project)
+		if len(recs) == 0 {
+			return map[string]any{"proposals": []any{}}, nil
+		}
+		sctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+		defer cancel()
+		proposals, err := session.SuggestTagOrganization(sctx, recs, "", "claude-sonnet-4-6")
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		out := make([]map[string]any, 0, len(proposals))
+		for _, pr := range proposals {
+			out = append(out, map[string]any{"threadId": pr.ThreadID, "tags": pr.Tags})
+		}
+		return map[string]any{"proposals": out}, nil
 	})
 
 	d.srv.Handle("agent.discard", func(_ context.Context, raw json.RawMessage) (any, error) {
@@ -2073,6 +2183,37 @@ func summarizePrompt(prompt string) string {
 		s = s[:max] + "…"
 	}
 	return s
+}
+
+// normalizeTags cleans a raw tag slice for persistence: trims whitespace,
+// drops empties, dedupes case-insensitively (keeping the first-seen casing),
+// caps each tag at 32 characters and the whole set at 12 tags. Order of the
+// surviving tags is preserved. Always returns a non-nil slice when there is at
+// least one valid tag; an all-empty input yields nil so omitempty stays clean.
+func normalizeTags(in []string) []string {
+	const maxLen = 32
+	const maxTags = 12
+	var out []string
+	seen := make(map[string]bool)
+	for _, t := range in {
+		t = strings.TrimSpace(t)
+		if t == "" {
+			continue
+		}
+		if len([]rune(t)) > maxLen {
+			t = string([]rune(t)[:maxLen])
+		}
+		key := strings.ToLower(t)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, t)
+		if len(out) >= maxTags {
+			break
+		}
+	}
+	return out
 }
 
 // runHotCompactIfConfigured runs a Hot-Opus compaction on the live thread

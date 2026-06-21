@@ -1,7 +1,9 @@
 package session
 
 import (
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -88,6 +90,65 @@ func TestUpdate(t *testing.T) {
 	if err := store.Update("t-nope", func(r *Record) { r.Status = "x" }); err != nil {
 		t.Fatalf("Update(unknown): %v", err)
 	}
+}
+
+func TestTagsRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "threads.json")
+	store, _ := NewStore(path)
+	rec := sampleRecord("t-tags")
+	rec.Tags = []string{"backend", "wip"}
+	if err := store.Put(rec); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	// Tags survive a flush+reopen unchanged and in order.
+	reopened, err := NewStore(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	got, ok := reopened.Get("t-tags")
+	if !ok {
+		t.Fatal("record did not survive reopen")
+	}
+	if len(got.Tags) != 2 || got.Tags[0] != "backend" || got.Tags[1] != "wip" {
+		t.Fatalf("tags = %v, want [backend wip]", got.Tags)
+	}
+
+	// A record with no tags omits the field (omitempty) — no migration churn.
+	plain := sampleRecord("t-plain")
+	if err := store.Put(plain); err != nil {
+		t.Fatalf("Put(plain): %v", err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read store: %v", err)
+	}
+	if strings.Contains(string(b), `"threadId": "t-plain"`) &&
+		strings.Contains(snippetAround(string(b), "t-plain"), `"tags"`) {
+		t.Fatal("a tagless record should not serialize a tags field")
+	}
+
+	// Update can mutate Tags in place.
+	if err := store.Update("t-tags", func(r *Record) { r.Tags = []string{"infra"} }); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if got, _ := store.Get("t-tags"); len(got.Tags) != 1 || got.Tags[0] != "infra" {
+		t.Fatalf("tags after Update = %v, want [infra]", got.Tags)
+	}
+}
+
+// snippetAround returns the slice of s within ~120 bytes of the first
+// occurrence of marker, so the omitempty check stays local to that record.
+func snippetAround(s, marker string) string {
+	i := strings.Index(s, marker)
+	if i < 0 {
+		return ""
+	}
+	end := i + 120
+	if end > len(s) {
+		end = len(s)
+	}
+	return s[i:end]
 }
 
 func TestRemove(t *testing.T) {
