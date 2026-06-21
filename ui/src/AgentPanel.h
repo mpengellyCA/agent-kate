@@ -119,6 +119,7 @@ private:
     // Rebuild the "queued messages" chip bar from m_sendQueue.
     void rebuildQueueChips();
     void onStopClicked();
+    void onInterruptClicked();
     void onChangesClicked();
     void onPromoteClicked();
     void onAttachClicked();
@@ -242,6 +243,7 @@ private:
     QMenu *m_compactNowMenu = nullptr;
     QPushButton *m_sendBtn = nullptr;
     QPushButton *m_stopBtn = nullptr;
+    QPushButton *m_interruptBtn = nullptr;
     QPushButton *m_diffBtn = nullptr;
     QPushButton *m_attachBtn = nullptr;
 

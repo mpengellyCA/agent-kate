@@ -692,9 +692,9 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     // whole transcript. The five options encode (when, model) combos; the
     // strip flag asks LLM-based compactors to pre-trim noisy events.
     m_compactCombo = new QComboBox(this);
-    m_compactCombo->addItem(QStringLiteral("Compact on Exit (Hot Opus)"),
+    m_compactCombo->addItem(QStringLiteral("Compact on Stop/Exit (Hot Opus)"),
                             QStringLiteral("exit_opus_hot"));
-    m_compactCombo->addItem(QStringLiteral("Compact on Exit (Cold Sonnet)"),
+    m_compactCombo->addItem(QStringLiteral("Compact on Stop/Exit (Cold Sonnet)"),
                             QStringLiteral("exit_sonnet_cold"));
     m_compactCombo->addItem(QStringLiteral("Compact on Resume (Cold Sonnet)"),
                             QStringLiteral("resume_sonnet_cold"));
@@ -801,6 +801,17 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     m_stopBtn = new QPushButton(
         QIcon::fromTheme(QStringLiteral("process-stop")), QStringLiteral("Stop"), this);
     m_stopBtn->setCursor(Qt::PointingHandCursor);
+    // Interrupt is distinct from Stop: it aborts only the in-flight turn (no
+    // more tokens billed) while keeping the Claude session, so you can type a
+    // new message to redirect the agent. Shown only while a turn is running.
+    m_interruptBtn = new QPushButton(
+        QIcon::fromTheme(QStringLiteral("media-playback-stop")),
+        QStringLiteral("Interrupt"), this);
+    m_interruptBtn->setCursor(Qt::PointingHandCursor);
+    m_interruptBtn->setToolTip(QStringLiteral(
+        "Interrupt the in-flight response now, keeping the session — then type a "
+        "new message to redirect the agent."));
+    m_interruptBtn->hide();
     m_sendBtn = new QPushButton(this);
     m_sendBtn->setIcon(QIcon::fromTheme(QStringLiteral("document-send")));
     m_sendBtn->setCursor(Qt::PointingHandCursor);
@@ -883,6 +894,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     buttons->addWidget(m_attachBtn);
     buttons->addWidget(m_diffBtn);
     buttons->addStretch(1);
+    buttons->addWidget(m_interruptBtn);
     buttons->addWidget(m_stopBtn);
     buttons->addWidget(m_sendBtn);
 
@@ -909,6 +921,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
 
     connect(m_sendBtn, &QPushButton::clicked, this, &AgentPanel::onSendClicked);
     connect(m_stopBtn, &QPushButton::clicked, this, &AgentPanel::onStopClicked);
+    connect(m_interruptBtn, &QPushButton::clicked, this, &AgentPanel::onInterruptClicked);
     connect(m_diffBtn, &QPushButton::clicked, this, &AgentPanel::onChangesClicked);
     connect(m_promoteBtn, &QPushButton::clicked, this, &AgentPanel::onPromoteClicked);
     connect(m_attachBtn, &QPushButton::clicked, this, &AgentPanel::onAttachClicked);
@@ -1178,6 +1191,27 @@ void AgentPanel::doResume()
                  });
 }
 
+// resumeStrategyModel maps a configured "Compact on Resume" strategy id to the
+// compactNow model it implies, so resume can follow it automatically instead of
+// prompting. Returns "" for non-resume strategies (Exit/Stop strategies, or an
+// unset/unknown id), in which case the caller falls back to asking.
+static QString resumeStrategyModel(const QString &strategy)
+{
+    if (strategy == QLatin1String("resume_opus_cold")) {
+        return QStringLiteral("opus");
+    }
+    if (strategy == QLatin1String("resume_sonnet_cold")) {
+        return QStringLiteral("sonnet");
+    }
+    if (strategy == QLatin1String("resume_haiku_cold")) {
+        return QStringLiteral("haiku");
+    }
+    if (strategy == QLatin1String("resume_local")) {
+        return QStringLiteral("local");
+    }
+    return QString();
+}
+
 // askRecoveryModel pops a modal asking which model should produce a missing
 // compacted summary before resume. Returns "opus"|"sonnet"|"haiku"|"local",
 // or "" if the user cancelled (in which case the caller should resume on the
@@ -1254,13 +1288,21 @@ void AgentPanel::resume()
                          doResume();
                          return;
                      }
-                     const bool stale =
-                         result.value(QStringLiteral("stale")).toBool(true);
-                     if (!stale) {
+                     // A stored summary already exists — reuse it silently.
+                     // Resume is meant to be one click; we don't re-ask just
+                     // because a turn post-dates the summary.
+                     if (result.value(QStringLiteral("hasSummary")).toBool(false)) {
                          doResume();
                          return;
                      }
-                     const QString model = askRecoveryModel(this);
+                     // No summary on disk. If a "Compact on Resume" strategy is
+                     // configured, follow it automatically; otherwise fall back
+                     // to asking which model should produce one.
+                     const QString strategy =
+                         result.value(QStringLiteral("strategy")).toString();
+                     const QString autoModel = resumeStrategyModel(strategy);
+                     const QString model =
+                         autoModel.isEmpty() ? askRecoveryModel(this) : autoModel;
                      if (model.isEmpty()) {
                          addNote(QStringLiteral("Resuming without compaction. "
                                                 "The next turn will pay the full re-cache cost."),
@@ -1303,10 +1345,12 @@ void AgentPanel::refresh()
                                  : (running ? QStringLiteral("Send")
                                             : QStringLiteral("Start agent")));
     m_stopBtn->setEnabled(running);
-    m_stopBtn->setToolTip((running && !m_idle)
-                              ? QStringLiteral("Interrupt the in-flight response "
-                                               "now (resumable)")
-                              : QStringLiteral("Stop this agent (resumable)"));
+    m_stopBtn->setToolTip(QStringLiteral("Stop this agent gracefully (resumable)"));
+    // Interrupt only makes sense while a turn is actually in flight — show it
+    // then, hide it otherwise so it doesn't read as a second idle Stop.
+    if (m_interruptBtn) {
+        m_interruptBtn->setVisible(running && !m_idle);
+    }
     m_diffBtn->setEnabled(running);
     // Compact-now needs a thread on disk (running or dormant). The Hot Opus
     // menu item is the only one that further needs the thread to be live.
@@ -2217,19 +2261,24 @@ void AgentPanel::onStopClicked()
     if (m_threadId.isEmpty() || m_dormant) {
         return;
     }
-    // While a turn is in flight (generating, or paused on a tool/permission),
-    // Stop is a hard interrupt: abort the response now so no more tokens are
-    // billed, leaving the session resumable. When idle, it's the graceful
-    // "end this agent" stop.
-    const bool turnInFlight = !m_idle;
-    if (turnInFlight) {
-        addNote(QStringLiteral("&#9209; interrupting…"), QStringLiteral("sys"));
-        m_core->call(QStringLiteral("agent.interrupt"),
-                     QJsonObject{{QStringLiteral("threadId"), m_threadId}});
-    } else {
-        m_core->call(QStringLiteral("agent.stop"),
-                     QJsonObject{{QStringLiteral("threadId"), m_threadId}});
+    // Stop is always the graceful end-this-agent path: it runs the configured
+    // Compact-on-Stop/Exit strategy (see agent.stop) and leaves the session
+    // resumable. To abort just the current turn, use Interrupt instead.
+    m_core->call(QStringLiteral("agent.stop"),
+                 QJsonObject{{QStringLiteral("threadId"), m_threadId}});
+}
+
+void AgentPanel::onInterruptClicked()
+{
+    // Only meaningful while a turn is in flight (generating, or paused on a
+    // tool/permission). Aborts the response now — no more tokens billed — but
+    // keeps the Claude session, so the next message redirects the same agent.
+    if (m_threadId.isEmpty() || m_dormant || m_idle) {
+        return;
     }
+    addNote(QStringLiteral("&#9209; interrupting…"), QStringLiteral("sys"));
+    m_core->call(QStringLiteral("agent.interrupt"),
+                 QJsonObject{{QStringLiteral("threadId"), m_threadId}});
 }
 
 void AgentPanel::onChangesClicked()
