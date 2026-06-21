@@ -22,6 +22,19 @@ struct UiLogEntry {
     int lane = 0;
     QList<int> lanesIn;
     QList<int> lanesOut;
+
+    // Two rows are "the same" for diffing purposes when they point at the same
+    // commit AND carry the same visible decoration. The sha identifies the
+    // commit; refs (branch/tag chips) and the graph lanes are the only other
+    // fields a HEAD move can change without rewriting the commit itself, so a
+    // change in any of them must repaint the row. Author/subject/date are
+    // immutable for a given sha, so they don't need to be compared.
+    bool operator==(const UiLogEntry &o) const
+    {
+        return sha == o.sha && refs == o.refs && lane == o.lane
+            && lanesIn == o.lanesIn && lanesOut == o.lanesOut;
+    }
+    bool operator!=(const UiLogEntry &o) const { return !(*this == o); }
 };
 
 // LogModel is the table model behind the log viewer's QTreeView. Columns are
@@ -31,6 +44,8 @@ struct UiLogEntry {
 //
 // Pagination is append-only: appendPage() tacks a new page onto the bottom,
 // reset() clears everything (used on refresh / branch switch / path filter).
+// applyHead() merges a fresh first page in place on a HEAD move so the user's
+// selection and scroll position survive — see its declaration below.
 class LogModel : public QAbstractTableModel
 {
     Q_OBJECT
@@ -61,6 +76,24 @@ public:
     void reset();
     void appendPage(const QVector<UiLogEntry> &page);
 
+    // applyHead merges a freshly fetched first page into the already-loaded
+    // history WITHOUT a full reset, so selection / scroll / loaded pages and the
+    // detail panel all survive a HEAD move. It distinguishes three cases:
+    //
+    //   * Commits were prepended (the common case — a new commit on top): the
+    //     existing top rows are a suffix of the fresh page, so only the k new
+    //     leading commits are inserted via beginInsertRows(0, k-1) and every
+    //     other row is left untouched.
+    //   * Only decoration moved (refs/lanes differ but the shas line up): emit
+    //     dataChanged() for just the affected rows.
+    //   * Histories genuinely diverged (a rewrite/force-push, or the fresh page
+    //     shares no anchor with what we hold): fall back to a full reset, then
+    //     the caller refetches.
+    //
+    // Returns true if the merge was applied in place; false if it fell back to a
+    // reset (the caller should then refetch from the first page).
+    bool applyHead(const QVector<UiLogEntry> &freshFirstPage);
+
     // Largest lane index seen so far across all rows — the graph delegate uses
     // it to size its column wide enough to fit the busiest row in the page.
     int maxLane() const { return m_maxLane; }
@@ -82,6 +115,11 @@ public:
                         int role = Qt::DisplayRole) const override;
 
 private:
+    // Recompute m_maxLane from scratch over all rows. Cheap enough for the
+    // first-page-sized scans applyHead() does, and avoids m_maxLane drifting
+    // when lanes change in place rather than only growing on append.
+    void recomputeMaxLane();
+
     QVector<UiLogEntry> m_rows;
     int m_maxLane = 0;
 };

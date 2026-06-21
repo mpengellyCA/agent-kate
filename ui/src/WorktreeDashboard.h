@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "state/Reactive.h"
+
 #include <QAbstractTableModel>
 #include <QJsonObject>
 #include <QList>
@@ -32,6 +34,20 @@ struct WorktreeRow {
     int remoteAhead = 0;
     int remoteBehind = 0;
     QString error;
+
+    // Value equality over every display-bearing field. Used by both the
+    // model's setRows merge (skip emitting dataChanged for unchanged rows) and
+    // by Reactive<QList<WorktreeRow>> (drop an identical snapshot entirely).
+    bool operator==(const WorktreeRow &o) const
+    {
+        return threadId == o.threadId && number == o.number && branch == o.branch
+            && path == o.path && isolated == o.isolated && ahead == o.ahead
+            && behindBase == o.behindBase && dirty == o.dirty
+            && conflicts == o.conflicts && hasUpstream == o.hasUpstream
+            && remoteAhead == o.remoteAhead && remoteBehind == o.remoteBehind
+            && error == o.error;
+    }
+    bool operator!=(const WorktreeRow &o) const { return !(*this == o); }
 };
 
 // WorktreeModel is the table model behind WorktreeDashboard. Pure data — the
@@ -92,6 +108,9 @@ protected:
 
 private:
     void refresh();
+    // Push `rows` into the model while preserving the selected row (by
+    // threadId), then sync placeholder + action enablement.
+    void applySnapshot(const QList<WorktreeRow> &rows);
     void onNotification(const QString &method, const QJsonObject &params);
     void openCommitDialog();
     void landSelected();
@@ -115,4 +134,9 @@ private:
     QLabel *m_placeholder = nullptr;
     QString m_activeProject;
     bool m_inFlight = false;
+
+    // Canonical snapshot. set() in the git.snapshot reply; an identical
+    // payload is dropped here (no subscriber, no setRows, no repaint).
+    // subscribe() drives applySnapshot() only on a genuine change.
+    Reactive<QList<WorktreeRow>> m_snapshot;
 };

@@ -20,6 +20,7 @@
 #include <QResizeEvent>
 #include <QSet>
 #include <QShortcut>
+#include <QSignalBlocker>
 #include <QShowEvent>
 #include <QToolButton>
 #include <QTreeWidget>
@@ -317,6 +318,12 @@ void AgentRoster::openFileManager(const QString &path) const
 
 void AgentRoster::setModelChoices(const QList<QPair<QString, QString>> &models)
 {
+    // Same value-unchanged guard as the other setters: an identical model list
+    // would rebuild an identical dropdown menu, so skip the teardown/repopulate
+    // (QList<QPair<QString, QString>> compares element-wise).
+    if (models == m_models) {
+        return;
+    }
     m_models = models;
     // Tear down any previous menu first so every path (including the empty one)
     // replaces it without leaking. setMenu(nullptr) detaches but does not delete
@@ -438,6 +445,12 @@ void AgentRoster::setAgentTags(int agentId, const QStringList &tags)
 {
     QTreeWidgetItem *item = agentItem(agentId);
     if (!item) {
+        return;
+    }
+    // Same guard shape as setAgentNumber/setAgentAttention: an identical tag set
+    // means the chip line, the filter menu and the filter result are all already
+    // correct, so skip the (expensive) full re-measure and menu rebuild.
+    if (item->data(0, Tags).toStringList() == tags) {
         return;
     }
     item->setData(0, Tags, tags);
@@ -635,46 +648,103 @@ void AgentRoster::rebuildTagFilterMenu()
     if (!menu) {
         return;
     }
-    menu->clear();
     const QStringList all = projectTags(QString()); // every project
     // Drop filter selections for tags that no longer exist anywhere.
     QSet<QString> live;
+    live.reserve(all.size());
     for (const QString &t : all) {
         live.insert(t.toLower());
     }
     m_tagFilter.intersect(live);
 
-    if (all.isEmpty()) {
-        QAction *none = menu->addAction(i18n("No tags yet"));
-        none->setEnabled(false);
-    } else {
-        for (const QString &tag : all) {
-            QAction *a = menu->addAction(tag);
-            a->setCheckable(true);
-            a->setChecked(m_tagFilter.contains(tag.toLower()));
-            connect(a, &QAction::toggled, this, [this, key = tag.toLower()](bool on) {
-                if (on) {
-                    m_tagFilter.insert(key);
-                } else {
-                    m_tagFilter.remove(key);
-                }
-                // Reflect the count in the button label without rebuilding the
-                // open menu (which would invalidate the action being toggled).
-                m_tagFilterButton->setText(m_tagFilter.isEmpty()
-                                               ? i18n("Tags")
-                                               : i18n("Tags (%1)", m_tagFilter.size()));
-                applyFilter();
-            });
+    // Diff the per-tag checkable actions against the live tag set: remove only
+    // departed tags, add only newly-appeared ones. An identical tag set leaves
+    // the action objects untouched (no menu->clear()/repopulate churn), which is
+    // the common case when a tag *change elsewhere* re-runs this with no net
+    // change to the global set.
+    QSet<QString> wantKeys = live;
+    for (auto it = m_tagFilterActions.begin(); it != m_tagFilterActions.end();) {
+        if (!wantKeys.contains(it.key())) {
+            // QMenu owns the action; removeAction() detaches it, delete frees it.
+            menu->removeAction(it.value());
+            delete it.value();
+            it = m_tagFilterActions.erase(it);
+        } else {
+            ++it;
         }
-        menu->addSeparator();
-        QAction *clear = menu->addAction(i18n("Clear tag filter"));
-        clear->setEnabled(!m_tagFilter.isEmpty());
-        connect(clear, &QAction::triggered, this, [this] {
+    }
+
+    // Lazily create the persistent trailing structure (placeholder / separator /
+    // clear) once; we toggle their visibility instead of recreating them.
+    if (!m_tagFilterEmptyAct) {
+        m_tagFilterEmptyAct = menu->addAction(i18n("No tags yet"));
+        m_tagFilterEmptyAct->setEnabled(false);
+        m_tagFilterSeparator = menu->addSeparator();
+        m_tagFilterClearAct = menu->addAction(i18n("Clear tag filter"));
+        connect(m_tagFilterClearAct, &QAction::triggered, this, [this] {
             m_tagFilter.clear();
             rebuildTagFilterMenu();
             applyFilter();
         });
     }
+
+    // Insert any newly-appeared tags, keeping the menu in `all`'s stable
+    // (case-insensitive) order. `all` is already sorted by lowercased key (see
+    // projectTags), so a new tag is anchored before the next already-present
+    // tag's action — or before the trailing structure when it sorts last.
+    for (int i = 0; i < all.size(); ++i) {
+        const QString key = all.at(i).toLower();
+        if (m_tagFilterActions.contains(key)) {
+            continue;
+        }
+        auto *a = new QAction(all.at(i), menu);
+        a->setCheckable(true);
+        connect(a, &QAction::toggled, this, [this, key](bool on) {
+            if (on) {
+                m_tagFilter.insert(key);
+            } else {
+                m_tagFilter.remove(key);
+            }
+            // Reflect the count in the button label without rebuilding the
+            // open menu (which would invalidate the action being toggled).
+            m_tagFilterButton->setText(m_tagFilter.isEmpty()
+                                           ? i18n("Tags")
+                                           : i18n("Tags (%1)", m_tagFilter.size()));
+            applyFilter();
+        });
+        // Anchor before the first following tag that already has an action;
+        // fall back to the separator (start of the trailing structure).
+        QAction *anchor = m_tagFilterSeparator;
+        for (int k = i + 1; k < all.size(); ++k) {
+            auto found = m_tagFilterActions.constFind(all.at(k).toLower());
+            if (found != m_tagFilterActions.constEnd()) {
+                anchor = found.value();
+                break;
+            }
+        }
+        menu->insertAction(anchor, a);
+        m_tagFilterActions.insert(key, a);
+    }
+
+    // Refresh checked states (filter selections may have been intersected away).
+    // QSignalBlocker stops setChecked() from re-emitting toggled() and looping
+    // back through applyFilter() while we are only mirroring existing state.
+    for (auto it = m_tagFilterActions.begin(); it != m_tagFilterActions.end(); ++it) {
+        const bool want = m_tagFilter.contains(it.key());
+        if (it.value()->isChecked() != want) {
+            QSignalBlocker block(it.value());
+            it.value()->setChecked(want);
+        }
+    }
+
+    // Show the placeholder only when there are no tags; show the separator/clear
+    // only when there are. The clear entry tracks whether a filter is active.
+    const bool hasTags = !all.isEmpty();
+    m_tagFilterEmptyAct->setVisible(!hasTags);
+    m_tagFilterSeparator->setVisible(hasTags);
+    m_tagFilterClearAct->setVisible(hasTags);
+    m_tagFilterClearAct->setEnabled(!m_tagFilter.isEmpty());
+
     // Reflect whether a tag filter is active in the button label.
     m_tagFilterButton->setText(m_tagFilter.isEmpty()
                                    ? i18n("Tags")

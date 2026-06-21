@@ -26,6 +26,7 @@ find_package(KF6 6.0 REQUIRED COMPONENTS
 
 add_executable(agentkate
     src/main.cpp
+    src/state/Reactive.cpp
     src/MainWindow.cpp
     src/EditorArea.cpp
     src/DiffView.cpp

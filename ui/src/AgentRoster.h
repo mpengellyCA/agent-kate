@@ -1,10 +1,12 @@
 #pragma once
 
+#include <QHash>
 #include <QSet>
 #include <QString>
 #include <QStringList>
 #include <QWidget>
 
+class QAction;
 class QLabel;
 class QLineEdit;
 class QToolButton;
@@ -111,5 +113,12 @@ private:
     QLabel *m_emptyHint = nullptr;
     QString m_filter;
     QSet<QString> m_tagFilter; // lowercased tags the user is filtering by
+    // The tag-filter menu's per-tag checkable actions, keyed by lowercased tag,
+    // so rebuildTagFilterMenu() can diff (add new / drop departed) instead of
+    // clearing and repopulating the whole menu on every tag change.
+    QHash<QString, QAction *> m_tagFilterActions;
+    QAction *m_tagFilterEmptyAct = nullptr; // "No tags yet" placeholder
+    QAction *m_tagFilterSeparator = nullptr;
+    QAction *m_tagFilterClearAct = nullptr;
     QList<QPair<QString, QString>> m_models;
 };

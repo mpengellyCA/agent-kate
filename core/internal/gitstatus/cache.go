@@ -33,7 +33,19 @@ type Cache struct {
 	log          *slog.Logger
 	onInvalidate func(threadID string)
 	onHeadChange func(threadID, newHeadSHA string)
+
+	// settleWindow is how long a thread's onInvalidate notification is deferred
+	// after the last fs event, so a burst of agent saves collapses into one
+	// notification once activity quiets. Configurable for tests; defaults to
+	// defaultSettleWindow.
+	settleWindow time.Duration
 }
+
+// defaultSettleWindow is the debounce window before an fs-event invalidation
+// fires its onInvalidate notification. Long enough to swallow a multi-file save
+// burst, short enough that a real change still surfaces promptly. Mutating RPC
+// handlers (commit, land) notify immediately and bypass this window.
+const defaultSettleWindow = 250 * time.Millisecond
 
 // entry is the cached state for one worktree. Its own mutex serialises the
 // "is this dirty? recompute" check so multiple pollers share one git walk.
@@ -46,6 +58,22 @@ type entry struct {
 	fileHunks  map[string]hunkCacheLine
 	generation uint64
 	dirty      bool // recompute on next read
+
+	// notifyPending marks that an fs event has landed since the last
+	// notification settled and a deferred notify is owed. It is deliberately
+	// SEPARATE from dirty: the 1 Hz poll clears dirty in ensureSnapshot mid-burst,
+	// and reusing dirty as the notify edge would re-arm a fresh notification on
+	// the very next event. notifyPending instead tracks the notification edge
+	// independently and is cleared only when the settle window fires.
+	notifyPending bool
+	// settleTimer fires settleWindow after the last fs event for this thread; it
+	// is reset on each new event so the notify is deferred until writes quiet.
+	settleTimer *time.Timer
+	// sentSnapshot is the last snapshot whose change we actually notified on. The
+	// settle pass diffs the freshly recomputed snapshot against this (ignoring the
+	// volatile UpdatedAt) and only fires onInvalidate when a meaningful field
+	// differs, so a save that leaves git status unchanged stays silent.
+	sentSnapshot *Snapshot
 }
 
 type hunkCacheLine struct {
@@ -59,8 +87,9 @@ type hunkCacheLine struct {
 // freshness.
 func NewCache(log *slog.Logger) *Cache {
 	c := &Cache{
-		entries: make(map[string]*entry),
-		log:     log,
+		entries:      make(map[string]*entry),
+		log:          log,
+		settleWindow: defaultSettleWindow,
 	}
 	if log != nil {
 		if w, err := newWatcher(log); err == nil {
@@ -74,9 +103,14 @@ func NewCache(log *slog.Logger) *Cache {
 	return c
 }
 
-// OnInvalidate registers a callback fired whenever an entry's dirty flag flips
-// from clean to dirty. This is the bus push hook: the core wires it to send a
-// git.invalidated notification so the UI can short-cut its next poll.
+// OnInvalidate registers a callback fired after a thread's invalidation settles
+// AND its recomputed snapshot differs meaningfully from the last one we sent.
+// This is the bus push hook: the core wires it to send a git.invalidated
+// notification so the UI can short-cut its next poll. The settle window
+// (debounce) collapses a save burst into one callback, and the snapshot diff
+// suppresses callbacks for events that didn't actually change visible git
+// status — together they stop the redundant-notification fire-hose that drove
+// dashboard flicker.
 func (c *Cache) OnInvalidate(fn func(threadID string)) {
 	c.mu.Lock()
 	c.onInvalidate = fn
@@ -131,17 +165,91 @@ func (c *Cache) Register(wt worktree.Worktree) {
 // Forget drops a thread from the cache, called when the thread is removed.
 func (c *Cache) Forget(threadID string) {
 	c.mu.Lock()
+	e, ok := c.entries[threadID]
 	delete(c.entries, threadID)
 	c.mu.Unlock()
+	if ok {
+		// Stop any armed settle timer so a pending notification for a removed
+		// thread can't fire after Forget. A settle that already fired is harmless:
+		// it no longer finds the entry in the map and bails.
+		e.mu.Lock()
+		if e.settleTimer != nil {
+			e.settleTimer.Stop()
+			e.settleTimer = nil
+		}
+		e.notifyPending = false
+		e.mu.Unlock()
+	}
 	if c.watcher != nil {
 		c.watcher.Unwatch(threadID)
 	}
 }
 
-// Invalidate marks a thread's cached data stale so the next read recomputes.
-// Called by the fs watcher on each event and by mutating RPC handlers (commit,
-// land) so the next poll sees the new state without waiting for inotify.
+// Invalidate marks a thread's cached data stale so the next read recomputes,
+// then arms a debounced notification. Called by the fs watcher on each event and
+// by mutating RPC handlers (commit, land) so the next poll sees the new state
+// without waiting for inotify.
+//
+// The dirty flag flips immediately (correctness — the next read always sees
+// fresh state). The onInvalidate notification, however, is deferred behind a
+// per-thread settle timer that resets on each event: a burst of agent saves
+// collapses into ONE settle pass once writes quiet. That pass recomputes the
+// snapshot and diffs it against the last SENT one, firing onInvalidate only when
+// a meaningful field actually changed — so the fire-hose of redundant
+// notifications that drove UI flicker is gone, while a real change still
+// surfaces within settleWindow.
 func (c *Cache) Invalidate(threadID string) {
+	c.mu.RLock()
+	e, ok := c.entries[threadID]
+	c.mu.RUnlock()
+	if !ok {
+		return
+	}
+	c.armSettle(e)
+}
+
+// InvalidateAll marks every thread stale and arms each one's debounced notify.
+func (c *Cache) InvalidateAll() {
+	c.mu.RLock()
+	entries := make([]*entry, 0, len(c.entries))
+	for _, e := range c.entries {
+		entries = append(entries, e)
+	}
+	c.mu.RUnlock()
+	for _, e := range entries {
+		c.armSettle(e)
+	}
+}
+
+// armSettle flips the entry dirty and (re)arms its per-thread settle timer. The
+// notifyPending edge is tracked separately from dirty: the 1 Hz poll clears
+// dirty in ensureSnapshot, so reusing dirty here would let a mid-burst poll
+// re-arm a fresh notification on the next event. notifyPending is set here and
+// cleared only when the settle pass runs, so a burst yields exactly one pass.
+func (c *Cache) armSettle(e *entry) {
+	e.mu.Lock()
+	e.dirty = true
+	e.notifyPending = true
+	if e.settleTimer != nil {
+		// Reset (or restart) the existing timer so the window slides forward to
+		// the latest event. Stop's return is ignored: if it already fired, its
+		// settle pass found notifyPending still set (or will be re-set here) and
+		// a fresh timer below covers the new activity, so no notification is lost.
+		e.settleTimer.Stop()
+	}
+	threadID := e.wt.ThreadID
+	e.settleTimer = time.AfterFunc(c.settleWindow, func() {
+		safe.Go("gitstatus.settle", func() { c.settle(threadID) })
+	})
+	e.mu.Unlock()
+}
+
+// settle runs once per quiet window after a burst of invalidations. It clears
+// the pending edge, recomputes the snapshot (sharing the work via
+// ensureSnapshot), and fires onInvalidate only when the new snapshot differs
+// meaningfully from the last one we sent — so an event that left git status
+// unchanged stays silent, and the final state of a burst is never dropped.
+func (c *Cache) settle(threadID string) {
 	c.mu.RLock()
 	e, ok := c.entries[threadID]
 	cb := c.onInvalidate
@@ -149,27 +257,33 @@ func (c *Cache) Invalidate(threadID string) {
 	if !ok {
 		return
 	}
-	e.mu.Lock()
-	wasDirty := e.dirty
-	e.dirty = true
-	e.mu.Unlock()
-	if !wasDirty && cb != nil {
-		cb(threadID) // only fire on the clean→dirty edge to keep notifications quiet
-	}
-}
 
-// InvalidateAll marks every thread stale.
-func (c *Cache) InvalidateAll() {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	for id, e := range c.entries {
-		e.mu.Lock()
-		wasDirty := e.dirty
-		e.dirty = true
+	e.mu.Lock()
+	if !e.notifyPending {
+		// A concurrent settle (or a Forget) already consumed this edge; nothing
+		// owed. Bail before recomputing so we don't notify twice for one burst.
 		e.mu.Unlock()
-		if !wasDirty && c.onInvalidate != nil {
-			c.onInvalidate(id)
-		}
+		return
+	}
+	e.notifyPending = false
+	e.mu.Unlock()
+
+	// Recompute outside the lock-and-edge dance; ensureSnapshot takes its own
+	// entry lock and clears dirty. This is the burst's single git walk.
+	snap := c.ensureSnapshot(e)
+	if snap == nil {
+		return
+	}
+
+	e.mu.Lock()
+	changed := !snapshotsEqual(e.sentSnapshot, snap)
+	if changed {
+		e.sentSnapshot = snap
+	}
+	e.mu.Unlock()
+
+	if changed && cb != nil {
+		cb(threadID)
 	}
 }
 
@@ -311,4 +425,44 @@ func (c *Cache) ensureSnapshot(e *entry) *Snapshot {
 		}
 	}
 	return snap
+}
+
+// snapshotsEqual reports whether two snapshots are equal for the purpose of the
+// settle-pass diff: every field the UI renders matches, ignoring the volatile
+// UpdatedAt (which changes on every recompute and would defeat the diff). A nil
+// previous snapshot is never equal — the first settle after registration always
+// notifies. This is the gate that stops a save which left git status unchanged
+// (e.g. touching a file then reverting it within one window) from firing a
+// redundant git.invalidated.
+func snapshotsEqual(a, b *Snapshot) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	if a.ThreadID != b.ThreadID ||
+		a.Number != b.Number ||
+		a.RepoRoot != b.RepoRoot ||
+		a.Path != b.Path ||
+		a.Branch != b.Branch ||
+		a.Isolated != b.Isolated ||
+		a.HeadSHA != b.HeadSHA ||
+		a.Base != b.Base ||
+		a.Ahead != b.Ahead ||
+		a.BehindBase != b.BehindBase ||
+		a.DirtyCount != b.DirtyCount ||
+		a.HasConflicts != b.HasConflicts ||
+		a.HasUpstream != b.HasUpstream ||
+		a.RemoteAhead != b.RemoteAhead ||
+		a.RemoteBehind != b.RemoteBehind ||
+		a.Error != b.Error {
+		return false
+	}
+	if len(a.Files) != len(b.Files) {
+		return false
+	}
+	for i := range a.Files {
+		if a.Files[i] != b.Files[i] {
+			return false
+		}
+	}
+	return true
 }

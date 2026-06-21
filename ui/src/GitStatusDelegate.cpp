@@ -61,9 +61,13 @@ GitStatusDelegate::GitStatusDelegate(QFileSystemModel *fsModel, QObject *parent)
 {
 }
 
-void GitStatusDelegate::setStatuses(QHash<QString, int> statuses)
+bool GitStatusDelegate::setStatuses(QHash<QString, int> statuses)
 {
+    if (statuses == m_statuses) {
+        return false;
+    }
     m_statuses = std::move(statuses);
+    return true;
 }
 
 int GitStatusDelegate::statusForIndex(const QModelIndex &index) const
