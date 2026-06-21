@@ -153,7 +153,8 @@ void CommitDialog::loadSnapshot()
                          }
                          break;
                      }
-                 });
+                 },
+                 this);
 }
 
 void CommitDialog::loadDiff()
@@ -179,7 +180,8 @@ void CommitDialog::loadDiff()
                      }
                      m_diff = new DiffView(patch, this);
                      m_diffSlot->addWidget(m_diff);
-                 });
+                 },
+                 this);
 }
 
 void CommitDialog::onSuggestClicked()
@@ -222,7 +224,8 @@ void CommitDialog::onSuggestClicked()
                      // Replace whatever is in the editor with the suggestion;
                      // the user can still edit it before committing.
                      m_message->setPlainText(msg);
-                 });
+                 },
+                 this);
 }
 
 void CommitDialog::onCommitClicked()
@@ -262,5 +265,6 @@ void CommitDialog::onCommitClicked()
                      emit committed(thread,
                                     result.value(QStringLiteral("branch")).toString());
                      accept();
-                 });
+                 },
+                 this);
 }

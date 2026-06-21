@@ -202,8 +202,14 @@ void LspClient::handleMessage(const QJsonObject &msg)
             m_queue.clear();
             return;
         }
-        if (const auto callback = m_callbacks.take(id)) {
-            callback(msg.value(QStringLiteral("result")));
+        const PendingCallback pending = m_callbacks.take(id);
+        if (pending.cb) {
+            // Lifetime guard: if the registrant supplied a context that has since
+            // been destroyed, drop the response rather than dereference freed state.
+            if (pending.guarded && pending.context.isNull()) {
+                return;
+            }
+            pending.cb(msg.value(QStringLiteral("result")));
         }
         return;
     }
@@ -306,11 +312,13 @@ void LspClient::didClose(const QString &path)
 }
 
 void LspClient::request(const QString &method, const QJsonObject &params,
-                        std::function<void(const QJsonValue &)> callback)
+                        std::function<void(const QJsonValue &)> callback, QObject *context)
 {
     const int id = m_nextId++;
     if (callback) {
-        m_callbacks.insert(id, std::move(callback));
+        m_callbacks.insert(id, PendingCallback{std::move(callback),
+                                               QPointer<QObject>(context),
+                                               context != nullptr});
     }
     const QJsonObject msg{{QStringLiteral("jsonrpc"), QStringLiteral("2.0")},
                           {QStringLiteral("id"), id},

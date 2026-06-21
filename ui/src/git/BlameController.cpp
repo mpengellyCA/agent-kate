@@ -161,7 +161,8 @@ void BlameController::refresh()
                          lines.append(b);
                      }
                      applyData(lines);
-                 });
+                 },
+                 this);
 }
 
 void BlameController::applyData(const QVector<UiBlameLine> &lines)

@@ -147,7 +147,8 @@ void ConflictDialog::refreshStatus()
                          m_finalizeBtn->setEnabled(false);
                          m_openBtn->setEnabled(true);
                      }
-                 });
+                 },
+                 this);
 }
 
 void ConflictDialog::onOpenTool()
@@ -163,7 +164,8 @@ void ConflictDialog::onOpenTool()
                              this, i18nc("@title:window", "KDiff3 unavailable"),
                              error.value(QStringLiteral("message")).toString());
                      }
-                 });
+                 },
+                 this);
 }
 
 void ConflictDialog::onFinalize()
@@ -183,7 +185,8 @@ void ConflictDialog::onFinalize()
                      }
                      emit finalized(thread, into);
                      accept();
-                 });
+                 },
+                 this);
 }
 
 void ConflictDialog::onAbort()
@@ -210,5 +213,6 @@ void ConflictDialog::onAbort()
                      }
                      emit aborted(thread);
                      accept();
-                 });
+                 },
+                 this);
 }

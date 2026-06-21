@@ -176,7 +176,8 @@ void GutterController::pollNow()
                                         result.value(QStringLiteral("hunks"))
                                             .toArray()
                                             .size());
-                 });
+                 },
+                 this);
 }
 
 void GutterController::clearMarks()

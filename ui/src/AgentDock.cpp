@@ -18,6 +18,7 @@
 #include <QPointer>
 #include <QSet>
 #include <QStackedWidget>
+#include <QTimer>
 #include <QVector>
 
 #include <KConfigGroup>
@@ -112,7 +113,12 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
                     }
                     for (const Entry &e : m_agents) {
                         if (e.panel->threadId() == threadId) {
-                            closeAgent(e.id);
+                            // Never delete a panel synchronously from inside a
+                            // core notification handler — the panel may be the
+                            // very object the core is mid-emit on. Defer the
+                            // teardown to the next event-loop turn.
+                            const int id = e.id;
+                            QTimer::singleShot(0, this, [this, id] { closeAgent(id); });
                             break;
                         }
                     }
@@ -175,7 +181,8 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
                                      ? i18n("Committed the agent's changes")
                                      : i18n("Committed to %1", branch));
                          }
-                     });
+                     },
+                     this);
     });
     connect(m_roster, &AgentRoster::prRequested, this, [this](int id) {
         Entry *e = entryById(id);
@@ -201,7 +208,8 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
                              emit statusMessage(i18n("Pull request opened: %1",
                                  result.value(QStringLiteral("url")).toString()));
                          }
-                     });
+                     },
+                     this);
     });
     connect(m_roster, &AgentRoster::landRequested, this, [this](int id) {
         Entry *e = entryById(id);
@@ -244,7 +252,8 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
                                  i18n("Merge into local main"),
                                  i18n("Merged %1 into %2.", branch, into));
                          }
-                     });
+                     },
+                     this);
     });
     connect(m_roster, &AgentRoster::discardRequested, this, [this](int id) {
         Entry *e = entryById(id);
@@ -270,7 +279,8 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
                          } else {
                              emit statusMessage(i18n("Discarded the agent's worktree"));
                          }
-                     });
+                     },
+                     this);
     });
     // Tagging. add/remove apply optimistically and roll back on error (like
     // rename); the full editor sends the whole set via agent.setTags. Each
@@ -520,7 +530,8 @@ void AgentDock::restoreThreads(const QString &project)
                      if (m_pendingFocusProjects.remove(project)) {
                          restoreInitialFocus(project);
                      }
-                 });
+                 },
+                 this);
 }
 
 void AgentDock::restoreInitialFocus(const QString &project)
@@ -614,7 +625,8 @@ void AgentDock::refreshAgentNumbers()
                          }
                          m_roster->setAgentNumber(e.id, byThread.value(tid, 0));
                      }
-                 });
+                 },
+                 this);
 }
 
 void AgentDock::removeAgentEntry(int agentId)
@@ -624,6 +636,9 @@ void AgentDock::removeAgentEntry(int agentId)
             AgentPanel *panel = m_agents.at(i).panel;
             m_agents.removeAt(i);
             m_stack->removeWidget(panel);
+            // Sever any core->panel wiring before tearing it down so no further
+            // core notifications or in-flight replies reach the doomed panel.
+            QObject::disconnect(m_core, nullptr, panel, nullptr);
             panel->deleteLater(); // ~AgentPanel stops its agent
             m_roster->removeAgent(agentId);
             return;
@@ -730,7 +745,8 @@ void AgentDock::renameAgent(int agentId)
                      } else {
                          emit statusMessage(i18n("Renamed agent to “%1”", title));
                      }
-                 });
+                 },
+                 this);
 }
 
 AgentDock::Entry *AgentDock::entryById(int agentId)
@@ -813,7 +829,8 @@ void AgentDock::mutateTag(int agentId, const QString &tag, bool add)
                              error.value(QStringLiteral("message")).toString()));
                      }
                      // On success the core's agent.tagsChanged converges us.
-                 });
+                 },
+                 this);
 }
 
 // editTags opens the full tag editor and, on accept, replaces the agent's tag
@@ -864,7 +881,8 @@ void AgentDock::editTags(int agentId)
                          emit statusMessage(i18n("Tag update failed: %1",
                              error.value(QStringLiteral("message")).toString()));
                      }
-                 });
+                 },
+                 this);
 }
 
 // autoOrganize asks the core for Sonnet's proposed tags for the project, then
@@ -894,7 +912,8 @@ void AgentDock::autoOrganize(const QString &projectPath)
                      self->showOrganizeProposals(
                          projectPath,
                          result.value(QStringLiteral("proposals")).toArray());
-                 });
+                 },
+                 this);
 }
 
 void AgentDock::showOrganizeProposals(const QString &projectPath,

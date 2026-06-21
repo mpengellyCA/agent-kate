@@ -927,7 +927,11 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     connect(m_attachBtn, &QPushButton::clicked, this, &AgentPanel::onAttachClicked);
     connect(m_permAllow, &QPushButton::clicked, this, [this] { answerPermission(true); });
     connect(m_permDeny, &QPushButton::clicked, this, [this] { answerPermission(false); });
-    connect(m_core, &CoreClient::notification, this, &AgentPanel::onNotification);
+    // Queued so a notification can never be delivered re-entrantly while this
+    // panel is being torn down (deleteLater'd on agent/project removal). Qt
+    // drops any still-queued events after the receiver is destroyed.
+    connect(m_core, &CoreClient::notification, this, &AgentPanel::onNotification,
+            Qt::QueuedConnection);
 
     applyChatSettings();
     refresh();
@@ -939,7 +943,8 @@ AgentPanel::~AgentPanel()
     // A dormant thread has no live process — leave it for a later resume.
     if (!m_threadId.isEmpty() && !m_dormant && m_core->isConnected()) {
         m_core->call(QStringLiteral("agent.stop"),
-                     QJsonObject{{QStringLiteral("threadId"), m_threadId}});
+                     QJsonObject{{QStringLiteral("threadId"), m_threadId}},
+                     nullptr, this);
     }
 }
 
@@ -1071,7 +1076,8 @@ void AgentPanel::setDormant(const QString &threadId, const QString &title, bool 
                      QSignalBlocker blocker(m_compactStrip);
                      m_compactStrip->setChecked(
                          result.value(QStringLiteral("strip")).toBool(false));
-                 });
+                 },
+                 this);
     addNote(QStringLiteral("dormant agent · %1 — Resume to continue.")
                 .arg(title.toHtmlEscaped()),
             QStringLiteral("sys"));
@@ -1116,7 +1122,8 @@ void AgentPanel::loadTranscript()
                      addNote(QStringLiteral("— prior conversation restored —"),
                              QStringLiteral("dim"));
                      scrollFeedToBottom();
-                 });
+                 },
+                 this);
 }
 
 void AgentPanel::pushCompactStrategy()
@@ -1129,7 +1136,8 @@ void AgentPanel::pushCompactStrategy()
                      {QStringLiteral("threadId"), m_threadId},
                      {QStringLiteral("strategy"), m_compactCombo->currentData().toString()},
                      {QStringLiteral("strip"), m_compactStrip->isChecked()},
-                 });
+                 },
+                 nullptr, this);
 }
 
 void AgentPanel::runCompactNow(const QString &model)
@@ -1172,7 +1180,8 @@ void AgentPanel::runCompactNow(const QString &model)
                                  .arg(res.value(QStringLiteral("turns")).toInt())
                                  .arg(res.value(QStringLiteral("bodyBytes")).toInt()),
                              QStringLiteral("ok"));
-                 });
+                 },
+                 this);
 }
 
 void AgentPanel::doResume()
@@ -1188,7 +1197,8 @@ void AgentPanel::doResume()
                                               .toHtmlEscaped()),
                                  QStringLiteral("err"));
                      }
-                 });
+                 },
+                 this);
 }
 
 // resumeStrategyModel maps a configured "Compact on Resume" strategy id to the
@@ -1334,8 +1344,10 @@ void AgentPanel::resume()
                                                   QStringLiteral("dim"));
                                       }
                                       doResume();
-                                  });
-                 });
+                                  },
+                                  this);
+                 },
+                 this);
 }
 
 void AgentPanel::refresh()
@@ -1845,7 +1857,8 @@ void AgentPanel::onSendClicked()
                          // that the thread exists on the server.
                          pushCompactStrategy();
                          refresh();
-                     });
+                     },
+                     this);
         refresh();
     } else {
         deliverMessage(text, attachments);
@@ -1880,7 +1893,8 @@ void AgentPanel::deliverMessage(const QString &text, const QJsonArray &attachmen
     m_core->call(QStringLiteral("agent.send"),
                  QJsonObject{{QStringLiteral("threadId"), m_threadId},
                              {QStringLiteral("text"), text},
-                             {QStringLiteral("attachments"), attachments}});
+                             {QStringLiteral("attachments"), attachments}},
+                 nullptr, this);
     refresh();
 }
 
@@ -2265,7 +2279,8 @@ void AgentPanel::onStopClicked()
     // Compact-on-Stop/Exit strategy (see agent.stop) and leaves the session
     // resumable. To abort just the current turn, use Interrupt instead.
     m_core->call(QStringLiteral("agent.stop"),
-                 QJsonObject{{QStringLiteral("threadId"), m_threadId}});
+                 QJsonObject{{QStringLiteral("threadId"), m_threadId}},
+                 nullptr, this);
 }
 
 void AgentPanel::onInterruptClicked()
@@ -2278,7 +2293,8 @@ void AgentPanel::onInterruptClicked()
     }
     addNote(QStringLiteral("&#9209; interrupting…"), QStringLiteral("sys"));
     m_core->call(QStringLiteral("agent.interrupt"),
-                 QJsonObject{{QStringLiteral("threadId"), m_threadId}});
+                 QJsonObject{{QStringLiteral("threadId"), m_threadId}},
+                 nullptr, this);
 }
 
 void AgentPanel::onChangesClicked()
@@ -2303,7 +2319,8 @@ void AgentPanel::onChangesClicked()
                          return;
                      }
                      emit openDiff(tid + QStringLiteral(" — changes.diff"), diff);
-                 });
+                 },
+                 this);
 }
 
 void AgentPanel::onPromoteClicked()
@@ -2327,7 +2344,8 @@ void AgentPanel::onPromoteClicked()
                                  QStringLiteral("err"));
                          refresh();
                      }
-                 });
+                 },
+                 this);
     refresh();
 }
 
@@ -2403,7 +2421,8 @@ void AgentPanel::answerPermission(bool allow)
     const QJsonObject req = m_permQueue.takeFirst();
     m_core->call(QStringLiteral("permission.respond"),
                  QJsonObject{{QStringLiteral("requestId"), req.value(QStringLiteral("requestId"))},
-                             {QStringLiteral("allow"), allow}});
+                             {QStringLiteral("allow"), allow}},
+                 nullptr, this);
     addNote(QStringLiteral("&#128274; %1 — %2")
                 .arg(req.value(QStringLiteral("toolName")).toString().toHtmlEscaped(),
                      allow ? QStringLiteral("approved") : QStringLiteral("denied")),
@@ -2519,7 +2538,8 @@ void AgentPanel::onQuestionSubmit()
         QStringLiteral("permission.respond"),
         QJsonObject{{QStringLiteral("requestId"), m_questionReq.value(QStringLiteral("requestId"))},
                     {QStringLiteral("allow"), true},
-                    {QStringLiteral("updatedInput"), updatedInput}});
+                    {QStringLiteral("updatedInput"), updatedInput}},
+        nullptr, this);
 
     addNote(QStringLiteral("&#10067; answered the agent's question"), QStringLiteral("ok"));
 

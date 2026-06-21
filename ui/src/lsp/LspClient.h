@@ -7,6 +7,7 @@
 #include <QJsonValue>
 #include <QList>
 #include <QObject>
+#include <QPointer>
 #include <QString>
 #include <QStringList>
 
@@ -38,8 +39,15 @@ public:
     void didClose(const QString &path);
 
     // Issue an LSP request; the callback receives the response "result".
+    //
+    // If context is non-null, the callback is lifetime-guarded: should the
+    // context QObject be destroyed before the response arrives, the callback is
+    // DROPPED (never invoked). Pass the object that owns the captured state so a
+    // late response cannot touch freed memory. A null context (the default)
+    // keeps the legacy behaviour: always invoked.
     void request(const QString &method, const QJsonObject &params,
-                 std::function<void(const QJsonValue &)> callback);
+                 std::function<void(const QJsonValue &)> callback,
+                 QObject *context = nullptr);
 
     // The server's advertised capabilities (from the initialize result).
     const QJsonObject &capabilities() const { return m_serverCaps; }
@@ -75,5 +83,13 @@ private:
     QJsonObject m_serverCaps;          // initialize result capabilities
     QHash<QString, int> m_versions;   // path -> document version
     QList<QJsonObject> m_queue;       // messages held until initialised
-    QHash<int, std::function<void(const QJsonValue &)>> m_callbacks; // pending requests
+
+    // A pending request slot. When guarded, the callback is invoked only if its
+    // context is still alive; a null context after destruction means DROP.
+    struct PendingCallback {
+        std::function<void(const QJsonValue &)> cb;
+        QPointer<QObject> context;
+        bool guarded = false;
+    };
+    QHash<int, PendingCallback> m_callbacks; // pending requests
 };

@@ -19,6 +19,7 @@
 #include <QCursor>
 #include <QFileInfo>
 #include <QJsonObject>
+#include <QPointer>
 #include <QTextCharFormat>
 #include <QTimer>
 #include <QToolTip>
@@ -740,11 +741,14 @@ void LspManager::formatDocument(KTextEditor::View *view, std::function<void(bool
         {QStringLiteral("options"),
          QJsonObject{{QStringLiteral("tabSize"), tabWidth > 0 ? tabWidth : 4},
                      {QStringLiteral("insertSpaces"), replaceTabs}}}};
+    // Guard the document against being closed before the formatting reply lands:
+    // applyTextEdits would otherwise dereference a dangling pointer.
+    QPointer<KTextEditor::Document> guardedDoc(doc);
     e->client->request(
         QStringLiteral("textDocument/formatting"), params,
-        [this, doc, then](const QJsonValue &result) {
-            if (result.isArray()) {
-                applyTextEdits(doc, result.toArray());
+        [this, guardedDoc, then](const QJsonValue &result) {
+            if (guardedDoc && result.isArray()) {
+                applyTextEdits(guardedDoc, result.toArray());
             }
             if (then) {
                 then(true);

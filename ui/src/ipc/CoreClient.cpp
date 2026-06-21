@@ -108,11 +108,13 @@ bool CoreClient::isConnected() const
     return m_socket->state() == QLocalSocket::ConnectedState;
 }
 
-void CoreClient::call(const QString &method, const QJsonObject &params, ReplyCallback cb)
+void CoreClient::call(const QString &method, const QJsonObject &params, ReplyCallback cb,
+                      QObject *context)
 {
     const int id = m_nextId++;
     if (cb) {
-        m_pending.insert(id, std::move(cb));
+        m_pending.insert(id, PendingReply{std::move(cb), QPointer<QObject>(context),
+                                          context != nullptr});
     }
     send(QJsonObject{
         {QStringLiteral("jsonrpc"), QStringLiteral("2.0")},
@@ -160,10 +162,15 @@ void CoreClient::handleFrame(const QJsonObject &frame)
         && (frame.contains(QStringLiteral("result"))
             || frame.contains(QStringLiteral("error")))) {
         const int id = frame.value(QStringLiteral("id")).toInt();
-        const ReplyCallback cb = m_pending.take(id);
-        if (cb) {
-            cb(frame.value(QStringLiteral("result")).toObject(),
-               frame.value(QStringLiteral("error")).toObject());
+        const PendingReply pending = m_pending.take(id);
+        if (pending.cb) {
+            // Lifetime guard: if the registrant supplied a context that has since
+            // been destroyed, drop the reply rather than dereference freed state.
+            if (pending.guarded && pending.context.isNull()) {
+                return;
+            }
+            pending.cb(frame.value(QStringLiteral("result")).toObject(),
+                       frame.value(QStringLiteral("error")).toObject());
         }
         return;
     }
