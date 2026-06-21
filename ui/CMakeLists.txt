@@ -52,6 +52,8 @@ add_executable(agentkate
     src/AgentRoster.cpp
     src/AgentCardDelegate.cpp
     src/AgentDock.cpp
+    src/TagEditorDialog.cpp
+    src/AutoOrganizeDialog.cpp
     src/AgentPanel.cpp
     src/WorktreeDashboard.cpp
     src/git/BlameController.cpp

@@ -2,6 +2,8 @@
 #include "RecentProjects.h"
 #include "AgentPanel.h"
 #include "AgentRoster.h"
+#include "AutoOrganizeDialog.h"
+#include "TagEditorDialog.h"
 #include "ipc/CoreClient.h"
 
 #include <QDir>
@@ -10,9 +12,13 @@
 #include <QInputDialog>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QJsonValue>
 #include <QLineEdit>
 #include <QMessageBox>
+#include <QPointer>
+#include <QSet>
 #include <QStackedWidget>
+#include <QVector>
 
 #include <KLocalizedString>
 
@@ -98,6 +104,21 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
                             closeAgent(e.id);
                             break;
                         }
+                    }
+                } else if (method == QLatin1String("agent.tagsChanged")) {
+                    const QString threadId =
+                        params.value(QStringLiteral("threadId")).toString();
+                    if (threadId.isEmpty()) {
+                        return;
+                    }
+                    QStringList tags;
+                    const QJsonArray arr =
+                        params.value(QStringLiteral("tags")).toArray();
+                    for (const QJsonValue &v : arr) {
+                        tags.append(v.toString());
+                    }
+                    if (Entry *e = entryByThread(threadId)) {
+                        m_roster->setAgentTags(e->id, tags);
                     }
                 }
             });
@@ -240,6 +261,17 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
                          }
                      });
     });
+    // Tagging. add/remove apply optimistically and roll back on error (like
+    // rename); the full editor sends the whole set via agent.setTags. Each
+    // success also broadcasts agent.tagsChanged, which reconciles the roster to
+    // the core's authoritatively normalized set.
+    connect(m_roster, &AgentRoster::addTagRequested, this,
+            [this](int id, const QString &tag) { mutateTag(id, tag, /*add=*/true); });
+    connect(m_roster, &AgentRoster::removeTagRequested, this,
+            [this](int id, const QString &tag) { mutateTag(id, tag, /*add=*/false); });
+    connect(m_roster, &AgentRoster::editTagsRequested, this, &AgentDock::editTags);
+    connect(m_roster, &AgentRoster::autoOrganizeRequested, this,
+            &AgentDock::autoOrganize);
 }
 
 QWidget *AgentDock::roster() const
@@ -425,9 +457,21 @@ void AgentDock::restoreThreads(const QString &project)
                                                    .toObject()
                                                    .value(QStringLiteral("isolated"))
                                                    .toBool();
-                         addDormantAgent(project, threadId,
-                                         rec.value(QStringLiteral("title")).toString(),
-                                         isolated);
+                         AgentPanel *panel = addDormantAgent(
+                             project, threadId,
+                             rec.value(QStringLiteral("title")).toString(), isolated);
+                         // Seed the roster card's tag chips from the persisted set.
+                         QStringList tags;
+                         const QJsonArray tagArr =
+                             rec.value(QStringLiteral("tags")).toArray();
+                         for (const QJsonValue &tv : tagArr) {
+                             tags.append(tv.toString());
+                         }
+                         if (!tags.isEmpty()) {
+                             if (Entry *e = entryByPanel(panel)) {
+                                 m_roster->setAgentTags(e->id, tags);
+                             }
+                         }
                      }
                      refreshAgentNumbers();
                  });
@@ -589,4 +633,218 @@ AgentDock::Entry *AgentDock::entryById(int agentId)
         }
     }
     return nullptr;
+}
+
+AgentDock::Entry *AgentDock::entryByPanel(const AgentPanel *panel)
+{
+    for (Entry &e : m_agents) {
+        if (e.panel == panel) {
+            return &e;
+        }
+    }
+    return nullptr;
+}
+
+AgentDock::Entry *AgentDock::entryByThread(const QString &threadId)
+{
+    for (Entry &e : m_agents) {
+        if (e.panel->threadId() == threadId) {
+            return &e;
+        }
+    }
+    return nullptr;
+}
+
+// --- tagging ----------------------------------------------------------------
+
+// mutateTag adds or removes one tag, applying the change to the roster
+// immediately and rolling back if the core rejects it.
+void AgentDock::mutateTag(int agentId, const QString &tag, bool add)
+{
+    Entry *e = entryById(agentId);
+    if (!e || e->panel->threadId().isEmpty()) {
+        emit statusMessage(i18n("Start the agent before tagging it"));
+        return;
+    }
+    const QString threadId = e->panel->threadId();
+    const QStringList before = m_roster->agentTags(agentId);
+
+    // Optimistic local update so chips react instantly.
+    QStringList next = before;
+    if (add) {
+        bool present = false;
+        for (const QString &t : before) {
+            if (t.compare(tag, Qt::CaseInsensitive) == 0) {
+                present = true;
+                break;
+            }
+        }
+        if (!present) {
+            next.append(tag);
+        }
+    } else {
+        QStringList kept;
+        for (const QString &t : next) {
+            if (t.compare(tag, Qt::CaseInsensitive) != 0) {
+                kept.append(t);
+            }
+        }
+        next = kept;
+    }
+    m_roster->setAgentTags(agentId, next);
+
+    const QString method = add ? QStringLiteral("agent.addTag")
+                               : QStringLiteral("agent.removeTag");
+    m_core->call(method,
+                 QJsonObject{{QStringLiteral("threadId"), threadId},
+                             {QStringLiteral("tag"), tag}},
+                 [this, agentId, before](const QJsonObject &, const QJsonObject &error) {
+                     if (!error.isEmpty()) {
+                         m_roster->setAgentTags(agentId, before); // roll back
+                         emit statusMessage(i18n("Tag update failed: %1",
+                             error.value(QStringLiteral("message")).toString()));
+                     }
+                     // On success the core's agent.tagsChanged converges us.
+                 });
+}
+
+// editTags opens the full tag editor and, on accept, replaces the agent's tag
+// set via agent.setTags.
+void AgentDock::editTags(int agentId)
+{
+    Entry *e = entryById(agentId);
+    if (!e || e->panel->threadId().isEmpty()) {
+        emit statusMessage(i18n("Start the agent before tagging it"));
+        return;
+    }
+    const QString threadId = e->panel->threadId();
+    const QStringList current = m_roster->agentTags(agentId);
+
+    // Suggestions: every tag in use across this agent's project.
+    QStringList suggestions;
+    QSet<QString> seen;
+    for (const Entry &other : m_agents) {
+        if (other.project != e->project) {
+            continue;
+        }
+        for (const QString &t : m_roster->agentTags(other.id)) {
+            if (!seen.contains(t.toLower())) {
+                seen.insert(t.toLower());
+                suggestions.append(t);
+            }
+        }
+    }
+
+    TagEditorDialog dlg(current, suggestions, m_dialogParent);
+    if (dlg.exec() != QDialog::Accepted) {
+        return;
+    }
+    const QStringList next = dlg.tags();
+    const QStringList before = current;
+    m_roster->setAgentTags(agentId, next); // optimistic
+
+    QJsonArray arr;
+    for (const QString &t : next) {
+        arr.append(t);
+    }
+    m_core->call(QStringLiteral("agent.setTags"),
+                 QJsonObject{{QStringLiteral("threadId"), threadId},
+                             {QStringLiteral("tags"), arr}},
+                 [this, agentId, before](const QJsonObject &, const QJsonObject &error) {
+                     if (!error.isEmpty()) {
+                         m_roster->setAgentTags(agentId, before); // roll back
+                         emit statusMessage(i18n("Tag update failed: %1",
+                             error.value(QStringLiteral("message")).toString()));
+                     }
+                 });
+}
+
+// autoOrganize asks the core for Sonnet's proposed tags for the project, then
+// shows a preview dialog. Nothing is applied until the user confirms; each
+// confirmed row is written via agent.setTags (which broadcasts tagsChanged so
+// the roster converges).
+void AgentDock::autoOrganize(const QString &projectPath)
+{
+    if (!m_core->isConnected()) {
+        emit statusMessage(i18n("The core is not connected"));
+        return;
+    }
+    emit statusMessage(i18n("Asking Claude to organize agents…"));
+    QPointer<AgentDock> self(this);
+    m_core->call(QStringLiteral("agent.suggestTags"),
+                 QJsonObject{{QStringLiteral("project"), projectPath}},
+                 [self, projectPath](const QJsonObject &result, const QJsonObject &error) {
+                     if (!self) {
+                         return;
+                     }
+                     if (!error.isEmpty()) {
+                         emit self->statusMessage(
+                             i18n("Auto-organize failed: %1",
+                                  error.value(QStringLiteral("message")).toString()));
+                         return;
+                     }
+                     self->showOrganizeProposals(
+                         projectPath,
+                         result.value(QStringLiteral("proposals")).toArray());
+                 });
+}
+
+void AgentDock::showOrganizeProposals(const QString &projectPath,
+                                      const QJsonArray &proposals)
+{
+    // Map each proposed threadId to the agent's roster title for the preview.
+    QVector<AutoOrganizeDialog::Proposal> rows;
+    for (const QJsonValue &v : proposals) {
+        const QJsonObject o = v.toObject();
+        const QString threadId = o.value(QStringLiteral("threadId")).toString();
+        if (threadId.isEmpty()) {
+            continue;
+        }
+        Entry *e = entryByThread(threadId);
+        if (!e || e->project != projectPath) {
+            continue; // only this project's currently-shown agents
+        }
+        QStringList tags;
+        const QJsonArray tagArr = o.value(QStringLiteral("tags")).toArray();
+        for (const QJsonValue &tv : tagArr) {
+            tags.append(tv.toString());
+        }
+        AutoOrganizeDialog::Proposal p;
+        p.threadId = threadId;
+        p.label = m_roster->agentTitle(e->id);
+        if (p.label.isEmpty()) {
+            p.label = i18n("Agent %1", e->id);
+        }
+        p.tags = tags;
+        rows.append(p);
+    }
+
+    if (rows.isEmpty()) {
+        emit statusMessage(i18n("Claude had no tag suggestions"));
+        return;
+    }
+
+    AutoOrganizeDialog dlg(rows, m_dialogParent);
+    if (dlg.exec() != QDialog::Accepted) {
+        return;
+    }
+    const QVector<AutoOrganizeDialog::Result> results = dlg.results();
+    int applied = 0;
+    for (const AutoOrganizeDialog::Result &res : results) {
+        Entry *e = entryByThread(res.threadId);
+        if (!e) {
+            continue;
+        }
+        m_roster->setAgentTags(e->id, res.tags); // optimistic
+        QJsonArray arr;
+        for (const QString &t : res.tags) {
+            arr.append(t);
+        }
+        m_core->call(QStringLiteral("agent.setTags"),
+                     QJsonObject{{QStringLiteral("threadId"), res.threadId},
+                                 {QStringLiteral("tags"), arr}},
+                     nullptr);
+        ++applied;
+    }
+    emit statusMessage(i18n("Applied tags to %1 agent(s)", applied));
 }

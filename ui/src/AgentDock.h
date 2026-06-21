@@ -10,6 +10,7 @@ class AgentPanel;
 class AgentRoster;
 class QStackedWidget;
 class QWidget;
+class QJsonArray;
 
 // AgentDock orchestrates the agent-centric workspace: a stack of agent
 // conversation panels plus the AgentRoster (project → agent tree). The shell
@@ -69,10 +70,20 @@ private:
     // roster, so the #N badge stays in sync with WorktreeDashboard.
     void refreshAgentNumbers();
     bool hasThread(const QString &threadId) const;
+    // Add or remove one tag on an agent, optimistic with rollback on error.
+    void mutateTag(int agentId, const QString &tag, bool add);
+    // Open the tag editor for an agent and persist the result via agent.setTags.
+    void editTags(int agentId);
+    // Sonnet auto-organize: request proposals, then preview+apply.
+    void autoOrganize(const QString &projectPath);
+    void showOrganizeProposals(const QString &projectPath,
+                               const QJsonArray &proposals);
     void removeAgentEntry(int agentId);
     void closeAgent(int agentId);
     void closeProject(const QString &path);
     Entry *entryById(int agentId);
+    Entry *entryByPanel(const AgentPanel *panel);
+    Entry *entryByThread(const QString &threadId);
 
     CoreClient *m_core = nullptr;
     QStackedWidget *m_stack = nullptr;

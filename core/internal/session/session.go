@@ -36,6 +36,7 @@ type Record struct {
 	Effort         string            `json:"effort"` // claude --effort level; "" = Claude Code default
 	Model          string            `json:"model"`  // claude --model id; "" = Claude Code default
 	Title          string            `json:"title"`  // short summary of the opening prompt
+	Tags           []string          `json:"tags,omitempty"` // user/auto labels for roster organization
 	Created        time.Time         `json:"created"`
 	Updated        time.Time         `json:"updated"`
 	Status         string            `json:"status"`
