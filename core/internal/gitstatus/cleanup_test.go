@@ -187,17 +187,21 @@ func TestAnalyzeRunningBlocked(t *testing.T) {
 	}
 }
 
-func TestAnalyzeNotIsolatedBlocked(t *testing.T) {
+// A dormant direct-workspace agent owns no worktree, so it is removable as a
+// record-only archive (the checkout is untouched) rather than hard-blocked.
+func TestAnalyzeNotIsolatedRecordOnly(t *testing.T) {
 	repo, _ := initLinearRepo(t, 1)
 	wt := worktree.Worktree{
 		ThreadID: "ws", RepoRoot: repo, Path: repo, Isolated: false,
 	}
 	c := AnalyzeCandidate(wt, snapFor(t, wt), false, "", time.Now())
-	if c.State != CleanupBlocked || c.Removable {
-		t.Fatalf("non-isolated must be blocked: state=%q removable=%v", c.State, c.Removable)
+	if c.State != CleanupRecordOnly || !c.Removable {
+		t.Fatalf("non-isolated, not running must be record-only & removable: state=%q removable=%v",
+			c.State, c.Removable)
 	}
-	if !hasCode(c.Blockers, BlockerNotIsolated) {
-		t.Fatalf("missing notIsolated blocker: %v", c.Blockers)
+	// No dedicated worktree means none of the worktree-loss blockers apply.
+	if hasCode(c.Blockers, BlockerNotIsolated) || hasCode(c.Blockers, BlockerDetached) {
+		t.Fatalf("record-only agent must carry no blockers: %v", c.Blockers)
 	}
 }
 
@@ -375,19 +379,23 @@ func TestAnalyzeRunningOrphanedStaysBlocked(t *testing.T) {
 	}
 }
 
-func TestAnalyzeMultipleBlockers(t *testing.T) {
+// A RUNNING direct-workspace agent is still hard-blocked: it is removable only
+// once stopped. Running takes precedence over the record-only path.
+func TestAnalyzeRunningWorkspaceBlocked(t *testing.T) {
 	repo, _ := initLinearRepo(t, 1)
-	// Non-isolated + running → two blockers, still single blocked verdict.
 	wt := worktree.Worktree{ThreadID: "x", RepoRoot: repo, Path: repo, Isolated: false}
 	c := AnalyzeCandidate(wt, snapFor(t, wt), true, "", time.Now())
-	if c.Removable {
-		t.Fatal("any blocker must make it unremovable")
+	if c.Removable || c.State != CleanupBlocked {
+		t.Fatalf("running workspace agent must be blocked: state=%q removable=%v",
+			c.State, c.Removable)
 	}
-	if !hasCode(c.Blockers, BlockerRunning) || !hasCode(c.Blockers, BlockerNotIsolated) {
-		t.Fatalf("expected both blockers: %v", c.Blockers)
+	if !hasCode(c.Blockers, BlockerRunning) {
+		t.Fatalf("expected running blocker: %v", c.Blockers)
 	}
-	if !hasCode(c.Blockers, BlockerDetached) {
-		t.Fatalf("workspace path has no agentkate branch so detached also fires: %v", c.Blockers)
+	// The "not isolated" / "detached" worktree faults no longer apply to a
+	// direct-workspace agent — only the genuine "still running" block does.
+	if hasCode(c.Blockers, BlockerNotIsolated) || hasCode(c.Blockers, BlockerDetached) {
+		t.Fatalf("workspace agent must not carry worktree blockers: %v", c.Blockers)
 	}
 }
 

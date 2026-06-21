@@ -39,6 +39,10 @@ QColor stateColor(const QString &state)
     if (state == QLatin1String("blocked")) {
         return scheme.foreground(KColorScheme::NegativeText).color();
     }
+    if (state == QLatin1String("recordOnly")) {
+        // Benign: archives the agent session, touches no files. Normal text.
+        return scheme.foreground(KColorScheme::NormalText).color();
+    }
     // orphaned (and anything unknown) — muted/inactive.
     return scheme.foreground(KColorScheme::InactiveText).color();
 }
@@ -56,6 +60,9 @@ QString stateLabel(const QString &state)
     }
     if (state == QLatin1String("orphaned")) {
         return i18n("Orphaned");
+    }
+    if (state == QLatin1String("recordOnly")) {
+        return i18n("Agent only");
     }
     return state;
 }
@@ -153,7 +160,13 @@ QVariant CleanupModel::data(const QModelIndex &index, int role) const
         case ColAgent:
             return c.number > 0 ? i18n("Agent #%1", c.number) : c.threadId.left(8);
         case ColBranch:
-            return c.branch.isEmpty() ? i18n("(detached)") : c.branch;
+            if (!c.branch.isEmpty()) {
+                return c.branch;
+            }
+            // A direct-workspace agent with no live snapshot has no branch of
+            // its own — it shares the checkout's. Label it as such, not detached.
+            return c.state == QLatin1String("recordOnly") ? i18n("workspace")
+                                                          : i18n("(detached)");
         case ColStatus:
             return stateLabel(c.state);
         case ColRecommendation:
@@ -185,6 +198,10 @@ QVariant CleanupModel::data(const QModelIndex &index, int role) const
         }
         if (c.state == QLatin1String("orphaned")) {
             lines << i18n("Directory is gone; removal only prunes git bookkeeping.");
+        }
+        if (c.state == QLatin1String("recordOnly")) {
+            lines << i18n("No worktree — removal archives the agent's session "
+                          "(reversible). Your checkout is left untouched.");
         }
         if (!c.reason.isEmpty()) {
             lines << i18n("AI: %1", c.reason);
@@ -258,10 +275,14 @@ void CleanupModel::setCandidates(QList<CleanupCandidate> cands)
     beginResetModel();
     m_rows = std::move(cands);
     // Pre-check only safe and orphaned rows — never review (those need a
-    // deliberate, informed choice).
+    // deliberate, informed choice). Record-only workspace agents are pre-checked
+    // only once dormant for 48h, so the active agent is never auto-swept.
+    const QDateTime staleBefore = QDateTime::currentDateTime().addSecs(-48 * 3600);
     for (CleanupCandidate &c : m_rows) {
         c.checked = c.removable
-            && (c.state == QLatin1String("safe") || c.state == QLatin1String("orphaned"));
+            && (c.state == QLatin1String("safe") || c.state == QLatin1String("orphaned")
+                || (c.state == QLatin1String("recordOnly") && c.lastActivity.isValid()
+                    && c.lastActivity < staleBefore));
     }
     endResetModel();
 }
@@ -320,7 +341,7 @@ CleanupDialog::CleanupDialog(CoreClient *core, const QString &project, QWidget *
     , m_view(new QTableView(this))
     , m_model(new CleanupModel(this))
 {
-    setWindowTitle(i18n("Analyze & Clean Up Worktrees"));
+    setWindowTitle(i18n("Analyze & Clean Up Worktrees & Agents"));
     resize(720, 420);
 
     m_view->setModel(m_model);
@@ -391,7 +412,7 @@ void CleanupDialog::applyResult(const QJsonObject &result)
     const QJsonArray arr = result.value(QStringLiteral("candidates")).toArray();
     QList<CleanupCandidate> cands;
     cands.reserve(arr.size());
-    int safe = 0, review = 0, blocked = 0, orphaned = 0;
+    int safe = 0, review = 0, blocked = 0, orphaned = 0, recordOnly = 0;
     for (const QJsonValue &v : arr) {
         const QJsonObject o = v.toObject();
         CleanupCandidate c;
@@ -406,6 +427,8 @@ void CleanupDialog::applyResult(const QJsonObject &result)
         c.dirtyCount = o.value(QStringLiteral("dirtyCount")).toInt();
         c.unpushedCommits = o.value(QStringLiteral("unpushedCommits")).toInt();
         c.stashCount = o.value(QStringLiteral("stashCount")).toInt();
+        c.lastActivity = QDateTime::fromString(
+            o.value(QStringLiteral("lastActivity")).toString(), Qt::ISODate);
         c.diffStat = o.value(QStringLiteral("diffStat")).toString();
         c.removable = o.value(QStringLiteral("removable")).toBool();
         c.recommendation = o.value(QStringLiteral("recommendation")).toString();
@@ -425,12 +448,14 @@ void CleanupDialog::applyResult(const QJsonObject &result)
             ++blocked;
         } else if (c.state == QLatin1String("orphaned")) {
             ++orphaned;
+        } else if (c.state == QLatin1String("recordOnly")) {
+            ++recordOnly;
         }
         cands << c;
     }
     m_model->setCandidates(cands);
-    m_status->setText(i18n("%1 safe · %2 to review · %3 orphaned · %4 blocked",
-                           safe, review, orphaned, blocked));
+    m_status->setText(i18n("%1 safe · %2 agent-only · %3 to review · %4 orphaned · %5 blocked",
+                           safe, recordOnly, review, orphaned, blocked));
 }
 
 void CleanupDialog::onRemoveClicked()
