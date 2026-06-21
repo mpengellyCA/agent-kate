@@ -367,6 +367,17 @@ void AgentDock::applyChatSettings()
     }
 }
 
+int AgentDock::runningAgentCount() const
+{
+    int n = 0;
+    for (const Entry &e : m_agents) {
+        if (e.panel->isRunning()) {
+            ++n;
+        }
+    }
+    return n;
+}
+
 QString AgentDock::currentThreadId() const
 {
     QWidget *w = m_stack->currentWidget();

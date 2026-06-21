@@ -42,6 +42,10 @@ public:
     // threadId of the currently-active agent panel, empty if none / not started.
     QString currentThreadId() const;
 
+    // Number of agents with a live process (used to decide whether app shutdown
+    // needs the graceful stop-and-compact dialog).
+    int runningAgentCount() const;
+
     // Persist the focused agent's thread so the next launch can land back in it.
     // Called on app shutdown to capture a thread that started while focused.
     void persistLastActiveSessions();

@@ -7,6 +7,7 @@
 #include "ProblemsPanel.h"
 #include "ProjectTree.h"
 #include "ReferencesPanel.h"
+#include "ShutdownDialog.h"
 #include "SearchPanel.h"
 #include "SessionBrowserDialog.h"
 #include "SkillsDialog.h"
@@ -1495,6 +1496,20 @@ void MainWindow::closeEvent(QCloseEvent *event)
     // Remember the focused agent per project so the next launch lands back in it.
     if (m_agent) {
         m_agent->persistLastActiveSessions();
+    }
+    // Graceful, observable shutdown: while agents are live, run the stop-and
+    // -compact dialog before tearing down so every agent is compacted and
+    // resumable. The modal dialog drives app.shutdown and pumps progress events
+    // until the core reports done; then we re-enter and take the normal path.
+    if (!m_shutdownComplete && m_core && m_core->isConnected() && m_agent
+        && m_agent->runningAgentCount() > 0) {
+        event->ignore();
+        ShutdownDialog dlg(m_core, this);
+        dlg.exec();
+        m_shutdownComplete = true;
+        // Re-close on the next loop turn so this handler fully unwinds first.
+        QMetaObject::invokeMethod(this, &QWidget::close, Qt::QueuedConnection);
+        return;
     }
     KMainWindow::closeEvent(event);
 }
