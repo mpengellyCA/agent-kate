@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2026 The Agent Kate developers
 
 #include "WorktreeDashboard.h"
+#include "CleanupDialog.h"
 #include "git/CommitDialog.h"
 #include "git/ConflictDialog.h"
 #include "git/PRDialog.h"
@@ -254,8 +255,13 @@ WorktreeDashboard::WorktreeDashboard(CoreClient *core, QWidget *parent)
     m_landBtn->setEnabled(false);
     m_prBtn = new QPushButton(i18nc("@action:button", "Open PR…"), this);
     m_prBtn->setEnabled(false);
+    // Cleanup is always enabled — it analyses every worktree, not the selection.
+    m_cleanupBtn = new QPushButton(
+        QIcon::fromTheme(QStringLiteral("edit-clear-history")),
+        i18nc("@action:button", "Analyze && Clean up…"), this);
     auto *toolbar = new QHBoxLayout;
     toolbar->setContentsMargins(6, 4, 6, 4);
+    toolbar->addWidget(m_cleanupBtn);
     toolbar->addWidget(m_discardBtn);
     toolbar->addStretch(1);
     toolbar->addWidget(m_commitBtn);
@@ -295,6 +301,18 @@ WorktreeDashboard::WorktreeDashboard(CoreClient *core, QWidget *parent)
     connect(m_prBtn, &QPushButton::clicked, this, &WorktreeDashboard::openPRDialog);
     connect(m_discardBtn, &QPushButton::clicked, this,
             &WorktreeDashboard::discardSelected);
+    connect(m_cleanupBtn, &QPushButton::clicked, this,
+            &WorktreeDashboard::analyzeAndCleanup);
+}
+
+void WorktreeDashboard::analyzeAndCleanup()
+{
+    auto *dlg = new CleanupDialog(m_core, m_activeProject, this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    connect(dlg, &CleanupDialog::statusMessage, this,
+            [this](const QString &text) { emit statusMessage(text); });
+    connect(dlg, &CleanupDialog::cleaned, this, [this] { refresh(); });
+    dlg->show();
 }
 
 void WorktreeDashboard::setActiveProject(const QString &projectPath)
@@ -516,6 +534,11 @@ void WorktreeDashboard::showRowContextMenu(const QPoint &pos)
         i18nc("@action:inmenu", "Remove worktree…"));
     // Only isolated worktrees can be removed (never the shared workspace).
     removeAct->setEnabled(r->isolated && !r->threadId.isEmpty());
+    menu.addSeparator();
+    // Project-wide bulk cleanup — always enabled, analyses every worktree.
+    QAction *cleanupAct = menu.addAction(
+        QIcon::fromTheme(QStringLiteral("edit-clear-history")),
+        i18nc("@action:inmenu", "Analyze && Clean up…"));
 
     QAction *chosen = menu.exec(m_view->viewport()->mapToGlobal(pos));
     if (chosen == commitAct) {
@@ -524,6 +547,8 @@ void WorktreeDashboard::showRowContextMenu(const QPoint &pos)
         discardSelected();
     } else if (chosen == removeAct) {
         removeSelected();
+    } else if (chosen == cleanupAct) {
+        analyzeAndCleanup();
     }
 }
 

@@ -121,3 +121,134 @@ func TestNewIDFormat(t *testing.T) {
 		t.Fatal("NewID returned the same id twice")
 	}
 }
+
+// --- archive / restore -----------------------------------------------------
+
+func TestArchivePreservesRecordAndDropsFromLive(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "threads.json")
+	store, _ := NewStore(path)
+	rec := sampleRecord("t-arch")
+	rec.Worktree.Isolated = true
+	rec.Worktree.Branch = "agentkate/t-arch"
+	if err := store.Put(rec); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	if err := store.Archive("t-arch", "cleanup: safe"); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+	// Gone from the live store.
+	if _, ok := store.Get("t-arch"); ok {
+		t.Fatal("archived record must be absent from live store")
+	}
+	if len(store.List("")) != 0 {
+		t.Fatal("live List should be empty after archive")
+	}
+	// Present, in full, in the archive.
+	arch := store.ListArchived()
+	if len(arch) != 1 {
+		t.Fatalf("ListArchived = %d, want 1", len(arch))
+	}
+	got := arch[0]
+	if got.ThreadID != "t-arch" {
+		t.Fatalf("archived threadId = %q", got.ThreadID)
+	}
+	if got.Reason != "cleanup: safe" {
+		t.Fatalf("archived reason = %q", got.Reason)
+	}
+	if got.SessionID != rec.SessionID {
+		t.Fatal("archive must preserve the full record (sessionId lost)")
+	}
+	if got.Status != StatusArchived {
+		t.Fatalf("archived status = %q, want archived", got.Status)
+	}
+	if got.ArchivedAt.IsZero() {
+		t.Fatal("archivedAt must be set")
+	}
+}
+
+func TestArchiveUnknownThread(t *testing.T) {
+	store, _ := NewStore(filepath.Join(t.TempDir(), "threads.json"))
+	if err := store.Archive("nope", "x"); err == nil {
+		t.Fatal("Archive of unknown thread must error")
+	}
+}
+
+func TestArchivePersistsAcrossReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "threads.json")
+	store, _ := NewStore(path)
+	_ = store.Put(sampleRecord("t-p"))
+	if err := store.Archive("t-p", "cleanup: review"); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+	// Reopen: the archive file is on disk independent of the live store.
+	store2, err := NewStore(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	arch := store2.ListArchived()
+	if len(arch) != 1 || arch[0].ThreadID != "t-p" {
+		t.Fatalf("archive not persisted across reopen: %+v", arch)
+	}
+	if _, ok := store2.Get("t-p"); ok {
+		t.Fatal("archived thread must not reappear in live store")
+	}
+}
+
+func TestRestoreMovesBackAsDormantNonIsolated(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "threads.json")
+	store, _ := NewStore(path)
+	rec := sampleRecord("t-r")
+	rec.Project = "/tmp/proj"
+	rec.Worktree.Isolated = true
+	rec.Worktree.Branch = "agentkate/t-r"
+	rec.Worktree.Path = "/tmp/proj/.agentkate/worktrees/t-r"
+	_ = store.Put(rec)
+	if err := store.Archive("t-r", "cleanup: safe"); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+
+	if err := store.Restore("t-r"); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	back, ok := store.Get("t-r")
+	if !ok {
+		t.Fatal("restored record missing from live store")
+	}
+	if back.Status != StatusDormant {
+		t.Fatalf("restored status = %q, want dormant", back.Status)
+	}
+	if back.Worktree.Isolated {
+		t.Fatal("restored worktree must be non-isolated (its worktree is gone)")
+	}
+	if back.Worktree.Path != back.Project {
+		t.Fatalf("restored path = %q, want project %q", back.Worktree.Path, back.Project)
+	}
+	// Archive entry consumed.
+	if len(store.ListArchived()) != 0 {
+		t.Fatal("archive entry must be removed after restore")
+	}
+}
+
+func TestRestoreUnknown(t *testing.T) {
+	store, _ := NewStore(filepath.Join(t.TempDir(), "threads.json"))
+	if err := store.Restore("nope"); err == nil {
+		t.Fatal("Restore of unknown thread must error")
+	}
+}
+
+func TestReArchiveReplacesEntry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "threads.json")
+	store, _ := NewStore(path)
+	_ = store.Put(sampleRecord("t-x"))
+	_ = store.Archive("t-x", "first")
+	_ = store.Restore("t-x")
+	_ = store.Archive("t-x", "second")
+	arch := store.ListArchived()
+	if len(arch) != 1 {
+		t.Fatalf("re-archive should not duplicate: got %d", len(arch))
+	}
+	if arch[0].Reason != "second" {
+		t.Fatalf("re-archive reason = %q, want second", arch[0].Reason)
+	}
+}

@@ -96,6 +96,7 @@ private:
     void openPRDialog();
     void discardSelected();
     void removeSelected();
+    void analyzeAndCleanup();
     void showRowContextMenu(const QPoint &pos);
     void updatePlaceholder();
     const WorktreeRow *selectedRow() const;
@@ -108,6 +109,7 @@ private:
     QPushButton *m_landBtn = nullptr;
     QPushButton *m_prBtn = nullptr;
     QPushButton *m_discardBtn = nullptr;
+    QPushButton *m_cleanupBtn = nullptr;
     QLabel *m_placeholder = nullptr;
     QString m_activeProject;
     bool m_inFlight = false;
