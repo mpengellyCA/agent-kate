@@ -28,9 +28,10 @@
 #include <QVBoxLayout>
 
 namespace {
-// Poll cadence while visible. The cache on the core side coalesces concurrent
-// reads, so 1 Hz is cheap even with many threads.
-constexpr int kPollIntervalMs = 1000;
+// Slow fallback poll cadence while visible. The dashboard refreshes reactively
+// on the core's git.invalidated notification (diff-suppressed in applySnapshot),
+// so this timer only backstops anything the watcher misses — no need for 1 Hz.
+constexpr int kPollIntervalMs = 20000;
 } // namespace
 
 WorktreeModel::WorktreeModel(QObject *parent)

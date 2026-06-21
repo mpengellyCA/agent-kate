@@ -1873,14 +1873,15 @@ func registerHandlers(d handlerDeps) {
 		if p.Path == "" {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "path is required")
 		}
-		// Resolve owning worktree + relative path, mirroring git.file.
+		// Resolve owning worktree + thread + relative path, mirroring git.file.
 		var wt worktree.Worktree
-		var relPath string
+		var threadID, relPath string
 		if p.ThreadID != "" {
 			if rec, ok := d.threads.get(p.ThreadID); ok {
 				if rel, err := filepath.Rel(rec.Path, p.Path); err == nil &&
 					!strings.HasPrefix(rel, "..") {
 					wt = rec
+					threadID = p.ThreadID
 					relPath = filepath.ToSlash(rel)
 				}
 			}
@@ -1897,14 +1898,27 @@ func registerHandlers(d handlerDeps) {
 			} else if rec, ok := d.sessions.Get(s.ThreadID); ok {
 				wt = rec.Worktree
 			}
+			threadID = s.ThreadID
 			relPath = rel
 		}
 		if wt.Path == "" {
 			return map[string]any{"lines": []gitstatus.BlameLine{}}, nil
 		}
-		lines, err := gitstatus.Blame(wt, relPath)
-		if err != nil {
+		// Prefer the cache (keyed on the snapshot generation, busted on HEAD
+		// move or save) so a repeated blame for an unchanged file never re-shells
+		// `git blame`. Fall back to a direct compute only when the thread is not
+		// cache-registered.
+		var lines []gitstatus.BlameLine
+		if cached, ok, err := d.gitCache.BlameFor(threadID, relPath); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		} else if ok {
+			lines = cached
+		} else {
+			l, err := gitstatus.Blame(wt, relPath)
+			if err != nil {
+				return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+			}
+			lines = l
 		}
 		if lines == nil {
 			lines = []gitstatus.BlameLine{}
@@ -2005,14 +2019,28 @@ func registerHandlers(d handlerDeps) {
 		} else {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "git.log requires threadId or repoRoot")
 		}
-		entries, err := gitstatus.Log(wt, gitstatus.LogOptions{
+		opts := gitstatus.LogOptions{
 			Skip:   p.Skip,
 			Limit:  p.Limit,
 			Path:   p.Path,
 			Branch: p.Branch,
-		})
-		if err != nil {
+		}
+		// The unfiltered HEAD graph for a registered thread goes through the
+		// cache, which keeps one history walk per (thread, HEAD) so deep scroll
+		// pages slice a precomputed array instead of re-walking git each time.
+		// Path / branch-scoped views and the workspace (repoRoot) view fall
+		// through to the bare walk — identical results either way.
+		var entries []gitstatus.LogEntry
+		if cached, ok, err := d.gitCache.LogPageFor(p.ThreadID, opts); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		} else if ok {
+			entries = cached
+		} else {
+			e, err := gitstatus.Log(wt, opts)
+			if err != nil {
+				return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+			}
+			entries = e
 		}
 		if entries == nil {
 			entries = []gitstatus.LogEntry{}

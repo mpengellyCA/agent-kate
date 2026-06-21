@@ -6,7 +6,9 @@
 
 #include <KLocalizedString>
 #include <KTextEditor/Document>
+#include <KTextEditor/View>
 
+#include <QEvent>
 #include <QIcon>
 #include <QJsonObject>
 #include <QJsonValue>
@@ -16,10 +18,13 @@
 #include <QTimer>
 
 namespace {
-// Polling cadence and post-edit debounce. The cache on the core side handles
-// concurrent reads, so 1 s is comfortable.
-constexpr int kPollIntervalMs = 1000;
+// The gutter is driven by the core's git.invalidated notification; this slow
+// timer is only a safety net in case a working-tree change slips past the fs
+// watcher. The post-edit debounce keeps a mid-edit save from painting against
+// half-typed code, and the invalidated debounce coalesces save bursts.
+constexpr int kPollIntervalMs = 20000;
 constexpr int kDebounceAfterEditMs = 2000;
+constexpr int kInvalidatedDebounceMs = 250;
 
 // Custom mark slots, picked from the unreserved range (01..07 are taken by
 // bookmarks / breakpoints / warning / error; 32 is SearchMatch).
@@ -88,16 +93,16 @@ GutterController::GutterController(KTextEditor::Document *doc, const QString &ab
 {
     m_pollTimer->setInterval(kPollIntervalMs);
     m_debounceTimer->setSingleShot(true);
-    m_debounceTimer->setInterval(kDebounceAfterEditMs);
+    m_debounceTimer->setInterval(kInvalidatedDebounceMs);
 
     registerMarkPixmaps();
 
     connect(m_pollTimer, &QTimer::timeout, this, &GutterController::pollNow);
     connect(m_debounceTimer, &QTimer::timeout, this, &GutterController::pollNow);
 
-    // Skipping ticks while the user is mid-edit: each text change defers the
-    // next poll by kDebounceAfterEditMs so the gutter doesn't churn against
-    // half-typed code.
+    // The gutter is normally refreshed by git.invalidated (debounced), but a
+    // mid-edit save should not paint against half-typed code: each text change
+    // defers the next refresh by kDebounceAfterEditMs so the user can pause.
     connect(doc, &KTextEditor::Document::textChanged, this,
             [this] { scheduleAfterEdit(); });
     connect(doc, &KTextEditor::Document::aboutToClose, this,
@@ -106,8 +111,33 @@ GutterController::GutterController(KTextEditor::Document *doc, const QString &ab
                 m_debounceTimer->stop();
             });
 
-    m_pollTimer->start();
-    // One immediate poll so freshly opened files don't wait a second.
+    // The fs watcher pushes git.invalidated on every working-tree change. That
+    // is the primary refresh trigger — coalesce bursts (e.g. a save touching
+    // several files) into one refresh, and only while the file is on screen.
+    if (m_core) {
+        connect(m_core, &CoreClient::notification, this,
+                [this](const QString &method, const QJsonObject &) {
+                    if (method == QLatin1String("git.invalidated")) {
+                        scheduleRefresh();
+                    }
+                });
+    }
+
+    // Watch the document's views for Show / Hide so a backgrounded tab stops
+    // polling. New views (split, reopen) get the same watcher.
+    const auto views = doc->views();
+    for (KTextEditor::View *v : views) {
+        watchView(v);
+    }
+    connect(doc, &KTextEditor::Document::viewCreated, this,
+            [this](KTextEditor::Document *, KTextEditor::View *view) {
+                watchView(view);
+                updateVisibility();
+            });
+
+    // Establish initial visibility (starts the safety-net timer if on screen)
+    // and do one immediate refresh so freshly opened files don't wait.
+    updateVisibility();
     QTimer::singleShot(0, this, &GutterController::pollNow);
 }
 
@@ -138,17 +168,88 @@ void GutterController::registerMarkPixmaps()
 
 void GutterController::scheduleAfterEdit()
 {
-    // Restart both timers: stop the regular ticker so it can't fire mid-edit,
-    // and (re)arm the debounce so the next poll happens once the user pauses.
-    m_pollTimer->stop();
-    m_debounceTimer->start();
+    if (!m_visible) {
+        return; // a background document does not chase its own edits
+    }
+    // Hold the refresh until the user pauses: (re)arm the debounce with the
+    // longer post-edit interval so the gutter does not churn against
+    // half-typed code.
+    m_debounceTimer->start(kDebounceAfterEditMs);
+}
+
+void GutterController::scheduleRefresh()
+{
+    if (!m_visible) {
+        return; // off-screen documents stay quiet until shown
+    }
+    // Coalesce bursts of git.invalidated (a save can touch several files) into
+    // a single refresh. Don't stretch an already-armed post-edit hold.
+    if (!m_debounceTimer->isActive()) {
+        m_debounceTimer->start(kInvalidatedDebounceMs);
+    }
+}
+
+bool GutterController::hasVisibleView() const
+{
+    if (!m_doc) {
+        return false;
+    }
+    const auto views = m_doc->views();
+    for (KTextEditor::View *v : views) {
+        if (v && v->isVisible()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void GutterController::watchView(KTextEditor::View *view)
+{
+    if (view) {
+        view->installEventFilter(this);
+    }
+}
+
+void GutterController::updateVisibility()
+{
+    const bool nowVisible = hasVisibleView();
+    if (nowVisible == m_visible) {
+        return;
+    }
+    m_visible = nowVisible;
+    if (m_visible) {
+        // Came on screen: resume the safety net and refresh promptly so the
+        // gutter reflects any change that happened while hidden.
+        if (!m_pollTimer->isActive()) {
+            m_pollTimer->start();
+        }
+        scheduleRefresh();
+    } else {
+        // Went off screen: go fully quiet.
+        m_pollTimer->stop();
+        m_debounceTimer->stop();
+    }
+}
+
+bool GutterController::eventFilter(QObject *watched, QEvent *event)
+{
+    if (event->type() == QEvent::Show || event->type() == QEvent::Hide) {
+        updateVisibility();
+    }
+    return QObject::eventFilter(watched, event);
 }
 
 void GutterController::pollNow()
 {
+    // Off-screen documents never poll: keep the timers stopped and bail. The
+    // immediate refresh on construction can also land before the view is shown
+    // — visibility decides, not the source of the call.
+    if (!m_visible) {
+        return;
+    }
     if (m_inFlight || m_path.isEmpty() || !m_doc || !m_core->isConnected()) {
-        // Always restart the regular ticker after the debounce fires so polls
-        // resume their cadence.
+        // Restart the safety-net ticker so refreshes keep their cadence while
+        // the file stays visible.
         if (!m_pollTimer->isActive()) {
             m_pollTimer->start();
         }
@@ -160,7 +261,7 @@ void GutterController::pollNow()
                  QJsonObject{{QStringLiteral("path"), path}},
                  [this, path](const QJsonObject &result, const QJsonObject &error) {
                      m_inFlight = false;
-                     if (!m_pollTimer->isActive()) {
+                     if (m_visible && !m_pollTimer->isActive()) {
                          m_pollTimer->start();
                      }
                      if (!m_doc || path != m_path) {
@@ -199,6 +300,13 @@ void GutterController::applyHunks(const QJsonArray &hunks)
     if (!m_doc) {
         return;
     }
+    // git.invalidated fires for any working-tree change in the worktree, so a
+    // refresh often returns hunks identical to what is already painted. Skip
+    // the clear + re-add (and the gutter repaint it triggers) in that case.
+    if (hunks == m_lastHunks) {
+        return;
+    }
+    m_lastHunks = hunks;
     clearMarks();
     const int lineCount = m_doc->lines();
     for (const QJsonValue &v : hunks) {

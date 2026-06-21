@@ -18,23 +18,48 @@ import (
 // times as streaming progresses, each carrying its own usage block. We dedupe
 // by `message.id` so the per-thread roll-up reflects one logical turn per id
 // regardless of how many partial events we observed.
+//
+// Over a long-lived thread the per-message bookkeeping would grow without
+// bound, so we fold each finalized turn into running cumulative totals and
+// retain detail only for a bounded recent window of message ids. The window is
+// sized to comfortably exceed the burst of partial stream events for a single
+// logical turn (which arrive contiguously), so supersession — replacing a
+// partial usage block with the final one for the same id — always lands while
+// the id is still in-window. Once an id ages out it never reappears, so its
+// contribution is already baked exactly into the running totals.
 type usageMeter struct {
 	log      *slog.Logger
 	threadID string
 
-	mu       sync.Mutex
-	model    string
-	byMsgID  map[string]usageBlock // latest usage we've seen per assistant message id
-	order    []string              // insertion order, so per-turn logs stay chronological
-	logged   map[string]bool       // ids we have already emitted a turn_usage line for
+	mu    sync.Mutex
+	model string
+
+	// Running cumulative totals across every unique turn observed, kept exact
+	// regardless of window eviction. turns counts distinct message ids.
+	turns                                     int
+	totalIn, totalOut, cacheRead, cacheCreate int64
+
+	// recent retains the latest usage seen per id for the bounded window only,
+	// so partial stream events can supersede earlier ones. recentOrder is the
+	// eviction queue (oldest first). seq is a monotonically increasing turn
+	// counter used for the synthetic anon key and the chronological turn number
+	// in per-turn logs, so neither depends on the (now bounded) map size.
+	recent      map[string]usageBlock
+	recentOrder []string
+	seq         int
 }
+
+// usageWindow bounds how many distinct message ids retain per-turn detail. It
+// only needs to exceed the number of partial stream events for one in-flight
+// turn (a handful in practice); 256 leaves a wide safety margin while capping
+// retained memory regardless of session length.
+const usageWindow = 256
 
 func newUsageMeter(log *slog.Logger, threadID string) *usageMeter {
 	return &usageMeter{
 		log:      log,
 		threadID: threadID,
-		byMsgID:  make(map[string]usageBlock),
-		logged:   make(map[string]bool),
+		recent:   make(map[string]usageBlock),
 	}
 }
 
@@ -81,27 +106,53 @@ func (m *usageMeter) recordTurn(id, model string, u usageBlock) {
 		// usage; skip them so the log isn't littered with empty turns.
 		return
 	}
-	// Stream events without an id (very old Claude Code, defensive) get a
-	// synthetic key so they still appear in the totals, just not deduped.
-	key := id
-	if key == "" {
-		key = fmt.Sprintf("anon-%d", len(m.byMsgID))
-	}
-
 	m.mu.Lock()
 	if model != "" {
 		m.model = model
 	}
-	_, known := m.byMsgID[key]
-	if !known {
-		m.order = append(m.order, key)
+	// Stream events without an id (very old Claude Code, defensive) get a
+	// synthetic key so they still appear in the totals, just not deduped. The
+	// key uses the monotonic seq rather than a map size so it stays unique even
+	// after window eviction.
+	key := id
+	if key == "" {
+		key = fmt.Sprintf("anon-%d", m.seq)
 	}
-	// Keep the latest usage for this id — partial stream events get
-	// superseded by the final one.
-	m.byMsgID[key] = u
-	shouldLog := !m.logged[key]
-	m.logged[key] = true
-	turn := len(m.order)
+
+	prev, known := m.recent[key]
+	if known {
+		// Supersede the partial usage we last saw for this id: adjust the
+		// running totals by the delta so the final block per id is what counts.
+		m.totalIn += u.InputTokens - prev.InputTokens
+		m.totalOut += u.OutputTokens - prev.OutputTokens
+		m.cacheRead += u.CacheReadInputTokens - prev.CacheReadInputTokens
+		m.cacheCreate += u.CacheCreationInputTokens - prev.CacheCreationInputTokens
+		m.recent[key] = u
+	} else {
+		// First sighting of this id: a new distinct turn.
+		m.seq++
+		m.turns++
+		m.totalIn += u.InputTokens
+		m.totalOut += u.OutputTokens
+		m.cacheRead += u.CacheReadInputTokens
+		m.cacheCreate += u.CacheCreationInputTokens
+		m.recent[key] = u
+		// Evict the oldest retained detail once the window is full. Its
+		// contribution is already final in the running totals, and a superseded
+		// id never reappears, so dropping the detail loses nothing. The shift
+		// reuses the backing array in place so its capacity stays bounded by the
+		// window rather than growing with the session.
+		if len(m.recentOrder) >= usageWindow {
+			delete(m.recent, m.recentOrder[0])
+			copy(m.recentOrder, m.recentOrder[1:])
+			m.recentOrder[len(m.recentOrder)-1] = key
+		} else {
+			m.recentOrder = append(m.recentOrder, key)
+		}
+	}
+	// A first sighting that lands in the window is one we have not logged yet.
+	shouldLog := !known
+	turn := m.turns
 	m.mu.Unlock()
 
 	if !shouldLog {
@@ -137,34 +188,30 @@ func (m *usageMeter) recordSession(u usageBlock, turns int, cost float64, durMS 
 	)
 }
 
-// Summary logs the per-thread roll-up by walking the deduped per-message map,
-// so partial stream events that emit the same usage block multiple times do
-// not inflate the totals. Called at thread exit; the figures should agree
-// with the sum of claude's `session_usage` events for the same thread.
+// Summary logs the per-thread roll-up from the running cumulative totals, which
+// are kept deduped (one logical turn per message id, latest usage block wins)
+// as turns are observed — so partial stream events that emit the same usage
+// block multiple times do not inflate the figures, and the totals stay exact
+// even after old per-message detail is evicted from the bounded window. Called
+// at thread exit; the figures should agree with the sum of claude's
+// `session_usage` events for the same thread.
 func (m *usageMeter) Summary() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if len(m.byMsgID) == 0 {
+	if m.turns == 0 {
 		return
 	}
-	var totalIn, totalOut, cacheRead, cacheCreate int64
-	for _, u := range m.byMsgID {
-		totalIn += u.InputTokens
-		totalOut += u.OutputTokens
-		cacheRead += u.CacheReadInputTokens
-		cacheCreate += u.CacheCreationInputTokens
-	}
-	prompt := totalIn + cacheRead + cacheCreate
+	prompt := m.totalIn + m.cacheRead + m.cacheCreate
 	m.log.Info("usage_total",
 		"thread", m.threadID,
 		"model", m.model,
-		"turns", len(m.byMsgID),
-		"in", totalIn,
-		"out", totalOut,
-		"cache_read", cacheRead,
-		"cache_create", cacheCreate,
+		"turns", m.turns,
+		"in", m.totalIn,
+		"out", m.totalOut,
+		"cache_read", m.cacheRead,
+		"cache_create", m.cacheCreate,
 		"prompt_total", prompt,
-		"cache_hit_pct", percent(cacheRead, prompt),
+		"cache_hit_pct", percent(m.cacheRead, prompt),
 	)
 }
 

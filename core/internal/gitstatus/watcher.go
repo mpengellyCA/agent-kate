@@ -308,6 +308,37 @@ func (w *watcher) handleEvent(e fsnotify.Event) {
 			}
 		}
 	}
+
+	// A removed or renamed-away directory leaves a stale dirOwner entry that
+	// would otherwise live until the whole thread is unwatched. Drop the entry
+	// (and any descendants that were watched beneath it) so the map can't grow
+	// unboundedly across a long session. inotify auto-drops the watch on the
+	// gone inode, so the explicit Remove is best-effort cleanup.
+	if e.Has(fsnotify.Remove) || e.Has(fsnotify.Rename) {
+		w.evictDir(e.Name)
+	}
+}
+
+// evictDir removes the dirOwner entries for path and anything watched beneath
+// it, releasing the fsnotify watches best-effort. Called when a watched
+// directory is deleted or renamed away so the owner map and watch set don't
+// accumulate dead directories over the life of a thread.
+func (w *watcher) evictDir(path string) {
+	prefix := path + string(filepath.Separator)
+	w.mu.Lock()
+	var gone []string
+	for dir := range w.dirOwner {
+		if dir == path || strings.HasPrefix(dir, prefix) {
+			gone = append(gone, dir)
+		}
+	}
+	for _, dir := range gone {
+		delete(w.dirOwner, dir)
+	}
+	w.mu.Unlock()
+	for _, dir := range gone {
+		_ = w.fs.Remove(dir)
+	}
 }
 
 // enqueueInvalidate hands a thread id to the dispatch consumer, coalescing

@@ -17,6 +17,8 @@ import (
 
 	"agentkate/internal/safe"
 	"agentkate/internal/worktree"
+
+	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
 // Cache holds per-thread git status, keyed by thread id. Snapshots and per-file
@@ -56,8 +58,18 @@ type entry struct {
 
 	snapshot   *Snapshot
 	fileHunks  map[string]hunkCacheLine
+	fileBlame  map[string]blameCacheLine
 	generation uint64
 	dirty      bool // recompute on next read
+
+	// logWalk caches the full HEAD-graph walk for the log viewer, keyed on the
+	// HEAD it was walked from. Resolving refs and re-walking history is the most
+	// expensive read path and was previously redone on every page request
+	// (quadratic with scroll depth); caching the walk + refs lets paging slice a
+	// precomputed array. Only the unfiltered HEAD view is cached here — path /
+	// branch-scoped requests still walk directly (they vary per call). Busted on
+	// HEAD change.
+	logWalk *logWalkCache
 
 	// notifyPending marks that an fs event has landed since the last
 	// notification settled and a deferred notify is owed. It is deliberately
@@ -79,6 +91,20 @@ type entry struct {
 type hunkCacheLine struct {
 	hunks      []Hunk
 	generation uint64
+}
+
+type blameCacheLine struct {
+	lines      []BlameLine
+	generation uint64
+}
+
+// logWalkCache holds one full HEAD-graph walk so the log viewer's pages slice a
+// precomputed array instead of re-walking history per request. headSHA pins the
+// walk to the HEAD it was taken from; a mismatch (HEAD moved) forces a re-walk.
+type logWalkCache struct {
+	headSHA string
+	walked  []*object.Commit
+	refs    map[string][]string
 }
 
 // NewCache creates an empty cache. If log is non-nil it also spins up an
@@ -155,6 +181,7 @@ func (c *Cache) Register(wt worktree.Worktree) {
 	c.entries[wt.ThreadID] = &entry{
 		wt:        wt,
 		fileHunks: make(map[string]hunkCacheLine),
+		fileBlame: make(map[string]blameCacheLine),
 		dirty:     true,
 	}
 	if c.watcher != nil {
@@ -381,6 +408,85 @@ func (c *Cache) HunksFor(threadID, relPath string) ([]Hunk, uint64, bool, error)
 	return hunks, e.generation, true, nil
 }
 
+// BlameFor returns per-line blame for one file vs the worktree's HEAD,
+// computing it on first request and caching against the snapshot generation so
+// it invalidates together — the same scheme HunksFor uses. The bool reports
+// whether the thread is known; an unknown thread yields (nil, false, nil) so
+// the caller can fall back. git blame is one of the two heaviest read paths and
+// was previously shelled out on every request with no caching at all.
+func (c *Cache) BlameFor(threadID, relPath string) ([]BlameLine, bool, error) {
+	c.mu.RLock()
+	e, ok := c.entries[threadID]
+	c.mu.RUnlock()
+	if !ok {
+		return nil, false, nil
+	}
+	s := c.ensureSnapshot(e)
+	if s == nil {
+		return nil, true, nil
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if line, ok := e.fileBlame[relPath]; ok && line.generation == e.generation {
+		return line.lines, true, nil
+	}
+	lines, err := Blame(e.wt, relPath)
+	if err != nil {
+		return nil, true, err
+	}
+	e.fileBlame[relPath] = blameCacheLine{lines: lines, generation: e.generation}
+	return lines, true, nil
+}
+
+// LogPageFor returns one page of the thread's HEAD-graph log, caching the full
+// history walk + ref map per (thread, HEAD) so paging slices a precomputed
+// array instead of re-walking from the top on every request. The bool reports
+// whether the thread is known and the request is cacheable; it is false (with
+// no error) for an unknown thread OR for a path / branch-scoped request, both
+// of which the caller should serve via the bare gitstatus.Log.
+//
+// Cache results are byte-for-byte identical to the uncached path: the cached
+// walk is the same iterator order, and the per-page topo-sort + lane layout are
+// computed over exactly the page's commits, just as Log always did.
+func (c *Cache) LogPageFor(threadID string, opts LogOptions) ([]LogEntry, bool, error) {
+	// Only the unfiltered HEAD view is cacheable: a Branch starts the walk from
+	// a different commit (not tracked by HEAD) and a Path changes which commits
+	// the walk yields, so neither is keyed by HEAD. Defer both to the caller.
+	if opts.Branch != "" || opts.Path != "" {
+		return nil, false, nil
+	}
+	c.mu.RLock()
+	e, ok := c.entries[threadID]
+	c.mu.RUnlock()
+	if !ok {
+		return nil, false, nil
+	}
+	s := c.ensureSnapshot(e)
+	if s == nil {
+		return nil, true, nil
+	}
+	head := s.HeadSHA
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.logWalk == nil || e.logWalk.headSHA != head {
+		// The full walk ignores Skip/Limit, so it is taken once per HEAD and
+		// every page reuses it. walkLog returns a nil slice for an empty /
+		// unborn repo; cache that too so we don't re-walk a repo with no
+		// commits on each page.
+		walked, refs, err := walkLog(e.wt, LogOptions{})
+		if err != nil {
+			return nil, true, err
+		}
+		e.logWalk = &logWalkCache{headSHA: head, walked: walked, refs: refs}
+	}
+	if e.logWalk.walked == nil {
+		return nil, true, nil
+	}
+	return pageLog(e.logWalk.walked, e.logWalk.refs, opts), true, nil
+}
+
 // ensureSnapshot returns the entry's snapshot, recomputing if dirty or missing.
 // The entry mutex serialises concurrent pollers so they share one git walk.
 func (c *Cache) ensureSnapshot(e *entry) *Snapshot {
@@ -411,7 +517,11 @@ func (c *Cache) ensureSnapshot(e *entry) *Snapshot {
 	e.snapshot = snap
 	e.generation++
 	e.fileHunks = make(map[string]hunkCacheLine)
+	e.fileBlame = make(map[string]blameCacheLine)
 	e.dirty = false
+	// logWalk is intentionally NOT cleared here: it is keyed on the HEAD it was
+	// walked from and self-invalidates on a HEAD change (see LogPageFor), so it
+	// survives the generation bumps that ordinary working-tree saves cause.
 	threadID := e.wt.ThreadID
 	newHead := snap.HeadSHA
 	e.mu.Unlock()

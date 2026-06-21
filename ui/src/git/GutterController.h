@@ -10,14 +10,18 @@
 
 namespace KTextEditor {
 class Document;
+class View;
 }
 class CoreClient;
+class QEvent;
 class QTimer;
 
 // GutterController paints per-line git markers (added / modified / deleted)
-// in a KTextEditor::Document's gutter. It owns one document and polls the
-// core's git.file RPC for line hunks, debouncing 2 s after the most recent
-// keystroke so editing the file does not flood the bus.
+// in a KTextEditor::Document's gutter. It owns one document and refreshes the
+// core's git.file RPC for line hunks, driven by the core's git.invalidated
+// notification (debounced to coalesce save bursts) plus a slow safety-net
+// timer. Refreshing is gated on visibility: a document with no visible view
+// stays quiet so background tabs cost nothing.
 //
 // One controller per open document — the parent owns it and destroys it when
 // the document closes.
@@ -38,12 +42,26 @@ Q_SIGNALS:
     void statusUpdated(const QString &path, const QString &branch,
                        const QString &status, int hunkCount);
 
+protected:
+    // Watches the document's views for Show / Hide so polling can be gated on
+    // whether the file is actually on screen.
+    bool eventFilter(QObject *watched, QEvent *event) override;
+
 private:
     void registerMarkPixmaps();
     void pollNow();
     void applyHunks(const QJsonArray &hunks);
     void clearMarks();
     void scheduleAfterEdit();
+    void scheduleRefresh();
+
+    // True when at least one of the document's views is visible on screen.
+    bool hasVisibleView() const;
+    // Re-evaluate visibility and start/stop the safety-net timer to match;
+    // a background document goes fully quiet.
+    void updateVisibility();
+    // Install the view watcher (Show / Hide) on a freshly created view.
+    void watchView(KTextEditor::View *view);
 
     QPointer<KTextEditor::Document> m_doc;
     CoreClient *m_core = nullptr;
@@ -51,6 +69,10 @@ private:
     QTimer *m_pollTimer = nullptr;
     QTimer *m_debounceTimer = nullptr;
     bool m_inFlight = false;
+    bool m_visible = false;
     QString m_lastBranch;
     QString m_lastStatus;
+    // The hunk array last painted into the gutter; an identical reply skips
+    // the clear + re-add churn (and the gutter repaint it triggers).
+    QJsonArray m_lastHunks;
 };

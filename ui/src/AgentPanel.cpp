@@ -332,10 +332,15 @@ public:
         m_timer->setInterval(70);
         connect(m_timer, &QTimer::timeout, this, [this] {
             m_angle = (m_angle + 26) % 360;
+            // The message text only rotates every 48 ticks; on those ticks
+            // repaint the whole widget, otherwise invalidate just the small
+            // spinner rect so the wide message isn't re-rendered every 70ms.
             if (++m_ticks % 48 == 0) {
                 ++m_genericIndex;
+                update();
+            } else {
+                update(spinnerRect());
             }
-            update();
         });
         setVisible(false);
     }
@@ -347,11 +352,7 @@ public:
         }
         m_active = on;
         setVisible(on);
-        if (on) {
-            m_timer->start();
-        } else {
-            m_timer->stop();
-        }
+        syncTimer();
     }
 
     void setActivity(const QString &message)
@@ -364,6 +365,20 @@ public:
     }
 
 protected:
+    // Pause the spinner while the panel is off-screen (backgrounded, or not the
+    // current stack page): a hidden widget can't show its animation, so ticking
+    // 14×/s only to repaint nothing is pure waste. Resume on show if still active.
+    void showEvent(QShowEvent *e) override
+    {
+        QWidget::showEvent(e);
+        syncTimer();
+    }
+    void hideEvent(QHideEvent *e) override
+    {
+        QWidget::hideEvent(e);
+        syncTimer();
+    }
+
     void paintEvent(QPaintEvent *) override
     {
         QPainter p(this);
@@ -395,6 +410,29 @@ protected:
     }
 
 private:
+    // The bounding box of the rotating arc (matching paintEvent's geometry),
+    // padded for the pen width — the only region the per-tick repaint touches.
+    QRect spinnerRect() const
+    {
+        const int d = 15;
+        const int cx = 9 + d / 2;
+        const int cy = height() / 2;
+        const int pad = 3; // pen width / round caps / antialiasing
+        return QRect(cx - d / 2 - pad, cy - d / 2 - pad, d + 2 * pad, d + 2 * pad);
+    }
+
+    // Run the animation timer only while active and actually on-screen.
+    void syncTimer()
+    {
+        if (m_active && isVisible()) {
+            if (!m_timer->isActive()) {
+                m_timer->start();
+            }
+        } else {
+            m_timer->stop();
+        }
+    }
+
     QTimer *m_timer = nullptr;
     QStringList m_generic;
     QString m_activity;

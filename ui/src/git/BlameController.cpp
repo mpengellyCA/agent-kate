@@ -99,9 +99,15 @@ BlameController::BlameController(KTextEditor::Document *doc, KTextEditor::View *
                     refresh();
                 }
             });
+    // Blame vs HEAD only changes when HEAD moves (a commit lands / branch
+    // switches) or this file is saved — the save is handled by the
+    // documentSavedOrUploaded hook above. A plain git.invalidated fires on
+    // every unrelated working-tree change, so refetching on it re-shelled
+    // `git blame` for nothing. Gate on git.log.invalidated, which the core
+    // emits only when a thread's HEAD actually moves.
     connect(m_core, &CoreClient::notification, this,
             [this](const QString &m, const QJsonObject &) {
-                if (m_enabled && m == QLatin1String("git.invalidated")) {
+                if (m_enabled && m == QLatin1String("git.log.invalidated")) {
                     refresh();
                 }
             });
