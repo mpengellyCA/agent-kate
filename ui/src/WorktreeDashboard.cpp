@@ -503,6 +503,11 @@ void WorktreeDashboard::showRowContextMenu(const QPoint &pos)
     }
 
     QMenu menu(this);
+    QAction *termAct = menu.addAction(
+        QIcon::fromTheme(QStringLiteral("utilities-terminal")),
+        i18nc("@action:inmenu", "Open Terminal Here"));
+    termAct->setEnabled(!r->path.isEmpty());
+    menu.addSeparator();
     QAction *commitAct = menu.addAction(
         i18nc("@action:inmenu", "Commit changes…"));
     commitAct->setEnabled(!r->threadId.isEmpty());
@@ -518,7 +523,9 @@ void WorktreeDashboard::showRowContextMenu(const QPoint &pos)
     removeAct->setEnabled(r->isolated && !r->threadId.isEmpty());
 
     QAction *chosen = menu.exec(m_view->viewport()->mapToGlobal(pos));
-    if (chosen == commitAct) {
+    if (chosen == termAct) {
+        emit openTerminalRequested(r->path);
+    } else if (chosen == commitAct) {
         openCommitDialog();
     } else if (chosen == discardAct) {
         discardSelected();

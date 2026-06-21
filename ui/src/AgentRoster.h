@@ -68,6 +68,7 @@ Q_SIGNALS:
     void landRequested(int agentId);
     void discardRequested(int agentId);
     void closeRequested(int agentId);
+    void openWorktreeTerminalRequested(int agentId);
 
 protected:
     void resizeEvent(QResizeEvent *event) override;
