@@ -251,7 +251,7 @@ func runCore() {
 		// background — Hot-Opus is a separate pre-reap flow.
 		if probe.Type == "_lifecycle" && (probe.Phase == "exited" || probe.Phase == "interrupted") {
 			coopState.ClearOwner(threadID)
-			_ = sessions.Update(threadID, func(r *session.Record) {
+			_ = sessions.UpdateQuiet(threadID, func(r *session.Record) {
 				r.Status = session.StatusDormant
 			})
 			// Cold-exit compaction runs only on a normal exit; a user interrupt
@@ -1039,7 +1039,7 @@ func registerHandlers(d handlerDeps) {
 		if err := d.summaries.Put(sum); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
 		}
-		_ = d.sessions.Update(p.ThreadID, func(r *session.Record) {
+		_ = d.sessions.UpdateQuiet(p.ThreadID, func(r *session.Record) {
 			r.SummaryUpdatedAt = sum.Created
 		})
 		d.log.Info("compaction complete",
@@ -2329,7 +2329,7 @@ func resumeAgentThread(d handlerDeps, rec session.Record) {
 		return
 	}
 
-	_ = d.sessions.Update(rec.ThreadID, func(r *session.Record) {
+	_ = d.sessions.UpdateQuiet(rec.ThreadID, func(r *session.Record) {
 		r.Status = session.StatusRunning
 		if current {
 			// The summary is now baked into the new session; clear our
@@ -2372,7 +2372,7 @@ func promoteAgentThread(d handlerDeps, rec session.Record) {
 	}
 
 	rec.Worktree = iso
-	_ = d.sessions.Update(rec.ThreadID, func(r *session.Record) { r.Worktree = iso })
+	_ = d.sessions.UpdateQuiet(rec.ThreadID, func(r *session.Record) { r.Worktree = iso })
 	d.threads.put(rec.ThreadID, iso)
 	d.gitCache.Register(iso)
 	d.log.Info("agent thread promoted", "thread", rec.ThreadID, "branch", iso.Branch)
@@ -2467,7 +2467,7 @@ func runHotCompactIfConfigured(d handlerDeps, threadID string) {
 		d.log.Warn("could not store hot summary", "thread", threadID, "err", err)
 		return
 	}
-	_ = d.sessions.Update(threadID, func(r *session.Record) {
+	_ = d.sessions.UpdateQuiet(threadID, func(r *session.Record) {
 		r.SummaryUpdatedAt = sum.Created
 	})
 	d.log.Info("hot-opus compact complete",
@@ -2587,7 +2587,7 @@ func runExitCompact(ctx context.Context, claudeBin string, log *slog.Logger,
 		log.Warn("could not store summary", "thread", rec.ThreadID, "err", err)
 		return
 	}
-	_ = sessions.Update(rec.ThreadID, func(r *session.Record) {
+	_ = sessions.UpdateQuiet(rec.ThreadID, func(r *session.Record) {
 		r.SummaryUpdatedAt = sum.Created
 	})
 	log.Info("exit compaction complete",
