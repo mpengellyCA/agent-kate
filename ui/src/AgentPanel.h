@@ -15,9 +15,12 @@ class QAbstractButton;
 class QCheckBox;
 class QComboBox;
 class QDragEnterEvent;
+class QDragLeaveEvent;
 class QDragMoveEvent;
 class QDropEvent;
 class QEvent;
+class QMimeData;
+class QPaintEvent;
 class QFrame;
 class QHBoxLayout;
 class QLabel;
@@ -27,6 +30,7 @@ class QPlainTextEdit;
 class QPushButton;
 class QScrollArea;
 class QTimer;
+class KMessageWidget;
 class QToolButton;
 class QVBoxLayout;
 
@@ -66,6 +70,11 @@ public:
     // by drag-and-drop from ProjectTree (and by the Attach… button).
     void attachPaths(const QStringList &paths);
 
+    // Attach a custom-MIME payload of {path,line,endLine} items. Ranged items
+    // become a text excerpt named "file:start-end"; whole-file items defer to
+    // attachPaths. Used by drops carrying line ranges from the search results.
+    void attachItems(const QJsonArray &items);
+
 Q_SIGNALS:
     void statusMessage(const QString &text);
     void titleChanged(const QString &title);
@@ -83,9 +92,14 @@ protected:
     bool eventFilter(QObject *obj, QEvent *event) override;
     void dragEnterEvent(QDragEnterEvent *event) override;
     void dragMoveEvent(QDragMoveEvent *event) override;
+    void dragLeaveEvent(QDragLeaveEvent *event) override;
     void dropEvent(QDropEvent *event) override;
+    void paintEvent(QPaintEvent *event) override;
 
 private:
+    // True when a drag carries our custom attachment MIME or at least one
+    // local-file URL — used to reject pure-text/remote drags.
+    bool canAcceptDrop(const QMimeData *mime) const;
     // One clarifying question currently shown to the human.
     struct QuestionField {
         QString question;
@@ -109,6 +123,9 @@ private:
     void onPromoteClicked();
     void onAttachClicked();
     void rebuildAttachChips();
+    // Surface why files were rejected (binary, too large, unreadable) in a
+    // prominent inline banner rather than a transient status-bar message.
+    void showAttachNotice(const QString &text);
     void onNotification(const QString &method, const QJsonObject &params);
     void renderEvent(const QJsonObject &event);
     void onPermissionRequested(const QJsonObject &params);
@@ -169,6 +186,7 @@ private:
     bool m_dormant = false;   // has a thread id, but no live process — resumable
     bool m_promoting = false; // a promote-to-worktree is in flight
     bool m_replaying = false; // inside loadTranscript() — don't double-count cost
+    bool m_dragActive = false; // an acceptable drag is hovering the panel
 
     // Running per-session usage totals, accumulated from each `result` event's
     // top-level usage block. Surfaced as a compact suffix on the header
@@ -230,6 +248,7 @@ private:
     // Pending attachments for the next message (each {kind,name,mediaType,…}).
     QWidget *m_attachBar = nullptr;
     QHBoxLayout *m_attachLayout = nullptr;
+    KMessageWidget *m_attachNotice = nullptr;
     QJsonArray m_attachments;
 
     // Per-tool approval banner and the queue of pending requests.

@@ -10,12 +10,15 @@
 #include <QFont>
 #include <QHBoxLayout>
 #include <QIcon>
+#include <QHash>
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMap>
 #include <QMenu>
 #include <QPalette>
 #include <QResizeEvent>
+#include <QSet>
 #include <QShortcut>
 #include <QShowEvent>
 #include <QToolButton>
@@ -31,6 +34,7 @@ namespace {
 // raw title and worktree number are stored separately so the (still-set, for
 // accessibility/tooltips) item text can be recomposed when either changes.
 using AgentRoles::Number;
+using AgentRoles::Tags;
 using AgentRoles::Title;
 
 QString composeLabel(int number, const QString &title)
@@ -126,18 +130,69 @@ AgentRoster::AgentRoster(QWidget *parent)
             QAction *renameAct = menu.addAction(
                 QIcon::fromTheme(QStringLiteral("document-edit")), i18n("Rename…"));
             menu.addSeparator();
+            const int number = item->data(0, AgentRoles::Number).toInt();
+            QAction *termAct = menu.addAction(
+                QIcon::fromTheme(QStringLiteral("utilities-terminal")),
+                i18n("Open Terminal in Worktree"));
+            // A worktree exists only once the agent has been assigned a #N and
+            // is not dormant; otherwise there is no directory to open.
+            termAct->setEnabled(number > 0 && !dormant);
+            menu.addSeparator();
             QAction *commitAct = menu.addAction(i18n("Commit changes…"));
             QAction *prAct = menu.addAction(i18n("Create pull request…"));
             QAction *landAct = menu.addAction(i18n("Merge into local main…"));
             QAction *discardAct = menu.addAction(i18n("Discard worktree"));
             menu.addSeparator();
+
+            // Tags submenu: a checkable entry per tag already used anywhere in
+            // this agent's project, checked when the agent carries it. Toggling
+            // emits add/removeTagRequested; "Edit tags…" opens the full editor.
+            QMenu *tagsMenu = menu.addMenu(
+                QIcon::fromTheme(QStringLiteral("tag")), i18n("Tags"));
+            const QString projectPath =
+                item->parent() ? item->parent()->data(0, Qt::UserRole).toString()
+                               : QString();
+            const QStringList own = item->data(0, Tags).toStringList();
+            QSet<QString> ownLower;
+            for (const QString &t : own) {
+                ownLower.insert(t.toLower());
+            }
+            QHash<QAction *, QString> tagActions;
+            const QStringList all = projectTags(projectPath);
+            for (const QString &tag : all) {
+                QAction *a = tagsMenu->addAction(tag);
+                a->setCheckable(true);
+                a->setChecked(ownLower.contains(tag.toLower()));
+                tagActions.insert(a, tag);
+            }
+            if (!all.isEmpty()) {
+                tagsMenu->addSeparator();
+            }
+            QAction *editTagsAct = tagsMenu->addAction(i18n("Edit tags…"));
+            menu.addSeparator();
+
             QAction *closeAct = menu.addAction(i18n("Close agent"));
             QAction *chosen = menu.exec(m_tree->viewport()->mapToGlobal(pos));
             if (!chosen) {
                 return;
             }
+            if (tagActions.contains(chosen)) {
+                const QString tag = tagActions.value(chosen);
+                if (chosen->isChecked()) {
+                    emit addTagRequested(id, tag);
+                } else {
+                    emit removeTagRequested(id, tag);
+                }
+                return;
+            }
+            if (chosen == editTagsAct) {
+                emit editTagsRequested(id);
+                return;
+            }
             if (chosen == resumeAct) {
                 emit resumeRequested(id);
+            } else if (chosen == termAct) {
+                emit openWorktreeTerminalRequested(id);
             } else if (chosen == renameAct) {
                 emit renameRequested(id);
             } else if (chosen == commitAct) {
@@ -156,6 +211,9 @@ AgentRoster::AgentRoster(QWidget *parent)
             QAction *newAct = menu.addAction(
                 QIcon::fromTheme(QStringLiteral("list-add")),
                 i18n("New agent in this project"));
+            QAction *organizeAct = menu.addAction(
+                QIcon::fromTheme(QStringLiteral("tag")),
+                i18n("Auto-organize agents…"));
             menu.addSeparator();
             QAction *termAct = menu.addAction(
                 QIcon::fromTheme(QStringLiteral("utilities-terminal")),
@@ -177,6 +235,8 @@ AgentRoster::AgentRoster(QWidget *parent)
             }
             if (chosen == newAct) {
                 emit newAgentRequested(path);
+            } else if (chosen == organizeAct) {
+                emit autoOrganizeRequested(path);
             } else if (chosen == termAct) {
                 emit openTerminalRequested(path);
             } else if (chosen == fmAct) {
@@ -200,11 +260,28 @@ AgentRoster::AgentRoster(QWidget *parent)
     buttons->addWidget(openButton);
     buttons->addWidget(m_newButton);
 
+    // Tag-filter button beside the text filter: a checkable menu of every tag in
+    // use. Selecting tags narrows the visible agents (intersection) via
+    // applyFilter(), alongside the text filter.
+    m_tagFilterButton = new QToolButton(this);
+    m_tagFilterButton->setText(i18n("Tags"));
+    m_tagFilterButton->setIcon(QIcon::fromTheme(QStringLiteral("tag")));
+    m_tagFilterButton->setPopupMode(QToolButton::InstantPopup);
+    m_tagFilterButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    m_tagFilterButton->setToolTip(i18n("Filter agents by tag"));
+    m_tagFilterButton->setMenu(new QMenu(m_tagFilterButton));
+    rebuildTagFilterMenu();
+
+    auto *filterRow = new QHBoxLayout;
+    filterRow->setSpacing(6);
+    filterRow->addWidget(m_filterEdit, 1);
+    filterRow->addWidget(m_tagFilterButton);
+
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(8, 8, 8, 8);
     layout->setSpacing(8);
     layout->addLayout(buttons);
-    layout->addWidget(m_filterEdit);
+    layout->addLayout(filterRow);
     layout->addWidget(m_tree, 1);
 
     // Empty-state hint, centred over the tree viewport when no projects exist.
@@ -357,6 +434,29 @@ void AgentRoster::setAgentNumber(int agentId, int number)
     item->setText(0, composeLabel(number, item->data(0, Title).toString()));
 }
 
+void AgentRoster::setAgentTags(int agentId, const QStringList &tags)
+{
+    QTreeWidgetItem *item = agentItem(agentId);
+    if (!item) {
+        return;
+    }
+    item->setData(0, Tags, tags);
+    // A chip line appears/disappears, so the row's sizeHint changed — force the
+    // view to re-measure rows (uniform row heights are already off, so the
+    // delegate's per-row sizeHint is honoured).
+    m_tree->doItemsLayout();
+    rebuildTagFilterMenu();
+    applyFilter();
+}
+
+QStringList AgentRoster::agentTags(int agentId) const
+{
+    if (QTreeWidgetItem *item = agentItem(agentId)) {
+        return item->data(0, Tags).toStringList();
+    }
+    return {};
+}
+
 void AgentRoster::setAgentStatus(int agentId, const QString &dotColorHex)
 {
     if (QTreeWidgetItem *item = agentItem(agentId)) {
@@ -448,24 +548,42 @@ void AgentRoster::setFilter(const QString &text)
 
 void AgentRoster::applyFilter()
 {
-    const bool filtering = !m_filter.isEmpty();
+    const bool textFiltering = !m_filter.isEmpty();
+    const bool tagFiltering = !m_tagFilter.isEmpty();
+    const bool filtering = textFiltering || tagFiltering;
     QTreeWidgetItem *current = m_tree->currentItem();
     for (int i = 0; i < m_tree->topLevelItemCount(); ++i) {
         QTreeWidgetItem *project = m_tree->topLevelItem(i);
         const QString path = project->data(0, Qt::UserRole).toString();
         // Match the project's real name (folder) and path, never the displayed
         // text(0): recomputeProjectBadge rewrites that to "name  (N)", which
-        // would otherwise make the attention-count suffix filterable.
+        // would otherwise make the attention-count suffix filterable. A tag
+        // filter never matches at the project level — it always narrows to
+        // agents carrying the selected tags.
         const QString name = QDir(path).dirName();
-        const bool projectMatches =
-            !filtering || name.contains(m_filter, Qt::CaseInsensitive)
+        const bool projectTextMatches =
+            !textFiltering || name.contains(m_filter, Qt::CaseInsensitive)
             || path.contains(m_filter, Qt::CaseInsensitive);
         int visibleChildren = 0;
         for (int j = 0; j < project->childCount(); ++j) {
             QTreeWidgetItem *agent = project->child(j);
             const QString title = agent->data(0, Title).toString();
-            bool show = !filtering || projectMatches
+            bool show = !textFiltering || projectTextMatches
                 || title.contains(m_filter, Qt::CaseInsensitive);
+            if (show && tagFiltering) {
+                // Intersection: the agent must carry every selected tag.
+                QSet<QString> have;
+                const QStringList tags = agent->data(0, Tags).toStringList();
+                for (const QString &t : tags) {
+                    have.insert(t.toLower());
+                }
+                for (const QString &want : m_tagFilter) {
+                    if (!have.contains(want)) {
+                        show = false;
+                        break;
+                    }
+                }
+            }
             // Don't yank the active agent's row out from under selection.
             if (!show && agent == current) {
                 show = true;
@@ -475,12 +593,92 @@ void AgentRoster::applyFilter()
                 ++visibleChildren;
             }
         }
-        // While filtering, hide projects that match nothing. Otherwise always
-        // show them (even empty ones).
-        const bool keepProject =
-            !filtering || projectMatches || visibleChildren > 0;
+        // While filtering, hide projects that match nothing. A pure tag filter
+        // keeps projects that still have visible agents; the text filter also
+        // keeps name/path matches. Otherwise always show them (even empty ones).
+        const bool keepProject = !filtering
+            || (textFiltering && projectTextMatches) || visibleChildren > 0;
         project->setHidden(!keepProject);
     }
+}
+
+QStringList AgentRoster::projectTags(const QString &projectPath) const
+{
+    // Map lowercased tag -> first-seen display casing, so the menu shows the
+    // user's casing while staying case-insensitive.
+    QMap<QString, QString> seen;
+    for (int i = 0; i < m_tree->topLevelItemCount(); ++i) {
+        QTreeWidgetItem *project = m_tree->topLevelItem(i);
+        if (!projectPath.isEmpty()
+            && project->data(0, Qt::UserRole).toString() != projectPath) {
+            continue;
+        }
+        for (int j = 0; j < project->childCount(); ++j) {
+            const QStringList tags = project->child(j)->data(0, Tags).toStringList();
+            for (const QString &t : tags) {
+                const QString key = t.toLower();
+                if (!seen.contains(key)) {
+                    seen.insert(key, t);
+                }
+            }
+        }
+    }
+    return QStringList(seen.values()); // QMap iterates keys sorted -> stable order
+}
+
+void AgentRoster::rebuildTagFilterMenu()
+{
+    if (!m_tagFilterButton) {
+        return;
+    }
+    QMenu *menu = m_tagFilterButton->menu();
+    if (!menu) {
+        return;
+    }
+    menu->clear();
+    const QStringList all = projectTags(QString()); // every project
+    // Drop filter selections for tags that no longer exist anywhere.
+    QSet<QString> live;
+    for (const QString &t : all) {
+        live.insert(t.toLower());
+    }
+    m_tagFilter.intersect(live);
+
+    if (all.isEmpty()) {
+        QAction *none = menu->addAction(i18n("No tags yet"));
+        none->setEnabled(false);
+    } else {
+        for (const QString &tag : all) {
+            QAction *a = menu->addAction(tag);
+            a->setCheckable(true);
+            a->setChecked(m_tagFilter.contains(tag.toLower()));
+            connect(a, &QAction::toggled, this, [this, key = tag.toLower()](bool on) {
+                if (on) {
+                    m_tagFilter.insert(key);
+                } else {
+                    m_tagFilter.remove(key);
+                }
+                // Reflect the count in the button label without rebuilding the
+                // open menu (which would invalidate the action being toggled).
+                m_tagFilterButton->setText(m_tagFilter.isEmpty()
+                                               ? i18n("Tags")
+                                               : i18n("Tags (%1)", m_tagFilter.size()));
+                applyFilter();
+            });
+        }
+        menu->addSeparator();
+        QAction *clear = menu->addAction(i18n("Clear tag filter"));
+        clear->setEnabled(!m_tagFilter.isEmpty());
+        connect(clear, &QAction::triggered, this, [this] {
+            m_tagFilter.clear();
+            rebuildTagFilterMenu();
+            applyFilter();
+        });
+    }
+    // Reflect whether a tag filter is active in the button label.
+    m_tagFilterButton->setText(m_tagFilter.isEmpty()
+                                   ? i18n("Tags")
+                                   : i18n("Tags (%1)", m_tagFilter.size()));
 }
 
 // --- project roll-up --------------------------------------------------------

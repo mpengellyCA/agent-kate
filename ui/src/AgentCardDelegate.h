@@ -22,6 +22,7 @@ constexpr int Attention = Qt::UserRole + 6; // bool — needs the user's input (
 // can be restored the moment the user navigates away from a still-blocked agent.
 constexpr int AttentionRaw = Qt::UserRole + 7; // bool — really needs input
 constexpr int Pinned    = Qt::UserRole + 8; // bool — title user-set, don't auto-overwrite
+constexpr int Tags      = Qt::UserRole + 9; // QStringList — organization labels
 } // namespace AgentRoles
 
 // AgentCardDelegate renders agent rows of the roster tree as multi-line cards:

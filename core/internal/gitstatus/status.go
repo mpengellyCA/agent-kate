@@ -5,7 +5,9 @@ package gitstatus
 
 import (
 	"errors"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,6 +16,74 @@ import (
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 )
+
+// IsMergedInto reports whether branchHeadSHA is an ancestor of targetRef in the
+// repo at repoRoot — i.e. every commit on the branch is already contained in
+// targetRef and the branch is fully merged. This is the ONLY correct "merged?"
+// test: it asks git itself via `git merge-base --is-ancestor`, which exits 0
+// when ancestor (merged), 1 when not, and >1 on a real error.
+//
+// CRITICAL: this is intentionally different from Snapshot.Ahead, which counts
+// commits since the fork point. A branch can be Ahead>0 yet fully merged (e.g.
+// merged then main advanced); only is-ancestor against main's TIP is safe to
+// gate destruction on.
+func IsMergedInto(repoRoot, branchHeadSHA, targetRef string) (bool, error) {
+	if repoRoot == "" || branchHeadSHA == "" || strings.TrimSpace(targetRef) == "" {
+		return false, nil
+	}
+	cmd := exec.Command("git", "merge-base", "--is-ancestor", branchHeadSHA, targetRef)
+	cmd.Dir = repoRoot
+	err := cmd.Run()
+	if err == nil {
+		return true, nil // exit 0: branch tip is reachable from target → merged
+	}
+	if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 1 {
+		return false, nil // exit 1: not an ancestor → not merged (not an error)
+	}
+	return false, err // exit >1 / spawn failure: a genuine error
+}
+
+// StashCount returns the number of stash entries in the repo at repoRoot.
+// Best-effort: any error (not a repo, git missing) yields 0. A populated stash
+// is a cleanup warning because `git worktree remove --force` would discard it.
+func StashCount(repoRoot string) int {
+	if repoRoot == "" {
+		return 0
+	}
+	out, err := runGit(repoRoot, "stash", "list")
+	if err != nil {
+		return 0
+	}
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return 0
+	}
+	return len(strings.Split(out, "\n"))
+}
+
+// UnpushedCount returns how many commits on branch are not present on its
+// upstream tracking branch, and whether the branch has an upstream at all.
+// With no upstream the second return is false and the count is 0 — the caller
+// decides whether "never pushed" with local commits is a warning.
+//
+// Best-effort and read-only: it queries `@{upstream}` via rev-list and treats a
+// missing upstream (the common case for agentkate/<id> branches that were never
+// pushed) as "no upstream", not an error.
+func UnpushedCount(repoRoot, branch string) (count int, hasUpstream bool) {
+	if repoRoot == "" || branch == "" {
+		return 0, false
+	}
+	// Does the branch have a configured upstream?
+	if _, err := runGit(repoRoot, "rev-parse", "--abbrev-ref", branch+"@{upstream}"); err != nil {
+		return 0, false
+	}
+	out, err := runGit(repoRoot, "rev-list", "--count", branch+"@{upstream}.."+branch)
+	if err != nil {
+		return 0, true
+	}
+	n, _ := strconv.Atoi(strings.TrimSpace(out))
+	return n, true
+}
 
 // Snapshot is one worktree's git state at a point in time. JSON-serialised
 // straight to the UI.

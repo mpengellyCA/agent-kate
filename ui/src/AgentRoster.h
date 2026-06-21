@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QSet>
 #include <QString>
 #include <QStringList>
 #include <QWidget>
@@ -38,6 +39,9 @@ public:
     // Worktree number (the same #N the WorktreeDashboard shows), so the
     // roster row can be cross-referenced with that table. 0 hides it.
     void setAgentNumber(int agentId, int number);
+    // Organization tags shown as chips on the card and used by the tag filter.
+    void setAgentTags(int agentId, const QStringList &tags);
+    QStringList agentTags(int agentId) const;
     void setAgentDormant(int agentId, bool dormant);
     // "Needs your input" (Attention) signal, drawn as a card marker and rolled
     // up into a per-project count suffix. Busy ("working a turn") is intentionally
@@ -68,6 +72,14 @@ Q_SIGNALS:
     void landRequested(int agentId);
     void discardRequested(int agentId);
     void closeRequested(int agentId);
+    // Tagging: toggle one tag on an agent, or open the full tag editor.
+    void addTagRequested(int agentId, const QString &tag);
+    void removeTagRequested(int agentId, const QString &tag);
+    void editTagsRequested(int agentId);
+    // Run the Sonnet auto-organize pass over a project's agents.
+    void autoOrganizeRequested(const QString &projectPath);
+    // Open a Konsole tab rooted at the agent's worktree.
+    void openWorktreeTerminalRequested(int agentId);
 
 protected:
     void resizeEvent(QResizeEvent *event) override;
@@ -77,6 +89,13 @@ protected:
 private:
     void setFilter(const QString &text);
     void applyFilter();
+    // All distinct tags currently in use across agents in projectPath (or every
+    // project when empty), in stable case-insensitive order. Reads the Tags role
+    // from sibling items — no extra IPC.
+    QStringList projectTags(const QString &projectPath) const;
+    // Rebuild the tag-filter menu from the tags currently in use, preserving any
+    // still-valid selections.
+    void rebuildTagFilterMenu();
     void applyAttentionDisplay(QTreeWidgetItem *item);
     void recomputeProjectBadge(QTreeWidgetItem *project);
     void updateEmptyState();
@@ -87,8 +106,10 @@ private:
 
     QLineEdit *m_filterEdit = nullptr;
     QToolButton *m_newButton = nullptr;
+    QToolButton *m_tagFilterButton = nullptr;
     QTreeWidget *m_tree = nullptr;
     QLabel *m_emptyHint = nullptr;
     QString m_filter;
+    QSet<QString> m_tagFilter; // lowercased tags the user is filtering by
     QList<QPair<QString, QString>> m_models;
 };

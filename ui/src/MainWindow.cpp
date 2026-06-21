@@ -163,9 +163,22 @@ void MainWindow::setupUi()
             view->setFocus();
         }
     });
+    connect(m_search, &SearchPanel::attachToChatRequested, this,
+            [this](const QStringList &paths) {
+                if (auto *panel = qobject_cast<AgentPanel *>(m_agent->activePanel())) {
+                    panel->attachPaths(paths);
+                }
+            });
 
     connect(m_worktreeDashboard, &WorktreeDashboard::statusMessage, this,
             [this](const QString &text) { statusBar()->showMessage(text, 6000); });
+    connect(m_worktreeDashboard, &WorktreeDashboard::openTerminalRequested, this,
+            [this](const QString &dir) {
+                if (m_terminal && !dir.isEmpty()) {
+                    raisePanelByKey(m_keyTerminal);
+                    m_terminal->openTerminalAt(dir);
+                }
+            });
 
     // Three Kate-style activity strips frame the centre. Each SideBar pairs
     // a KMultiTabBar (placed at the window edge by ShellLayout) with its own
@@ -354,6 +367,13 @@ void MainWindow::setupUi()
     connect(m_agent, &AgentDock::openTerminalRequested, this,
             [this](const QString &dir) {
                 if (m_terminal && !dir.isEmpty()) {
+                    m_terminal->openTerminalAt(dir);
+                }
+            });
+    connect(m_agent, &AgentDock::openWorktreeTerminalRequested, this,
+            [this](const QString &dir) {
+                if (m_terminal && !dir.isEmpty()) {
+                    raisePanelByKey(m_keyTerminal);
                     m_terminal->openTerminalAt(dir);
                 }
             });
@@ -662,6 +682,23 @@ void MainWindow::setupActions()
     connect(prevTermAct, &QAction::triggered, this, [this] {
         if (m_terminal) {
             m_terminal->previousTerminal();
+        }
+    });
+
+    m_openWorktreeTerminalAct = viewMenu->addAction(
+        QIcon::fromTheme(QStringLiteral("utilities-terminal")),
+        i18n("Open Terminal in &Worktree"));
+    // Ctrl+Shift+T is "New Terminal" here; Ctrl+Alt+T is free.
+    m_openWorktreeTerminalAct->setShortcut(Qt::CTRL | Qt::ALT | Qt::Key_T);
+    m_openWorktreeTerminalAct->setToolTip(
+        i18n("Open a terminal rooted in the active agent's worktree."));
+    m_openWorktreeTerminalAct->setEnabled(false);
+    connect(m_openWorktreeTerminalAct, &QAction::triggered, this, [this] {
+        const QString dir =
+            m_agent ? m_agent->worktreePathForAgent(m_activeAgentId) : QString();
+        if (m_terminal && !dir.isEmpty()) {
+            raisePanelByKey(m_keyTerminal);
+            m_terminal->openTerminalAt(dir);
         }
     });
 
@@ -1303,6 +1340,10 @@ void MainWindow::onAgentActivated(int agentId, const QString &projectPath)
     }
     if (m_worktreeDashboard) {
         m_worktreeDashboard->setActiveProject(projectPath);
+    }
+    if (m_openWorktreeTerminalAct) {
+        m_openWorktreeTerminalAct->setEnabled(
+            m_agent && !m_agent->worktreePathForAgent(agentId).isEmpty());
     }
     setWindowTitle(i18n("Agent Kate — %1", QDir(projectPath).dirName()));
     m_editor->setActiveGroup(groupKey());

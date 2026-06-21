@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QHash>
 #include <QList>
 #include <QObject>
 #include <QString>
@@ -10,6 +11,7 @@ class AgentPanel;
 class AgentRoster;
 class QStackedWidget;
 class QWidget;
+class QJsonArray;
 
 // AgentDock orchestrates the agent-centric workspace: a stack of agent
 // conversation panels plus the AgentRoster (project → agent tree). The shell
@@ -39,6 +41,10 @@ public:
     // threadId of the currently-active agent panel, empty if none / not started.
     QString currentThreadId() const;
 
+    // Worktree directory for the given agent, derived from the last git.snapshot.
+    // Empty if the agent has no worktree yet (not started / not promoted).
+    QString worktreePathForAgent(int agentId) const;
+
 Q_SIGNALS:
     void statusMessage(const QString &text);
     void openDiff(const QString &title, const QString &diffText);
@@ -49,6 +55,9 @@ Q_SIGNALS:
     void projectClosed(const QString &projectPath);
     // Routed to MainWindow to focus the Terminal panel at this project path.
     void openTerminalRequested(const QString &projectPath);
+    // Carries an agent's WORKTREE path (distinct from a project path) so the
+    // shell can open a terminal rooted there.
+    void openWorktreeTerminalRequested(const QString &worktreePath);
 
 private:
     struct Entry {
@@ -69,10 +78,20 @@ private:
     // roster, so the #N badge stays in sync with WorktreeDashboard.
     void refreshAgentNumbers();
     bool hasThread(const QString &threadId) const;
+    // Add or remove one tag on an agent, optimistic with rollback on error.
+    void mutateTag(int agentId, const QString &tag, bool add);
+    // Open the tag editor for an agent and persist the result via agent.setTags.
+    void editTags(int agentId);
+    // Sonnet auto-organize: request proposals, then preview+apply.
+    void autoOrganize(const QString &projectPath);
+    void showOrganizeProposals(const QString &projectPath,
+                               const QJsonArray &proposals);
     void removeAgentEntry(int agentId);
     void closeAgent(int agentId);
     void closeProject(const QString &path);
     Entry *entryById(int agentId);
+    Entry *entryByPanel(const AgentPanel *panel);
+    Entry *entryByThread(const QString &threadId);
 
     CoreClient *m_core = nullptr;
     QStackedWidget *m_stack = nullptr;
@@ -80,5 +99,8 @@ private:
     QWidget *m_dialogParent = nullptr; // window-scope parent for modal dialogs
     QList<Entry> m_agents;
     QStringList m_projects;
+    // threadId → worktree path, refreshed from each git.snapshot. Lets the
+    // roster resolve an agent's worktree dir without a fresh RPC round-trip.
+    QHash<QString, QString> m_worktreePathByThread;
     int m_counter = 0;
 };
