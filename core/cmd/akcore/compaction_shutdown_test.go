@@ -84,19 +84,21 @@ func TestColdExitCompactionCompletesOnShutdown(t *testing.T) {
 	// Wire the cold-exit path exactly as runCore does, but with the fake claude
 	// injected so RunLLM spawns the stub instead of a real model.
 	coldCompacts := &exitCompactTracker{ctx: t.Context(), claudeBin: claudeBin}
-	sup := agent.NewSupervisor(claudeBin, log, func(tid string, event json.RawMessage) {
-		var probe struct {
-			Type  string `json:"type"`
-			Phase string `json:"phase"`
-		}
-		if json.Unmarshal(event, &probe) != nil {
-			return
-		}
-		if probe.Type == "_lifecycle" && probe.Phase == "exited" {
-			if r, ok := sessions.Get(tid); ok {
-				strat := compact.Strategy(r.CompactStrategy).Resolve()
-				if strat.RunsOnExit() && strat != compact.ExitOpusHot {
-					coldCompacts.spawn(log, sessions, summaries, r, strat)
+	sup := agent.NewSupervisor(claudeBin, log, func(tid string, events []json.RawMessage) {
+		for _, event := range events {
+			var probe struct {
+				Type  string `json:"type"`
+				Phase string `json:"phase"`
+			}
+			if json.Unmarshal(event, &probe) != nil {
+				continue
+			}
+			if probe.Type == "_lifecycle" && probe.Phase == "exited" {
+				if r, ok := sessions.Get(tid); ok {
+					strat := compact.Strategy(r.CompactStrategy).Resolve()
+					if strat.RunsOnExit() && strat != compact.ExitOpusHot {
+						coldCompacts.spawn(log, sessions, summaries, r, strat)
+					}
 				}
 			}
 		}

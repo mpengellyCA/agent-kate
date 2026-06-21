@@ -25,6 +25,7 @@ import (
 	"agentkate/internal/gitstatus"
 	"agentkate/internal/ipc"
 	"agentkate/internal/permission"
+	"agentkate/internal/safe"
 	"agentkate/internal/search"
 	"agentkate/internal/session"
 	"agentkate/internal/skills"
@@ -226,41 +227,49 @@ func runCore() {
 	coldCompacts := &exitCompactTracker{ctx: exitCompactCtx}
 
 	// The agent supervisor relays every thread event to the UI as a
-	// notification, so the agent panel can render the conversation live.
-	sup := agent.NewSupervisor("", log, func(threadID string, event json.RawMessage) {
-		srv.Notify("agent.event", agentEventParams{ThreadID: threadID, Event: event})
-		var probe struct {
-			Type  string `json:"type"`
-			Phase string `json:"phase"`
-		}
-		if json.Unmarshal(event, &probe) != nil {
+	// notification, so the agent panel can render the conversation live. Events
+	// arrive pre-coalesced as an ordered batch; we forward the whole batch in a
+	// single notification and run the per-event side effects in order.
+	sup := agent.NewSupervisor("", log, func(threadID string, events []json.RawMessage) {
+		if len(events) == 0 {
 			return
 		}
-		// Bump LastTurnAt on each turn completion. This is the staleness
-		// signal for the compaction layer — if the summary is older than the
-		// last turn, it needs to be refreshed before resume.
-		if probe.Type == "result" {
-			_ = sessions.Update(threadID, func(r *session.Record) {
-				r.LastTurnAt = time.Now()
-			})
-			return
-		}
-		// When a thread exits, drop its cooperation locks and presence, and
-		// mark it dormant so it can be resumed later. If the thread is
-		// configured for a cold-exit compaction strategy, fire it in the
-		// background — Hot-Opus is a separate pre-reap flow.
-		if probe.Type == "_lifecycle" && (probe.Phase == "exited" || probe.Phase == "interrupted") {
-			coopState.ClearOwner(threadID)
-			_ = sessions.UpdateQuiet(threadID, func(r *session.Record) {
-				r.Status = session.StatusDormant
-			})
-			// Cold-exit compaction runs only on a normal exit; a user interrupt
-			// is meant to be immediate, so we don't spend a turn summarising it.
-			if probe.Phase == "exited" {
-				if rec, ok := sessions.Get(threadID); ok {
-					strat := compact.Strategy(rec.CompactStrategy).Resolve()
-					if strat.RunsOnExit() && strat != compact.ExitOpusHot {
-						coldCompacts.spawn(log, sessions, summaries, rec, strat)
+		srv.Notify("agent.event", agentEventParams{ThreadID: threadID, Events: events})
+		for _, event := range events {
+			var probe struct {
+				Type  string `json:"type"`
+				Phase string `json:"phase"`
+			}
+			if json.Unmarshal(event, &probe) != nil {
+				continue
+			}
+			// Bump LastTurnAt on each turn completion. This is the staleness
+			// signal for the compaction layer — if the summary is older than the
+			// last turn, it needs to be refreshed before resume.
+			if probe.Type == "result" {
+				_ = sessions.Update(threadID, func(r *session.Record) {
+					r.LastTurnAt = time.Now()
+				})
+				continue
+			}
+			// When a thread exits, drop its cooperation locks and presence, and
+			// mark it dormant so it can be resumed later. If the thread is
+			// configured for a cold-exit compaction strategy, fire it in the
+			// background — Hot-Opus is a separate pre-reap flow.
+			if probe.Type == "_lifecycle" && (probe.Phase == "exited" || probe.Phase == "interrupted") {
+				coopState.ClearOwner(threadID)
+				_ = sessions.UpdateQuiet(threadID, func(r *session.Record) {
+					r.Status = session.StatusDormant
+				})
+				// Cold-exit compaction runs only on a normal exit; a user
+				// interrupt is meant to be immediate, so we don't spend a turn
+				// summarising it.
+				if probe.Phase == "exited" {
+					if rec, ok := sessions.Get(threadID); ok {
+						strat := compact.Strategy(rec.CompactStrategy).Resolve()
+						if strat.RunsOnExit() && strat != compact.ExitOpusHot {
+							coldCompacts.spawn(log, sessions, summaries, rec, strat)
+						}
 					}
 				}
 			}
@@ -364,9 +373,13 @@ func runCore() {
 
 // --- IPC parameter / result types ------------------------------------------
 
+// agentEventParams is the wire shape of an "agent.event" notification. Events
+// are delivered as an ordered batch (the core coalesces the per-line
+// stream-json flood); the UI iterates Events in order. A batch always carries
+// at least one event.
 type agentEventParams struct {
-	ThreadID string          `json:"threadId"`
-	Event    json.RawMessage `json:"event"`
+	ThreadID string            `json:"threadId"`
+	Events   []json.RawMessage `json:"events"`
 }
 
 type agentStartParams struct {
@@ -444,7 +457,7 @@ func registerHandlers(d handlerDeps) {
 		// always reaches the UI before any streamed event for the thread.
 		threadID := agent.NewThreadID()
 		sessionID := session.NewID()
-		go startAgentThread(d, threadID, sessionID, p)
+		safe.Go("agent.startThread", func() { startAgentThread(d, threadID, sessionID, p) })
 		return map[string]any{"threadId": threadID, "sessionId": sessionID}, nil
 	})
 
@@ -465,7 +478,7 @@ func registerHandlers(d handlerDeps) {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams,
 				"thread has no Claude Code session to resume")
 		}
-		go resumeAgentThread(d, rec)
+		safe.Go("agent.resumeThread", func() { resumeAgentThread(d, rec) })
 		return map[string]any{"threadId": rec.ThreadID, "sessionId": rec.SessionID}, nil
 	})
 
@@ -513,7 +526,7 @@ func registerHandlers(d handlerDeps) {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams,
 				"this thread already runs in an isolated worktree")
 		}
-		go promoteAgentThread(d, rec)
+		safe.Go("agent.promoteThread", func() { promoteAgentThread(d, rec) })
 		return map[string]any{"threadId": rec.ThreadID}, nil
 	})
 
@@ -1329,14 +1342,15 @@ func registerHandlers(d handlerDeps) {
 		var wg sync.WaitGroup
 		for i, e := range exts {
 			wg.Add(1)
-			go func(i int, id string) {
+			i, id := i, e.ID
+			safe.Go("vsix.latestVersion", func() {
 				defer wg.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
 				if v, err := d.extensions.LatestVersion(lctx, id); err == nil {
 					latest[i] = v
 				}
-			}(i, e.ID)
+			})
 		}
 		wg.Wait()
 		for i, e := range exts {
@@ -2542,7 +2556,8 @@ func runHotCompactsAtShutdown(d handlerDeps, progress shutdownProgressFn) {
 	done := 0
 	for _, rec := range targets {
 		wg.Add(1)
-		go func(rec session.Record) {
+		rec := rec
+		safe.Go("shutdown.hotCompact", func() {
 			defer wg.Done()
 			runHotCompactIfConfigured(d, rec.ThreadID)
 			// Report completion as each finishes so the shutdown dialog can show
@@ -2551,7 +2566,7 @@ func runHotCompactsAtShutdown(d handlerDeps, progress shutdownProgressFn) {
 			done++
 			progress("compacting", rec.Title, done, total)
 			mu.Unlock()
-		}(rec)
+		})
 	}
 	wg.Wait()
 }
@@ -2587,10 +2602,10 @@ type exitCompactTracker struct {
 func (e *exitCompactTracker) spawn(log *slog.Logger, sessions *session.Store,
 	summaries *compact.Store, rec session.Record, strategy compact.Strategy) {
 	e.wg.Add(1)
-	go func() {
+	safe.Go("shutdown.exitCompact", func() {
 		defer e.wg.Done()
 		runExitCompact(e.ctx, e.claudeBin, log, sessions, summaries, rec, strategy)
-	}()
+	})
 }
 
 // drain waits for all spawned cold-exit compactions to finish, bounded by cap.
@@ -2613,10 +2628,10 @@ func (e *exitCompactTracker) drain(cancel context.CancelFunc, cap time.Duration,
 // WaitGroup drained in time, false on timeout.
 func waitWithDeadline(wg *sync.WaitGroup, d time.Duration) bool {
 	done := make(chan struct{})
-	go func() {
+	safe.Go("shutdown.waitWithDeadline", func() {
 		wg.Wait()
 		close(done)
-	}()
+	})
 	select {
 	case <-done:
 		return true
@@ -2719,7 +2734,12 @@ func emitLifecycle(srv *ipc.Server, threadID, phase, detail string, wt *worktree
 	if err != nil {
 		return
 	}
-	srv.Notify("agent.event", agentEventParams{ThreadID: threadID, Event: b})
+	// Single lifecycle event, but sent in the same batch shape as the supervisor
+	// relay so the UI has exactly one wire contract to parse.
+	srv.Notify("agent.event", agentEventParams{
+		ThreadID: threadID,
+		Events:   []json.RawMessage{b},
+	})
 }
 
 // writeMCPConfig writes a per-thread --mcp-config file that points `claude` at

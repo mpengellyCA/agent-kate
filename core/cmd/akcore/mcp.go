@@ -13,6 +13,7 @@ import (
 
 	"agentkate/internal/coop"
 	"agentkate/internal/ipc"
+	"agentkate/internal/safe"
 )
 
 const (
@@ -75,7 +76,8 @@ func (b *mcpBridge) serve() {
 		}
 		// Handle concurrently: a pending permission request must not block
 		// other MCP traffic (pings, further tool calls).
-		go b.handle(&f)
+		frame := f
+		safe.Go("mcp.handle", func() { b.handle(&frame) })
 	}
 }
 

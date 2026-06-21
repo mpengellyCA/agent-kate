@@ -2352,8 +2352,21 @@ void AgentPanel::onPromoteClicked()
 void AgentPanel::onNotification(const QString &method, const QJsonObject &params)
 {
     if (method == QLatin1String("agent.event")) {
-        if (!m_threadId.isEmpty()
-            && params.value(QStringLiteral("threadId")).toString() == m_threadId) {
+        if (m_threadId.isEmpty()
+            || params.value(QStringLiteral("threadId")).toString() != m_threadId) {
+            return;
+        }
+        // The core coalesces the per-line stream-json flood into one
+        // notification carrying an ordered batch; render each event in order.
+        // Fall back to the legacy single-"event" key for forward/backward
+        // safety, though every current sender emits the "events" array.
+        const QJsonValue evs = params.value(QStringLiteral("events"));
+        if (evs.isArray()) {
+            const QJsonArray events = evs.toArray();
+            for (const QJsonValue &v : events) {
+                renderEvent(v.toObject());
+            }
+        } else if (params.contains(QStringLiteral("event"))) {
             renderEvent(params.value(QStringLiteral("event")).toObject());
         }
     } else if (method == QLatin1String("permission.requested")) {

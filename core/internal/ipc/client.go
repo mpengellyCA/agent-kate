@@ -9,6 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"agentkate/internal/safe"
 )
 
 // callTimeout bounds how long a Client.Call waits for a response.
@@ -32,7 +34,7 @@ func Dial(socketPath string) (*Client, error) {
 		return nil, err
 	}
 	c := &Client{conn: conn, w: bufio.NewWriter(conn)}
-	go c.readLoop()
+	safe.Go("ipc.client.readLoop", func() { c.readLoop() })
 	return c, nil
 }
 

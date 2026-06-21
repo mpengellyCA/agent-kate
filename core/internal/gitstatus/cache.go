@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"agentkate/internal/safe"
 	"agentkate/internal/worktree"
 )
 
@@ -64,7 +65,7 @@ func NewCache(log *slog.Logger) *Cache {
 	if log != nil {
 		if w, err := newWatcher(log); err == nil {
 			c.watcher = w
-			go w.run(c)
+			safe.Go("gitstatus.watcher.run", func() { w.run(c) })
 		} else {
 			log.Warn("git fs watcher unavailable; per-snapshot recompute will be used",
 				"err", err)
