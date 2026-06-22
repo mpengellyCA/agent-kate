@@ -2,6 +2,7 @@
 
 #include <QList>
 #include <QString>
+#include <QStringList>
 
 // BrowserLaunch opens a web browser with its accessibility tree forced on, so a
 // Cowork agent can read and activate page elements via AT-SPI. Browsers don't expose
@@ -30,6 +31,20 @@ void addCustom(const Browser &b);
 
 // all returns detected() + custom(), de-duplicated by command.
 QList<Browser> all();
+
+// names returns the display names from all(), for showing the agent its options.
+QStringList names();
+
+// find resolves a browser by display name or command (case-insensitive) against
+// all(); the returned Browser has an empty command if there is no match.
+Browser find(const QString &nameOrCommand);
+
+// preferred returns the browser the agent should open by default: the user's chosen
+// one (KConfig) if still available, else the first of all(). Empty command if none.
+Browser preferred();
+
+// setPreferred records the user's default browser for agents (by command).
+void setPreferred(const QString &command);
 
 // launch starts b with accessibility forced on for its engine family. Returns false
 // and sets *error on failure. NOTE: the flag/env only takes effect on a FRESH browser

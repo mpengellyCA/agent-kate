@@ -118,6 +118,47 @@ QList<Browser> all()
     return out;
 }
 
+QStringList names()
+{
+    QStringList out;
+    for (const Browser &b : all()) {
+        out << b.name;
+    }
+    return out;
+}
+
+Browser find(const QString &nameOrCommand)
+{
+    const QString needle = nameOrCommand.trimmed();
+    for (const Browser &b : all()) {
+        if (b.name.compare(needle, Qt::CaseInsensitive) == 0
+            || b.command.compare(needle, Qt::CaseInsensitive) == 0) {
+            return b;
+        }
+    }
+    return {};
+}
+
+Browser preferred()
+{
+    const QList<Browser> list = all();
+    const QString pref = configGroup().readEntry("agentBrowser", QString());
+    if (!pref.isEmpty()) {
+        for (const Browser &b : list) {
+            if (b.command == pref) {
+                return b;
+            }
+        }
+    }
+    return list.isEmpty() ? Browser{} : list.first();
+}
+
+void setPreferred(const QString &command)
+{
+    configGroup().writeEntry("agentBrowser", command);
+    configGroup().sync();
+}
+
 bool launch(const Browser &b, QString *error)
 {
     if (b.command.isEmpty()) {

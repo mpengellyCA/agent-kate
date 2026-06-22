@@ -47,6 +47,7 @@ private Q_SLOTS:
 
 private:
     void handleScreenshot(const QJsonObject &req);
+    void handleLaunchBrowser(const QJsonObject &req);
     void finishScreenshot(const QString &corrId, int maxDim, const QString &format,
                           uint code, const QVariantMap &results);
     void replyResult(const QString &corrId, const QString &kind, bool ok,

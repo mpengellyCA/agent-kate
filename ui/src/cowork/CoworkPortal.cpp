@@ -1,5 +1,6 @@
 #include "CoworkPortal.h"
 
+#include "BrowserLaunch.h"
 #include "ipc/CoreClient.h"
 
 #include <KLocalizedString>
@@ -73,6 +74,10 @@ void CoworkPortal::onNotification(const QString &method, const QJsonObject &para
     const QString kind = params.value(QStringLiteral("kind")).toString();
     if (kind == QLatin1String("screenshot")) {
         handleScreenshot(params);
+        return;
+    }
+    if (kind == QLatin1String("launchBrowser")) {
+        handleLaunchBrowser(params);
         return;
     }
     if (kind == QLatin1String("inject")) {
@@ -181,6 +186,45 @@ void CoworkPortal::finishScreenshot(const QString &corrId, int maxDim, const QSt
         {QStringLiteral("height"), img.height()},
     };
     replyResult(corrId, QStringLiteral("screenshot"), true, QString(), extra);
+}
+
+void CoworkPortal::handleLaunchBrowser(const QJsonObject &req)
+{
+    const QString corrId = req.value(QStringLiteral("corrId")).toString();
+    const QString name = req.value(QStringLiteral("name")).toString();
+
+    const QStringList allNames = BrowserLaunch::names();
+    QJsonArray namesArr;
+    for (const QString &n : allNames) {
+        namesArr.append(n);
+    }
+    QJsonObject extra{{QStringLiteral("browsers"), namesArr}};
+
+    // Resolve against the user's configured browsers only — the agent can name one but
+    // never supply an arbitrary command. An empty name means "the user's default".
+    const BrowserLaunch::Browser b =
+        name.isEmpty() ? BrowserLaunch::preferred() : BrowserLaunch::find(name);
+    if (b.command.isEmpty()) {
+        QString err;
+        if (allNames.isEmpty()) {
+            err = i18n("no browser is configured — open one from the Cowork panel first");
+        } else if (name.isEmpty()) {
+            err = i18n("no default browser is set for agents");
+        } else {
+            err = i18n("no configured browser named “%1” (available: %2)", name,
+                       allNames.join(QStringLiteral(", ")));
+        }
+        replyResult(corrId, QStringLiteral("launchBrowser"), false, err, extra);
+        return;
+    }
+
+    QString launchErr;
+    if (!BrowserLaunch::launch(b, &launchErr)) {
+        replyResult(corrId, QStringLiteral("launchBrowser"), false, launchErr, extra);
+        return;
+    }
+    extra.insert(QStringLiteral("browser"), b.name);
+    replyResult(corrId, QStringLiteral("launchBrowser"), true, QString(), extra);
 }
 
 void CoworkPortal::replyResult(const QString &corrId, const QString &kind, bool ok,

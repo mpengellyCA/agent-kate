@@ -155,6 +155,7 @@ func AllToggleable() []Capability {
 		CapScreenshot,
 		CapA11yRead,
 		CapScreencast,
+		CapLaunchBrowser,
 		CapVDSandbox,
 		CapA11yAction,
 		CapInputInject,

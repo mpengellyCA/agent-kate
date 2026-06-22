@@ -513,6 +513,49 @@ func registerCoworkHandlers(d handlerDeps) {
 		cw.AuditCapture(p.ThreadID, cowork.CapA11yAction, target, dec.GrantID, hashString(elemLabel+"|"+p.Text))
 		return map[string]any{"ok": true, "element": elemLabel}, nil
 	})
+
+	// --- launch a user-configured browser with its a11y tree enabled (R1) ---------
+
+	d.srv.Handle("cowork.launchBrowser", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID string `json:"threadId"`
+			Name     string `json:"name"` // optional: pick one of the user's configured browsers
+		}
+		_ = json.Unmarshal(raw, &p)
+		if err := requireCoworkBridge(d, ctx, p.ThreadID); err != nil {
+			return nil, err
+		}
+		if !cw.Available() {
+			return nil, ipc.Errorf(codeCoworkDenied, "desktop integration unavailable (no KDE session bus)")
+		}
+		label := "open a web browser"
+		if p.Name != "" {
+			label = "open " + p.Name
+		}
+		dec, err := cw.Authorize(ctx, cowork.AuthRequest{
+			ThreadID: p.ThreadID, Capability: cowork.CapLaunchBrowser,
+			Target: cowork.Target{Kind: cowork.TargetAny, Label: label}, SuggestedScope: cowork.ScopeSession,
+		})
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		if !dec.Allow {
+			return nil, ipc.Errorf(codeCoworkDenied, dec.Reason)
+		}
+		// The UI owns the browser list + launching (KConfig + the right a11y flag/env);
+		// it resolves p.Name against the user's configured browsers — the agent can
+		// never name an arbitrary executable.
+		res, err := runPortal(d, ctx, "launchBrowser", map[string]any{
+			"threadId": p.ThreadID,
+			"name":     p.Name,
+		}, 15*time.Second)
+		if err != nil {
+			return nil, err
+		}
+		cw.AuditCapture(p.ThreadID, cowork.CapLaunchBrowser,
+			cowork.Target{Kind: cowork.TargetAny, Label: "browser: " + res.Browser}, dec.GrantID, hashString(res.Browser))
+		return map[string]any{"ok": true, "browser": res.Browser, "browsers": res.Browsers, "grantId": dec.GrantID}, nil
+	})
 }
 
 // resolveTargetWindow returns the KWin window the agent wants to inspect: the one

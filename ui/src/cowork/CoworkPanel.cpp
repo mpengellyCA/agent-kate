@@ -11,6 +11,7 @@
 
 #include <QAction>
 #include <QCheckBox>
+#include <QComboBox>
 #include <QDateTime>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -24,6 +25,7 @@
 #include <QMenu>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QSignalBlocker>
 #include <QToolButton>
 #include <QTreeWidget>
 #include <QVBoxLayout>
@@ -53,6 +55,7 @@ QString capLabel(const QString &key)
     if (key == QLatin1String("screenshot")) return i18n("Take screenshots");
     if (key == QLatin1String("a11y_read")) return i18n("Read on-screen text");
     if (key == QLatin1String("screencast")) return i18n("Watch the screen live");
+    if (key == QLatin1String("launch_browser")) return i18n("Open a web browser");
     if (key == QLatin1String("vd_sandbox")) return i18n("Use a sandbox desktop");
     if (key == QLatin1String("a11y_action")) return i18n("Click buttons & controls");
     if (key == QLatin1String("input_inject")) return i18n("Type & click as me");
@@ -134,6 +137,24 @@ CoworkPanel::CoworkPanel(CoreClient *core, QWidget *parent)
     browserRow->addWidget(browserLabel, 1);
     browserRow->addWidget(m_browserBtn);
     layout->addLayout(browserRow);
+
+    // Which browser an agent opens when it calls desktop_open_browser itself.
+    auto *prefRow = new QHBoxLayout;
+    auto *prefLabel = new QLabel(i18n("Agent's default browser:"), this);
+    m_agentBrowserCombo = new QComboBox(this);
+    m_agentBrowserCombo->setToolTip(i18n(
+        "When an agent opens a browser on its own, it uses this one. The agent can "
+        "only open browsers listed here — never an arbitrary program."));
+    connect(m_agentBrowserCombo, &QComboBox::currentIndexChanged, this, [this] {
+        const QString cmd = m_agentBrowserCombo->currentData().toString();
+        if (!cmd.isEmpty()) {
+            BrowserLaunch::setPreferred(cmd);
+        }
+    });
+    prefRow->addWidget(prefLabel);
+    prefRow->addWidget(m_agentBrowserCombo, 1);
+    layout->addLayout(prefRow);
+    refreshBrowserPrefCombo();
 
     // Active grants.
     auto *grantsBox = new QGroupBox(i18n("Active access"), this);
@@ -441,7 +462,32 @@ void CoworkPanel::pickCustomBrowser()
         engines.indexOf(choice) == 1 ? QStringLiteral("chromium") : QStringLiteral("firefox");
     const QString name = QFileInfo(path).fileName();
     BrowserLaunch::addCustom({name, path, family});
+    refreshBrowserPrefCombo(); // the new browser becomes selectable as the agent default
     launchBrowserAndReport(name, path, family);
+}
+
+void CoworkPanel::refreshBrowserPrefCombo()
+{
+    if (!m_agentBrowserCombo) {
+        return;
+    }
+    const QSignalBlocker block(m_agentBrowserCombo); // repopulating must not persist a choice
+    m_agentBrowserCombo->clear();
+    const QList<BrowserLaunch::Browser> browsers = BrowserLaunch::all();
+    if (browsers.isEmpty()) {
+        m_agentBrowserCombo->addItem(i18n("(none configured)"), QString());
+        m_agentBrowserCombo->setEnabled(false);
+        return;
+    }
+    m_agentBrowserCombo->setEnabled(true);
+    for (const BrowserLaunch::Browser &b : browsers) {
+        const QString engine = b.family == QLatin1String("chromium") ? i18n("Chromium") : i18n("Firefox");
+        m_agentBrowserCombo->addItem(i18n("%1  (%2)", b.name, engine), b.command);
+    }
+    const int idx = m_agentBrowserCombo->findData(BrowserLaunch::preferred().command);
+    if (idx >= 0) {
+        m_agentBrowserCombo->setCurrentIndex(idx);
+    }
 }
 
 void CoworkPanel::launchBrowserAndReport(const QString &name, const QString &command,

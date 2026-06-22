@@ -31,11 +31,12 @@ import (
 type Capability string
 
 const (
-	CapWindowList    Capability = "window_list"   // R0
+	CapWindowList    Capability = "window_list"    // R0
 	CapVDSandbox     Capability = "vd_sandbox"     // R0
 	CapA11yRead      Capability = "a11y_read"      // R1
 	CapScreenshot    Capability = "screenshot"     // R1
 	CapScreencast    Capability = "screencast"     // R1
+	CapLaunchBrowser Capability = "launch_browser" // R1 — open a user-configured browser
 	CapA11yAction    Capability = "a11y_action"    // R2
 	CapInputInject   Capability = "input_inject"   // R2
 	CapRemoteDesktop Capability = "remote_desktop" // R2 — reserved, unused (08 §Q5)
@@ -55,7 +56,7 @@ func TierOf(c Capability) Tier {
 	switch c {
 	case CapWindowList, CapVDSandbox:
 		return TierR0
-	case CapA11yRead, CapScreenshot, CapScreencast:
+	case CapA11yRead, CapScreenshot, CapScreencast, CapLaunchBrowser:
 		return TierR1
 	case CapA11yAction, CapInputInject, CapRemoteDesktop:
 		return TierR2
@@ -68,7 +69,7 @@ func TierOf(c Capability) Tier {
 func (c Capability) Valid() bool {
 	switch c {
 	case CapWindowList, CapVDSandbox, CapA11yRead, CapScreenshot, CapScreencast,
-		CapA11yAction, CapInputInject, CapRemoteDesktop:
+		CapLaunchBrowser, CapA11yAction, CapInputInject, CapRemoteDesktop:
 		return true
 	}
 	return false

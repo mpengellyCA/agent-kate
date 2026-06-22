@@ -25,6 +25,9 @@ type PortalResult struct {
 	NodeID       int    `json:"nodeId,omitempty"`       // screencastStart
 	CastToken    string `json:"castToken,omitempty"`    // screencastStart
 	RestoreToken string `json:"restoreToken,omitempty"` // screencastStart (rotated)
+
+	Browser  string   `json:"browser,omitempty"`  // launchBrowser: the browser that was opened
+	Browsers []string `json:"browsers,omitempty"` // launchBrowser: names the user has configured
 }
 
 func NewPortalBroker() *PortalBroker {

@@ -121,6 +121,29 @@ func coworkToolDefs() []map[string]any {
 			},
 		},
 		{
+			"name": "desktop_open_browser",
+			"description": "Open the user's web browser with its accessibility tree enabled, so " +
+				"you can then read and click page content with desktop_list_elements / " +
+				"desktop_activate_element. Call this FIRST whenever a task needs the web and " +
+				"there isn't already an accessible browser window open — a browser started any " +
+				"other way hides its page content from the accessibility layer, leaving you " +
+				"unable to see links or buttons. Launches the user's configured/default browser; " +
+				"optionally pass 'name' to choose a specific one (the result lists the available " +
+				"names). You can only open browsers the user has configured — not arbitrary " +
+				"programs. Requires the 'launch_browser' capability. After it opens, wait a " +
+				"moment, then desktop_list_windows to find the window and desktop_list_elements " +
+				"to read the page.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name": map[string]any{
+						"type":        "string",
+						"description": "Optional: the browser to open, from the user's configured browsers. Omit for their default.",
+					},
+				},
+			},
+		},
+		{
 			"name": "desktop_inject_input",
 			"description": "Type keys and click on the user's desktop — acting AS the user. " +
 				"Use for keyboard control where there is no targetable element: press 'space' " +
@@ -306,6 +329,27 @@ func (b *mcpBridge) runCoworkTool(name string, args json.RawMessage) (string, er
 			return "", err
 		}
 		return fmt.Sprintf("Set the text of %s.", res.Element), nil
+
+	case "desktop_open_browser":
+		var a struct {
+			Name string `json:"name"`
+		}
+		_ = json.Unmarshal(args, &a)
+		var res struct {
+			OK       bool     `json:"ok"`
+			Browser  string   `json:"browser"`
+			Browsers []string `json:"browsers"`
+		}
+		if err := b.client.CallTimeout("cowork.launchBrowser",
+			map[string]any{"threadId": b.thread, "name": a.Name}, &res, 25*time.Second); err != nil {
+			return "", err
+		}
+		msg := fmt.Sprintf("Opened %s with accessibility enabled. Wait a moment, then use "+
+			"desktop_list_windows to find its window and desktop_list_elements to read the page.", res.Browser)
+		if len(res.Browsers) > 1 {
+			msg += "\nConfigured browsers you can open by name: " + strings.Join(res.Browsers, ", ") + "."
+		}
+		return msg, nil
 
 	default:
 		return "", fmt.Errorf("unknown cowork tool: %s", name)
