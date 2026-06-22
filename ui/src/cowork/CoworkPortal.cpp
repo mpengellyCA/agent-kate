@@ -2,9 +2,12 @@
 
 #include "ipc/CoreClient.h"
 
+#include <KLocalizedString>
+
 #include <QBuffer>
 #include <QDBusConnection>
 #include <QDBusInterface>
+#include <QDBusMessage>
 #include <QDBusObjectPath>
 #include <QDBusReply>
 #include <QFile>
@@ -42,6 +45,13 @@ CoworkPortal::CoworkPortal(CoreClient *core, QWidget *topLevel, QObject *parent)
 
 void CoworkPortal::onNotification(const QString &method, const QJsonObject &params)
 {
+    // The kill-switch tears down any live RemoteDesktop input session immediately.
+    if (method == QLatin1String("cowork.killSwitch")) {
+        if (params.value(QStringLiteral("on")).toBool()) {
+            teardownRemoteDesktop();
+        }
+        return;
+    }
     if (method != QLatin1String("cowork.portalRequest")) {
         return;
     }
@@ -50,8 +60,16 @@ void CoworkPortal::onNotification(const QString &method, const QJsonObject &para
         handleScreenshot(params);
         return;
     }
-    // v1 only runs screenshots; everything else is fail-closed so the core's
-    // staggered timeout resolves with a clear error rather than hanging.
+    if (kind == QLatin1String("inject")) {
+        handleInject(params);
+        return;
+    }
+    if (kind == QLatin1String("killInject")) {
+        handleKillInject(params);
+        return;
+    }
+    // Anything else is fail-closed so the core's staggered timeout resolves with a
+    // clear error rather than hanging.
     replyResult(params.value(QStringLiteral("corrId")).toString(), kind, false,
                 QStringLiteral("portal op '%1' is not supported in this version").arg(kind));
 }
@@ -90,7 +108,9 @@ void CoworkPortal::handleScreenshot(const QJsonObject &req)
                           QStringLiteral("org.freedesktop.portal.Screenshot"), bus);
     QVariantMap opts;
     opts.insert(QStringLiteral("handle_token"), token);
-    opts.insert(QStringLiteral("interactive"), false);
+    // interactive=true lets the user pick a specific window/region in KDE's native
+    // picker (a "share this window" flow); false captures the screen directly.
+    opts.insert(QStringLiteral("interactive"), req.value(QStringLiteral("interactive")).toBool());
 
     QDBusReply<QDBusObjectPath> reply = portal.call(QStringLiteral("Screenshot"),
                                                     parentWindowHandle(), opts);
@@ -172,4 +192,170 @@ QString CoworkPortal::parentWindowHandle() const
     // is a v2 refinement. On X11 a handle could be x11:<hex winId>, but empty works
     // there too for the screenshot portal.
     return QString();
+}
+
+// --- RemoteDesktop input injection ----------------------------------------------
+
+void CoworkPortal::portalRequest(const QString &iface, const QString &method,
+                                 const QVariantList &args, QVariantMap options,
+                                 std::function<void(uint, const QVariantMap &)> cb)
+{
+    QDBusConnection bus = QDBusConnection::sessionBus();
+    const QString token = QStringLiteral("ak%1").arg(QRandomGenerator::global()->generate());
+    options.insert(QStringLiteral("handle_token"), token);
+
+    QString sender = bus.baseService();
+    if (sender.startsWith(QLatin1Char(':'))) {
+        sender.remove(0, 1);
+    }
+    sender.replace(QLatin1Char('.'), QLatin1Char('_'));
+    const QString reqPath =
+        QStringLiteral("%1/request/%2/%3").arg(QString::fromLatin1(kPortalPath), sender, token);
+
+    auto *waiter = new PortalResponseWaiter(reqPath, this);
+    connect(waiter, &PortalResponseWaiter::responded, this,
+            [cb](uint code, const QVariantMap &results) { cb(code, results); });
+
+    QDBusMessage msg = QDBusMessage::createMethodCall(
+        QString::fromLatin1(kPortalService), QString::fromLatin1(kPortalPath), iface, method);
+    QVariantList full = args;
+    full.append(options);
+    msg.setArguments(full);
+
+    QDBusMessage reply = bus.call(msg);
+    if (reply.type() == QDBusMessage::ErrorMessage) {
+        waiter->deleteLater();
+        cb(2, QVariantMap()); // no Response will arrive; surface the failure now
+    }
+}
+
+void CoworkPortal::handleInject(const QJsonObject &req)
+{
+    const QString corrId = req.value(QStringLiteral("corrId")).toString();
+    const QJsonArray ops = req.value(QStringLiteral("ops")).toArray();
+
+    if (m_rdReady && !m_rdSession.isEmpty()) {
+        runInjectOps(ops);
+        replyResult(corrId, QStringLiteral("inject"), true, QString());
+        return;
+    }
+    m_injectQueue.append({corrId, ops});
+    if (!m_rdStarting) {
+        startRemoteDesktop();
+    }
+}
+
+void CoworkPortal::startRemoteDesktop()
+{
+    m_rdStarting = true;
+    const QString sessToken = QStringLiteral("aks%1").arg(QRandomGenerator::global()->generate());
+
+    QVariantMap createOpts;
+    createOpts.insert(QStringLiteral("session_handle_token"), sessToken);
+
+    portalRequest(QStringLiteral("org.freedesktop.portal.RemoteDesktop"), QStringLiteral("CreateSession"),
+                  {}, createOpts, [this](uint code, const QVariantMap &results) {
+        if (code != 0) {
+            failInjectQueue(i18n("the remote-control session could not be created"));
+            return;
+        }
+        m_rdSession = results.value(QStringLiteral("session_handle")).toString();
+        if (m_rdSession.isEmpty()) {
+            failInjectQueue(i18n("no remote-control session handle was returned"));
+            return;
+        }
+        // SelectDevices: keyboard (1) | pointer (2) = 3.
+        QVariantMap selOpts;
+        selOpts.insert(QStringLiteral("types"), uint(3));
+        portalRequest(QStringLiteral("org.freedesktop.portal.RemoteDesktop"), QStringLiteral("SelectDevices"),
+                      {QVariant::fromValue(QDBusObjectPath(m_rdSession))}, selOpts,
+                      [this](uint code2, const QVariantMap &) {
+            if (code2 != 0) {
+                failInjectQueue(i18n("input devices were not granted"));
+                return;
+            }
+            portalRequest(QStringLiteral("org.freedesktop.portal.RemoteDesktop"), QStringLiteral("Start"),
+                          {QVariant::fromValue(QDBusObjectPath(m_rdSession)), parentWindowHandle()},
+                          QVariantMap(), [this](uint code3, const QVariantMap &) {
+                m_rdStarting = false;
+                if (code3 != 0) {
+                    failInjectQueue(i18n("remote control was declined"));
+                    return;
+                }
+                m_rdReady = true;
+                flushInjectQueue();
+            });
+        });
+    });
+}
+
+void CoworkPortal::runInjectOps(const QJsonArray &ops)
+{
+    if (m_rdSession.isEmpty()) {
+        return;
+    }
+    QDBusConnection bus = QDBusConnection::sessionBus();
+    const QDBusObjectPath session(m_rdSession);
+    for (const QJsonValue &ov : ops) {
+        const QJsonObject op = ov.toObject();
+        const QString t = op.value(QStringLiteral("t")).toString();
+        QDBusMessage msg;
+        if (t == QLatin1String("key")) {
+            msg = QDBusMessage::createMethodCall(
+                QString::fromLatin1(kPortalService), QString::fromLatin1(kPortalPath),
+                QStringLiteral("org.freedesktop.portal.RemoteDesktop"), QStringLiteral("NotifyKeyboardKeysym"));
+            msg.setArguments({QVariant::fromValue(session), QVariant::fromValue(QVariantMap()),
+                              op.value(QStringLiteral("keysym")).toInt(),
+                              uint(op.value(QStringLiteral("state")).toInt())});
+        } else if (t == QLatin1String("btn")) {
+            msg = QDBusMessage::createMethodCall(
+                QString::fromLatin1(kPortalService), QString::fromLatin1(kPortalPath),
+                QStringLiteral("org.freedesktop.portal.RemoteDesktop"), QStringLiteral("NotifyPointerButton"));
+            msg.setArguments({QVariant::fromValue(session), QVariant::fromValue(QVariantMap()),
+                              op.value(QStringLiteral("button")).toInt(),
+                              uint(op.value(QStringLiteral("state")).toInt())});
+        } else {
+            continue;
+        }
+        bus.asyncCall(msg); // fire-and-forget; Notify* return nothing meaningful
+    }
+}
+
+void CoworkPortal::flushInjectQueue()
+{
+    const auto queued = m_injectQueue;
+    m_injectQueue.clear();
+    for (const auto &pi : queued) {
+        runInjectOps(pi.ops);
+        replyResult(pi.corrId, QStringLiteral("inject"), true, QString());
+    }
+}
+
+void CoworkPortal::failInjectQueue(const QString &err)
+{
+    m_rdStarting = false;
+    m_rdReady = false;
+    m_rdSession.clear();
+    const auto queued = m_injectQueue;
+    m_injectQueue.clear();
+    for (const auto &pi : queued) {
+        replyResult(pi.corrId, QStringLiteral("inject"), false, err);
+    }
+}
+
+void CoworkPortal::teardownRemoteDesktop()
+{
+    if (!m_rdSession.isEmpty()) {
+        QDBusMessage msg = QDBusMessage::createMethodCall(
+            QString::fromLatin1(kPortalService), m_rdSession,
+            QStringLiteral("org.freedesktop.portal.Session"), QStringLiteral("Close"));
+        QDBusConnection::sessionBus().asyncCall(msg);
+    }
+    failInjectQueue(i18n("desktop control was stopped"));
+}
+
+void CoworkPortal::handleKillInject(const QJsonObject &req)
+{
+    teardownRemoteDesktop();
+    replyResult(req.value(QStringLiteral("corrId")).toString(), QStringLiteral("killInject"), true, QString());
 }

@@ -68,10 +68,11 @@ func registerCoworkHandlers(d handlerDeps) {
 
 	d.srv.Handle("cowork.screenshot", func(ctx context.Context, raw json.RawMessage) (any, error) {
 		var p struct {
-			ThreadID string        `json:"threadId"`
-			Target   cowork.Target `json:"target"`
-			MaxDim   int           `json:"maxDim"`
-			Format   string        `json:"format"`
+			ThreadID    string        `json:"threadId"`
+			Target      cowork.Target `json:"target"`
+			MaxDim      int           `json:"maxDim"`
+			Format      string        `json:"format"`
+			Interactive bool          `json:"interactive"`
 		}
 		_ = json.Unmarshal(raw, &p)
 		if err := requireCoworkBridge(d, ctx, p.ThreadID); err != nil {
@@ -103,7 +104,7 @@ func registerCoworkHandlers(d handlerDeps) {
 			"target":      p.Target,
 			"maxDim":      maxDim,
 			"format":      format,
-			"interactive": false,
+			"interactive": p.Interactive,
 		}, 125*time.Second)
 		if err != nil {
 			return nil, err
@@ -262,6 +263,120 @@ func registerCoworkHandlers(d handlerDeps) {
 		// Readable by the UI; reports the capability probe + kill state.
 		_, killed := cw.ListGrants("")
 		return map[string]any{"available": cw.Available(), "killed": killed, "tampered": cw.Tampered()}, nil
+	})
+
+	// --- global capability policy (the toggle switchboard, Phase 2) — UI-only -----
+
+	d.srv.Handle("cowork.getPolicy", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUI(d, ctx); err != nil {
+			return nil, err
+		}
+		enabled := cw.PolicyList()
+		caps := make([]map[string]any, 0)
+		for _, c := range cowork.AllToggleable() {
+			caps = append(caps, map[string]any{
+				"key":     string(c),
+				"tier":    string(cowork.TierOf(c)),
+				"enabled": enabled[c],
+			})
+		}
+		return map[string]any{"capabilities": caps}, nil
+	})
+
+	d.srv.Handle("cowork.setPolicy", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUI(d, ctx); err != nil {
+			return nil, err
+		}
+		var p struct {
+			Capability string `json:"capability"`
+			Enabled    bool   `json:"enabled"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		cap := cowork.Capability(p.Capability)
+		if !cap.Valid() {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown capability")
+		}
+		if err := cw.SetPolicy(cap, p.Enabled); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		return map[string]any{"ok": true}, nil
+	})
+
+	// --- control: keyboard/pointer injection (R2) — agent bridge → core ----------
+
+	d.srv.Handle("cowork.injectInput", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID       string        `json:"threadId"`
+			TargetWindowID string        `json:"targetWindowId"`
+			Events         []injectEvent `json:"events"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		if err := requireCoworkBridge(d, ctx, p.ThreadID); err != nil {
+			return nil, err
+		}
+		if !cw.Available() {
+			return nil, ipc.Errorf(codeCoworkDenied, "desktop integration unavailable (no KDE session bus)")
+		}
+
+		ops, desc, err := buildInjectOps(p.Events)
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+
+		// Resolve the target window's class/title so the self-target guard can refuse
+		// Agent Kate's own UI and the consent prompt can name the window.
+		target := cowork.Target{Kind: cowork.TargetWindow, WindowID: p.TargetWindowID, Label: "the focused window"}
+		if p.TargetWindowID != "" {
+			if wins, err := cw.KDE().ListWindows(4 * time.Second); err == nil {
+				for _, w := range wins {
+					if w.InternalID == p.TargetWindowID {
+						target.ResourceClass = w.ResourceClass
+						if w.Caption != "" {
+							target.Label = w.Caption
+						}
+						break
+					}
+				}
+			}
+		}
+
+		dec, err := cw.Authorize(ctx, cowork.AuthRequest{
+			ThreadID:       p.ThreadID,
+			Capability:     cowork.CapInputInject,
+			Target:         target,
+			SuggestedScope: cowork.ScopeOnce,
+			ActionPreview: &cowork.ActionDescriptor{
+				Mechanism:   "input_inject",
+				WindowTitle: target.Label,
+				Detail:      desc,
+			},
+		})
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		if !dec.Allow {
+			return nil, ipc.Errorf(codeCoworkDenied, dec.Reason)
+		}
+
+		// Focus the target window first so the keystrokes land on it.
+		if p.TargetWindowID != "" {
+			if err := cw.KDE().ActivateWindow(p.TargetWindowID, 4*time.Second); err != nil {
+				d.log.Warn("cowork: could not focus target window", "id", p.TargetWindowID, "err", err)
+			}
+		}
+
+		if _, err := runPortal(d, ctx, "inject", map[string]any{
+			"threadId": p.ThreadID,
+			"ops":      ops,
+		}, 35*time.Second); err != nil {
+			return nil, err
+		}
+		cw.AuditCapture(p.ThreadID, cowork.CapInputInject, target, dec.GrantID, hashString(desc))
+		return map[string]any{"ok": true, "actions": desc}, nil
 	})
 }
 

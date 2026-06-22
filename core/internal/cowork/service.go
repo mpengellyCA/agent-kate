@@ -28,7 +28,7 @@ type Service struct {
 //
 // kdeClient may be nil (e.g. no session bus); capability calls that need it return
 // a clean "unavailable" error rather than panicking.
-func New(grantsPath, auditPath string, kdeClient *kde.Client, notify Notifier, log *slog.Logger) (*Service, []string, error) {
+func New(grantsPath, auditPath, policyPath string, kdeClient *kde.Client, notify Notifier, log *slog.Logger) (*Service, []string, error) {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -47,11 +47,22 @@ func New(grantsPath, auditPath string, kdeClient *kde.Client, notify Notifier, l
 		warnings = append(warnings, "consent audit chain failed verification — desktop access is disabled until reset")
 		log.Error("cowork: audit chain tampered; access fails closed")
 	}
+	policy, err := LoadPolicy(policyPath)
+	if err != nil {
+		warnings = append(warnings, err.Error())
+		log.Warn("cowork: policy load issue", "err", err)
+		policy, _ = LoadPolicy("") // empty deny-all fallback
+	}
 
-	auth := newAuthority(store, audit, notify, log)
+	auth := newAuthority(store, audit, policy, notify, log)
 	store.SetOnChange(func() {
 		if notify != nil {
 			notify.Notify("cowork.grantsChanged", map[string]any{})
+		}
+	})
+	policy.SetOnChange(func() {
+		if notify != nil {
+			notify.Notify("cowork.policyChanged", map[string]any{})
 		}
 	})
 

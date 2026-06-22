@@ -31,7 +31,7 @@ func (f *fakeNotifier) Notify(method string, params any) {
 func newTestService(t *testing.T, n Notifier) *Service {
 	t.Helper()
 	dir := t.TempDir()
-	svc, _, err := New(filepath.Join(dir, "grants.json"), filepath.Join(dir, "audit.jsonl"), nil, n, nil)
+	svc, _, err := New(filepath.Join(dir, "grants.json"), filepath.Join(dir, "audit.jsonl"), filepath.Join(dir, "policy.json"), nil, n, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -256,7 +256,7 @@ func TestTamperedAuthorityFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	n := &fakeNotifier{allow: true}
-	svc, warnings, err := New(gp, ap, nil, n, nil)
+	svc, warnings, err := New(gp, ap, filepath.Join(dir, "policy.json"), nil, n, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,5 +267,47 @@ func TestTamperedAuthorityFailsClosed(t *testing.T) {
 	d, _ := svc.Authorize(context.Background(), AuthRequest{ThreadID: "t", Capability: CapWindowList, Target: Target{Kind: TargetAny}})
 	if d.Allow {
 		t.Fatal("tampered audit must fail closed (deny all)")
+	}
+}
+
+func TestPolicyPreauthNoPrompt(t *testing.T) {
+	// A notifier that DENIES if ever prompted — so a pass proves NO prompt happened.
+	n := &fakeNotifier{allow: false}
+	svc := newTestService(t, n)
+	n.auth = svc.Authority
+
+	if err := svc.SetPolicy(CapScreenshot, true); err != nil {
+		t.Fatal(err)
+	}
+	d, _ := svc.Authorize(context.Background(), AuthRequest{ThreadID: "t", Capability: CapScreenshot, Target: Target{Kind: TargetScreen}})
+	if !d.Allow || d.GrantID != "policy" {
+		t.Fatalf("policy-enabled capability must allow with no prompt; got allow=%v id=%q", d.Allow, d.GrantID)
+	}
+	for _, e := range n.events {
+		if e == "cowork.grantRequested" {
+			t.Fatal("policy pre-auth must NOT raise a consent prompt")
+		}
+	}
+
+	// R2 control (input injection) is honored too when toggled on (full no-prompt).
+	if err := svc.SetPolicy(CapInputInject, true); err != nil {
+		t.Fatal(err)
+	}
+	if d2, _ := svc.Authorize(context.Background(), AuthRequest{ThreadID: "t", Capability: CapInputInject, Target: Target{Kind: TargetWindow, WindowID: "w"}}); !d2.Allow {
+		t.Fatal("policy-enabled R2 control must allow with no prompt")
+	}
+	// ...but NEVER against Agent Kate's own UI, even with the toggle on.
+	if d3, _ := svc.Authorize(context.Background(), AuthRequest{ThreadID: "t", Capability: CapInputInject, Target: Target{Kind: TargetWindow, ResourceClass: "org.kde.agentkate"}}); d3.Allow {
+		t.Fatal("self-target must be refused even when the toggle is on")
+	}
+
+	// Kill-switch clears the policy (panic button); afterwards it falls back to prompt.
+	svc.Kill("panic")
+	if len(svc.PolicyList()) != 0 {
+		t.Fatal("kill-switch must clear all policy toggles")
+	}
+	svc.Rearm("resume")
+	if d4, _ := svc.Authorize(context.Background(), AuthRequest{ThreadID: "t", Capability: CapScreenshot, Target: Target{Kind: TargetScreen}}); d4.Allow {
+		t.Fatal("after kill cleared the policy, capability must fall back to prompt/deny")
 	}
 }

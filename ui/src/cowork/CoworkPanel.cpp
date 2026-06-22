@@ -8,6 +8,7 @@
 #include <KMessageBox>
 #include <KMessageWidget>
 
+#include <QCheckBox>
 #include <QDateTime>
 #include <QGroupBox>
 #include <QHBoxLayout>
@@ -37,6 +38,18 @@ QString targetSummary(const QJsonObject &t)
         return i18n("whole desktop");
     }
     return kind;
+}
+
+QString capLabel(const QString &key)
+{
+    if (key == QLatin1String("window_list")) return i18n("See open windows");
+    if (key == QLatin1String("screenshot")) return i18n("Take screenshots");
+    if (key == QLatin1String("a11y_read")) return i18n("Read on-screen text");
+    if (key == QLatin1String("screencast")) return i18n("Watch the screen live");
+    if (key == QLatin1String("vd_sandbox")) return i18n("Use a sandbox desktop");
+    if (key == QLatin1String("a11y_action")) return i18n("Click buttons & controls");
+    if (key == QLatin1String("input_inject")) return i18n("Type & click as me");
+    return key;
 }
 
 QString expiryText(const QJsonObject &g)
@@ -84,6 +97,13 @@ CoworkPanel::CoworkPanel(CoreClient *core, QWidget *parent)
     enableRow->addWidget(m_activeLabel, 1);
     enableRow->addWidget(m_enableBtn);
     layout->addLayout(enableRow);
+
+    // Capability switchboard: flip a capability ON to pre-authorize it for any
+    // cowork-enabled agent — no per-action prompt while on (the kill-switch + audit
+    // log remain the safety net). Populated from cowork.getPolicy.
+    auto *capsBox = new QGroupBox(i18n("What agents may do (on = allowed without asking)"), this);
+    m_capsLayout = new QVBoxLayout(capsBox);
+    layout->addWidget(capsBox);
 
     // Active grants.
     auto *grantsBox = new QGroupBox(i18n("Active access"), this);
@@ -147,14 +167,51 @@ void CoworkPanel::onNotification(const QString &method, const QJsonObject &param
         m_killed = params.value(QStringLiteral("on")).toBool();
         refreshStatus();
         refreshGrants();
+        refreshPolicy(); // kill clears the toggles
+    } else if (method == QLatin1String("cowork.policyChanged")) {
+        refreshPolicy();
     }
 }
 
 void CoworkPanel::refresh()
 {
     refreshStatus();
+    refreshPolicy();
     refreshGrants();
     refreshAudit();
+}
+
+void CoworkPanel::refreshPolicy()
+{
+    m_core->call(QStringLiteral("cowork.getPolicy"), {}, [this](const QJsonObject &res, const QJsonObject &err) {
+        if (!err.isEmpty()) {
+            return;
+        }
+        const QJsonArray caps = res.value(QStringLiteral("capabilities")).toArray();
+        for (const QJsonValue &cv : caps) {
+            const QJsonObject c = cv.toObject();
+            const QString key = c.value(QStringLiteral("key")).toString();
+            const bool enabled = c.value(QStringLiteral("enabled")).toBool();
+            const bool dangerous = c.value(QStringLiteral("tier")).toString() == QLatin1String("R2");
+            QCheckBox *box = m_policyChecks.value(key, nullptr);
+            if (!box) {
+                box = new QCheckBox(dangerous ? i18n("⚠ %1", capLabel(key)) : capLabel(key), this);
+                if (dangerous) {
+                    box->setToolTip(i18n("High-risk: lets the agent act as you (type, click). "
+                                         "The kill-switch and audit log are your safety net."));
+                }
+                // clicked() fires on user interaction only — not on setChecked() below.
+                connect(box, &QCheckBox::clicked, this, [this, key](bool on) {
+                    m_core->call(QStringLiteral("cowork.setPolicy"),
+                                 {{QStringLiteral("capability"), key}, {QStringLiteral("enabled"), on}},
+                                 nullptr, this);
+                });
+                m_capsLayout->addWidget(box);
+                m_policyChecks.insert(key, box);
+            }
+            box->setChecked(enabled);
+        }
+    }, this);
 }
 
 void CoworkPanel::refreshStatus()

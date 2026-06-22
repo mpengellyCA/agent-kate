@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QHash>
 #include <QJsonObject>
 #include <QString>
 #include <QWidget>
@@ -10,6 +11,8 @@ class QTreeWidget;
 class QPlainTextEdit;
 class QPushButton;
 class QLabel;
+class QCheckBox;
+class QVBoxLayout;
 
 // CoworkPanel is the user's control surface for the KDE Plasma Cowork feature: it
 // shows what desktop access agents currently hold, answers consent prompts, lets the
@@ -34,6 +37,7 @@ private:
     void refreshStatus();
     void refreshGrants();
     void refreshAudit();
+    void refreshPolicy();
     void handleGrantRequested(const QJsonObject &params);
     void revokeSelected();
     void toggleKill();
@@ -48,6 +52,8 @@ private:
     KMessageWidget *m_status = nullptr;
     QLabel *m_activeLabel = nullptr;
     QPushButton *m_enableBtn = nullptr;
+    QVBoxLayout *m_capsLayout = nullptr;                 // holds the capability toggles
+    QHash<QString, QCheckBox *> m_policyChecks;          // capability key -> switch
     QTreeWidget *m_grants = nullptr;
     QPushButton *m_revokeBtn = nullptr;
     QPushButton *m_killBtn = nullptr;

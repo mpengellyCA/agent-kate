@@ -1,9 +1,14 @@
 #pragma once
 
+#include <QJsonArray>
 #include <QJsonObject>
+#include <QList>
 #include <QObject>
 #include <QString>
+#include <QVariantList>
 #include <QVariantMap>
+
+#include <functional>
 
 class CoreClient;
 class QWidget;
@@ -46,6 +51,32 @@ private:
                      const QString &error, const QJsonObject &extra = QJsonObject());
     QString parentWindowHandle() const;
 
+    // --- RemoteDesktop input injection -------------------------------------------
+    // A single RemoteDesktop session is created lazily on the first inject (the user
+    // approves the portal's remote-control dialog once) and reused for the rest of
+    // the run; the kill-switch tears it down.
+    void handleInject(const QJsonObject &req);
+    void handleKillInject(const QJsonObject &req);
+    void startRemoteDesktop();
+    void runInjectOps(const QJsonArray &ops);
+    void flushInjectQueue();
+    void failInjectQueue(const QString &err);
+    void teardownRemoteDesktop();
+    // Invoke a portal method that returns a Request handle and deliver its async
+    // Response to cb. options gains a fresh handle_token; args precede options.
+    void portalRequest(const QString &iface, const QString &method, const QVariantList &args,
+                       QVariantMap options, std::function<void(uint, const QVariantMap &)> cb);
+
+    struct PendingInject {
+        QString corrId;
+        QJsonArray ops;
+    };
+
     CoreClient *m_core = nullptr;
     QWidget *m_topLevel = nullptr;
+
+    QString m_rdSession;            // RemoteDesktop session object path ("" = none)
+    bool m_rdReady = false;         // session started, devices granted
+    bool m_rdStarting = false;      // Create/Select/Start in flight
+    QList<PendingInject> m_injectQueue;
 };

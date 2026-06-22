@@ -287,7 +287,7 @@ func runCore() {
 		log.Warn("cowork: KDE session bus unavailable; desktop features disabled", "err", kerr)
 		kdeClient = nil
 	}
-	coworkSvc, coworkWarn, cerr := cowork.New(cowork.DefaultGrantsPath(), cowork.DefaultAuditPath(), kdeClient, coworkNotifier{srv}, log)
+	coworkSvc, coworkWarn, cerr := cowork.New(cowork.DefaultGrantsPath(), cowork.DefaultAuditPath(), cowork.DefaultPolicyPath(), kdeClient, coworkNotifier{srv}, log)
 	if cerr != nil {
 		log.Error("cowork: consent store init failed; desktop features disabled", "err", cerr)
 		coworkSvc = nil

@@ -55,7 +55,35 @@ func coworkToolDefs() []map[string]any {
 					},
 					"maxDim": map[string]any{"type": "integer", "description": "Max longest-edge pixels (default 1568)."},
 					"format": map[string]any{"type": "string", "enum": []string{"png", "jpeg"}, "description": "Image format (default png)."},
+					"interactive": map[string]any{"type": "boolean", "description": "If true, the user picks a specific window/region in KDE's native screenshot picker (a 'share this window' flow). Default false captures the screen directly."},
 				},
+			},
+		},
+		{
+			"name": "desktop_inject_input",
+			"description": "Type keys and click on the user's desktop — acting AS the user. " +
+				"Use to control an app (e.g. press 'space' or 'playpause' to pause a video, " +
+				"'left'/'right' to seek, type text, or click). Highest-risk capability " +
+				"('input_inject'): it is refused unless the user has switched on the control " +
+				"toggle in the Cowork panel, or approves the action. Optionally pass " +
+				"targetWindowId (from desktop_list_windows) to focus that window first.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"events": map[string]any{
+						"type": "array",
+						"description": "Ordered input events. Each is a key — " +
+							"{\"type\":\"key\",\"key\":\"space\"} (names: space, enter, tab, escape, " +
+							"left/right/up/down, playpause, play, pause, next, prev, volumeup/down, mute, " +
+							"or a single character) — or a click {\"type\":\"button\",\"button\":\"left\"}.",
+						"items": map[string]any{"type": "object"},
+					},
+					"targetWindowId": map[string]any{
+						"type":        "string",
+						"description": "Optional KWin internalId to focus before injecting (from desktop_list_windows).",
+					},
+				},
+				"required": []string{"events"},
 			},
 		},
 	}
@@ -102,6 +130,31 @@ func (b *mcpBridge) runCoworkTool(name string, args json.RawMessage) (string, er
 		}
 		return strings.TrimRight(sb.String(), "\n"), nil
 
+	case "desktop_inject_input":
+		var a struct {
+			Events         json.RawMessage `json:"events"`
+			TargetWindowID string          `json:"targetWindowId"`
+		}
+		_ = json.Unmarshal(args, &a)
+		params := map[string]any{"threadId": b.thread}
+		if len(a.Events) > 0 {
+			params["events"] = a.Events
+		}
+		if a.TargetWindowID != "" {
+			params["targetWindowId"] = a.TargetWindowID
+		}
+		var res struct {
+			OK      bool   `json:"ok"`
+			Actions string `json:"actions"`
+		}
+		if err := b.client.CallTimeout("cowork.injectInput", params, &res, 40*time.Second); err != nil {
+			return "", err
+		}
+		if res.Actions == "" {
+			return "Input sent.", nil
+		}
+		return fmt.Sprintf("Sent input: %s.", res.Actions), nil
+
 	default:
 		return "", fmt.Errorf("unknown cowork tool: %s", name)
 	}
@@ -111,9 +164,10 @@ func (b *mcpBridge) runCoworkTool(name string, args json.RawMessage) (string, er
 // against the UI) and returns MCP image content blocks.
 func (b *mcpBridge) runScreenshot(args json.RawMessage) ([]map[string]any, error) {
 	var a struct {
-		Target json.RawMessage `json:"target"`
-		MaxDim int             `json:"maxDim"`
-		Format string          `json:"format"`
+		Target      json.RawMessage `json:"target"`
+		MaxDim      int             `json:"maxDim"`
+		Format      string          `json:"format"`
+		Interactive bool            `json:"interactive"`
 	}
 	_ = json.Unmarshal(args, &a)
 
@@ -126,6 +180,9 @@ func (b *mcpBridge) runScreenshot(args json.RawMessage) ([]map[string]any, error
 	}
 	if a.Format != "" {
 		params["format"] = a.Format
+	}
+	if a.Interactive {
+		params["interactive"] = true
 	}
 
 	var res struct {

@@ -99,6 +99,7 @@ func (b *grantBroker) Close(id string) {
 type Authority struct {
 	store  *Store
 	audit  *Audit
+	policy *Policy
 	broker *grantBroker
 	notify Notifier
 	log    *slog.Logger
@@ -114,13 +115,14 @@ type Authority struct {
 	promptTimeoutR2   time.Duration
 }
 
-func newAuthority(store *Store, audit *Audit, notify Notifier, log *slog.Logger) *Authority {
+func newAuthority(store *Store, audit *Audit, policy *Policy, notify Notifier, log *slog.Logger) *Authority {
 	if log == nil {
 		log = slog.Default()
 	}
 	return &Authority{
 		store:             store,
 		audit:             audit,
+		policy:            policy,
 		broker:            newGrantBroker(),
 		notify:            notify,
 		log:               log,
@@ -153,6 +155,15 @@ func (a *Authority) Authorize(ctx context.Context, req AuthRequest) (Decision, e
 	if tier == TierR2 && a.IsSelfTarget(req.Target) {
 		a.auditDeny(req, "refused: target is Agent Kate's own UI")
 		return Decision{Reason: "refused: Agent Kate cannot control its own interface"}, nil
+	}
+
+	// Global pre-authorization (the toggle switchboard — Phase 2). A capability the
+	// user has switched on is allowed with NO prompt, for any cowork-enabled agent,
+	// overriding even the R2 per-action default. Still audited; the kill-switch /
+	// audit-tamper / self-target guards above still hard-block it.
+	if a.policy != nil && a.policy.Allows(req.Capability) {
+		a.auditAction(req, "policy", "", "pre-authorized (toggle on)")
+		return Decision{Allow: true, GrantID: "policy", Reason: "pre-authorized (toggle on)"}, nil
 	}
 
 	now := time.Now()
@@ -291,11 +302,37 @@ func (a *Authority) Kill(reason string) []string {
 		runTeardown(fn)
 	}
 	ids := a.store.RevokeAll("kill-switch: " + reason)
+	// Panic button: also clear every pre-authorization toggle, so re-arming starts
+	// from a clean (deny-all) posture rather than silently restoring standing access.
+	if a.policy != nil {
+		a.policy.Clear()
+	}
 	_ = a.audit.Append(AuditEntry{Kind: AuditKill, Detail: reason})
 	if a.notify != nil {
 		a.notify.Notify("cowork.killSwitch", map[string]any{"on": true, "reason": reason, "at": time.Now()})
 	}
 	return ids
+}
+
+// PolicyList returns the current global capability pre-authorizations.
+func (a *Authority) PolicyList() map[Capability]bool {
+	if a.policy == nil {
+		return map[Capability]bool{}
+	}
+	return a.policy.List()
+}
+
+// SetPolicy turns a global capability toggle on or off (UI-only at the RPC layer).
+func (a *Authority) SetPolicy(c Capability, on bool) error {
+	if a.policy == nil {
+		return nil
+	}
+	if on {
+		_ = a.audit.Append(AuditEntry{Kind: AuditGrant, Capability: c, Detail: "policy toggle on"})
+	} else {
+		_ = a.audit.Append(AuditEntry{Kind: AuditRevoke, Capability: c, Detail: "policy toggle off"})
+	}
+	return a.policy.Set(c, on)
 }
 
 // Rearm re-enables access after a kill (grants are NOT restored).
