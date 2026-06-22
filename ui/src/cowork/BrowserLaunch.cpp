@@ -208,7 +208,9 @@ bool launch(const Browser &b, QString *error)
     }
     args << program;
     if (b.family == kChromium) {
-        args << QStringLiteral("--force-renderer-accessibility");
+        // =complete forces the full AX tree explicitly. Some Chromium builds/forks
+        // (e.g. Helium) gate the bare flag behind activation heuristics, so be explicit.
+        args << QStringLiteral("--force-renderer-accessibility=complete");
     }
 
     QProcess proc;

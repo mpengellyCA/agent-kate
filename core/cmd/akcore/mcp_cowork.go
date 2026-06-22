@@ -73,7 +73,7 @@ func coworkToolDefs() []map[string]any {
 				"(from desktop_list_windows); omit to use the active window. Note: web pages in " +
 				"a browser only expose their elements when the browser's accessibility is " +
 				"enabled (Firefox/Zen auto-enable when an accessibility client is present; " +
-				"Chromium may need --force-renderer-accessibility).",
+				"Chromium may need --force-renderer-accessibility=complete).",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{

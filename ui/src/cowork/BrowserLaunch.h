@@ -7,7 +7,7 @@
 // BrowserLaunch opens a web browser with its accessibility tree forced on, so a
 // Cowork agent can read and activate page elements via AT-SPI. Browsers don't expose
 // web content over AT-SPI by default: Chromium-family browsers need the
-// --force-renderer-accessibility flag, and Firefox-family browsers need
+// --force-renderer-accessibility=complete flag, and Firefox-family browsers need
 // GNOME_ACCESSIBILITY=1 in the environment at startup. We set the right one per
 // engine family. This is user-initiated (a menu in the Cowork panel) — launching
 // arbitrary executables is deliberately not an agent capability.
