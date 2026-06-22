@@ -31,15 +31,16 @@ import (
 type Capability string
 
 const (
-	CapWindowList    Capability = "window_list"    // R0
-	CapVDSandbox     Capability = "vd_sandbox"     // R0
-	CapA11yRead      Capability = "a11y_read"      // R1
-	CapScreenshot    Capability = "screenshot"     // R1
-	CapScreencast    Capability = "screencast"     // R1
-	CapLaunchBrowser Capability = "launch_browser" // R1 — open a user-configured browser
-	CapA11yAction    Capability = "a11y_action"    // R2
-	CapInputInject   Capability = "input_inject"   // R2
-	CapRemoteDesktop Capability = "remote_desktop" // R2 — reserved, unused (08 §Q5)
+	CapWindowList     Capability = "window_list"     // R0
+	CapVDSandbox      Capability = "vd_sandbox"      // R0
+	CapA11yRead       Capability = "a11y_read"       // R1
+	CapScreenshot     Capability = "screenshot"      // R1
+	CapScreencast     Capability = "screencast"      // R1
+	CapLaunchBrowser  Capability = "launch_browser"  // R1 — open a user-configured browser
+	CapA11yAction     Capability = "a11y_action"     // R2
+	CapInputInject    Capability = "input_inject"    // R2
+	CapPointerControl Capability = "pointer_control" // R2 — move & click the pointer at absolute coords
+	CapRemoteDesktop  Capability = "remote_desktop"  // R2 — reserved, unused (08 §Q5)
 )
 
 // Tier drives prompt strength and default scope.
@@ -58,7 +59,7 @@ func TierOf(c Capability) Tier {
 		return TierR0
 	case CapA11yRead, CapScreenshot, CapScreencast, CapLaunchBrowser:
 		return TierR1
-	case CapA11yAction, CapInputInject, CapRemoteDesktop:
+	case CapA11yAction, CapInputInject, CapPointerControl, CapRemoteDesktop:
 		return TierR2
 	default:
 		return TierR2 // unknown ⇒ treat as highest risk (fail-safe)
@@ -69,7 +70,7 @@ func TierOf(c Capability) Tier {
 func (c Capability) Valid() bool {
 	switch c {
 	case CapWindowList, CapVDSandbox, CapA11yRead, CapScreenshot, CapScreencast,
-		CapLaunchBrowser, CapA11yAction, CapInputInject, CapRemoteDesktop:
+		CapLaunchBrowser, CapA11yAction, CapInputInject, CapPointerControl, CapRemoteDesktop:
 		return true
 	}
 	return false

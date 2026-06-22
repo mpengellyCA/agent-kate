@@ -2,10 +2,12 @@ package cowork
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -113,26 +115,18 @@ func hashEntry(e AuditEntry) string {
 }
 
 // Append writes a new chained entry. Seq, At, PrevHash and Hash are filled in here;
-// the caller supplies the semantic fields.
+// the caller supplies the semantic fields. The true chain head is re-read from the
+// file UNDER the flock before linking, so a second akcore process sharing the data dir
+// (or a stale in-memory head) cannot fork the chain: flock serializes the write, and
+// re-reading guarantees PrevHash points at whatever is actually last on disk.
 func (a *Audit) Append(e AuditEntry) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.seq++
-	e.Seq = a.seq
-	if e.At.IsZero() {
-		e.At = time.Now()
-	}
-	e.PrevHash = a.head
-	e.Hash = hashEntry(e)
 
 	if err := os.MkdirAll(filepath.Dir(a.path), 0o700); err != nil {
 		return err
 	}
-	line, err := json.Marshal(e)
-	if err != nil {
-		return err
-	}
-	f, err := os.OpenFile(a.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	f, err := os.OpenFile(a.path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
 	if err != nil {
 		return err
 	}
@@ -141,11 +135,77 @@ func (a *Audit) Append(e AuditEntry) error {
 		return err
 	}
 	defer func() { _ = unix.Flock(int(f.Fd()), unix.LOCK_UN) }()
+
+	// Re-sync the head/seq to the on-disk tail (another process may have appended
+	// since we loaded). An unreadable/empty tail is a clean genesis (head="").
+	if head, seq, ok, rerr := lastChainState(f); rerr != nil {
+		return rerr
+	} else if ok {
+		a.head, a.seq = head, seq
+	} else {
+		a.head, a.seq = "", 0
+	}
+
+	a.seq++
+	e.Seq = a.seq
+	if e.At.IsZero() {
+		e.At = time.Now()
+	}
+	e.PrevHash = a.head
+	e.Hash = hashEntry(e)
+	line, err := json.Marshal(e)
+	if err != nil {
+		return err
+	}
 	if _, err := f.Write(append(line, '\n')); err != nil {
 		return err
 	}
 	a.head = e.Hash
 	return nil
+}
+
+// lastChainState reads the last complete entry from f (its Hash and Seq) so a new append
+// can link onto the actual on-disk tail. It reads only a trailing window — entries are
+// small, so the last line always lies within it. ok is false for an empty/garbled tail.
+func lastChainState(f *os.File) (head string, seq int64, ok bool, err error) {
+	st, err := f.Stat()
+	if err != nil {
+		return "", 0, false, err
+	}
+	size := st.Size()
+	if size == 0 {
+		return "", 0, false, nil
+	}
+	const window = 64 * 1024
+	start := int64(0)
+	if size > window {
+		start = size - window
+	}
+	buf := make([]byte, size-start)
+	if _, err := f.ReadAt(buf, start); err != nil && err != io.EOF {
+		return "", 0, false, err
+	}
+	for _, ln := range bytesReverseLines(buf) {
+		ln = bytes.TrimSpace(ln)
+		if len(ln) == 0 {
+			continue
+		}
+		var e AuditEntry
+		if json.Unmarshal(ln, &e) != nil {
+			return "", 0, false, nil // garbled tail: treat as genesis rather than guess
+		}
+		return e.Hash, e.Seq, true, nil
+	}
+	return "", 0, false, nil
+}
+
+// bytesReverseLines splits on '\n' and returns the lines newest-first.
+func bytesReverseLines(b []byte) [][]byte {
+	parts := bytes.Split(b, []byte{'\n'})
+	for i, j := 0, len(parts)-1; i < j; i, j = i+1, j-1 {
+		parts[i], parts[j] = parts[j], parts[i]
+	}
+	return parts
 }
 
 // Tail returns up to limit entries (oldest→newest) with Seq > sinceSeq, optionally

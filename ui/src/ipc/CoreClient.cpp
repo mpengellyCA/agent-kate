@@ -100,7 +100,19 @@ void CoreClient::tryConnect()
 void CoreClient::onSocketConnected()
 {
     m_connectAttempts = 0;
-    emit connected();
+    // Claim the UI role and only announce the connection once it is established. The core
+    // dispatches each request on its own goroutine, so merely sending the handshake first
+    // does not guarantee it is *processed* before the panels' UI-only queries (getPolicy,
+    // listGrants, listAudit, …) that fire on connected(). Waiting for the handshake reply
+    // does: the reply is sent after the connection is marked "ui", so every connected()
+    // consumer runs after the role is set. Without this, those queries race the handshake,
+    // are rejected, and panels are left empty until some later notification refreshes them
+    // — which for the Cowork capability toggles never happened (only a policy change
+    // re-fetches them), so the switchboard stayed blank. The callback fires on both success
+    // and error, so a handshake failure still surfaces the connection rather than hanging.
+    call(QStringLiteral("handshake"), {}, [this](const QJsonObject &, const QJsonObject &) {
+        emit connected();
+    });
 }
 
 bool CoreClient::isConnected() const

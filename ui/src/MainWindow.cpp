@@ -1320,15 +1320,12 @@ void MainWindow::setupCore()
     connect(m_core, &CoreClient::failed, this, [](const QString &msg) {
         qWarning().noquote() << "[core]" << msg;
     });
+    // The UI handshake (claiming the "ui" role) is now sent by CoreClient as the first
+    // frame on connect, so by the time connected() fires the role is already being
+    // established ahead of any UI-only query. Just do the post-connect work here.
     connect(m_core, &CoreClient::connected, this, [this] {
-        m_core->call(QStringLiteral("handshake"), {},
-                     [this](const QJsonObject &, const QJsonObject &error) {
-                         if (!error.isEmpty()) {
-                             return;
-                         }
-                         pushOpenFilesToCore();
-                         reloadExtensionServers();
-                     });
+        pushOpenFilesToCore();
+        reloadExtensionServers();
     });
 
     const QString corePath =

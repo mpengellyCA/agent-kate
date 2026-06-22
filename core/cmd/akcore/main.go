@@ -300,6 +300,17 @@ func runCore() {
 	}
 	if coworkSvc != nil {
 		coworkSvc.StartSweeper(30 * time.Second)
+		// Teach the anti-escalation guards Agent Kate's own identity so a free pointer can
+		// never click our consent/kill-switch UI (plan 09 §7). The AK window is owned by
+		// the UI (Qt) process, which spawns akcore as a child (CoreClient QProcess) — so
+		// our PARENT pid is the window owner; our own pid is added belt-and-suspenders.
+		// We seed both plausible resourceClass spellings (the Wayland app_id may be the
+		// reverse-DNS desktop name or the bare component name) so the geometric class
+		// match holds whichever KWin reports.
+		coworkSvc.SetSelfIdentity(
+			[]string{"org.kde.agentkate", "agentkate"},
+			[]int{os.Getppid(), os.Getpid()},
+		)
 	}
 
 	deps := handlerDeps{

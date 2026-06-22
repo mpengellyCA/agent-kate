@@ -8,6 +8,16 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(Qt6 6.6 REQUIRED COMPONENTS Core Gui Widgets Network DBus)
+
+# Optional: libpipewire-0.3 powers the SPIKE-1 screencast-stream consumer that keeps a
+# stream "consumed" so KWin honours absolute pointer motion (plan 09, true cursor
+# control). The build stays green without it — all libpipewire code is guarded by
+# AK_HAVE_PIPEWIRE and the feature simply degrades.
+find_package(PkgConfig)
+if(PkgConfig_FOUND)
+    pkg_check_modules(PipeWire IMPORTED_TARGET libpipewire-0.3)
+endif()
+
 find_package(KF6 6.0 REQUIRED COMPONENTS
     TextEditor          # the Kate editor engine
     SyntaxHighlighting
@@ -110,6 +120,17 @@ target_link_libraries(agentkate PRIVATE
     KF6::KIOWidgets
     KF6::Archive
 )
+
+# SPIKE-1 cursor-control consumer: link libpipewire and flip AK_HAVE_PIPEWIRE only when
+# the dev package is present. Absent, CoworkPortal still compiles (all libpipewire code is
+# #ifdef AK_HAVE_PIPEWIRE) and the screencast-consumer defense is simply omitted.
+if(TARGET PkgConfig::PipeWire)
+    target_compile_definitions(agentkate PRIVATE AK_HAVE_PIPEWIRE)
+    target_link_libraries(agentkate PRIVATE PkgConfig::PipeWire)
+    message(STATUS "agentkate: libpipewire-0.3 found — cowork cursor-control consumer enabled")
+else()
+    message(STATUS "agentkate: libpipewire-0.3 not found — cowork cursor-control consumer disabled")
+endif()
 
 # Place the UI binary in the build root so it sits next to akcore; the UI
 # locates the core relative to its own executable directory.

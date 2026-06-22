@@ -15,6 +15,8 @@ class QMenu;
 class QLabel;
 class QCheckBox;
 class QComboBox;
+class QSlider;
+class QSpinBox;
 class QVBoxLayout;
 
 // CoworkPanel is the user's control surface for the KDE Plasma Cowork feature: it
@@ -49,6 +51,7 @@ private:
     void pickCustomBrowser();
     void launchBrowserAndReport(const QString &name, const QString &command, const QString &family);
     void refreshBrowserPrefCombo();
+    void savePointerBounds(); // persist + push the user's pointer-motion defaults to core
 
     CoreClient *m_core = nullptr;
     QString m_activeThread;
@@ -64,6 +67,10 @@ private:
     QComboBox *m_agentBrowserCombo = nullptr;
     QVBoxLayout *m_capsLayout = nullptr;                 // holds the capability toggles
     QHash<QString, QCheckBox *> m_policyChecks;          // capability key -> switch
+    QComboBox *m_pointerSpeed = nullptr;                 // default agent pointer px/s
+    QSlider *m_pointerAccuracy = nullptr;                // 0..100% path exactness
+    QLabel *m_pointerAccuracyLabel = nullptr;           // "Accuracy: N%"
+    QSpinBox *m_pointerSettle = nullptr;                 // ms to settle before a click
     QTreeWidget *m_grants = nullptr;
     QPushButton *m_revokeBtn = nullptr;
     QPushButton *m_killBtn = nullptr;

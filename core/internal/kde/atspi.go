@@ -385,6 +385,35 @@ func (c *Client) ElementInfo(id string, timeout time.Duration) (ElementContext, 
 	}, nil
 }
 
+// ElementBounds re-resolves an element's live screen extents and metadata: a TOCTOU
+// re-check before a pointer click, since the element may have moved or vanished since
+// it was listed. ok is false when the element no longer reports usable on-screen
+// bounds (caller should re-list rather than click a stale rectangle).
+func (c *Client) ElementBounds(id string, timeout time.Duration) (ElementContext, Rect, bool, error) {
+	ref, err := decodeElementID(id)
+	if err != nil {
+		return ElementContext{}, Rect{}, false, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	conn, err := c.atspiConnect(ctx)
+	if err != nil {
+		return ElementContext{}, Rect{}, false, err
+	}
+	role, err := c.a11yRoleName(ctx, conn, ref)
+	if err != nil {
+		return ElementContext{}, Rect{}, false, fmt.Errorf("kde: the element is no longer available (re-list elements)")
+	}
+	info := ElementContext{
+		Role:    role,
+		Name:    c.a11yName(ctx, conn, ref),
+		PID:     c.a11yPID(ctx, conn, ref.Name),
+		Actions: c.a11yActions(ctx, conn, ref),
+	}
+	x, y, w, h, ok := c.a11yExtents(ctx, conn, ref)
+	return info, Rect{X: x, Y: y, W: w, H: h}, ok && w > 0 && h > 0, nil
+}
+
 // ActivateElement fires an element's action by name (empty = the default action,
 // index 0) directly through AT-SPI — no pointer movement involved.
 func (c *Client) ActivateElement(id, action string, timeout time.Duration) error {

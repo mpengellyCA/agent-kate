@@ -106,9 +106,11 @@ func (s *Service) Close() error {
 	default:
 		close(s.sweepStop)
 	}
-	// Engaging the kill path on shutdown tears down any live portal/screencast
-	// sessions and revokes non-durable grants (until_revoked persist to disk).
-	s.Authority.Kill("akcore shutdown")
+	// Graceful teardown of any live portal/screencast sessions. This is NOT the panic
+	// Kill: a normal quit must leave the user's standing policy toggles intact (they are
+	// meant to persist across restarts) and must not spam the audit chain with a "kill"
+	// entry on every exit. Non-durable grants lapse on next load (restart semantics).
+	s.Authority.Shutdown()
 	if s.kde != nil {
 		return s.kde.Close()
 	}

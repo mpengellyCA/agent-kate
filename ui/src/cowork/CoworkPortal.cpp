@@ -6,11 +6,13 @@
 #include <KLocalizedString>
 
 #include <QBuffer>
+#include <QDBusArgument>
 #include <QDBusConnection>
 #include <QDBusInterface>
 #include <QDBusMessage>
 #include <QDBusObjectPath>
 #include <QDBusReply>
+#include <QDBusUnixFileDescriptor>
 #include <QDBusVariant>
 #include <QFile>
 #include <QImage>
@@ -19,7 +21,12 @@
 #include <QUrl>
 #include <QWidget>
 
-#include <utility>
+#include <unistd.h>
+
+#ifdef AK_HAVE_PIPEWIRE
+#include <pipewire/pipewire.h>
+#include <spa/param/video/format-utils.h>
+#endif
 
 namespace {
 constexpr auto kPortalService = "org.freedesktop.portal.Desktop";
@@ -70,27 +77,157 @@ void PortalResponseWaiter::onResponse(uint code, const QVariantMap &results)
     deleteLater();
 }
 
-namespace {
-// Idle window after which a live RemoteDesktop session is torn down on its own, so
-// the virtual input devices it holds never linger for the whole run.
-constexpr int kInjectIdleMs = 60'000;
-} // namespace
+#ifdef AK_HAVE_PIPEWIRE
+// SPIKE-1 defense — a MINIMAL libpipewire consumer.
+//
+// NotifyPointerMotionAbsolute may require the screencast stream to be actively
+// *consumed* (a downstream pulling frames), not merely *started*, before KWin will
+// honour absolute motion. This consumer connects to the stream node via the PipeWire
+// remote fd and DRAINS frames: every buffer is dequeued and immediately requeued.
+// We never decode a frame, never copy pixels, never let an fd/frame cross the JSON
+// bus (INV: no frames/FDs cross the JSON boundary) — it exists purely to satisfy the
+// compositor that the stream is live.
+//
+// SPIKE-1: this must be verified against a live KWin session. If absolute motion turns
+// out NOT to need a consumer on KWin, this whole struct + its call sites can be deleted
+// (see the call site in startRemoteDesktop's Start callback). The libpipewire API
+// details below follow the standard minimal pw_stream consumer pattern and should be
+// re-checked against the installed libpipewire-0.3 headers.
+struct CoworkPortal::PwConsumer {
+    pw_thread_loop *loop = nullptr;
+    pw_context *context = nullptr;
+    pw_core *core = nullptr;
+    pw_stream *stream = nullptr;
+    spa_hook streamListener{};
+
+    // process: a frame is ready — dequeue it and immediately requeue it (drain + drop).
+    static void onProcess(void *userdata)
+    {
+        auto *self = static_cast<PwConsumer *>(userdata);
+        pw_buffer *b = nullptr;
+        // Drain everything currently queued so we never build a backlog.
+        while ((b = pw_stream_dequeue_buffer(self->stream)) != nullptr) {
+            pw_stream_queue_buffer(self->stream, b);
+        }
+    }
+
+    static const pw_stream_events &events()
+    {
+        static const pw_stream_events ev = [] {
+            pw_stream_events e{};
+            e.version = PW_VERSION_STREAM_EVENTS;
+            e.process = &PwConsumer::onProcess;
+            return e;
+        }();
+        return ev;
+    }
+
+    // Connect to nodeId on the remote reached through fd. Returns true on success.
+    bool start(int fd, uint nodeId)
+    {
+        static bool inited = false;
+        if (!inited) {
+            pw_init(nullptr, nullptr);
+            inited = true;
+        }
+        loop = pw_thread_loop_new("ak-cowork-pw", nullptr);
+        if (!loop) {
+            return false;
+        }
+        context = pw_context_new(pw_thread_loop_get_loop(loop), nullptr, 0);
+        if (!context) {
+            return false;
+        }
+        // Order matters: pw_thread_loop_start() must run WITHOUT the lock held — it waits
+        // for the loop thread to reach its running state, and the loop thread cannot make
+        // progress while we hold the lock. Locking first deadlocks start() forever (the
+        // pthread is created but start() never returns, so the portal callback never
+        // replies → "desktop portal timed out"). Start first, THEN lock for the API calls.
+        if (pw_thread_loop_start(loop) < 0) {
+            return false;
+        }
+        pw_thread_loop_lock(loop);
+        // pw_context_connect_fd takes ownership of the fd, so hand it a dup.
+        core = pw_context_connect_fd(context, fcntl_dup(fd), nullptr, 0);
+        if (!core) {
+            pw_thread_loop_unlock(loop);
+            return false;
+        }
+        stream = pw_stream_new(core, "ak-cowork-drain", nullptr);
+        if (!stream) {
+            pw_thread_loop_unlock(loop);
+            return false;
+        }
+        pw_stream_add_listener(stream, &streamListener, &events(), this);
+
+        // Minimal video param: accept any raw video format/size — we drop frames, so we
+        // do not care about the actual format, only that the stream connects.
+        uint8_t buffer[1024];
+        spa_pod_builder pb = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+        const spa_pod *params[1];
+        params[0] = reinterpret_cast<const spa_pod *>(spa_pod_builder_add_object(
+            &pb, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
+            SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
+            SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw)));
+
+        const int rc = pw_stream_connect(
+            stream, PW_DIRECTION_INPUT, nodeId,
+            static_cast<pw_stream_flags>(PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS),
+            params, 1);
+        pw_thread_loop_unlock(loop);
+        return rc >= 0;
+    }
+
+    void stop()
+    {
+        if (loop) {
+            pw_thread_loop_lock(loop);
+        }
+        if (stream) {
+            pw_stream_destroy(stream);
+            stream = nullptr;
+        }
+        if (core) {
+            pw_core_disconnect(core);
+            core = nullptr;
+        }
+        if (loop) {
+            pw_thread_loop_unlock(loop);
+            pw_thread_loop_stop(loop);
+        }
+        if (context) {
+            pw_context_destroy(context);
+            context = nullptr;
+        }
+        if (loop) {
+            pw_thread_loop_destroy(loop);
+            loop = nullptr;
+        }
+    }
+
+    // dup wrapper kept local so the only <fcntl.h>/<unistd.h> usage lives here.
+    static int fcntl_dup(int fd) { return ::dup(fd); }
+};
+#endif // AK_HAVE_PIPEWIRE
 
 CoworkPortal::CoworkPortal(CoreClient *core, QWidget *topLevel, QObject *parent)
     : QObject(parent), m_core(core), m_topLevel(topLevel)
 {
     connect(m_core, &CoreClient::notification, this, &CoworkPortal::onNotification);
-    m_idleTimer.setSingleShot(true);
-    m_idleTimer.setInterval(kInjectIdleMs);
-    connect(&m_idleTimer, &QTimer::timeout, this, [this] {
-        if (m_rdReady || m_rdStarting) {
-            teardownRemoteDesktop();
-        }
-    });
+    // No idle teardown: once the user approves the remote-control + screen-share portal
+    // once, the session is kept alive for the whole app run so we never re-prompt during
+    // an interaction (a remote-desktop session cannot persist across restarts anyway).
+    // The kill-switch (and app exit) are the only teardown points.
+    // Timed (profiled-motion) playback: one op per tick, never blocking the event loop.
+    m_playTimer.setSingleShot(true);
+    connect(&m_playTimer, &QTimer::timeout, this, &CoworkPortal::playbackTick);
 }
 
 CoworkPortal::~CoworkPortal()
 {
+    // Release the screencast/PipeWire resources and cancel any playback timer before we
+    // go (closeSessionOnly does all of this and is safe with no live session).
+    closeSessionOnly();
     restoreAtspiStatus();
 }
 
@@ -346,6 +483,11 @@ void CoworkPortal::portalRequest(const QString &iface, const QString &method,
 
     QDBusMessage reply = bus.call(msg);
     if (reply.type() == QDBusMessage::ErrorMessage) {
+        // Log the concrete D-Bus error: a method-level rejection (e.g. an invalid option)
+        // never reaches the Response signal, so without this it reads as a silent
+        // "declined" with no clue why.
+        qWarning("cowork: portal %s.%s failed: %s", qUtf8Printable(iface), qUtf8Printable(method),
+                 qUtf8Printable(reply.errorMessage()));
         waiter->deleteLater();
         cb(2, QVariantMap()); // no Response will arrive; surface the failure now
     }
@@ -358,30 +500,57 @@ uint CoworkPortal::deviceTypesFor(const QJsonArray &ops)
         const QString t = ov.toObject().value(QStringLiteral("t")).toString();
         if (t == QLatin1String("key")) {
             types |= 1u; // keyboard
-        } else if (t == QLatin1String("btn")) {
+        } else if (t == QLatin1String("btn") || t == QLatin1String("move")
+                   || t == QLatin1String("axis") || t == QLatin1String("axis_discrete")) {
             types |= 2u; // pointer
         }
     }
     return types ? types : 1u; // default to keyboard-only — never a bare virtual pointer
 }
 
+bool CoworkPortal::needsScreencastFor(const QJsonArray &ops)
+{
+    // Only absolute motion needs a screencast stream bound to the session; scroll and
+    // relative button events do not. Lazy on purpose — keyboard/button/scroll paths must
+    // never spin up frame capture.
+    for (const QJsonValue &ov : ops) {
+        if (ov.toObject().value(QStringLiteral("t")).toString() == QLatin1String("move")) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void CoworkPortal::handleInject(const QJsonObject &req)
 {
     const QString corrId = req.value(QStringLiteral("corrId")).toString();
     const QJsonArray ops = req.value(QStringLiteral("ops")).toArray();
-    m_idleTimer.start(); // (re)arm the idle teardown on any inject activity
 
     if (m_rdReady && !m_rdSession.isEmpty()) {
         const uint needed = deviceTypesFor(ops);
-        if ((needed & ~m_rdTypes) == 0) {
-            // The live session already owns every device these ops use.
-            runInjectOps(ops);
-            replyResult(corrId, QStringLiteral("inject"), true, QString());
+        const bool needSc = needsScreencastFor(ops);
+        if ((needed & ~m_rdTypes) == 0 && (!needSc || m_scReady)) {
+            // If a timed playback is in flight, queue this batch behind it so ops do not
+            // interleave and the active playback's corrId is never clobbered; the queue is
+            // re-flushed when playback drains (playbackTick → flushInjectQueue).
+            if (!m_playCorrId.isEmpty()) {
+                m_injectQueue.append({corrId, ops});
+                return;
+            }
+            // The live session already owns every device these ops use AND has the
+            // screencast stream a move needs (if any).
+            runInjectOps(corrId, ops);
+            // runInjectOps replies itself when it starts a non-blocking timed playback;
+            // otherwise (synchronous fast path) it returns having done nothing async, so
+            // we reply here. It signals that by leaving m_playCorrId == corrId.
+            if (m_playCorrId != corrId) {
+                replyResult(corrId, QStringLiteral("inject"), true, QString());
+            }
             return;
         }
-        // The batch needs a device the session was not started with (e.g. a click
-        // arriving on a keyboard-only session). Drop the session — keeping the queue
-        // intact — and rebuild it below with the wider device set.
+        // The batch needs a device — or a screencast stream — the session was not started
+        // with (e.g. a click or a move arriving on a keyboard-only session). Drop the
+        // session, keeping the queue intact, and rebuild it below with the wider set.
         closeSessionOnly();
     }
     m_injectQueue.append({corrId, ops});
@@ -395,23 +564,23 @@ void CoworkPortal::startRemoteDesktop()
     m_rdStarting = true;
     const QString sessToken = QStringLiteral("aks%1").arg(QRandomGenerator::global()->generate());
 
-    // Request only the device types the queued work actually needs. The common case
-    // (typing / media / navigation keys) is keyboard-only, so no virtual pointer is
-    // created in the compositor — the cursor cannot be wedged by a phantom pointer.
-    uint types = 0;
-    for (const auto &pi : std::as_const(m_injectQueue)) {
-        types |= deviceTypesFor(pi.ops);
-    }
-    if (types == 0) {
-        types = 1u;
-    }
-    const uint startTypes = types;
+    // Stand up the FULL session up-front — keyboard | pointer + screencast — so the user
+    // approves the portal's remote-control + screen-share dialog ONCE and every later
+    // action (type, click, move, scroll, drag) reuses this session with no further
+    // prompts, for the whole app run. This deliberately trades the old lazy/minimal set
+    // (which re-prompted on every escalation: keyboard→+pointer→+screencast) for a single
+    // up-front grant. A positioned pointer bound to a screencast stream is the safe,
+    // intended usage (plan 09); the cursor-freeze risk was a *bare* unpositioned pointer,
+    // which this path never creates. deviceTypesFor/needsScreencastFor remain for the
+    // reuse check in handleInject.
+    const uint startTypes = 3u;        // keyboard | pointer
+    const bool wantScreencast = true;  // absolute motion needs a bound screencast stream
 
     QVariantMap createOpts;
     createOpts.insert(QStringLiteral("session_handle_token"), sessToken);
 
     portalRequest(QStringLiteral("org.freedesktop.portal.RemoteDesktop"), QStringLiteral("CreateSession"),
-                  {}, createOpts, [this, startTypes](uint code, const QVariantMap &results) {
+                  {}, createOpts, [this, startTypes, wantScreencast](uint code, const QVariantMap &results) {
         if (code != 0) {
             failInjectQueue(i18n("the remote-control session could not be created"));
             return;
@@ -426,22 +595,81 @@ void CoworkPortal::startRemoteDesktop()
         selOpts.insert(QStringLiteral("types"), startTypes);
         portalRequest(QStringLiteral("org.freedesktop.portal.RemoteDesktop"), QStringLiteral("SelectDevices"),
                       {QVariant::fromValue(QDBusObjectPath(m_rdSession))}, selOpts,
-                      [this, startTypes](uint code2, const QVariantMap &) {
+                      [this, startTypes, wantScreencast](uint code2, const QVariantMap &) {
             if (code2 != 0) {
                 failInjectQueue(i18n("input devices were not granted"));
                 return;
             }
-            portalRequest(QStringLiteral("org.freedesktop.portal.RemoteDesktop"), QStringLiteral("Start"),
-                          {QVariant::fromValue(QDBusObjectPath(m_rdSession)), parentWindowHandle()},
-                          QVariantMap(), [this, startTypes](uint code3, const QVariantMap &) {
-                m_rdStarting = false;
-                if (code3 != 0) {
-                    failInjectQueue(i18n("remote control was declined"));
+            // The Start step is shared by both paths; capture it so SelectSources can
+            // chain into it (screencast path) or we can call it directly (input-only).
+            auto doStart = [this, startTypes, wantScreencast]() {
+                portalRequest(QStringLiteral("org.freedesktop.portal.RemoteDesktop"), QStringLiteral("Start"),
+                              {QVariant::fromValue(QDBusObjectPath(m_rdSession)), parentWindowHandle()},
+                              QVariantMap(),
+                              [this, startTypes, wantScreencast](uint code3, const QVariantMap &startResults) {
+                    m_rdStarting = false;
+                    // The session may have been torn down while the user sat on the portal
+                    // dialog (idle-timeout / kill-switch). Don't parse streams or stand up a
+                    // PipeWire consumer against a dead session — that would leak an fd and a
+                    // consumer thread bound to nothing.
+                    if (m_rdSession.isEmpty()) {
+                        failInjectQueue(i18n("desktop control was stopped"));
+                        return;
+                    }
+                    if (code3 != 0) {
+                        failInjectQueue(i18n("remote control was declined"));
+                        return;
+                    }
+                    m_rdReady = true;
+                    m_rdTypes = startTypes;
+                    if (wantScreencast) {
+                        // Parse the captured monitor streams (a(ua{sv})) — our coordinate
+                        // map. No restore_token to stash: remote-desktop sessions can't
+                        // persist (see SelectSources above), so each session is fresh.
+                        parseStreams(startResults.value(QStringLiteral("streams")));
+                        m_scReady = !m_streams.isEmpty();
+                        if (m_scReady) {
+                            // Open the PipeWire remote and (SPIKE-1) keep one stream
+                            // consumed so KWin honours absolute motion.
+                            m_pwFd = openPipeWireRemote();
+#ifdef AK_HAVE_PIPEWIRE
+                            if (m_pwFd >= 0) {
+                                startPwConsumer(m_streams.first().nodeId);
+                            }
+#endif
+                        }
+                    }
+                    flushInjectQueue();
+                });
+            };
+
+            if (!wantScreencast) {
+                doStart();
+                return;
+            }
+            // Screencast.SelectSources on the SAME session before Start, so the granted
+            // streams arrive in Start's results bound to this RemoteDesktop session.
+            QVariantMap scOpts;
+            scOpts.insert(QStringLiteral("types"), 1u);            // MONITOR
+            scOpts.insert(QStringLiteral("multiple"), true);       // all outputs → multi-monitor
+            // cursor_mode 4 = METADATA: we never render frames, so we only want cursor
+            // metadata, not it composited in. SPIKE-3: if the hardware cursor stops
+            // following absolute motion, fall back to EMBEDDED (2).
+            scOpts.insert(QStringLiteral("cursor_mode"), 4u);
+            // Do NOT request persist_mode/restore_token: xdg-desktop-portal-kde rejects
+            // SelectSources with InvalidArgument "Remote desktop sessions cannot persist"
+            // — a combined RemoteDesktop+ScreenCast session is inherently non-persistent.
+            // (Verified live: with persist_mode the call errors before any dialog, which
+            // read as a silent decline.) We re-prompt per new session and lean on the 60s
+            // idle timer to keep an approved session alive across a burst of pointer ops.
+            portalRequest(QStringLiteral("org.freedesktop.portal.ScreenCast"), QStringLiteral("SelectSources"),
+                          {QVariant::fromValue(QDBusObjectPath(m_rdSession))}, scOpts,
+                          [this, doStart](uint codeSc, const QVariantMap &) {
+                if (codeSc != 0) {
+                    failInjectQueue(i18n("screen capture for cursor control was declined"));
                     return;
                 }
-                m_rdReady = true;
-                m_rdTypes = startTypes;
-                flushInjectQueue();
+                doStart();
             });
         });
     });
@@ -483,21 +711,262 @@ void CoworkPortal::notifyButton(int button, uint state)
     }
 }
 
-void CoworkPortal::runInjectOps(const QJsonArray &ops)
+void CoworkPortal::notifyPointerMotionAbsolute(uint streamNodeId, double x, double y)
 {
     if (m_rdSession.isEmpty()) {
         return;
     }
-    for (const QJsonValue &ov : ops) {
-        const QJsonObject op = ov.toObject();
-        const QString t = op.value(QStringLiteral("t")).toString();
-        const uint state = uint(op.value(QStringLiteral("state")).toInt());
-        if (t == QLatin1String("key")) {
-            notifyKeysym(op.value(QStringLiteral("keysym")).toInt(), state);
-        } else if (t == QLatin1String("btn")) {
-            notifyButton(op.value(QStringLiteral("button")).toInt(), state);
+    QDBusMessage msg = QDBusMessage::createMethodCall(
+        QString::fromLatin1(kPortalService), QString::fromLatin1(kPortalPath),
+        QStringLiteral("org.freedesktop.portal.RemoteDesktop"),
+        QStringLiteral("NotifyPointerMotionAbsolute"));
+    msg.setArguments({QVariant::fromValue(QDBusObjectPath(m_rdSession)), QVariant::fromValue(QVariantMap()),
+                      streamNodeId, x, y});
+    QDBusConnection::sessionBus().asyncCall(msg);
+}
+
+void CoworkPortal::notifyAxis(double dx, double dy)
+{
+    if (m_rdSession.isEmpty()) {
+        return;
+    }
+    QDBusMessage msg = QDBusMessage::createMethodCall(
+        QString::fromLatin1(kPortalService), QString::fromLatin1(kPortalPath),
+        QStringLiteral("org.freedesktop.portal.RemoteDesktop"), QStringLiteral("NotifyPointerAxis"));
+    msg.setArguments({QVariant::fromValue(QDBusObjectPath(m_rdSession)), QVariant::fromValue(QVariantMap()),
+                      dx, dy});
+    QDBusConnection::sessionBus().asyncCall(msg);
+}
+
+void CoworkPortal::notifyAxisDiscrete(uint axis, int steps)
+{
+    if (m_rdSession.isEmpty()) {
+        return;
+    }
+    QDBusMessage msg = QDBusMessage::createMethodCall(
+        QString::fromLatin1(kPortalService), QString::fromLatin1(kPortalPath),
+        QStringLiteral("org.freedesktop.portal.RemoteDesktop"), QStringLiteral("NotifyPointerAxisDiscrete"));
+    msg.setArguments({QVariant::fromValue(QDBusObjectPath(m_rdSession)), QVariant::fromValue(QVariantMap()),
+                      axis, steps});
+    QDBusConnection::sessionBus().asyncCall(msg);
+}
+
+bool CoworkPortal::globalToStream(int gx, int gy, uint &outNode, double &outLx, double &outLy) const
+{
+    for (const StreamInfo &s : m_streams) {
+        if (gx >= s.originX && gx < s.originX + s.w && gy >= s.originY && gy < s.originY + s.h) {
+            outNode = s.nodeId;
+            // Clamp local coordinates into [0, w-1] / [0, h-1].
+            int lx = gx - s.originX;
+            int ly = gy - s.originY;
+            lx = qBound(0, lx, s.w > 0 ? s.w - 1 : 0);
+            ly = qBound(0, ly, s.h > 0 ? s.h - 1 : 0);
+            outLx = double(lx);
+            outLy = double(ly);
+            return true;
         }
     }
+    return false;
+}
+
+void CoworkPortal::parseStreams(const QVariant &v)
+{
+    // streams is a(ua{sv}): an array of (uint node_id, a{sv} props) structs. Each props
+    // map carries "position" (a (ii) struct → origin) and "size" (a (ii) struct → w,h).
+    m_streams.clear();
+    if (!v.canConvert<QDBusArgument>()) {
+        return;
+    }
+    // MUST be const: QDBusArgument's begin/endStructure() etc. have both a non-const
+    // (marshalling/write) and a const (demarshalling/read) overload taking no args, so on
+    // a NON-const argument C++ picks the WRITE overload — which corrupts the read iterator
+    // ("write from a read-only object") and then aborts in libdbus ("type struct not a
+    // basic type"). A const argument selects the reading overloads.
+    const QDBusArgument arg = v.value<QDBusArgument>();
+    arg.beginArray();
+    while (!arg.atEnd()) {
+        uint nodeId = 0;
+        QVariantMap props;
+        arg.beginStructure();
+        arg >> nodeId >> props;
+        arg.endStructure();
+
+        StreamInfo info;
+        info.nodeId = nodeId;
+
+        // position / size arrive as (ii) structs wrapped in a QDBusArgument.
+        const auto readPair = [](const QVariant &pv, int &a, int &b) {
+            if (!pv.canConvert<QDBusArgument>()) {
+                return;
+            }
+            const QDBusArgument pa = pv.value<QDBusArgument>(); // const → reading overloads
+            pa.beginStructure();
+            pa >> a >> b;
+            pa.endStructure();
+        };
+        if (props.contains(QStringLiteral("position"))) {
+            readPair(props.value(QStringLiteral("position")), info.originX, info.originY);
+        }
+        if (props.contains(QStringLiteral("size"))) {
+            readPair(props.value(QStringLiteral("size")), info.w, info.h);
+        }
+        m_streams.append(info);
+    }
+    arg.endArray();
+}
+
+int CoworkPortal::openPipeWireRemote()
+{
+    // Plain method call (NOT a Request) returning a unix fd — the PipeWire remote.
+    QDBusMessage m = QDBusMessage::createMethodCall(
+        QString::fromLatin1(kPortalService), QString::fromLatin1(kPortalPath),
+        QStringLiteral("org.freedesktop.portal.ScreenCast"), QStringLiteral("OpenPipeWireRemote"));
+    m.setArguments({QVariant::fromValue(QDBusObjectPath(m_rdSession)), QVariant::fromValue(QVariantMap())});
+    QDBusReply<QDBusUnixFileDescriptor> reply = QDBusConnection::sessionBus().call(m);
+    if (!reply.isValid() || !reply.value().isValid()) {
+        return -1;
+    }
+    // QDBusUnixFileDescriptor owns its fd and closes it when destroyed; dup so the fd
+    // outlives this reply.
+    return ::dup(reply.value().fileDescriptor());
+}
+
+#ifdef AK_HAVE_PIPEWIRE
+void CoworkPortal::startPwConsumer(uint nodeId)
+{
+    // SPIKE-1: keep the screencast stream consumed so KWin honours absolute motion. If a
+    // live KWin session proves this is unnecessary, drop this and stopPwConsumer().
+    stopPwConsumer();
+    if (m_pwFd < 0) {
+        return;
+    }
+    m_pwConsumer = new PwConsumer();
+    if (!m_pwConsumer->start(m_pwFd, nodeId)) {
+        m_pwConsumer->stop();
+        delete m_pwConsumer;
+        m_pwConsumer = nullptr;
+    }
+}
+
+void CoworkPortal::stopPwConsumer()
+{
+    if (m_pwConsumer) {
+        m_pwConsumer->stop();
+        delete m_pwConsumer;
+        m_pwConsumer = nullptr;
+    }
+}
+#endif // AK_HAVE_PIPEWIRE
+
+void CoworkPortal::runOneOp(const QJsonObject &op)
+{
+    if (m_rdSession.isEmpty()) {
+        return;
+    }
+    const QString t = op.value(QStringLiteral("t")).toString();
+    const uint state = uint(op.value(QStringLiteral("state")).toInt());
+    if (t == QLatin1String("key")) {
+        notifyKeysym(op.value(QStringLiteral("keysym")).toInt(), state);
+    } else if (t == QLatin1String("btn")) {
+        // Back/forward etc. arrive as larger int codes (0x113/0x114); passed through
+        // unchanged.
+        notifyButton(op.value(QStringLiteral("button")).toInt(), state);
+    } else if (t == QLatin1String("move")) {
+        const int gx = op.value(QStringLiteral("x")).toInt();
+        const int gy = op.value(QStringLiteral("y")).toInt();
+        uint node = 0;
+        double lx = 0.0, ly = 0.0;
+        if (globalToStream(gx, gy, node, lx, ly)) {
+            notifyPointerMotionAbsolute(node, lx, ly);
+            m_ptr = QPoint(gx, gy);
+        } else {
+            // No captured stream contains this point (or no screencast map at all): an
+            // absolute move is impossible without a node id, so skip it.
+            qWarning("cowork: move (%d,%d) has no containing screencast stream; skipped", gx, gy);
+        }
+    } else if (t == QLatin1String("axis")) {
+        notifyAxis(double(op.value(QStringLiteral("dx")).toInt()),
+                   double(op.value(QStringLiteral("dy")).toInt()));
+    } else if (t == QLatin1String("axis_discrete")) {
+        notifyAxisDiscrete(uint(op.value(QStringLiteral("axis")).toInt()),
+                           op.value(QStringLiteral("steps")).toInt());
+    }
+}
+
+void CoworkPortal::runInjectOps(const QString &corrId, const QJsonArray &ops)
+{
+    if (m_rdSession.isEmpty()) {
+        return;
+    }
+    // Fast path: if no op carries delayMs>0, run the whole batch synchronously.
+    bool anyDelay = false;
+    for (const QJsonValue &ov : ops) {
+        if (ov.toObject().value(QStringLiteral("delayMs")).toInt() > 0) {
+            anyDelay = true;
+            break;
+        }
+    }
+    if (!anyDelay) {
+        for (const QJsonValue &ov : ops) {
+            runOneOp(ov.toObject());
+        }
+        return; // caller replies (m_playCorrId stays != corrId)
+    }
+
+    // Timed playback: a profiled move is many move ops each carrying delayMs. Drive one
+    // op per QTimer tick so the Qt event loop never blocks. The reply is sent on drain.
+    stopPlayback(); // a prior playback (if any) is superseded
+    m_playOps = ops;
+    m_playIdx = 0;
+    m_playCorrId = corrId;
+    // Kick the first tick; playbackTick applies op[idx]'s own delayMs before executing.
+    m_playTimer.start(0);
+}
+
+void CoworkPortal::playbackTick()
+{
+    if (m_playIdx >= m_playOps.size() || m_rdSession.isEmpty()) {
+        // Drained (or session gone): reply success once and clear playback state.
+        const QString corrId = m_playCorrId;
+        const bool sessionAlive = !m_rdSession.isEmpty();
+        m_playOps = QJsonArray();
+        m_playIdx = 0;
+        m_playCorrId.clear();
+        if (!corrId.isEmpty()) {
+            replyResult(corrId, QStringLiteral("inject"), true, QString());
+        }
+        // Carry on with any batches that queued behind this timed one.
+        if (sessionAlive && !m_injectQueue.isEmpty()) {
+            flushInjectQueue();
+        }
+        return;
+    }
+    const QJsonObject op = m_playOps.at(m_playIdx).toObject();
+    runOneOp(op);
+    ++m_playIdx;
+    // Schedule the next op after ITS delayMs (the pause applied BEFORE executing it).
+    int nextDelay = 0;
+    if (m_playIdx < m_playOps.size()) {
+        nextDelay = m_playOps.at(m_playIdx).toObject().value(QStringLiteral("delayMs")).toInt();
+    }
+    m_playTimer.start(qMax(0, nextDelay));
+}
+
+void CoworkPortal::stopPlayback()
+{
+    m_playTimer.stop();
+    // If a timed playback is still in flight, its corrId is the ONLY reference to that
+    // batch (it was already taken out of the inject queue). Reply now so the core's
+    // runPortal wait resolves immediately instead of hanging until its timeout — this is
+    // the teardown/rebuild path (kill-switch, idle, device/screencast growth). The
+    // supersede caller (runInjectOps) only reaches here with no active playback, so this
+    // never double-replies a live batch.
+    if (!m_playCorrId.isEmpty()) {
+        replyResult(m_playCorrId, QStringLiteral("inject"), false, i18n("desktop control was stopped"));
+    }
+    m_playOps = QJsonArray();
+    m_playIdx = 0;
+    m_playCorrId.clear();
 }
 
 // releaseHeld synthesises a key/button-up for every input still logically pressed.
@@ -520,10 +989,19 @@ void CoworkPortal::releaseHeld()
 
 void CoworkPortal::flushInjectQueue()
 {
-    const auto queued = m_injectQueue;
-    m_injectQueue.clear();
-    for (const auto &pi : queued) {
-        runInjectOps(pi.ops);
+    // Drain queued batches. A batch with no delayMs runs synchronously and is replied to
+    // here. A timed (profiled-motion) batch is handed to runInjectOps, which drives it
+    // off a QTimer and replies on drain — we then stop and re-queue any remaining batches
+    // so the next flush (triggered after playback, see below) carries on. Since timed and
+    // synchronous batches are processed in order, this preserves ordering.
+    while (!m_injectQueue.isEmpty()) {
+        const PendingInject pi = m_injectQueue.takeFirst();
+        runInjectOps(pi.corrId, pi.ops);
+        if (m_playCorrId == pi.corrId) {
+            // Timed playback started for this batch; reply happens on drain. Anything
+            // still queued waits until playback finishes (re-flushed from playbackTick).
+            return;
+        }
         replyResult(pi.corrId, QStringLiteral("inject"), true, QString());
     }
 }
@@ -546,6 +1024,8 @@ void CoworkPortal::failInjectQueue(const QString &err)
 // wider device set without failing the work that triggered the rebuild.
 void CoworkPortal::closeSessionOnly()
 {
+    // Cancel any in-flight timed playback so it cannot drive ops into a torn-down session.
+    stopPlayback();
     if (!m_rdSession.isEmpty()) {
         releaseHeld();
         QDBusMessage msg = QDBusMessage::createMethodCall(
@@ -553,6 +1033,18 @@ void CoworkPortal::closeSessionOnly()
             QStringLiteral("org.freedesktop.portal.Session"), QStringLiteral("Close"));
         QDBusConnection::sessionBus().asyncCall(msg);
     }
+    // Tear down the screencast side: stop the PipeWire consumer, close the remote fd, and
+    // drop the stream map. (No restore token to keep — remote-desktop sessions can't
+    // persist, so the next session re-prompts.)
+#ifdef AK_HAVE_PIPEWIRE
+    stopPwConsumer();
+#endif
+    if (m_pwFd >= 0) {
+        ::close(m_pwFd);
+        m_pwFd = -1;
+    }
+    m_streams.clear();
+    m_scReady = false;
     m_rdSession.clear();
     m_rdReady = false;
     m_rdStarting = false;
@@ -561,7 +1053,6 @@ void CoworkPortal::closeSessionOnly()
 
 void CoworkPortal::teardownRemoteDesktop()
 {
-    m_idleTimer.stop();
     closeSessionOnly();
     failInjectQueue(i18n("desktop control was stopped"));
 }

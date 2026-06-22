@@ -37,6 +37,10 @@ func registerCoworkHandlers(d handlerDeps) {
 		return
 	}
 
+	// Per-thread pointer profiles + last-position mirror + the user's speed/accuracy
+	// bounds, shared by the positioned-pointer handlers below (plan 09 §4).
+	pstate := newPointerState()
+
 	// --- capability RPCs (agent bridge → core; consent-gated) ------------------
 
 	d.srv.Handle("cowork.listWindows", func(ctx context.Context, raw json.RawMessage) (any, error) {
@@ -329,6 +333,31 @@ func registerCoworkHandlers(d handlerDeps) {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
 
+		// Anti-escalation: this low-level path fires buttons wherever the pointer already
+		// sits, so it cannot self-target by coordinate the way the positioned tools do. If
+		// a prior pointer_control move parked the cursor on Agent Kate's own UI, a bare
+		// click here would hit our consent/kill-switch controls — the geometric guard's
+		// blind spot. Fail CLOSED: a bare click is allowed only when the last commanded
+		// pointer position is known AND verified outside every Agent Kate window. If the
+		// position is unknown (no positioned move this session), refuse and steer the agent
+		// to the guarded desktop_click(x,y).
+		if injectHasButton(p.Events) {
+			last, ok := pstate.last(p.ThreadID)
+			if !ok {
+				cw.AuditRefusal(p.ThreadID, cowork.CapInputInject,
+					cowork.Target{Kind: cowork.TargetScreen, Label: "bare click at an unverified pointer position"},
+					"refused: cannot verify where a bare click would land")
+				return nil, ipc.Errorf(codeCoworkDenied,
+					"refused: a bare click fires at the cursor's current position, which can't be verified safe — "+
+						"use desktop_click(x,y) (it targets and guards an exact point), or move the pointer first with desktop_move_pointer")
+			}
+			if err := guardPointerTargets(cw, []point{last}); err != nil {
+				cw.AuditRefusal(p.ThreadID, cowork.CapInputInject,
+					cowork.Target{Kind: cowork.TargetScreen, Label: "bare click at the current pointer"}, err.Error())
+				return nil, ipc.Errorf(codeCoworkDenied, err.Error())
+			}
+		}
+
 		// Resolve the target window's class/title so the self-target guard can refuse
 		// Agent Kate's own UI and the consent prompt can name the window.
 		target := cowork.Target{Kind: cowork.TargetWindow, WindowID: p.TargetWindowID, Label: "the focused window"}
@@ -379,6 +408,272 @@ func registerCoworkHandlers(d handlerDeps) {
 		}
 		cw.AuditCapture(p.ThreadID, cowork.CapInputInject, target, dec.GrantID, hashString(desc))
 		return map[string]any{"ok": true, "actions": desc}, nil
+	})
+
+	// --- control: positioned pointer (move/click/scroll/drag) (R2) ----------------
+	// All of these gate on the single pointer_control capability and route through the
+	// same move+notify ops the UI plays. Coordinates are absolute desktop pixels.
+
+	d.srv.Handle("cowork.movePointer", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID   string               `json:"threadId"`
+			X          int                  `json:"x"`
+			Y          int                  `json:"y"`
+			RelativeTo *pointerRef          `json:"relativeTo"`
+			Profile    *pointerProfilePatch `json:"profile"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		if err := requirePointerControl(d, ctx, p.ThreadID); err != nil {
+			return nil, err
+		}
+		pt, frame, err := resolveGlobalPoint(cw, p.X, p.Y, p.RelativeTo)
+		if err != nil {
+			return nil, err
+		}
+		prof := pstate.resolve(p.ThreadID, p.Profile)
+		ops := pstate.moveOps(p.ThreadID, pt.X, pt.Y, prof, newPointerRNG())
+		desc := fmt.Sprintf("move pointer to (%d,%d)%s", pt.X, pt.Y, frame)
+		// Move-only may pass over Agent Kate's windows (motion has no side effect); only
+		// a click/scroll on them is refused — so no geometric guard here.
+		res, err := runPointerAction(d, ctx, p.ThreadID, pointerTarget(desc), desc, ops, nil)
+		if err == nil {
+			pstate.setLast(p.ThreadID, pt)
+		}
+		return res, err
+	})
+
+	d.srv.Handle("cowork.pointerClick", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID   string               `json:"threadId"`
+			X          int                  `json:"x"`
+			Y          int                  `json:"y"`
+			Button     string               `json:"button"`
+			Count      int                  `json:"count"`
+			RelativeTo *pointerRef          `json:"relativeTo"`
+			Profile    *pointerProfilePatch `json:"profile"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		if err := requirePointerControl(d, ctx, p.ThreadID); err != nil {
+			return nil, err
+		}
+		code, err := buttonCodeFor(p.Button)
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		pt, frame, err := resolveGlobalPoint(cw, p.X, p.Y, p.RelativeTo)
+		if err != nil {
+			return nil, err
+		}
+		count := p.Count
+		if count < 1 {
+			count = 1
+		}
+		if count > 3 {
+			count = 3
+		}
+		prof := pstate.resolve(p.ThreadID, p.Profile)
+		ops := clickOps(pstate.moveOps(p.ThreadID, pt.X, pt.Y, prof, newPointerRNG()), code, count, prof.SettleMs)
+		click := buttonName(code) + "-click"
+		if count == 2 {
+			click = "double " + click
+		} else if count > 2 {
+			click = fmt.Sprintf("%d× %s", count, click)
+		}
+		desc := fmt.Sprintf("%s at (%d,%d)%s", click, pt.X, pt.Y, frame)
+		res, err := runPointerAction(d, ctx, p.ThreadID, pointerTarget(desc), desc, ops, []point{pt})
+		if err == nil {
+			pstate.setLast(p.ThreadID, pt)
+		}
+		return res, err
+	})
+
+	d.srv.Handle("cowork.pointerClickElement", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID  string               `json:"threadId"`
+			ElementID string               `json:"elementId"`
+			Button    string               `json:"button"`
+			Anchor    string               `json:"anchor"` // center (default), corners, edge midpoints
+			Dx        int                  `json:"dx"`     // pixel nudge from the anchor
+			Dy        int                  `json:"dy"`
+			Profile   *pointerProfilePatch `json:"profile"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		if err := requirePointerControl(d, ctx, p.ThreadID); err != nil {
+			return nil, err
+		}
+		if p.ElementID == "" {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "elementId is required (from desktop_list_elements)")
+		}
+		code, err := buttonCodeFor(p.Button)
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		// TOCTOU re-check: re-resolve the element's live bounds (it may have moved/gone).
+		info, rect, ok, err := cw.KDE().ElementBounds(p.ElementID, 8*time.Second)
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		if !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "the element has no on-screen bounds to click (re-list elements)")
+		}
+		// Resolve the owning window (for the consent prompt's class/title AND to translate
+		// AT-SPI's surface-relative bounds into the global pixels the pointer uses).
+		target, elemLabel, ownWin, haveWin := elementTargetWindow(cw, info)
+		// Click point = the chosen anchor on the element + a pixel nudge, all translated to
+		// global. anchor=center+(0,0) reproduces the old "click the middle" behaviour.
+		ax, ay := anchorPoint(rect, p.Anchor)
+		ox, oy := elementGlobalOffset(rect, ownWin, haveWin)
+		cx, cy := ax+ox+p.Dx, ay+oy+p.Dy
+		prof := pstate.resolve(p.ThreadID, p.Profile)
+		ops := clickOps(pstate.moveOps(p.ThreadID, cx, cy, prof, newPointerRNG()), code, 1, prof.SettleMs)
+		desc := fmt.Sprintf("%s-click %s at (%d,%d)", buttonName(code), elemLabel, cx, cy)
+		target.Label = orDefault(target.Label, "the focused window")
+		dec, err := cw.Authorize(ctx, cowork.AuthRequest{
+			ThreadID: p.ThreadID, Capability: cowork.CapPointerControl,
+			Target: target, SuggestedScope: cowork.ScopeOnce,
+			ActionPreview: &cowork.ActionDescriptor{
+				Mechanism: "pointer_control", AppName: target.ResourceClass,
+				WindowTitle: target.Label, Element: elemLabel, Detail: desc,
+			},
+		})
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		if !dec.Allow {
+			return nil, ipc.Errorf(codeCoworkDenied, dec.Reason)
+		}
+		if err := guardPointerTargets(cw, []point{{cx, cy}}); err != nil {
+			cw.AuditRefusal(p.ThreadID, cowork.CapPointerControl, target, err.Error())
+			return nil, ipc.Errorf(codeCoworkDenied, err.Error())
+		}
+		if _, err := runPortal(d, ctx, "inject", map[string]any{"threadId": p.ThreadID, "ops": ops}, 45*time.Second); err != nil {
+			return nil, err
+		}
+		pstate.setLast(p.ThreadID, point{cx, cy})
+		cw.AuditCapture(p.ThreadID, cowork.CapPointerControl, target, dec.GrantID, hashString(desc))
+		return map[string]any{"ok": true, "action": desc, "element": elemLabel}, nil
+	})
+
+	d.srv.Handle("cowork.scroll", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID   string      `json:"threadId"`
+			DX         int         `json:"dx"` // horizontal wheel notches (sign = direction)
+			DY         int         `json:"dy"` // vertical wheel notches (sign = direction)
+			X          *int        `json:"x"`  // optional: move here first
+			Y          *int        `json:"y"`
+			RelativeTo *pointerRef `json:"relativeTo"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		if err := requirePointerControl(d, ctx, p.ThreadID); err != nil {
+			return nil, err
+		}
+		if p.DX == 0 && p.DY == 0 {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "dx and dy are both zero — nothing to scroll")
+		}
+		var ops []map[string]any
+		var at point
+		switch {
+		case p.X != nil && p.Y != nil:
+			pt, _, err := resolveGlobalPoint(cw, *p.X, *p.Y, p.RelativeTo)
+			if err != nil {
+				return nil, err
+			}
+			at = pt
+			prof := pstate.resolve(p.ThreadID, nil)
+			ops = append(ops, pstate.moveOps(p.ThreadID, at.X, at.Y, prof, newPointerRNG())...)
+		default:
+			// Scroll lands at the current pointer position; we must know it to run the
+			// geometric guard (a scroll on Agent Kate's UI is refused). Fail closed.
+			last, ok := pstate.last(p.ThreadID)
+			if !ok {
+				return nil, ipc.Errorf(ipc.CodeInvalidParams,
+					"pass x,y (or move the pointer first) so the scroll location can be verified")
+			}
+			at = last
+		}
+		if p.DY != 0 {
+			ops = append(ops, scrollOp(0, p.DY))
+		}
+		if p.DX != 0 {
+			ops = append(ops, scrollOp(1, p.DX))
+		}
+		desc := fmt.Sprintf("scroll vertical %d / horizontal %d notches at (%d,%d)", p.DY, p.DX, at.X, at.Y)
+		res, err := runPointerAction(d, ctx, p.ThreadID, pointerTarget(desc), desc, ops, []point{at})
+		if err == nil {
+			pstate.setLast(p.ThreadID, at)
+		}
+		return res, err
+	})
+
+	d.srv.Handle("cowork.pointerDrag", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID   string               `json:"threadId"`
+			FromX      int                  `json:"fromX"`
+			FromY      int                  `json:"fromY"`
+			ToX        int                  `json:"toX"`
+			ToY        int                  `json:"toY"`
+			RelativeTo *pointerRef          `json:"relativeTo"` // shared frame for both endpoints
+			Profile    *pointerProfilePatch `json:"profile"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		if err := requirePointerControl(d, ctx, p.ThreadID); err != nil {
+			return nil, err
+		}
+		from, _, err := resolveGlobalPoint(cw, p.FromX, p.FromY, p.RelativeTo)
+		if err != nil {
+			return nil, err
+		}
+		to, frame, err := resolveGlobalPoint(cw, p.ToX, p.ToY, p.RelativeTo)
+		if err != nil {
+			return nil, err
+		}
+		prof := pstate.resolve(p.ThreadID, p.Profile)
+		ops := pstate.dragOps(p.ThreadID, from, to, prof, newPointerRNG())
+		desc := fmt.Sprintf("drag from (%d,%d) to (%d,%d)%s", from.X, from.Y, to.X, to.Y, frame)
+		res, err := runPointerAction(d, ctx, p.ThreadID, pointerTarget(desc), desc, ops, []point{from, to})
+		if err == nil {
+			pstate.setLast(p.ThreadID, to)
+		}
+		return res, err
+	})
+
+	d.srv.Handle("cowork.setPointerProfile", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID string `json:"threadId"`
+			pointerProfilePatch
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		// Setting a session preference performs no desktop action, so it only needs the
+		// bridge gate (no consent prompt), but the thread must have Cowork enabled.
+		if err := requireCoworkBridge(d, ctx, p.ThreadID); err != nil {
+			return nil, err
+		}
+		eff := pstate.setThreadProfile(p.ThreadID, &p.pointerProfilePatch)
+		return map[string]any{"ok": true, "profile": eff}, nil
+	})
+
+	d.srv.Handle("cowork.setPointerBounds", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUI(d, ctx); err != nil {
+			return nil, err
+		}
+		var patch pointerProfilePatch
+		if err := json.Unmarshal(raw, &patch); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		eff := pstate.setBounds(&patch)
+		return map[string]any{"ok": true, "bounds": eff}, nil
 	})
 
 	// --- AT-SPI element index + cursor-free activation (R1 read / R2 act) ---------
@@ -627,7 +922,17 @@ func resolveTargetWindow(cw *cowork.Service, windowID string) (kde.Window, bool)
 // self-target guard (refuse Agent Kate's own UI) and the R2 consent prompt have a
 // resourceClass + title. Returns the consent Target and a human label for the element.
 func elementTarget(cw *cowork.Service, info kde.ElementContext) (cowork.Target, string) {
+	t, label, _, _ := elementTargetWindow(cw, info)
+	return t, label
+}
+
+// elementTargetWindow is elementTarget plus the resolved owning KWin window (and whether
+// one was found) — the pointer-click path needs the window's global origin to translate
+// AT-SPI's surface-relative element bounds into global desktop pixels.
+func elementTargetWindow(cw *cowork.Service, info kde.ElementContext) (cowork.Target, string, kde.Window, bool) {
 	t := cowork.Target{Kind: cowork.TargetApp, Label: "the focused window"}
+	var win kde.Window
+	found := false
 	if info.PID > 0 {
 		if wins, err := cw.KDE().ListWindows(4 * time.Second); err == nil {
 			for _, w := range wins {
@@ -636,6 +941,7 @@ func elementTarget(cw *cowork.Service, info kde.ElementContext) (cowork.Target, 
 					if w.Caption != "" {
 						t.Label = w.Caption
 					}
+					win, found = w, true
 					break
 				}
 			}
@@ -648,7 +954,100 @@ func elementTarget(cw *cowork.Service, info kde.ElementContext) (cowork.Target, 
 	if label == "" {
 		label = "element"
 	}
-	return t, label
+	return t, label, win, found
+}
+
+// elementGlobalOffset returns the (ox,oy) to add to an element's AT-SPI coords to get
+// global desktop pixels. On Wayland a client cannot know its own global position, so
+// AT-SPI reports element bounds relative to the owning window's surface; when the
+// element's center falls OUTSIDE the owning window's global rect it is surface-relative
+// and we add the window origin. On X11 (already global, center inside the window) the
+// offset is zero.
+func elementGlobalOffset(rect kde.Rect, win kde.Window, haveWin bool) (int, int) {
+	if !haveWin || win.Width <= 0 || win.Height <= 0 {
+		return 0, 0
+	}
+	cx, cy := rect.X+rect.W/2, rect.Y+rect.H/2
+	inside := cx >= win.X && cy >= win.Y && cx < win.X+win.Width && cy < win.Y+win.Height
+	if inside {
+		return 0, 0
+	}
+	return win.X, win.Y
+}
+
+// elementCenterGlobal returns the element's center as a global-desktop-pixel point.
+func elementCenterGlobal(rect kde.Rect, win kde.Window, haveWin bool) (int, int) {
+	ox, oy := elementGlobalOffset(rect, win, haveWin)
+	return rect.X + rect.W/2 + ox, rect.Y + rect.H/2 + oy
+}
+
+// anchorPoint returns a point on the element's bounds (in the element's own AT-SPI coord
+// space) for the named anchor — center (default), the four corners, the four edge
+// midpoints. Combined with elementGlobalOffset + a dx/dy nudge this lets the agent click
+// a sub-region (a dropdown arrow at the right edge, just below a label, a drag handle).
+func anchorPoint(rect kde.Rect, anchor string) (int, int) {
+	cx, cy := rect.X+rect.W/2, rect.Y+rect.H/2
+	switch strings.ToLower(strings.TrimSpace(anchor)) {
+	case "topleft":
+		return rect.X, rect.Y
+	case "top":
+		return cx, rect.Y
+	case "topright":
+		return rect.X + rect.W, rect.Y
+	case "left":
+		return rect.X, cy
+	case "right":
+		return rect.X + rect.W, cy
+	case "bottomleft":
+		return rect.X, rect.Y + rect.H
+	case "bottom":
+		return cx, rect.Y + rect.H
+	case "bottomright":
+		return rect.X + rect.W, rect.Y + rect.H
+	}
+	return cx, cy // "center" / default
+}
+
+// pointerRef is an optional reference frame for a pointer coordinate: relative to a
+// window's top-left, or offset from an element's center. Empty → the coordinate is
+// already a global desktop pixel. This lets the agent target points in the frame it
+// actually perceives (a window it is looking at, or an element from desktop_list_elements)
+// and have the core translate to global — including spots with no element of their own
+// (a canvas, a map, a video scrubber).
+type pointerRef struct {
+	Window  string `json:"window"`
+	Element string `json:"element"`
+}
+
+// resolveGlobalPoint maps (x,y) in ref's frame to a global desktop point, plus a short
+// human description of the frame (for the audit log + consent prompt). A nil/empty ref
+// means (x,y) is already global.
+func resolveGlobalPoint(cw *cowork.Service, x, y int, ref *pointerRef) (point, string, error) {
+	if ref == nil || (ref.Window == "" && ref.Element == "") {
+		return point{x, y}, "", nil
+	}
+	if ref.Element != "" {
+		info, rect, ok, err := cw.KDE().ElementBounds(ref.Element, 8*time.Second)
+		if err != nil {
+			return point{}, "", ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		if !ok {
+			return point{}, "", ipc.Errorf(ipc.CodeInvalidParams, "the reference element has no on-screen bounds")
+		}
+		_, _, win, haveWin := elementTargetWindow(cw, info)
+		ex, ey := elementCenterGlobal(rect, win, haveWin)
+		label := strings.TrimSpace(strings.TrimSpace(info.Role) + " " + info.Name)
+		if label == "" {
+			label = "element"
+		}
+		return point{ex + x, ey + y}, fmt.Sprintf(" (rel. to %s)", label), nil
+	}
+	w, ok := resolveTargetWindow(cw, ref.Window)
+	if !ok {
+		return point{}, "", ipc.Errorf(ipc.CodeInvalidParams,
+			"the reference window was not found (use a windowId from desktop_list_windows)")
+	}
+	return point{w.X + x, w.Y + y}, " (rel. to window)", nil
 }
 
 // requireCoworkBridge enforces: the caller is an agent bridge (not the UI), bound to
@@ -673,6 +1072,62 @@ func requireUI(d handlerDeps, ctx context.Context) error {
 		return ipc.Errorf(codeCoworkDenied, "this action may only be performed from the Agent Kate window")
 	}
 	return nil
+}
+
+// requirePointerControl is the common front gate for the positioned-pointer handlers:
+// the caller is the agent bridge for an opted-in thread and the desktop is reachable.
+func requirePointerControl(d handlerDeps, ctx context.Context, threadID string) error {
+	if err := requireCoworkBridge(d, ctx, threadID); err != nil {
+		return err
+	}
+	if !d.cowork.Available() {
+		return ipc.Errorf(codeCoworkDenied, "desktop integration unavailable (no KDE session bus)")
+	}
+	return nil
+}
+
+// pointerTarget builds the consent/audit Target for a coordinate-addressed action. The
+// geometric self-target guard (guardPointerTargets), not the Target's class, is what
+// protects Agent Kate's own UI here — raw coordinates carry no resourceClass.
+func pointerTarget(label string) cowork.Target {
+	return cowork.Target{Kind: cowork.TargetScreen, Label: label}
+}
+
+// runPointerAction is the shared tail for the positioned-pointer handlers: it gates the
+// action under the R2 pointer_control capability, enforces the geometric self-target
+// guard against LIVE geometry for each action point, plays the ops through the UI portal,
+// and audits the literal target. guardPts is nil for a pure move (which may pass over
+// Agent Kate's windows — only a click/scroll on them is dangerous).
+func runPointerAction(d handlerDeps, ctx context.Context, threadID string, target cowork.Target, desc string, ops []map[string]any, guardPts []point) (any, error) {
+	cw := d.cowork
+	dec, err := cw.Authorize(ctx, cowork.AuthRequest{
+		ThreadID:       threadID,
+		Capability:     cowork.CapPointerControl,
+		Target:         target,
+		SuggestedScope: cowork.ScopeOnce,
+		ActionPreview: &cowork.ActionDescriptor{
+			Mechanism:   "pointer_control",
+			WindowTitle: target.Label,
+			Detail:      desc,
+		},
+	})
+	if err != nil {
+		return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+	}
+	if !dec.Allow {
+		return nil, ipc.Errorf(codeCoworkDenied, dec.Reason)
+	}
+	if len(guardPts) > 0 {
+		if err := guardPointerTargets(cw, guardPts); err != nil {
+			cw.AuditRefusal(threadID, cowork.CapPointerControl, target, err.Error())
+			return nil, ipc.Errorf(codeCoworkDenied, err.Error())
+		}
+	}
+	if _, err := runPortal(d, ctx, "inject", map[string]any{"threadId": threadID, "ops": ops}, 45*time.Second); err != nil {
+		return nil, err
+	}
+	cw.AuditCapture(threadID, cowork.CapPointerControl, target, dec.GrantID, hashString(desc))
+	return map[string]any{"ok": true, "action": desc}, nil
 }
 
 // runPortal runs the core↔UI portal round-trip and returns the UI's result.

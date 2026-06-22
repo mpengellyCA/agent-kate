@@ -83,10 +83,20 @@ ControlConsentDialog::ControlConsentDialog(const QJsonObject &request, QWidget *
     m_allow = buttons->addButton(i18n("Allow once"), QDialogButtonBox::AcceptRole);
     auto *deny = buttons->addButton(i18n("Deny"), QDialogButtonBox::RejectRole);
     m_allow->setEnabled(false);
-    deny->setDefault(true);
-    deny->setFocus();
-    connect(phrase, &QLineEdit::textChanged, this, [this](const QString &t) {
-        m_allow->setEnabled(t.trimmed().compare(kPhrase, Qt::CaseInsensitive) == 0);
+    // Both can be the Enter target; we swap which is the default below as the phrase is
+    // typed. Focus the input so the user can type immediately.
+    m_allow->setAutoDefault(true);
+    deny->setAutoDefault(true);
+    deny->setDefault(true); // until the phrase matches, Enter is the safe Deny
+    phrase->setFocus();
+    connect(phrase, &QLineEdit::textChanged, this, [this, deny](const QString &t) {
+        const bool ok = t.trimmed().compare(kPhrase, Qt::CaseInsensitive) == 0;
+        m_allow->setEnabled(ok);
+        // Once the user has typed the confirmation phrase, pressing Enter must ALLOW
+        // (that is the whole point of typing it) — so make Allow the default and demote
+        // Deny. While the phrase is incomplete, Enter stays the safe Deny.
+        m_allow->setDefault(ok);
+        deny->setDefault(!ok);
     });
     connect(m_allow, &QPushButton::clicked, this, [this] {
         m_allowed = true;

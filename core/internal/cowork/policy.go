@@ -159,5 +159,6 @@ func AllToggleable() []Capability {
 		CapVDSandbox,
 		CapA11yAction,
 		CapInputInject,
+		CapPointerControl,
 	}
 }

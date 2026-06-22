@@ -195,6 +195,159 @@ func coworkToolDefs() []map[string]any {
 				"required": []string{"events"},
 			},
 		},
+		{
+			"name": "desktop_click_element",
+			"description": "Move the real cursor to an element (from desktop_list_elements) and " +
+				"click it. PREFER desktop_activate_element first — it fires the element's own " +
+				"action with NO cursor movement and is more reliable. Use this when a real click " +
+				"is required: to open a link in a NEW TAB pass button:\"middle\" (or hold Ctrl with " +
+				"desktop_inject_input then click), or for hover/canvas/drag UIs that ignore the " +
+				"accessibility action. By default it clicks the element's center; use anchor + " +
+				"dx/dy to hit a sub-region — e.g. anchor:\"right\",dx:-12 for a combo box's dropdown " +
+				"arrow, or anchor:\"bottom\",dy:8 to click just below it. Re-checks the element's " +
+				"live position before clicking. Buttons: left (default), right, middle, back, " +
+				"forward. Highest-risk capability ('pointer_control'): refused unless the user " +
+				"switched on the toggle in the Cowork panel, or approves. Refuses Agent Kate's own window.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"elementId": map[string]any{"type": "string", "description": "Element id from desktop_list_elements."},
+					"button":    map[string]any{"type": "string", "enum": []string{"left", "right", "middle", "back", "forward"}, "description": "Mouse button (default left). middle opens links in a new tab."},
+					"anchor":    map[string]any{"type": "string", "enum": []string{"center", "topleft", "top", "topright", "left", "right", "bottomleft", "bottom", "bottomright"}, "description": "Which point of the element to aim at (default center)."},
+					"dx":        map[string]any{"type": "integer", "description": "Pixel nudge from the anchor, +x = right (default 0)."},
+					"dy":        map[string]any{"type": "integer", "description": "Pixel nudge from the anchor, +y = down (default 0)."},
+					"profile":   pointerProfileSchema(),
+				},
+				"required": []string{"elementId"},
+			},
+		},
+		{
+			"name": "desktop_click",
+			"description": "Move the real cursor to an absolute desktop pixel (x,y) and click. Use " +
+				"this ONLY when there is no targetable element — a <canvas>, <video>, map widget, " +
+				"game, or an app with a broken/absent accessibility tree. When the target is a " +
+				"link or button, PREFER desktop_click_element (by id) or desktop_activate_element " +
+				"so you don't have to guess pixels. Coordinates are global desktop pixels, the same " +
+				"space as desktop_screenshot. button: left " +
+				"(default), right, middle (opens links in a new tab), back, forward. count:2 = " +
+				"double-click. By default x,y are GLOBAL desktop pixels; pass relativeTo to give " +
+				"them in a window's or element's frame instead (often easier and matches " +
+				"desktop_list_elements coordinates). Highest-risk capability ('pointer_control'); " +
+				"refuses Agent Kate's own window.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"x":          map[string]any{"type": "integer", "description": "x pixel (global, or in relativeTo's frame)."},
+					"y":          map[string]any{"type": "integer", "description": "y pixel (global, or in relativeTo's frame)."},
+					"button":     map[string]any{"type": "string", "enum": []string{"left", "right", "middle", "back", "forward"}, "description": "Mouse button (default left)."},
+					"count":      map[string]any{"type": "integer", "description": "Click count (1 = single, 2 = double; default 1)."},
+					"relativeTo": pointerRefSchema(),
+					"profile":    pointerProfileSchema(),
+				},
+				"required": []string{"x", "y"},
+			},
+		},
+		{
+			"name": "desktop_move_pointer",
+			"description": "Move the real cursor to a point without clicking — e.g. to reveal a " +
+				"hover menu or tooltip. x,y are GLOBAL desktop pixels by default; pass relativeTo " +
+				"to give them in a window's or element's frame instead. Capability 'pointer_control'.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"x":          map[string]any{"type": "integer", "description": "x pixel (global, or in relativeTo's frame)."},
+					"y":          map[string]any{"type": "integer", "description": "y pixel (global, or in relativeTo's frame)."},
+					"relativeTo": pointerRefSchema(),
+					"profile":    pointerProfileSchema(),
+				},
+				"required": []string{"x", "y"},
+			},
+		},
+		{
+			"name": "desktop_scroll",
+			"description": "Scroll the wheel — vertically and/or horizontally — in mouse-wheel " +
+				"notches (sign sets direction: positive dy scrolls down, positive dx scrolls " +
+				"right). Optionally pass x,y to move the cursor there first; otherwise it scrolls " +
+				"at the cursor's current position (you must have moved/clicked first so the " +
+				"location can be verified). x,y are global pixels unless you pass relativeTo. " +
+				"Capability 'pointer_control'.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"dy":         map[string]any{"type": "integer", "description": "Vertical notches (positive = down)."},
+					"dx":         map[string]any{"type": "integer", "description": "Horizontal notches (positive = right)."},
+					"x":          map[string]any{"type": "integer", "description": "Optional: move the cursor to this x first (global, or in relativeTo's frame)."},
+					"y":          map[string]any{"type": "integer", "description": "Optional: move the cursor to this y first."},
+					"relativeTo": pointerRefSchema(),
+				},
+			},
+		},
+		{
+			"name": "desktop_drag",
+			"description": "Press the left button at (fromX,fromY), move to (toX,toY), and release " +
+				"— a drag. For reordering lists, drawing, resizing, or drag-and-drop. Coordinates " +
+				"are global desktop pixels unless you pass relativeTo, which applies to BOTH " +
+				"endpoints (e.g. {\"window\":id} to drag within a window). Capability " +
+				"'pointer_control'; refuses Agent Kate's own window at either endpoint.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"fromX":      map[string]any{"type": "integer"},
+					"fromY":      map[string]any{"type": "integer"},
+					"toX":        map[string]any{"type": "integer"},
+					"toY":        map[string]any{"type": "integer"},
+					"relativeTo": pointerRefSchema(),
+					"profile":    pointerProfileSchema(),
+				},
+				"required": []string{"fromX", "fromY", "toX", "toY"},
+			},
+		},
+		{
+			"name": "desktop_set_pointer_profile",
+			"description": "Set this session's default pointer motion: speed (pixels/second, or 0 " +
+				"for an instant jump), accuracy (1.0 = a straight line that lands exactly; below " +
+				"1.0 = human-like easing/overshoot/jitter, but the click still lands exactly), and " +
+				"settleMs (a pause after arrival before clicking). Most automation wants the " +
+				"default (fast + exact). Values are clamped to the user's configured bounds.",
+			"inputSchema": map[string]any{
+				"type":       "object",
+				"properties": pointerProfileProps(),
+			},
+		},
+	}
+}
+
+// pointerProfileProps is the shared property schema for a movement profile.
+func pointerProfileProps() map[string]any {
+	return map[string]any{
+		"speed":    map[string]any{"type": "number", "description": "Pixels/second; 0 = instant jump (default ~1600)."},
+		"accuracy": map[string]any{"type": "number", "description": "0..1; 1 = straight & exact (default), lower = human-like path."},
+		"settleMs": map[string]any{"type": "integer", "description": "Pause after arrival before a click, in ms (default ~30)."},
+	}
+}
+
+// pointerProfileSchema is an optional per-call movement-profile override object.
+func pointerProfileSchema() map[string]any {
+	return map[string]any{
+		"type":        "object",
+		"description": "Optional movement-profile override for this call (speed/accuracy/settleMs).",
+		"properties":  pointerProfileProps(),
+	}
+}
+
+// pointerRefSchema is an optional reference frame for the x,y of a pointer action.
+func pointerRefSchema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"description": "Optional reference frame for x,y. Omit = global desktop pixels. " +
+			"{\"window\":\"<windowId>\"} = x,y relative to that window's top-left (matches " +
+			"desktop_list_elements coordinates). {\"element\":\"<elementId>\"} = x,y offset from " +
+			"that element's center. The core translates to global and still applies the " +
+			"self-target guard.",
+		"properties": map[string]any{
+			"window":  map[string]any{"type": "string", "description": "windowId from desktop_list_windows."},
+			"element": map[string]any{"type": "string", "description": "elementId from desktop_list_elements."},
+		},
 	}
 }
 
@@ -402,6 +555,166 @@ func (b *mcpBridge) runCoworkTool(name string, args json.RawMessage) (string, er
 			msg += "\nConfigured browsers you can open by name: " + strings.Join(res.Browsers, ", ") + "."
 		}
 		return msg, nil
+
+	case "desktop_move_pointer":
+		var a struct {
+			X          int             `json:"x"`
+			Y          int             `json:"y"`
+			RelativeTo json.RawMessage `json:"relativeTo"`
+			Profile    json.RawMessage `json:"profile"`
+		}
+		_ = json.Unmarshal(args, &a)
+		params := map[string]any{"threadId": b.thread, "x": a.X, "y": a.Y}
+		if len(a.RelativeTo) > 0 {
+			params["relativeTo"] = a.RelativeTo
+		}
+		if len(a.Profile) > 0 {
+			params["profile"] = a.Profile
+		}
+		var res struct {
+			Action string `json:"action"`
+		}
+		if err := b.client.CallTimeout("cowork.movePointer", params, &res, 50*time.Second); err != nil {
+			return "", err
+		}
+		return "Done: " + res.Action + ".", nil
+
+	case "desktop_click":
+		var a struct {
+			X          int             `json:"x"`
+			Y          int             `json:"y"`
+			Button     string          `json:"button"`
+			Count      int             `json:"count"`
+			RelativeTo json.RawMessage `json:"relativeTo"`
+			Profile    json.RawMessage `json:"profile"`
+		}
+		_ = json.Unmarshal(args, &a)
+		params := map[string]any{"threadId": b.thread, "x": a.X, "y": a.Y}
+		if a.Button != "" {
+			params["button"] = a.Button
+		}
+		if a.Count > 0 {
+			params["count"] = a.Count
+		}
+		if len(a.RelativeTo) > 0 {
+			params["relativeTo"] = a.RelativeTo
+		}
+		if len(a.Profile) > 0 {
+			params["profile"] = a.Profile
+		}
+		var res struct {
+			Action string `json:"action"`
+		}
+		if err := b.client.CallTimeout("cowork.pointerClick", params, &res, 50*time.Second); err != nil {
+			return "", err
+		}
+		return "Done: " + res.Action + ".", nil
+
+	case "desktop_click_element":
+		var a struct {
+			ElementID string          `json:"elementId"`
+			Button    string          `json:"button"`
+			Anchor    string          `json:"anchor"`
+			Dx        int             `json:"dx"`
+			Dy        int             `json:"dy"`
+			Profile   json.RawMessage `json:"profile"`
+		}
+		_ = json.Unmarshal(args, &a)
+		params := map[string]any{"threadId": b.thread, "elementId": a.ElementID}
+		if a.Button != "" {
+			params["button"] = a.Button
+		}
+		if a.Anchor != "" {
+			params["anchor"] = a.Anchor
+		}
+		if a.Dx != 0 {
+			params["dx"] = a.Dx
+		}
+		if a.Dy != 0 {
+			params["dy"] = a.Dy
+		}
+		if len(a.Profile) > 0 {
+			params["profile"] = a.Profile
+		}
+		var res struct {
+			Action  string `json:"action"`
+			Element string `json:"element"`
+		}
+		if err := b.client.CallTimeout("cowork.pointerClickElement", params, &res, 50*time.Second); err != nil {
+			return "", err
+		}
+		return "Done: " + res.Action + ".", nil
+
+	case "desktop_scroll":
+		var a struct {
+			DX         int             `json:"dx"`
+			DY         int             `json:"dy"`
+			X          *int            `json:"x"`
+			Y          *int            `json:"y"`
+			RelativeTo json.RawMessage `json:"relativeTo"`
+		}
+		_ = json.Unmarshal(args, &a)
+		params := map[string]any{"threadId": b.thread, "dx": a.DX, "dy": a.DY}
+		if a.X != nil {
+			params["x"] = *a.X
+		}
+		if a.Y != nil {
+			params["y"] = *a.Y
+		}
+		if len(a.RelativeTo) > 0 {
+			params["relativeTo"] = a.RelativeTo
+		}
+		var res struct {
+			Action string `json:"action"`
+		}
+		if err := b.client.CallTimeout("cowork.scroll", params, &res, 40*time.Second); err != nil {
+			return "", err
+		}
+		return "Done: " + res.Action + ".", nil
+
+	case "desktop_drag":
+		var a struct {
+			FromX      int             `json:"fromX"`
+			FromY      int             `json:"fromY"`
+			ToX        int             `json:"toX"`
+			ToY        int             `json:"toY"`
+			RelativeTo json.RawMessage `json:"relativeTo"`
+			Profile    json.RawMessage `json:"profile"`
+		}
+		_ = json.Unmarshal(args, &a)
+		params := map[string]any{
+			"threadId": b.thread, "fromX": a.FromX, "fromY": a.FromY, "toX": a.ToX, "toY": a.ToY,
+		}
+		if len(a.RelativeTo) > 0 {
+			params["relativeTo"] = a.RelativeTo
+		}
+		if len(a.Profile) > 0 {
+			params["profile"] = a.Profile
+		}
+		var res struct {
+			Action string `json:"action"`
+		}
+		if err := b.client.CallTimeout("cowork.pointerDrag", params, &res, 50*time.Second); err != nil {
+			return "", err
+		}
+		return "Done: " + res.Action + ".", nil
+
+	case "desktop_set_pointer_profile":
+		// Pass the raw object straight through (speed/accuracy/settleMs are all optional).
+		var a map[string]any
+		_ = json.Unmarshal(args, &a)
+		if a == nil {
+			a = map[string]any{}
+		}
+		a["threadId"] = b.thread
+		var res struct {
+			Profile PointerProfile `json:"profile"`
+		}
+		if err := b.client.CallTimeout("cowork.setPointerProfile", a, &res, 10*time.Second); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("Pointer profile set: speed=%.0f px/s, accuracy=%.2f, settle=%dms.",
+			res.Profile.Speed, res.Profile.Accuracy, res.Profile.SettleMs), nil
 
 	default:
 		return "", fmt.Errorf("unknown cowork tool: %s", name)

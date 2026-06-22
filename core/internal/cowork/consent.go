@@ -126,9 +126,11 @@ func newAuthority(store *Store, audit *Audit, policy *Policy, notify Notifier, l
 		broker:            newGrantBroker(),
 		notify:            notify,
 		log:               log,
-		teardowns:         map[string]func(){},
-		selfClasses:       map[string]bool{"org.kde.agentkate": true},
-		selfPIDs:          map[int]bool{},
+		teardowns: map[string]func(){},
+		// Both spellings: KWin reports the Wayland app_id as either the reverse-DNS
+		// desktop name or the bare component name depending on how the app set it.
+		selfClasses: map[string]bool{"org.kde.agentkate": true, "agentkate": true},
+		selfPIDs:    map[int]bool{},
 		promptTimeoutR0R1: 5 * time.Minute,
 		promptTimeoutR2:   3 * time.Minute,
 	}
@@ -272,11 +274,11 @@ func (a *Authority) grantRequestPayload(reqID string, req AuthRequest, tier Tier
 		}
 	}
 	p := map[string]any{
-		"requestId":     reqID,
-		"threadId":      req.ThreadID,
-		"capability":    string(req.Capability),
-		"riskTier":      string(tier),
-		"target":        req.Target,
+		"requestId":      reqID,
+		"threadId":       req.ThreadID,
+		"capability":     string(req.Capability),
+		"riskTier":       string(tier),
+		"target":         req.Target,
 		"suggestedScope": string(suggested),
 	}
 	if req.ActionPreview != nil {
@@ -312,6 +314,23 @@ func (a *Authority) Kill(reason string) []string {
 		a.notify.Notify("cowork.killSwitch", map[string]any{"on": true, "reason": reason, "at": time.Now()})
 	}
 	return ids
+}
+
+// Shutdown runs the live-session teardowns for a graceful akcore exit. Unlike Kill
+// (the panic button), it must NOT clear the user's standing policy toggles, revoke
+// durable grants, or write a "kill" audit entry — a normal quit is not a panic. Ephemeral
+// (session/once) grants lapse naturally via LoadStore's restart semantics on next launch.
+func (a *Authority) Shutdown() {
+	a.mu.Lock()
+	teardowns := make([]func(), 0, len(a.teardowns))
+	for id, fn := range a.teardowns {
+		teardowns = append(teardowns, fn)
+		delete(a.teardowns, id)
+	}
+	a.mu.Unlock()
+	for _, fn := range teardowns {
+		runTeardown(fn)
+	}
 }
 
 // PolicyList returns the current global capability pre-authorizations.
@@ -428,6 +447,40 @@ func (a *Authority) IsSelfTarget(t Target) bool {
 	return false
 }
 
+// WindowRect is a live KWin window rectangle in absolute desktop pixels, with the
+// identity fields needed to decide whether it belongs to Agent Kate. Callers in
+// package main translate kde.Window into this so cowork stays decoupled from kde.
+type WindowRect struct {
+	X, Y, W, H    int
+	PID           int
+	ResourceClass string
+}
+
+// IsSelfPoint reports whether the absolute desktop point (x,y) falls inside any
+// Agent-Kate-owned window in wins — matched by the self PID set (and its ancestry
+// is the caller's concern) or a self resourceClass. This is the geometric analogue
+// of IsSelfTarget and is the defense that stops the agent from moving the pointer
+// onto Agent Kate's own Allow/kill-switch buttons and clicking them. Half-open
+// rect test [X, X+W) x [Y, Y+H). Returns false for an empty list.
+func (a *Authority) IsSelfPoint(x, y int, wins []WindowRect) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, win := range wins {
+		if win.W <= 0 || win.H <= 0 {
+			continue
+		}
+		self := a.selfPIDs[win.PID] ||
+			(win.ResourceClass != "" && a.selfClasses[strings.ToLower(win.ResourceClass)])
+		if !self {
+			continue
+		}
+		if x >= win.X && x < win.X+win.W && y >= win.Y && y < win.Y+win.H {
+			return true
+		}
+	}
+	return false
+}
+
 // --- Pull surfaces ---------------------------------------------------------------
 
 func (a *Authority) ListGrants(threadID string) ([]*Grant, bool) {
@@ -439,6 +492,15 @@ func (a *Authority) ListAudit(threadID string, sinceSeq int64, limit int) ([]Aud
 }
 
 func (a *Authority) Tampered() bool { return a.audit.Tampered() }
+
+// AuditRefusal records an action refused after consent (e.g. the geometric self-target
+// guard caught a click aimed at Agent Kate's own UI) so the log shows the attempt, not
+// only the successes.
+func (a *Authority) AuditRefusal(threadID string, cap Capability, t Target, reason string) {
+	_ = a.audit.Append(AuditEntry{
+		Kind: AuditDeny, ThreadID: threadID, Capability: cap, Target: &t, Detail: reason,
+	})
+}
 
 // AuditCapture records a successful capture/read with a content hash (never content).
 func (a *Authority) AuditCapture(threadID string, cap Capability, t Target, grantID, artifactHash string) {

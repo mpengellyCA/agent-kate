@@ -5,9 +5,11 @@
 #include "ControlConsentDialog.h"
 #include "ipc/CoreClient.h"
 
+#include <KConfigGroup>
 #include <KLocalizedString>
 #include <KMessageBox>
 #include <KMessageWidget>
+#include <KSharedConfig>
 
 #include <QAction>
 #include <QCheckBox>
@@ -26,6 +28,8 @@
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QSignalBlocker>
+#include <QSlider>
+#include <QSpinBox>
 #include <QToolButton>
 #include <QTreeWidget>
 #include <QVBoxLayout>
@@ -59,6 +63,7 @@ QString capLabel(const QString &key)
     if (key == QLatin1String("vd_sandbox")) return i18n("Use a sandbox desktop");
     if (key == QLatin1String("a11y_action")) return i18n("Click buttons & controls");
     if (key == QLatin1String("input_inject")) return i18n("Type & click as me");
+    if (key == QLatin1String("pointer_control")) return i18n("Move & click the pointer");
     return key;
 }
 
@@ -114,6 +119,65 @@ CoworkPanel::CoworkPanel(CoreClient *core, QWidget *parent)
     auto *capsBox = new QGroupBox(i18n("What agents may do (on = allowed without asking)"), this);
     m_capsLayout = new QVBoxLayout(capsBox);
     layout->addWidget(capsBox);
+
+    // Pointer motion defaults: sane USER-set bounds the core clamps every agent
+    // pointer move to. The agent may still ask for slower/less-exact motion within
+    // these limits, but never faster or jerkier. Saved in KConfig (group "Cowork")
+    // and pushed to the core via cowork.setPointerBounds.
+    auto *pointerBox = new QGroupBox(i18n("Pointer motion"), this);
+    auto *pointerLayout = new QVBoxLayout(pointerBox);
+
+    const KConfigGroup cfg = KSharedConfig::openConfig()->group(QStringLiteral("Cowork"));
+    const int savedSpeed = cfg.readEntry("PointerSpeed", 1600);
+    const int savedAccuracy = cfg.readEntry("PointerAccuracy", 100);
+    const int savedSettle = cfg.readEntry("PointerSettleMs", 30);
+
+    auto *speedRow = new QHBoxLayout;
+    auto *speedLabel = new QLabel(i18n("Speed:"), this);
+    m_pointerSpeed = new QComboBox(this);
+    m_pointerSpeed->setToolTip(i18n("How fast the agent's pointer travels. 'Instant' "
+                                    "teleports straight to the target with no visible motion."));
+    m_pointerSpeed->addItem(i18n("Instant"), 0);     // teleport, no animation
+    m_pointerSpeed->addItem(i18n("Fast"), 3000);
+    m_pointerSpeed->addItem(i18n("Normal"), 1600);   // default
+    m_pointerSpeed->addItem(i18n("Slow"), 800);
+    {
+        const int idx = m_pointerSpeed->findData(savedSpeed);
+        m_pointerSpeed->setCurrentIndex(idx >= 0 ? idx : m_pointerSpeed->findData(1600));
+    }
+    speedRow->addWidget(speedLabel);
+    speedRow->addWidget(m_pointerSpeed, 1);
+    pointerLayout->addLayout(speedRow);
+
+    m_pointerAccuracyLabel = new QLabel(i18n("Accuracy: %1%", savedAccuracy), this);
+    m_pointerAccuracy = new QSlider(Qt::Horizontal, this);
+    m_pointerAccuracy->setRange(0, 100);
+    m_pointerAccuracy->setValue(savedAccuracy);
+    m_pointerAccuracy->setToolTip(i18n("100% = straight, exact, robotic motion. Lower adds a "
+                                       "more human-like path (easing, overshoot, jitter) — but "
+                                       "the click always lands exactly on the target."));
+    pointerLayout->addWidget(m_pointerAccuracyLabel);
+    pointerLayout->addWidget(m_pointerAccuracy);
+
+    auto *settleRow = new QHBoxLayout;
+    auto *settleLabel = new QLabel(i18n("Settle before click (ms)"), this);
+    m_pointerSettle = new QSpinBox(this);
+    m_pointerSettle->setRange(0, 500);
+    m_pointerSettle->setValue(savedSettle);
+    m_pointerSettle->setToolTip(i18n("Pause after the pointer arrives, before clicking, so the "
+                                     "target has time to react to hover."));
+    settleRow->addWidget(settleLabel, 1);
+    settleRow->addWidget(m_pointerSettle);
+    pointerLayout->addLayout(settleRow);
+
+    connect(m_pointerSpeed, &QComboBox::currentIndexChanged, this, &CoworkPanel::savePointerBounds);
+    connect(m_pointerAccuracy, &QSlider::valueChanged, this, [this](int v) {
+        m_pointerAccuracyLabel->setText(i18n("Accuracy: %1%", v));
+        savePointerBounds();
+    });
+    connect(m_pointerSettle, &QSpinBox::valueChanged, this, &CoworkPanel::savePointerBounds);
+
+    layout->addWidget(pointerBox);
 
     // Browser launcher. Browsers hide their web content from the accessibility tree
     // unless started with the right flag/env, so agents can't read or click page
@@ -263,6 +327,29 @@ void CoworkPanel::refreshPolicy()
             box->setChecked(enabled);
         }
     }, this);
+}
+
+void CoworkPanel::savePointerBounds()
+{
+    const int spd = m_pointerSpeed->currentData().toInt();
+    const int acc = m_pointerAccuracy->value();
+    const int settle = m_pointerSettle->value();
+
+    // Persist locally so the choice survives restarts (same group as the browser prefs).
+    KConfigGroup cfg = KSharedConfig::openConfig()->group(QStringLiteral("Cowork"));
+    cfg.writeEntry("PointerSpeed", spd);
+    cfg.writeEntry("PointerAccuracy", acc);
+    cfg.writeEntry("PointerSettleMs", settle);
+    cfg.sync();
+
+    // Inform the core so it clamps each agent's per-call pointer values to these bounds.
+    // The cowork.setPointerBounds RPC is being added core-side (plan 09); until it ships
+    // this call simply no-ops on the core, which is harmless.
+    m_core->call(QStringLiteral("cowork.setPointerBounds"),
+                 {{QStringLiteral("speed"), spd},
+                  {QStringLiteral("accuracy"), acc},
+                  {QStringLiteral("settleMs"), settle}},
+                 nullptr, this);
 }
 
 void CoworkPanel::refreshStatus()

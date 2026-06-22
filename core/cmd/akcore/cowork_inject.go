@@ -7,8 +7,9 @@ import (
 
 // injectEvent is one high-level input event the agent asks for. Keyboard keys are
 // named ("space", "k", "playpause", or a single printable character); pointer
-// buttons are "left"/"right"/"middle". Pointer motion / absolute clicks are deferred
-// (they need a paired ScreenCast stream — plan 04 §2 / review D5).
+// buttons are "left"/"right"/"middle"/"back"/"forward". Positioned pointer motion +
+// absolute clicks live in the dedicated pointer tools (cowork_pointer.go, plan 09);
+// this low-level path fires buttons wherever the pointer already sits.
 type injectEvent struct {
 	Type   string `json:"type"`   // "key" | "button"
 	Key    string `json:"key"`    // for type=key
@@ -43,11 +44,44 @@ func buttonCodeFor(name string) (uint32, error) {
 	case "left", "":
 		return 0x110, nil // BTN_LEFT
 	case "right":
-		return 0x111, nil
+		return 0x111, nil // BTN_RIGHT
 	case "middle":
-		return 0x112, nil
+		return 0x112, nil // BTN_MIDDLE
+	case "back":
+		return 0x113, nil // BTN_SIDE — SPIKE-2: some stacks drive history-back via BTN_BACK (0x116)
+	case "forward":
+		return 0x114, nil // BTN_EXTRA — SPIKE-2: some stacks drive history-forward via BTN_FORWARD (0x115)
 	}
 	return 0, fmt.Errorf("unknown button %q", name)
+}
+
+// buttonName is the inverse of buttonCodeFor for audit/consent descriptions.
+func buttonName(code uint32) string {
+	switch code {
+	case 0x110:
+		return "left"
+	case 0x111:
+		return "right"
+	case 0x112:
+		return "middle"
+	case 0x113:
+		return "back"
+	case 0x114:
+		return "forward"
+	}
+	return fmt.Sprintf("button-0x%x", code)
+}
+
+// injectHasButton reports whether any event is a pointer button (so the bare-click
+// self-target guard applies — keyboard-only batches are exempt).
+func injectHasButton(events []injectEvent) bool {
+	for _, e := range events {
+		switch strings.ToLower(e.Type) {
+		case "button", "click":
+			return true
+		}
+	}
+	return false
 }
 
 // buildInjectOps expands the high-level events into an ordered op list for the UI
