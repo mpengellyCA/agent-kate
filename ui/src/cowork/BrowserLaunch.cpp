@@ -159,6 +159,20 @@ void setPreferred(const QString &command)
     configGroup().sync();
 }
 
+QString guessFamily(const QString &commandOrPath)
+{
+    const QString base = QFileInfo(commandOrPath).fileName().toLower();
+    static const char *firefoxHints[] = {"firefox", "zen", "librewolf", "floorp", "waterfox", "mullvad"};
+    for (const char *h : firefoxHints) {
+        if (base.contains(QLatin1String(h))) {
+            return QString(kFirefox);
+        }
+    }
+    // Most other modern browsers (Helium, Chrome, Brave, Vivaldi, Edge, Opera, Thorium…)
+    // are Chromium-based, so default unknowns there — that's where the a11y flag lives.
+    return QString(kChromium);
+}
+
 bool launch(const Browser &b, QString *error)
 {
     if (b.command.isEmpty()) {

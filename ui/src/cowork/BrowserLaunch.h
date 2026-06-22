@@ -46,6 +46,10 @@ Browser preferred();
 // setPreferred records the user's default browser for agents (by command).
 void setPreferred(const QString &command);
 
+// guessFamily infers the engine family ("firefox" | "chromium") from an executable's
+// name, so the custom-browser picker can pre-select the right one.
+QString guessFamily(const QString &commandOrPath);
+
 // launch starts b with accessibility forced on for its engine family. Returns false
 // and sets *error on failure. NOTE: the flag/env only takes effect on a FRESH browser
 // process — if the browser is already running, the new invocation just signals the

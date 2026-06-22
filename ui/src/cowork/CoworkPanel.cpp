@@ -450,11 +450,12 @@ void CoworkPanel::pickCustomBrowser()
     }
     const QStringList engines{i18n("Firefox-based (Zen, Firefox, LibreWolf…)"),
                               i18n("Chromium-based (Helium, Chrome, Brave…)")};
+    const int guessIdx = BrowserLaunch::guessFamily(path) == QLatin1String("chromium") ? 1 : 0;
     bool ok = false;
     const QString choice = QInputDialog::getItem(
         this, i18n("Browser engine"),
         i18n("Which engine is this browser built on? It decides how accessibility is enabled."),
-        engines, 0, false, &ok);
+        engines, guessIdx, false, &ok);
     if (!ok) {
         return;
     }
