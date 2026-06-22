@@ -21,6 +21,8 @@ class SearchPanel;
 class TerminalPanel;
 class WorktreeDashboard;
 class LogViewer;
+class CoworkPanel;
+class CoworkPortal;
 class SideBar;
 class ShellLayout;
 class QAction;
@@ -99,6 +101,8 @@ private:
     SearchPanel *m_search = nullptr;
     WorktreeDashboard *m_worktreeDashboard = nullptr;
     LogViewer *m_logViewer = nullptr;
+    CoworkPanel *m_coworkPanel = nullptr;
+    CoworkPortal *m_coworkPortal = nullptr;
     QLabel *m_gitStatusLabel = nullptr; // status-bar git widget for the active editor
 
     ShellLayout *m_shell = nullptr;
@@ -130,6 +134,7 @@ private:
     QString m_keyWorktrees = QStringLiteral("worktrees");
     QString m_keyGitLog = QStringLiteral("gitlog");
     QString m_keyCoop = QStringLiteral("coop");
+    QString m_keyCowork = QStringLiteral("cowork");
     QString m_keyInspector = QStringLiteral("inspector");
     QString m_keyTerminal = QStringLiteral("terminal");
     QString m_keyReferences = QStringLiteral("references");

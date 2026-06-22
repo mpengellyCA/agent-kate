@@ -53,6 +53,11 @@ type Record struct {
 	CompactStrip     bool      `json:"compactStrip,omitempty"`
 	SummaryUpdatedAt time.Time `json:"summaryUpdatedAt,omitempty"`
 	LastTurnAt       time.Time `json:"lastTurnAt,omitempty"`
+
+	// CoworkEnabled opts this thread into the KDE Plasma Cowork MCP server
+	// (desktop see/control). Off by default; only the UI may flip it
+	// (cowork.setEnabled). See docs/plans/08-kde-cowork/.
+	CoworkEnabled bool `json:"coworkEnabled,omitempty"`
 }
 
 // Store is the on-disk set of thread records, mirrored in memory.

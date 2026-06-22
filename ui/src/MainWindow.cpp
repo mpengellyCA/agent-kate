@@ -14,6 +14,8 @@
 #include "TerminalPanel.h"
 #include "WelcomeDialog.h"
 #include "WorktreeDashboard.h"
+#include "cowork/CoworkPanel.h"
+#include "cowork/CoworkPortal.h"
 #include "shell/ShellLayout.h"
 #include "shell/SideBar.h"
 #include "shell/StubPanel.h"
@@ -145,6 +147,9 @@ void MainWindow::setupUi()
     m_terminal = new TerminalPanel(this);
     m_worktreeDashboard = new WorktreeDashboard(m_core, this);
     m_logViewer = new LogViewer(m_core, this);
+    m_coworkPanel = new CoworkPanel(m_core, this);
+    // CoworkPortal services the core's portal requests using this window's surface.
+    m_coworkPortal = new CoworkPortal(m_core, this, this);
 
     connect(problems, &ProblemsPanel::activated, this,
             [this](const QString &path, int line) {
@@ -216,6 +221,8 @@ void MainWindow::setupUi()
                                 i18n("Live agent presence and file locks from the Cooperation MCP."),
                                 this),
                   QStringLiteral("right"));
+    registerPanel(m_keyCowork, QIcon::fromTheme(QStringLiteral("video-display")),
+                  i18n("Cowork"), m_coworkPanel, QStringLiteral("right"));
     registerPanel(m_keyInspector, QIcon::fromTheme(QStringLiteral("view-statistics")),
                   i18n("AI Inspector"),
                   new StubPanel(i18n("AI Inspector"),
@@ -1341,6 +1348,9 @@ void MainWindow::onAgentActivated(int agentId, const QString &projectPath)
     }
     if (m_worktreeDashboard) {
         m_worktreeDashboard->setActiveProject(projectPath);
+    }
+    if (m_coworkPanel) {
+        m_coworkPanel->setActiveThread(m_agent->currentThreadId(), QString());
     }
     if (m_openWorktreeTerminalAct) {
         m_openWorktreeTerminalAct->setEnabled(

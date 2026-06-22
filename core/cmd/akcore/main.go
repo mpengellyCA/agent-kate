@@ -22,8 +22,10 @@ import (
 	"agentkate/internal/agent"
 	"agentkate/internal/compact"
 	"agentkate/internal/coop"
+	"agentkate/internal/cowork"
 	"agentkate/internal/gitstatus"
 	"agentkate/internal/ipc"
+	"agentkate/internal/kde"
 	"agentkate/internal/permission"
 	"agentkate/internal/safe"
 	"agentkate/internal/search"
@@ -276,6 +278,30 @@ func runCore() {
 		}
 	})
 
+	// --- KDE Plasma Cowork (opt-in desktop see/control; off by default) --------
+	// The shared D-Bus client and consent authority are constructed eagerly so the
+	// capability probe (cowork.status) is accurate, but no thread can use them until
+	// it is opted in (session.Record.CoworkEnabled) and the user grants consent.
+	kdeClient, kerr := kde.New(log)
+	if kerr != nil {
+		log.Warn("cowork: KDE session bus unavailable; desktop features disabled", "err", kerr)
+		kdeClient = nil
+	}
+	coworkSvc, coworkWarn, cerr := cowork.New(cowork.DefaultGrantsPath(), cowork.DefaultAuditPath(), kdeClient, coworkNotifier{srv}, log)
+	if cerr != nil {
+		log.Error("cowork: consent store init failed; desktop features disabled", "err", cerr)
+		coworkSvc = nil
+		if kdeClient != nil {
+			_ = kdeClient.Close()
+		}
+	}
+	for _, w := range coworkWarn {
+		log.Warn("cowork startup warning", "warning", w)
+	}
+	if coworkSvc != nil {
+		coworkSvc.StartSweeper(30 * time.Second)
+	}
+
 	deps := handlerDeps{
 		srv:        srv,
 		sup:        sup,
@@ -287,6 +313,7 @@ func runCore() {
 		summaries:  summaries,
 		skills:     skillCatalog,
 		gitCache:   gitCache,
+		cowork:     coworkSvc,
 		socketPath: *socket,
 		exePath:    exePath,
 		log:        log,
@@ -319,6 +346,12 @@ func runCore() {
 			coldCompacts.drain(cancelExitCompacts, exitCompactCap, log)
 			progress("watchers", "", 0, 0)
 			_ = gitCache.Close()
+			// Tear down any live Cowork portal/screencast sessions, revoke
+			// non-durable grants, and release the D-Bus connection.
+			if coworkSvc != nil {
+				progress("cowork", "", 0, 0)
+				_ = coworkSvc.Close()
+			}
 			progress("done", "", 0, running)
 		})
 	}
@@ -390,6 +423,7 @@ type agentStartParams struct {
 	Model          string             `json:"model"`     // claude --model id; "" = Claude Code default
 	Isolation      string             `json:"isolation"` // worktree.Mode*; "" = auto
 	Attachments    []agent.Attachment `json:"attachments"`
+	CoworkEnabled  bool               `json:"coworkEnabled"` // opt into the KDE Cowork desktop tools
 }
 
 type agentSendParams struct {
@@ -428,6 +462,7 @@ type handlerDeps struct {
 	summaries  *compact.Store
 	skills     *skills.Catalog
 	gitCache   *gitstatus.Cache
+	cowork     *cowork.Service // nil if KDE/consent init failed; handlers guard
 	socketPath string
 	exePath    string
 	log        *slog.Logger
@@ -435,7 +470,10 @@ type handlerDeps struct {
 
 // registerHandlers wires the JSON-RPC methods the core serves.
 func registerHandlers(d handlerDeps) {
-	d.srv.Handle("handshake", func(_ context.Context, _ json.RawMessage) (any, error) {
+	d.srv.Handle("handshake", func(ctx context.Context, _ json.RawMessage) (any, error) {
+		// Tag this connection as the UI (the first UI becomes the primary that runs
+		// Cowork portal sessions) — the Cowork keystone (08 §C).
+		d.srv.MarkUI(ctx)
 		d.log.Info("handshake received")
 		return map[string]any{
 			"name":    "akcore",
@@ -443,6 +481,9 @@ func registerHandlers(d handlerDeps) {
 			"pid":     os.Getpid(),
 		}, nil
 	})
+
+	// Cowork (KDE desktop see/control) RPCs. No-op if the service is unavailable.
+	registerCoworkHandlers(d)
 
 	// --- agent threads -----------------------------------------------------
 	d.srv.Handle("agent.start", func(_ context.Context, raw json.RawMessage) (any, error) {
@@ -2297,7 +2338,7 @@ func startAgentThread(d handlerDeps, threadID, sessionID string, p agentStartPar
 	d.gitCache.Register(wt)
 	d.gitCache.Activate(threadID) // an agent is about to run here — watch it live
 
-	mcpConfig, err := writeMCPConfig(d.exePath, d.socketPath, threadID, wt.Path)
+	mcpConfig, err := writeMCPConfig(d.exePath, d.socketPath, threadID, wt.Path, p.CoworkEnabled)
 	if err != nil {
 		emitLifecycle(d.srv, threadID, "error", "mcp config: "+err.Error(), &wt)
 		return
@@ -2318,6 +2359,7 @@ func startAgentThread(d handlerDeps, threadID, sessionID string, p agentStartPar
 		Model:          model,
 		Attachments:    p.Attachments,
 		SessionID:      sessionID,
+		CoworkEnabled:  p.CoworkEnabled,
 	}); err != nil {
 		os.Remove(mcpConfig)
 		emitLifecycle(d.srv, threadID, "error", err.Error(), &wt)
@@ -2341,6 +2383,7 @@ func startAgentThread(d handlerDeps, threadID, sessionID string, p agentStartPar
 		Title:          summarizePrompt(p.Prompt),
 		Created:        time.Now(),
 		Status:         session.StatusRunning,
+		CoworkEnabled:  p.CoworkEnabled,
 	}); err != nil {
 		d.log.Warn("could not persist thread record", "thread", threadID, "err", err)
 	}
@@ -2368,7 +2411,7 @@ func resumeAgentThread(d handlerDeps, rec session.Record) {
 	d.gitCache.Register(rec.Worktree)
 	d.gitCache.Activate(rec.ThreadID) // resuming — this thread is active again, watch it
 
-	mcpConfig, err := writeMCPConfig(d.exePath, d.socketPath, rec.ThreadID, rec.Worktree.Path)
+	mcpConfig, err := writeMCPConfig(d.exePath, d.socketPath, rec.ThreadID, rec.Worktree.Path, rec.CoworkEnabled)
 	if err != nil {
 		emitLifecycle(d.srv, rec.ThreadID, "error", "mcp config: "+err.Error(), &rec.Worktree)
 		return
@@ -2388,6 +2431,7 @@ func resumeAgentThread(d handlerDeps, rec session.Record) {
 		PermissionMode: rec.PermissionMode,
 		Effort:         rec.Effort,
 		Model:          rec.Model,
+		CoworkEnabled:  rec.CoworkEnabled,
 	}
 	var sessionIDForRecord string
 	var detail string
@@ -2774,22 +2818,35 @@ func emitLifecycle(srv *ipc.Server, threadID, phase, detail string, wt *worktree
 }
 
 // writeMCPConfig writes a per-thread --mcp-config file that points `claude` at
-// this binary's Cooperation MCP bridge subcommand.
-func writeMCPConfig(exePath, socketPath, threadID, workspace string) (string, error) {
-	cfg := map[string]any{
-		"mcpServers": map[string]any{
-			"cooperation": map[string]any{
-				"type":    "stdio",
-				"command": exePath,
-				"args": []string{
-					"mcp",
-					"--socket", socketPath,
-					"--thread", threadID,
-					"--workspace", workspace,
-				},
+// this binary's Cooperation MCP bridge subcommand, plus the opt-in Cowork desktop
+// bridge when the thread enabled it (a second `akcore mcp ... --cowork` server).
+func writeMCPConfig(exePath, socketPath, threadID, workspace string, coworkEnabled bool) (string, error) {
+	servers := map[string]any{
+		"cooperation": map[string]any{
+			"type":    "stdio",
+			"command": exePath,
+			"args": []string{
+				"mcp",
+				"--socket", socketPath,
+				"--thread", threadID,
+				"--workspace", workspace,
 			},
 		},
 	}
+	if coworkEnabled {
+		servers["cowork"] = map[string]any{
+			"type":    "stdio",
+			"command": exePath,
+			"args": []string{
+				"mcp",
+				"--socket", socketPath,
+				"--thread", threadID,
+				"--workspace", workspace,
+				"--cowork",
+			},
+		}
+	}
+	cfg := map[string]any{"mcpServers": servers}
 	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return "", err

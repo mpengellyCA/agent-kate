@@ -7,7 +7,7 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(Qt6 6.6 REQUIRED COMPONENTS Core Gui Widgets Network)
+find_package(Qt6 6.6 REQUIRED COMPONENTS Core Gui Widgets Network DBus)
 find_package(KF6 6.0 REQUIRED COMPONENTS
     TextEditor          # the Kate editor engine
     SyntaxHighlighting
@@ -46,6 +46,10 @@ add_executable(agentkate
     src/shell/SideBar.cpp
     src/shell/ShellLayout.cpp
     src/shell/StubPanel.cpp
+    src/cowork/CoworkPanel.cpp
+    src/cowork/CoworkPortal.cpp
+    src/cowork/ConsentDialog.cpp
+    src/cowork/ControlConsentDialog.cpp
     src/TerminalPanel.cpp
     src/SearchPanel.cpp
     src/SessionBrowserDialog.cpp
@@ -88,6 +92,7 @@ target_link_libraries(agentkate PRIVATE
     Qt6::Gui
     Qt6::Widgets
     Qt6::Network
+    Qt6::DBus
     KF6::TextEditor
     KF6::SyntaxHighlighting
     KF6::XmlGui

@@ -94,6 +94,7 @@ type StartOptions struct {
 	Attachments    []Attachment // files attached to the opening message
 	SessionID      string       // Claude Code session id (a UUID)
 	Resume         bool         // true: --resume the session; false: --session-id a new one
+	CoworkEnabled  bool         // opt this thread into the KDE Cowork desktop MCP server
 }
 
 // buildUserContent assembles a stream-json user message content array from the
@@ -277,15 +278,21 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 	if mode == "" {
 		mode = "acceptEdits"
 	}
+	// The Cooperation MCP is always allowed; the opt-in Cowork desktop server is
+	// added only when the thread enabled it. Consent for individual desktop
+	// actions is enforced server-side (the cowork consent authority), NOT by this
+	// allow-list — so --permission-mode cannot bypass it.
+	allowedTools := "mcp__cooperation"
+	if opts.CoworkEnabled {
+		allowedTools += ",mcp__cowork"
+	}
 	args := []string{
 		"--print",
 		"--output-format", "stream-json",
 		"--input-format", "stream-json",
 		"--verbose",
 		"--permission-mode", mode,
-		// The Cooperation MCP is always allowed so every agent can see and
-		// coordinate with its collaborators without a permission prompt.
-		"--allowedTools", "mcp__cooperation",
+		"--allowedTools", allowedTools,
 	}
 	// Reasoning effort is optional: an empty value leaves Claude Code on
 	// whatever default the user has configured.

@@ -37,10 +37,11 @@ type Server struct {
 	socketPath string
 	log        *slog.Logger
 
-	mu        sync.RWMutex
-	handlers  map[string]Handler
-	conns     map[*conn]struct{}
-	onAllGone func()
+	mu          sync.RWMutex
+	handlers    map[string]Handler
+	conns       map[*conn]struct{}
+	onAllGone   func()
+	primaryConn *conn // the first UI to handshake; runs portal sessions (Cowork keystone)
 }
 
 // NewServer creates a server bound to socketPath. Call Handle to register
@@ -77,6 +78,12 @@ func (s *Server) Serve(ctx context.Context) error {
 		return err
 	}
 	defer os.Remove(s.socketPath)
+	// Defense in depth: restrict the socket to the owning user. $XDG_RUNTIME_DIR is
+	// already 0700, so this does not stop a same-uid process (see 08 §F Option A),
+	// but it does stop other users on a shared host.
+	if err := os.Chmod(s.socketPath, 0o600); err != nil {
+		s.log.Warn("ipc socket chmod failed", "err", err)
+	}
 	s.log.Info("ipc listening", "socket", s.socketPath)
 
 	safe.Go("ipc.listenerCloser", func() {
@@ -121,6 +128,9 @@ func (s *Server) serveConn(ctx context.Context, netConn net.Conn) {
 			c.close() // stops the writer goroutine; idempotent
 			s.mu.Lock()
 			delete(s.conns, c)
+			if s.primaryConn == c {
+				s.primaryConn = nil // a Cowork portal request will now fail closed until a UI reconnects
+			}
 			remaining := len(s.conns)
 			s.mu.Unlock()
 			netConn.Close()
@@ -160,6 +170,11 @@ func (s *Server) dispatch(ctx context.Context, c *conn, raw []byte) {
 	s.mu.RLock()
 	h, ok := s.handlers[f.Method]
 	s.mu.RUnlock()
+
+	// Carry the calling connection's identity (role/threadId/primary) so the Cowork
+	// consent handlers can enforce UI-only RPCs and per-thread binding. Other
+	// handlers ignore it (Cowork keystone, 08 §C).
+	ctx = context.WithValue(ctx, connCtxKey{}, c)
 
 	// Notification (no id): run the handler, discard the result.
 	if f.ID == nil {
@@ -228,6 +243,31 @@ type conn struct {
 	done chan struct{} // closed once to stop the writer; guarded by closeOnce
 
 	closeOnce sync.Once
+
+	// Cowork keystone identity (08 §C). idMu guards these; they are set once at
+	// handshake/attach and read by Cowork consent handlers via ConnFromContext.
+	idMu      sync.RWMutex
+	role      string // "" (unknown) | "ui" | "bridge"
+	connTID   string // for bridge conns: the bound thread id (trust-on-first-use)
+	isPrimary bool   // the one UI that runs portal sessions
+}
+
+func (c *conn) getRole() string {
+	c.idMu.RLock()
+	defer c.idMu.RUnlock()
+	return c.role
+}
+
+func (c *conn) getThreadID() string {
+	c.idMu.RLock()
+	defer c.idMu.RUnlock()
+	return c.connTID
+}
+
+func (c *conn) getPrimary() bool {
+	c.idMu.RLock()
+	defer c.idMu.RUnlock()
+	return c.isPrimary
 }
 
 // enqueue queues f for delivery to this client. It never blocks a shared
@@ -338,4 +378,111 @@ func (c *conn) writeFrame(f *Frame) bool {
 // from either the reader's cleanup path or the writer itself.
 func (c *conn) close() {
 	c.closeOnce.Do(func() { close(c.done) })
+}
+
+// --- Cowork keystone: per-connection identity (08 §C) ----------------------------
+//
+// The Cowork consent model must distinguish the UI (which may answer grant prompts,
+// press the kill-switch, run portals) from an agent's MCP bridge (which may only
+// REQUEST consent-gated capabilities, never grant them) and bind each bridge to a
+// single thread so it cannot spend another thread's grant. Identity is injected into
+// the request context in dispatch; handlers retrieve it via ConnFromContext.
+//
+// Same-uid honesty: a malicious local process can still forge a handshake on the raw
+// socket (Option A, 08 §F). This gate stops the realistic prompt-injection path (the
+// agent acting through its own bridge) and cross-thread grant theft, not a determined
+// raw-socket forger — for which the audit log + kill-switch provide detection.
+
+type connCtxKey struct{}
+
+// ConnRef exposes the calling connection's identity to handlers that need it.
+type ConnRef struct{ c *conn }
+
+// ConnFromContext returns the calling connection's identity, or nil if absent
+// (e.g. an internally-synthesized call).
+func ConnFromContext(ctx context.Context) *ConnRef {
+	if c, ok := ctx.Value(connCtxKey{}).(*conn); ok && c != nil {
+		return &ConnRef{c}
+	}
+	return nil
+}
+
+// Role is "" (not yet identified), "ui", or "bridge".
+func (r *ConnRef) Role() string { return r.c.getRole() }
+
+// ThreadID is the bound thread for a bridge connection ("" otherwise).
+func (r *ConnRef) ThreadID() string { return r.c.getThreadID() }
+
+// IsPrimaryUI reports whether this is the UI that runs portal sessions.
+func (r *ConnRef) IsPrimaryUI() bool { return r.c.getPrimary() }
+
+// MarkUI tags this connection as the UI. The first UI to call becomes primary
+// (runs portal sessions). Called from the existing `handshake` handler.
+func (s *Server) MarkUI(ctx context.Context) {
+	ref := ConnFromContext(ctx)
+	if ref == nil {
+		return
+	}
+	c := ref.c
+	s.mu.Lock()
+	primary := false
+	if s.primaryConn == nil {
+		s.primaryConn = c
+		primary = true
+	}
+	s.mu.Unlock()
+	c.idMu.Lock()
+	c.role = "ui"
+	c.isPrimary = primary
+	c.idMu.Unlock()
+}
+
+// BindBridge tags this connection as an agent bridge for threadID on first use, and
+// reports whether the binding is consistent (a bridge may not switch threads). A UI
+// connection may never act as a bridge.
+func (s *Server) BindBridge(ctx context.Context, threadID string) (ok bool, reason string) {
+	ref := ConnFromContext(ctx)
+	if ref == nil {
+		return false, "no connection identity"
+	}
+	c := ref.c
+	c.idMu.Lock()
+	defer c.idMu.Unlock()
+	if c.role == "ui" {
+		return false, "UI connection may not invoke agent capabilities"
+	}
+	if c.role == "" {
+		c.role = "bridge"
+		c.connTID = threadID
+		return true, ""
+	}
+	if c.connTID != threadID {
+		return false, "thread mismatch: connection is bound to a different thread"
+	}
+	return true, ""
+}
+
+// RequireUI reports whether the caller is the UI (for grant responses, kill-switch,
+// revoke, enable — never an agent).
+func (s *Server) RequireUI(ctx context.Context) bool {
+	ref := ConnFromContext(ctx)
+	return ref != nil && ref.Role() == "ui"
+}
+
+// NotifyPrimaryUI sends a notification only to the primary UI (portal requests).
+// Returns false if there is no primary UI connected (caller should fail closed).
+func (s *Server) NotifyPrimaryUI(method string, params any) bool {
+	b, err := json.Marshal(params)
+	if err != nil {
+		s.log.Warn("notify-primary marshal failed", "method", method, "err", err)
+		return false
+	}
+	s.mu.RLock()
+	c := s.primaryConn
+	s.mu.RUnlock()
+	if c == nil {
+		return false
+	}
+	c.enqueue(&Frame{JSONRPC: "2.0", Method: method, Params: json.RawMessage(b)})
+	return true
 }

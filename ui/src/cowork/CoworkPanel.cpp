@@ -1,0 +1,315 @@
+#include "CoworkPanel.h"
+
+#include "ConsentDialog.h"
+#include "ControlConsentDialog.h"
+#include "ipc/CoreClient.h"
+
+#include <KLocalizedString>
+#include <KMessageBox>
+#include <KMessageWidget>
+
+#include <QDateTime>
+#include <QGroupBox>
+#include <QHBoxLayout>
+#include <QHeaderView>
+#include <QJsonArray>
+#include <QJsonValue>
+#include <QLabel>
+#include <QPlainTextEdit>
+#include <QPushButton>
+#include <QTreeWidget>
+#include <QVBoxLayout>
+
+namespace {
+
+QString targetSummary(const QJsonObject &t)
+{
+    const QString label = t.value(QStringLiteral("label")).toString();
+    if (!label.isEmpty()) {
+        return label;
+    }
+    const QString kind = t.value(QStringLiteral("kind")).toString();
+    if (kind == QLatin1String("window")) {
+        const QString rc = t.value(QStringLiteral("resourceClass")).toString();
+        return rc.isEmpty() ? i18n("a window") : rc;
+    }
+    if (kind == QLatin1String("any")) {
+        return i18n("whole desktop");
+    }
+    return kind;
+}
+
+QString expiryText(const QJsonObject &g)
+{
+    const QString exp = g.value(QStringLiteral("expiresAt")).toString();
+    if (exp.isEmpty()) {
+        const QString scope = g.value(QStringLiteral("scope")).toString();
+        if (scope == QLatin1String("until_revoked")) {
+            return i18n("until revoked");
+        }
+        if (scope == QLatin1String("session")) {
+            return i18n("this session");
+        }
+        return i18n("once");
+    }
+    const QDateTime t = QDateTime::fromString(exp, Qt::ISODateWithMs);
+    return t.isValid() ? t.toLocalTime().toString(QStringLiteral("HH:mm:ss")) : exp;
+}
+
+} // namespace
+
+CoworkPanel::CoworkPanel(CoreClient *core, QWidget *parent)
+    : QWidget(parent), m_core(core)
+{
+    auto *layout = new QVBoxLayout(this);
+    layout->setContentsMargins(8, 8, 8, 8);
+
+    auto *title = new QLabel(i18n("<b>Cowork</b> — share your KDE desktop with agents"), this);
+    title->setWordWrap(true);
+    layout->addWidget(title);
+
+    m_status = new KMessageWidget(this);
+    m_status->setCloseButtonVisible(false);
+    m_status->setText(i18n("Checking desktop integration…"));
+    layout->addWidget(m_status);
+
+    // Enable-for-active-agent row.
+    auto *enableRow = new QHBoxLayout;
+    m_activeLabel = new QLabel(i18n("No active agent."), this);
+    m_activeLabel->setWordWrap(true);
+    m_enableBtn = new QPushButton(i18n("Enable Cowork for this agent"), this);
+    m_enableBtn->setIcon(QIcon::fromTheme(QStringLiteral("dialog-ok-apply")));
+    m_enableBtn->setEnabled(false);
+    connect(m_enableBtn, &QPushButton::clicked, this, &CoworkPanel::enableForActiveThread);
+    enableRow->addWidget(m_activeLabel, 1);
+    enableRow->addWidget(m_enableBtn);
+    layout->addLayout(enableRow);
+
+    // Active grants.
+    auto *grantsBox = new QGroupBox(i18n("Active access"), this);
+    auto *grantsLayout = new QVBoxLayout(grantsBox);
+    m_grants = new QTreeWidget(grantsBox);
+    m_grants->setRootIsDecorated(false);
+    m_grants->setHeaderLabels({i18n("Agent"), i18n("Can"), i18n("Target"), i18n("Until")});
+    m_grants->header()->setSectionResizeMode(QHeaderView::ResizeToContents);
+    grantsLayout->addWidget(m_grants);
+    m_revokeBtn = new QPushButton(i18n("Revoke selected"), grantsBox);
+    m_revokeBtn->setIcon(QIcon::fromTheme(QStringLiteral("edit-delete")));
+    connect(m_revokeBtn, &QPushButton::clicked, this, &CoworkPanel::revokeSelected);
+    grantsLayout->addWidget(m_revokeBtn, 0, Qt::AlignRight);
+    layout->addWidget(grantsBox, 1);
+
+    // Kill-switch.
+    m_killBtn = new QPushButton(i18n("Stop ALL desktop access"), this);
+    m_killBtn->setIcon(QIcon::fromTheme(QStringLiteral("process-stop")));
+    connect(m_killBtn, &QPushButton::clicked, this, &CoworkPanel::toggleKill);
+    layout->addWidget(m_killBtn);
+
+    // Audit log.
+    auto *auditBox = new QGroupBox(i18n("Recent activity"), this);
+    auto *auditLayout = new QVBoxLayout(auditBox);
+    m_audit = new QPlainTextEdit(auditBox);
+    m_audit->setReadOnly(true);
+    m_audit->setMaximumBlockCount(2000);
+    m_audit->setFrameShape(QFrame::NoFrame);
+    auditLayout->addWidget(m_audit);
+    layout->addWidget(auditBox, 1);
+
+    connect(m_core, &CoreClient::notification, this, &CoworkPanel::onNotification);
+    connect(m_core, &CoreClient::connected, this, &CoworkPanel::refresh);
+    if (m_core->isConnected()) {
+        refresh();
+    }
+}
+
+void CoworkPanel::setActiveThread(const QString &threadId, const QString &title)
+{
+    m_activeThread = threadId;
+    m_activeTitle = title;
+    if (threadId.isEmpty()) {
+        m_activeLabel->setText(i18n("No active agent."));
+        m_enableBtn->setEnabled(false);
+    } else {
+        m_activeLabel->setText(i18n("Active agent: <b>%1</b>",
+                                    (title.isEmpty() ? threadId : title).toHtmlEscaped()));
+        m_enableBtn->setEnabled(m_available);
+    }
+}
+
+void CoworkPanel::onNotification(const QString &method, const QJsonObject &params)
+{
+    if (method == QLatin1String("cowork.grantRequested")) {
+        handleGrantRequested(params);
+    } else if (method == QLatin1String("cowork.grantsChanged")) {
+        refreshGrants();
+        refreshAudit();
+    } else if (method == QLatin1String("cowork.killSwitch")) {
+        m_killed = params.value(QStringLiteral("on")).toBool();
+        refreshStatus();
+        refreshGrants();
+    }
+}
+
+void CoworkPanel::refresh()
+{
+    refreshStatus();
+    refreshGrants();
+    refreshAudit();
+}
+
+void CoworkPanel::refreshStatus()
+{
+    m_core->call(QStringLiteral("cowork.status"), {}, [this](const QJsonObject &res, const QJsonObject &err) {
+        if (!err.isEmpty()) {
+            return;
+        }
+        m_available = res.value(QStringLiteral("available")).toBool();
+        m_killed = res.value(QStringLiteral("killed")).toBool();
+        const bool tampered = res.value(QStringLiteral("tampered")).toBool();
+        if (tampered) {
+            m_status->setMessageType(KMessageWidget::Error);
+            m_status->setText(i18n("Consent audit integrity check FAILED — desktop access is disabled."));
+        } else if (m_killed) {
+            m_status->setMessageType(KMessageWidget::Error);
+            m_status->setText(i18n("Kill-switch engaged — all desktop access is blocked."));
+        } else if (!m_available) {
+            m_status->setMessageType(KMessageWidget::Warning);
+            m_status->setText(i18n("Desktop integration unavailable (no KDE portal/KWin on this session)."));
+        } else {
+            m_status->setMessageType(KMessageWidget::Information);
+            m_status->setText(i18n("Desktop integration ready. Agents can only act with your explicit consent."));
+        }
+        m_killBtn->setText(m_killed ? i18n("Re-enable desktop access") : i18n("Stop ALL desktop access"));
+        m_enableBtn->setEnabled(m_available && !m_activeThread.isEmpty());
+    }, this);
+}
+
+void CoworkPanel::refreshGrants()
+{
+    m_core->call(QStringLiteral("cowork.listGrants"), {}, [this](const QJsonObject &res, const QJsonObject &err) {
+        if (!err.isEmpty()) {
+            return;
+        }
+        m_grants->clear();
+        const QJsonArray grants = res.value(QStringLiteral("grants")).toArray();
+        for (const QJsonValue &gv : grants) {
+            const QJsonObject g = gv.toObject();
+            // Skip already-revoked grants (the store keeps history).
+            if (!g.value(QStringLiteral("revokedAt")).toString().isEmpty()) {
+                continue;
+            }
+            auto *item = new QTreeWidgetItem(m_grants);
+            item->setText(0, g.value(QStringLiteral("threadId")).toString());
+            item->setText(1, g.value(QStringLiteral("capability")).toString());
+            item->setText(2, targetSummary(g.value(QStringLiteral("target")).toObject()));
+            item->setText(3, expiryText(g));
+            item->setData(0, Qt::UserRole, g.value(QStringLiteral("id")).toString());
+            if (g.value(QStringLiteral("tier")).toString() == QLatin1String("R2")) {
+                item->setIcon(1, QIcon::fromTheme(QStringLiteral("dialog-warning")));
+            }
+        }
+        m_revokeBtn->setEnabled(m_grants->topLevelItemCount() > 0);
+    }, this);
+}
+
+void CoworkPanel::refreshAudit()
+{
+    QJsonObject p{{QStringLiteral("limit"), 100}};
+    m_core->call(QStringLiteral("cowork.listAudit"), p, [this](const QJsonObject &res, const QJsonObject &err) {
+        if (!err.isEmpty()) {
+            return;
+        }
+        QStringList lines;
+        const QJsonArray entries = res.value(QStringLiteral("entries")).toArray();
+        for (const QJsonValue &ev : entries) {
+            const QJsonObject e = ev.toObject();
+            const QDateTime at = QDateTime::fromString(e.value(QStringLiteral("at")).toString(), Qt::ISODateWithMs);
+            const QString ts = at.isValid() ? at.toLocalTime().toString(QStringLiteral("HH:mm:ss")) : QString();
+            lines << QStringLiteral("%1  %2  %3  %4  %5")
+                         .arg(ts,
+                              e.value(QStringLiteral("kind")).toString(),
+                              e.value(QStringLiteral("capability")).toString(),
+                              e.value(QStringLiteral("threadId")).toString(),
+                              e.value(QStringLiteral("detail")).toString());
+        }
+        m_audit->setPlainText(lines.join(QLatin1Char('\n')));
+    }, this);
+}
+
+void CoworkPanel::handleGrantRequested(const QJsonObject &params)
+{
+    const QString requestId = params.value(QStringLiteral("requestId")).toString();
+    const QString tier = params.value(QStringLiteral("riskTier")).toString();
+
+    bool allow = false;
+    QString scope = QStringLiteral("once");
+    int expiresInSec = 0;
+
+    if (tier == QLatin1String("R2")) {
+        ControlConsentDialog dlg(params, this);
+        dlg.exec();
+        allow = dlg.allowed();
+        scope = dlg.scope();
+        expiresInSec = dlg.expiresInSec();
+    } else {
+        ConsentDialog dlg(params, this);
+        dlg.exec();
+        allow = dlg.allowed();
+        scope = dlg.scope();
+        expiresInSec = dlg.expiresInSec();
+    }
+
+    QJsonObject resp{
+        {QStringLiteral("requestId"), requestId},
+        {QStringLiteral("allow"), allow},
+        {QStringLiteral("scope"), scope},
+        {QStringLiteral("expiresInSec"), expiresInSec},
+    };
+    m_core->call(QStringLiteral("cowork.respondGrant"), resp, nullptr, this);
+}
+
+void CoworkPanel::revokeSelected()
+{
+    auto *item = m_grants->currentItem();
+    if (!item) {
+        return;
+    }
+    const QString id = item->data(0, Qt::UserRole).toString();
+    if (id.isEmpty()) {
+        return;
+    }
+    m_core->call(QStringLiteral("cowork.revokeGrant"),
+                 {{QStringLiteral("id"), id}, {QStringLiteral("reason"), QStringLiteral("revoked from the Cowork panel")}},
+                 nullptr, this);
+}
+
+void CoworkPanel::toggleKill()
+{
+    if (m_killed) {
+        m_core->call(QStringLiteral("cowork.killSwitch"), {{QStringLiteral("on"), false}}, nullptr, this);
+        return;
+    }
+    const auto ans = KMessageBox::warningContinueCancel(
+        this,
+        i18n("Immediately revoke ALL desktop access for every agent and tear down any live "
+             "capture? Agents will have to ask again."),
+        i18n("Stop all desktop access"),
+        KGuiItem(i18n("Stop everything"), QStringLiteral("process-stop")));
+    if (ans == KMessageBox::Continue) {
+        m_core->call(QStringLiteral("cowork.killSwitch"), {{QStringLiteral("on"), true}}, nullptr, this);
+    }
+}
+
+void CoworkPanel::enableForActiveThread()
+{
+    if (m_activeThread.isEmpty()) {
+        return;
+    }
+    QJsonObject p{{QStringLiteral("threadId"), m_activeThread}, {QStringLiteral("enabled"), true}};
+    m_core->call(QStringLiteral("cowork.setEnabled"), p, [this](const QJsonObject &, const QJsonObject &err) {
+        if (err.isEmpty()) {
+            m_status->setMessageType(KMessageWidget::Positive);
+            m_status->setText(i18n("Cowork enabled for this agent. Restart or resume it to load the desktop tools."));
+        }
+    }, this);
+}
