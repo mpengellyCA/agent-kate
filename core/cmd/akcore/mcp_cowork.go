@@ -145,8 +145,10 @@ func (b *mcpBridge) runScreenshot(args json.RawMessage) ([]map[string]any, error
 	if mime == "" {
 		mime = "image/png"
 	}
+	// MCP image content block: flat data + mimeType (NOT the Anthropic Messages-API
+	// {source:{type:base64,media_type,data}} shape — they are different schemas).
 	return []map[string]any{
-		{"type": "image", "source": map[string]any{"type": "base64", "media_type": mime, "data": res.PNGB64}},
+		{"type": "image", "data": res.PNGB64, "mimeType": mime},
 		{"type": "text", "text": fmt.Sprintf("Screenshot captured (%d×%d).", res.Width, res.Height)},
 	}, nil
 }
