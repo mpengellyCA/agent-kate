@@ -4,7 +4,9 @@
 #include <QJsonObject>
 #include <QList>
 #include <QObject>
+#include <QSet>
 #include <QString>
+#include <QTimer>
 #include <QVariantList>
 #include <QVariantMap>
 
@@ -62,6 +64,19 @@ private:
     void flushInjectQueue();
     void failInjectQueue(const QString &err);
     void teardownRemoteDesktop();
+    // closeSessionOnly drops the live portal session (after force-releasing held
+    // input) WITHOUT failing the queue — used to rebuild a session that lacks a
+    // device type a new batch needs. notifyKeysym/notifyButton send one raw event;
+    // releaseHeld synthesises a key/button-up for everything still logically down so
+    // a torn-down session can never leave the compositor in a stuck-grab state.
+    void closeSessionOnly();
+    void releaseHeld();
+    void notifyKeysym(int keysym, uint state);
+    void notifyButton(int button, uint state);
+    // deviceTypesFor returns the RemoteDesktop SelectDevices bitmask the ops need:
+    // keyboard (1) and/or pointer (2). Keyboard-only by default so the common case
+    // never creates a virtual pointer (the cursor-freeze root cause).
+    static uint deviceTypesFor(const QJsonArray &ops);
     // Invoke a portal method that returns a Request handle and deliver its async
     // Response to cb. options gains a fresh handle_token; args precede options.
     void portalRequest(const QString &iface, const QString &method, const QVariantList &args,
@@ -78,5 +93,10 @@ private:
     QString m_rdSession;            // RemoteDesktop session object path ("" = none)
     bool m_rdReady = false;         // session started, devices granted
     bool m_rdStarting = false;      // Create/Select/Start in flight
+    uint m_rdTypes = 0;             // device types the live session was started with
     QList<PendingInject> m_injectQueue;
+
+    QSet<int> m_heldKeys;           // keysyms currently pressed (state==1, no release yet)
+    QSet<int> m_heldButtons;        // button codes currently pressed
+    QTimer m_idleTimer;             // tears the session down after a spell of no injects
 };

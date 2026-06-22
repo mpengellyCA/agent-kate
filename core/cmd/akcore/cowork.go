@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"strings"
 	"time"
 
 	"agentkate/internal/cowork"
@@ -378,6 +380,191 @@ func registerCoworkHandlers(d handlerDeps) {
 		cw.AuditCapture(p.ThreadID, cowork.CapInputInject, target, dec.GrantID, hashString(desc))
 		return map[string]any{"ok": true, "actions": desc}, nil
 	})
+
+	// --- AT-SPI element index + cursor-free activation (R1 read / R2 act) ---------
+
+	d.srv.Handle("cowork.listElements", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID       string `json:"threadId"`
+			TargetWindowID string `json:"targetWindowId"`
+			Max            int    `json:"max"`
+		}
+		_ = json.Unmarshal(raw, &p)
+		if err := requireCoworkBridge(d, ctx, p.ThreadID); err != nil {
+			return nil, err
+		}
+		if !cw.Available() {
+			return nil, ipc.Errorf(codeCoworkDenied, "desktop integration unavailable (no KDE session bus)")
+		}
+		win, ok := resolveTargetWindow(cw, p.TargetWindowID)
+		if !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams,
+				"no target window: pass targetWindowId (from desktop_list_windows), or focus a window first")
+		}
+		target := cowork.Target{
+			Kind: cowork.TargetWindow, WindowID: win.InternalID,
+			ResourceClass: win.ResourceClass, Label: orDefault(win.Caption, win.ResourceClass),
+		}
+		dec, err := cw.Authorize(ctx, cowork.AuthRequest{
+			ThreadID: p.ThreadID, Capability: cowork.CapA11yRead,
+			Target: target, SuggestedScope: cowork.ScopeSession,
+		})
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		if !dec.Allow {
+			return nil, ipc.Errorf(codeCoworkDenied, dec.Reason)
+		}
+		elems, truncated, err := cw.KDE().ListElements(win.PID,
+			kde.Rect{X: win.X, Y: win.Y, W: win.Width, H: win.Height}, p.Max, 30*time.Second)
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		cw.AuditCapture(p.ThreadID, cowork.CapA11yRead, target, dec.GrantID, hashJSON(elems))
+		return map[string]any{"elements": elems, "truncated": truncated, "grantId": dec.GrantID}, nil
+	})
+
+	d.srv.Handle("cowork.activateElement", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID  string `json:"threadId"`
+			ElementID string `json:"elementId"`
+			Action    string `json:"action"`
+		}
+		_ = json.Unmarshal(raw, &p)
+		if err := requireCoworkBridge(d, ctx, p.ThreadID); err != nil {
+			return nil, err
+		}
+		if !cw.Available() {
+			return nil, ipc.Errorf(codeCoworkDenied, "desktop integration unavailable (no KDE session bus)")
+		}
+		if p.ElementID == "" {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "elementId is required (from desktop_list_elements)")
+		}
+		info, err := cw.KDE().ElementInfo(p.ElementID, 8*time.Second)
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		target, elemLabel := elementTarget(cw, info)
+		act := p.Action
+		if act == "" {
+			act = "activate (default action)"
+		}
+		dec, err := cw.Authorize(ctx, cowork.AuthRequest{
+			ThreadID: p.ThreadID, Capability: cowork.CapA11yAction,
+			Target: target, SuggestedScope: cowork.ScopeOnce,
+			ActionPreview: &cowork.ActionDescriptor{
+				Mechanism: "a11y_action", AppName: target.ResourceClass,
+				WindowTitle: target.Label, Element: elemLabel, Detail: act,
+			},
+		})
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		if !dec.Allow {
+			return nil, ipc.Errorf(codeCoworkDenied, dec.Reason)
+		}
+		if err := cw.KDE().ActivateElement(p.ElementID, p.Action, 10*time.Second); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		cw.AuditCapture(p.ThreadID, cowork.CapA11yAction, target, dec.GrantID, hashString(elemLabel+"|"+act))
+		return map[string]any{"ok": true, "element": elemLabel, "action": act}, nil
+	})
+
+	d.srv.Handle("cowork.setElementText", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID  string `json:"threadId"`
+			ElementID string `json:"elementId"`
+			Text      string `json:"text"`
+		}
+		_ = json.Unmarshal(raw, &p)
+		if err := requireCoworkBridge(d, ctx, p.ThreadID); err != nil {
+			return nil, err
+		}
+		if !cw.Available() {
+			return nil, ipc.Errorf(codeCoworkDenied, "desktop integration unavailable (no KDE session bus)")
+		}
+		if p.ElementID == "" {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "elementId is required (from desktop_list_elements)")
+		}
+		info, err := cw.KDE().ElementInfo(p.ElementID, 8*time.Second)
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		target, elemLabel := elementTarget(cw, info)
+		detail := fmt.Sprintf("set text (%d chars)", len([]rune(p.Text)))
+		dec, err := cw.Authorize(ctx, cowork.AuthRequest{
+			ThreadID: p.ThreadID, Capability: cowork.CapA11yAction,
+			Target: target, SuggestedScope: cowork.ScopeOnce,
+			ActionPreview: &cowork.ActionDescriptor{
+				Mechanism: "a11y_action", AppName: target.ResourceClass,
+				WindowTitle: target.Label, Element: elemLabel, Detail: detail,
+			},
+		})
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		if !dec.Allow {
+			return nil, ipc.Errorf(codeCoworkDenied, dec.Reason)
+		}
+		if err := cw.KDE().SetElementText(p.ElementID, p.Text, 10*time.Second); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		// Audit the action + a hash of the text (never the plaintext itself).
+		cw.AuditCapture(p.ThreadID, cowork.CapA11yAction, target, dec.GrantID, hashString(elemLabel+"|"+p.Text))
+		return map[string]any{"ok": true, "element": elemLabel}, nil
+	})
+}
+
+// resolveTargetWindow returns the KWin window the agent wants to inspect: the one
+// matching windowID, or the active window when windowID is empty. ok is false if no
+// such window can be found (so the caller can ask for an explicit target).
+func resolveTargetWindow(cw *cowork.Service, windowID string) (kde.Window, bool) {
+	wins, err := cw.KDE().ListWindows(5 * time.Second)
+	if err != nil {
+		return kde.Window{}, false
+	}
+	if windowID != "" {
+		for _, w := range wins {
+			if w.InternalID == windowID {
+				return w, true
+			}
+		}
+		return kde.Window{}, false
+	}
+	for _, w := range wins {
+		if w.Active && !w.Minimized {
+			return w, true
+		}
+	}
+	return kde.Window{}, false
+}
+
+// elementTarget maps an AT-SPI element's owning pid back to a KWin window so the
+// self-target guard (refuse Agent Kate's own UI) and the R2 consent prompt have a
+// resourceClass + title. Returns the consent Target and a human label for the element.
+func elementTarget(cw *cowork.Service, info kde.ElementContext) (cowork.Target, string) {
+	t := cowork.Target{Kind: cowork.TargetApp, Label: "the focused window"}
+	if info.PID > 0 {
+		if wins, err := cw.KDE().ListWindows(4 * time.Second); err == nil {
+			for _, w := range wins {
+				if w.PID == info.PID {
+					t.ResourceClass = w.ResourceClass
+					if w.Caption != "" {
+						t.Label = w.Caption
+					}
+					break
+				}
+			}
+		}
+	}
+	label := strings.TrimSpace(info.Role)
+	if info.Name != "" {
+		label = strings.TrimSpace(info.Role + " “" + info.Name + "”")
+	}
+	if label == "" {
+		label = "element"
+	}
+	return t, label
 }
 
 // requireCoworkBridge enforces: the caller is an agent bridge (not the UI), bound to

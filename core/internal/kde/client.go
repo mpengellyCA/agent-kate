@@ -31,6 +31,9 @@ type Client struct {
 
 	mu      sync.Mutex
 	reports map[string]chan string // nonce -> first Report payload (one-shot rendezvous)
+
+	atspiMu   sync.Mutex
+	atspiConn *dbus.Conn // the AT-SPI accessibility bus, dialed lazily (see atspi.go)
 }
 
 // New connects to the session bus, exports the window-list callback receiver, and
@@ -76,6 +79,12 @@ func (c *Client) Close() error {
 	if c == nil || c.conn == nil {
 		return nil
 	}
+	c.atspiMu.Lock()
+	if c.atspiConn != nil {
+		_ = c.atspiConn.Close()
+		c.atspiConn = nil
+	}
+	c.atspiMu.Unlock()
 	_, _ = c.conn.ReleaseName(c.busName)
 	err := c.conn.Close()
 	c.conn = nil
