@@ -41,6 +41,7 @@ class CoworkPortal : public QObject
     Q_OBJECT
 public:
     CoworkPortal(CoreClient *core, QWidget *topLevel, QObject *parent = nullptr);
+    ~CoworkPortal() override;
 
 private Q_SLOTS:
     void onNotification(const QString &method, const QJsonObject &params);
@@ -48,6 +49,13 @@ private Q_SLOTS:
 private:
     void handleScreenshot(const QJsonObject &req);
     void handleLaunchBrowser(const QJsonObject &req);
+    // Chromium-family browsers only export their accessibility tree over AT-SPI when
+    // org.a11y.Status reports accessibility enabled AT LAUNCH (Firefox activates
+    // lazily on any AT-SPI client connect; Chromium does not). So before launching a
+    // Chromium browser we announce ourselves as an assistive technology by flipping the
+    // status flags true, and we restore the originals on teardown.
+    void enableAtspiStatusForLaunch();
+    void restoreAtspiStatus();
     void finishScreenshot(const QString &corrId, int maxDim, const QString &format,
                           uint code, const QVariantMap &results);
     void replyResult(const QString &corrId, const QString &kind, bool ok,
@@ -100,4 +108,8 @@ private:
     QSet<int> m_heldKeys;           // keysyms currently pressed (state==1, no release yet)
     QSet<int> m_heldButtons;        // button codes currently pressed
     QTimer m_idleTimer;             // tears the session down after a spell of no injects
+
+    bool m_a11yStatusCaptured = false; // whether we recorded the user's original a11y status
+    bool m_origIsEnabled = false;      // org.a11y.Status.IsEnabled before we forced it on
+    bool m_origScreenReader = false;   // org.a11y.Status.ScreenReaderEnabled before we forced it on
 };

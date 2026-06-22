@@ -11,6 +11,7 @@
 #include <QDBusMessage>
 #include <QDBusObjectPath>
 #include <QDBusReply>
+#include <QDBusVariant>
 #include <QFile>
 #include <QImage>
 #include <QJsonValue>
@@ -23,6 +24,35 @@
 namespace {
 constexpr auto kPortalService = "org.freedesktop.portal.Desktop";
 constexpr auto kPortalPath = "/org/freedesktop/portal/desktop";
+
+// org.a11y.Status lives on the session bus and reports whether accessibility is
+// enabled; toolkits read it to decide whether to export an AT-SPI tree. Chromium
+// checks it at launch, so we set it before launching a Chromium browser.
+QDBusInterface a11yStatusProps()
+{
+    return QDBusInterface(QStringLiteral("org.a11y.Bus"), QStringLiteral("/org/a11y/bus"),
+                          QStringLiteral("org.freedesktop.DBus.Properties"),
+                          QDBusConnection::sessionBus());
+}
+
+bool readA11yStatus(const QString &prop, bool fallback)
+{
+    QDBusInterface props = a11yStatusProps();
+    if (!props.isValid()) {
+        return fallback;
+    }
+    QDBusReply<QDBusVariant> r = props.call(QStringLiteral("Get"), QStringLiteral("org.a11y.Status"), prop);
+    return r.isValid() ? r.value().variant().toBool() : fallback;
+}
+
+void writeA11yStatus(const QString &prop, bool value)
+{
+    QDBusInterface props = a11yStatusProps();
+    if (props.isValid()) {
+        props.call(QStringLiteral("Set"), QStringLiteral("org.a11y.Status"), prop,
+                   QVariant::fromValue(QDBusVariant(value)));
+    }
+}
 } // namespace
 
 PortalResponseWaiter::PortalResponseWaiter(const QString &requestPath, QObject *parent)
@@ -57,6 +87,33 @@ CoworkPortal::CoworkPortal(CoreClient *core, QWidget *topLevel, QObject *parent)
             teardownRemoteDesktop();
         }
     });
+}
+
+CoworkPortal::~CoworkPortal()
+{
+    restoreAtspiStatus();
+}
+
+void CoworkPortal::enableAtspiStatusForLaunch()
+{
+    // Record the user's original state once, so we can put it back on teardown.
+    if (!m_a11yStatusCaptured) {
+        m_origIsEnabled = readA11yStatus(QStringLiteral("IsEnabled"), false);
+        m_origScreenReader = readA11yStatus(QStringLiteral("ScreenReaderEnabled"), false);
+        m_a11yStatusCaptured = true;
+    }
+    writeA11yStatus(QStringLiteral("IsEnabled"), true);
+    writeA11yStatus(QStringLiteral("ScreenReaderEnabled"), true);
+}
+
+void CoworkPortal::restoreAtspiStatus()
+{
+    if (!m_a11yStatusCaptured) {
+        return;
+    }
+    writeA11yStatus(QStringLiteral("ScreenReaderEnabled"), m_origScreenReader);
+    writeA11yStatus(QStringLiteral("IsEnabled"), m_origIsEnabled);
+    m_a11yStatusCaptured = false;
 }
 
 void CoworkPortal::onNotification(const QString &method, const QJsonObject &params)
@@ -216,6 +273,12 @@ void CoworkPortal::handleLaunchBrowser(const QJsonObject &req)
         }
         replyResult(corrId, QStringLiteral("launchBrowser"), false, err, extra);
         return;
+    }
+
+    // Chromium browsers only export their a11y tree if accessibility is enabled at
+    // launch — announce ourselves as an AT first (Firefox doesn't need this).
+    if (b.family == QLatin1String("chromium")) {
+        enableAtspiStatusForLaunch();
     }
 
     QString launchErr;
