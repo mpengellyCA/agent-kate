@@ -68,7 +68,8 @@ func coworkToolDefs() []map[string]any {
 				"PREFERRED way to interact with a window: prefer it over typing or blind " +
 				"clicks. Pass the returned id to desktop_activate_element (to click/activate) " +
 				"or desktop_set_text (to fill a field) — both act directly on the element with " +
-				"NO cursor movement. Requires the 'a11y_read' capability. Pass targetWindowId " +
+				"NO cursor movement. This returns only clickable elements; to read a page's prose " +
+				"(article body, headings) use desktop_read_text. Requires the 'a11y_read' capability. Pass targetWindowId " +
 				"(from desktop_list_windows); omit to use the active window. Note: web pages in " +
 				"a browser only expose their elements when the browser's accessibility is " +
 				"enabled (Firefox/Zen auto-enable when an accessibility client is present; " +
@@ -81,6 +82,27 @@ func coworkToolDefs() []map[string]any {
 						"description": "KWin internalId to inspect (from desktop_list_windows). Omit for the active window.",
 					},
 					"max": map[string]any{"type": "integer", "description": "Max elements to return (default/cap 200)."},
+				},
+			},
+		},
+		{
+			"name": "desktop_read_text",
+			"description": "Read the visible text content of a window through the accessibility " +
+				"tree — headings and paragraphs in document order. Use this to read an article " +
+				"or page's prose (it returns the actual text, not OCR of a screenshot, and isn't " +
+				"limited like desktop_list_elements which only returns clickable elements). " +
+				"Requires the 'a11y_read' capability. Pass targetWindowId (from " +
+				"desktop_list_windows); omit for the active window. Returns up to maxChars " +
+				"characters (default 20000). Works only where the app exposes accessibility — for " +
+				"a browser, open it with desktop_open_browser first.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"targetWindowId": map[string]any{
+						"type":        "string",
+						"description": "KWin internalId to read (from desktop_list_windows). Omit for the active window.",
+					},
+					"maxChars": map[string]any{"type": "integer", "description": "Max characters to return (default 20000)."},
 				},
 			},
 		},
@@ -294,6 +316,36 @@ func (b *mcpBridge) runCoworkTool(name string, args json.RawMessage) (string, er
 			sb.WriteString("(list truncated at the cap — target a specific window or raise max to see more)\n")
 		}
 		return strings.TrimRight(sb.String(), "\n"), nil
+
+	case "desktop_read_text":
+		var a struct {
+			TargetWindowID string `json:"targetWindowId"`
+			MaxChars       int    `json:"maxChars"`
+		}
+		_ = json.Unmarshal(args, &a)
+		params := map[string]any{"threadId": b.thread}
+		if a.TargetWindowID != "" {
+			params["targetWindowId"] = a.TargetWindowID
+		}
+		if a.MaxChars > 0 {
+			params["maxChars"] = a.MaxChars
+		}
+		var res struct {
+			Text      string `json:"text"`
+			Truncated bool   `json:"truncated"`
+		}
+		if err := b.client.CallTimeout("cowork.readText", params, &res, 45*time.Second); err != nil {
+			return "", err
+		}
+		if strings.TrimSpace(res.Text) == "" {
+			return "No readable text was found (the app may not expose accessibility; for a browser, " +
+				"open it with desktop_open_browser first).", nil
+		}
+		out := res.Text
+		if res.Truncated {
+			out += "\n\n(text truncated at the cap — raise maxChars for more)"
+		}
+		return out, nil
 
 	case "desktop_activate_element":
 		var a struct {

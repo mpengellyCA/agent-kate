@@ -424,6 +424,47 @@ func registerCoworkHandlers(d handlerDeps) {
 		return map[string]any{"elements": elems, "truncated": truncated, "grantId": dec.GrantID}, nil
 	})
 
+	d.srv.Handle("cowork.readText", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID       string `json:"threadId"`
+			TargetWindowID string `json:"targetWindowId"`
+			MaxChars       int    `json:"maxChars"`
+		}
+		_ = json.Unmarshal(raw, &p)
+		if err := requireCoworkBridge(d, ctx, p.ThreadID); err != nil {
+			return nil, err
+		}
+		if !cw.Available() {
+			return nil, ipc.Errorf(codeCoworkDenied, "desktop integration unavailable (no KDE session bus)")
+		}
+		win, ok := resolveTargetWindow(cw, p.TargetWindowID)
+		if !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams,
+				"no target window: pass targetWindowId (from desktop_list_windows), or focus a window first")
+		}
+		target := cowork.Target{
+			Kind: cowork.TargetWindow, WindowID: win.InternalID,
+			ResourceClass: win.ResourceClass, Label: orDefault(win.Caption, win.ResourceClass),
+		}
+		dec, err := cw.Authorize(ctx, cowork.AuthRequest{
+			ThreadID: p.ThreadID, Capability: cowork.CapA11yRead,
+			Target: target, SuggestedScope: cowork.ScopeSession,
+		})
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		if !dec.Allow {
+			return nil, ipc.Errorf(codeCoworkDenied, dec.Reason)
+		}
+		text, truncated, err := cw.KDE().ReadText(win.PID,
+			kde.Rect{X: win.X, Y: win.Y, W: win.Width, H: win.Height}, p.MaxChars, 30*time.Second)
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		cw.AuditCapture(p.ThreadID, cowork.CapA11yRead, target, dec.GrantID, hashString(text))
+		return map[string]any{"text": text, "truncated": truncated, "grantId": dec.GrantID}, nil
+	})
+
 	d.srv.Handle("cowork.activateElement", func(ctx context.Context, raw json.RawMessage) (any, error) {
 		var p struct {
 			ThreadID  string `json:"threadId"`

@@ -26,6 +26,7 @@ const (
 	ifaceAccessible   = "org.a11y.atspi.Accessible"
 	ifaceComponent    = "org.a11y.atspi.Component"
 	ifaceAction       = "org.a11y.atspi.Action"
+	ifaceText         = "org.a11y.atspi.Text"
 	ifaceEditableText = "org.a11y.atspi.EditableText"
 
 	atspiCoordScreen = uint32(0) // GetExtents coordinate type: absolute screen pixels
@@ -63,6 +64,16 @@ var atspiActionableRoles = map[string]bool{
 var atspiEditableRoles = map[string]bool{
 	"entry": true, "password text": true, "text": true,
 	"paragraph": true, "document text": true,
+}
+
+// atspiContentRoles are the text-bearing roles ReadText harvests prose from. They are
+// taken as whole blocks (not descended into) so a paragraph's inline runs aren't
+// double-counted. Form fields are excluded — reading their contents risks leaking
+// secrets and isn't page prose.
+var atspiContentRoles = map[string]bool{
+	"heading": true, "paragraph": true, "static text": true, "text": true,
+	"label": true, "list item": true, "caption": true, "block quote": true,
+	"table cell": true, "link": true, "term": true, "definition": true,
 }
 
 // Rect is a screen rectangle in absolute pixels (used to spatially filter elements
@@ -282,31 +293,9 @@ func (c *Client) ListElements(targetPID int, winRect Rect, max int, timeout time
 	}
 	defer func() { sortElementsReadingOrder(elems) }()
 
-	root := atspiRef{Name: atspiRegistryName, Path: atspiRootPath}
-	appCount := c.a11yChildCount(ctx, conn, root)
-
-	// Decide which apps to scan: prefer a pid match, else scan all + geometry-filter.
-	var apps []atspiRef
-	geomFilter := false
-	for i := 0; i < appCount; i++ {
-		app, e := c.a11yChild(ctx, conn, root, i)
-		if e != nil || app.Name == "" {
-			continue
-		}
-		if targetPID > 0 && c.a11yPID(ctx, conn, app.Name) == targetPID {
-			apps = append(apps, app)
-		}
-	}
-	if len(apps) == 0 {
-		geomFilter = winRect.W > 0 && winRect.H > 0
-		for i := 0; i < appCount; i++ {
-			app, e := c.a11yChild(ctx, conn, root, i)
-			if e != nil || app.Name == "" {
-				continue
-			}
-			apps = append(apps, app)
-		}
-	}
+	// Prefer apps whose pid matches the window; else scan all and geometry-filter.
+	apps, geomFilter := c.atspiApps(ctx, conn, targetPID)
+	geomFilter = geomFilter && winRect.W > 0 && winRect.H > 0
 
 	type queued struct {
 		ref   atspiRef
@@ -458,6 +447,133 @@ func (c *Client) SetElementText(id, text string, timeout time.Duration) error {
 		return fmt.Errorf("kde: the element rejected the text (it may not be editable)")
 	}
 	return nil
+}
+
+// atspiApps returns the application accessibles to scan for a target window: those
+// whose pid matches, or — when none report that pid — every application (with
+// geomFilter true so the caller spatially clips results to the window).
+func (c *Client) atspiApps(ctx context.Context, conn *dbus.Conn, targetPID int) (apps []atspiRef, geomFilter bool) {
+	root := atspiRef{Name: atspiRegistryName, Path: atspiRootPath}
+	appCount := c.a11yChildCount(ctx, conn, root)
+	for i := 0; i < appCount; i++ {
+		app, e := c.a11yChild(ctx, conn, root, i)
+		if e != nil || app.Name == "" {
+			continue
+		}
+		if targetPID > 0 && c.a11yPID(ctx, conn, app.Name) == targetPID {
+			apps = append(apps, app)
+		}
+	}
+	if len(apps) > 0 {
+		return apps, false
+	}
+	for i := 0; i < appCount; i++ {
+		app, e := c.a11yChild(ctx, conn, root, i)
+		if e != nil || app.Name == "" {
+			continue
+		}
+		apps = append(apps, app)
+	}
+	return apps, true
+}
+
+// a11yTextOf returns the rendered text of a node — its Text-interface contents if it
+// has any, else its accessible Name.
+func (c *Client) a11yTextOf(ctx context.Context, conn *dbus.Conn, ref atspiRef) string {
+	obj := c.a11yObj(conn, ref)
+	if v, err := a11yProp(ctx, obj, ifaceText, "CharacterCount"); err == nil {
+		n := 0
+		switch x := v.Value().(type) {
+		case int32:
+			n = int(x)
+		case int:
+			n = x
+		}
+		if n > 0 {
+			var s string
+			if e := obj.CallWithContext(ctx, ifaceText+".GetText", 0, int32(0), int32(n)).Store(&s); e == nil {
+				return s
+			}
+		}
+	}
+	return c.a11yName(ctx, conn, ref)
+}
+
+// ReadText extracts the readable prose of the target window's content from the
+// accessibility tree — headings and paragraphs, in document order — so an agent can
+// read an article without OCR'ing a downscaled screenshot. Text-bearing roles are
+// taken as whole blocks (not descended into) to avoid double-counting inline runs;
+// form fields are skipped. truncated reports whether a cap stopped the walk.
+func (c *Client) ReadText(targetPID int, winRect Rect, maxChars int, timeout time.Duration) (text string, truncated bool, err error) {
+	if maxChars <= 0 || maxChars > 80000 {
+		maxChars = 20000
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	conn, err := c.atspiConnect(ctx)
+	if err != nil {
+		return "", false, err
+	}
+
+	apps, geomFilter := c.atspiApps(ctx, conn, targetPID)
+	geomFilter = geomFilter && winRect.W > 0 && winRect.H > 0
+
+	var b strings.Builder
+	visited := 0
+	type queued struct {
+		ref   atspiRef
+		depth int
+	}
+	for _, app := range apps {
+		queue := []queued{{app, 0}}
+		for len(queue) > 0 {
+			if ctx.Err() != nil || visited >= atspiMaxVisited || b.Len() >= maxChars {
+				return strings.TrimSpace(b.String()), true, nil
+			}
+			node := queue[0]
+			queue = queue[1:]
+			visited++
+
+			roleName, e := c.a11yRoleName(ctx, conn, node.ref)
+			if e != nil {
+				continue
+			}
+			rl := strings.ToLower(roleName)
+
+			if atspiContentRoles[rl] {
+				st := c.a11yState(ctx, conn, node.ref)
+				if stateHas(st, stShowing) && stateHas(st, stVisible) && !stateHas(st, stEditable) {
+					take := true
+					if geomFilter {
+						x, y, w, h, okE := c.a11yExtents(ctx, conn, node.ref)
+						take = okE && rectsIntersect(x, y, w, h, winRect.X, winRect.Y, winRect.W, winRect.H)
+					}
+					if take {
+						t := strings.TrimSpace(c.a11yTextOf(ctx, conn, node.ref))
+						if t != "" {
+							if strings.HasPrefix(rl, "heading") {
+								b.WriteString("\n## " + t + "\n")
+							} else {
+								b.WriteString(t + "\n")
+							}
+						}
+					}
+				}
+				continue // a content block is taken whole; don't descend into its runs
+			}
+
+			if node.depth < atspiMaxDepth {
+				n := c.a11yChildCount(ctx, conn, node.ref)
+				for i := 0; i < n; i++ {
+					child, ce := c.a11yChild(ctx, conn, node.ref, i)
+					if ce == nil && child.Name != "" {
+						queue = append(queue, queued{child, node.depth + 1})
+					}
+				}
+			}
+		}
+	}
+	return strings.TrimSpace(b.String()), truncated, nil
 }
 
 // sortElementsReadingOrder orders elements roughly top-to-bottom, left-to-right so
