@@ -1,5 +1,6 @@
 #include "CoworkPanel.h"
 
+#include "BrowserLaunch.h"
 #include "ConsentDialog.h"
 #include "ControlConsentDialog.h"
 #include "ipc/CoreClient.h"
@@ -8,16 +9,22 @@
 #include <KMessageBox>
 #include <KMessageWidget>
 
+#include <QAction>
 #include <QCheckBox>
 #include <QDateTime>
+#include <QFileDialog>
+#include <QFileInfo>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QInputDialog>
 #include <QJsonArray>
 #include <QJsonValue>
 #include <QLabel>
+#include <QMenu>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QToolButton>
 #include <QTreeWidget>
 #include <QVBoxLayout>
 
@@ -104,6 +111,29 @@ CoworkPanel::CoworkPanel(CoreClient *core, QWidget *parent)
     auto *capsBox = new QGroupBox(i18n("What agents may do (on = allowed without asking)"), this);
     m_capsLayout = new QVBoxLayout(capsBox);
     layout->addWidget(capsBox);
+
+    // Browser launcher. Browsers hide their web content from the accessibility tree
+    // unless started with the right flag/env, so agents can't read or click page
+    // elements. This opens one with accessibility forced on (the menu lists browsers
+    // found on PATH plus an "Other browser…" picker).
+    auto *browserRow = new QHBoxLayout;
+    auto *browserLabel = new QLabel(i18n("Open a browser agents can read:"), this);
+    browserLabel->setWordWrap(true);
+    m_browserBtn = new QToolButton(this);
+    m_browserBtn->setText(i18n("Launch browser"));
+    m_browserBtn->setIcon(QIcon::fromTheme(QStringLiteral("internet-web-browser")));
+    m_browserBtn->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    m_browserBtn->setPopupMode(QToolButton::InstantPopup);
+    m_browserBtn->setToolTip(i18n(
+        "Launch a web browser with its accessibility tree enabled so agents can read\n"
+        "and click page elements. The browser must be started fresh from here — if it\n"
+        "is already running, quit it first."));
+    m_browserMenu = new QMenu(m_browserBtn);
+    m_browserBtn->setMenu(m_browserMenu);
+    connect(m_browserMenu, &QMenu::aboutToShow, this, &CoworkPanel::rebuildBrowserMenu);
+    browserRow->addWidget(browserLabel, 1);
+    browserRow->addWidget(m_browserBtn);
+    layout->addLayout(browserRow);
 
     // Active grants.
     auto *grantsBox = new QGroupBox(i18n("Active access"), this);
@@ -369,4 +399,61 @@ void CoworkPanel::enableForActiveThread()
             m_status->setText(i18n("Cowork enabled for this agent. Restart or resume it to load the desktop tools."));
         }
     }, this);
+}
+
+void CoworkPanel::rebuildBrowserMenu()
+{
+    m_browserMenu->clear();
+    const QList<BrowserLaunch::Browser> browsers = BrowserLaunch::all();
+    for (const BrowserLaunch::Browser &b : browsers) {
+        const QString engine = b.family == QLatin1String("chromium") ? i18n("Chromium") : i18n("Firefox");
+        QAction *act = m_browserMenu->addAction(i18n("%1  (%2)", b.name, engine));
+        const QString name = b.name, cmd = b.command, fam = b.family;
+        connect(act, &QAction::triggered, this, [this, name, cmd, fam] {
+            launchBrowserAndReport(name, cmd, fam);
+        });
+    }
+    if (!browsers.isEmpty()) {
+        m_browserMenu->addSeparator();
+    }
+    QAction *other = m_browserMenu->addAction(i18n("Other browser…"));
+    connect(other, &QAction::triggered, this, &CoworkPanel::pickCustomBrowser);
+}
+
+void CoworkPanel::pickCustomBrowser()
+{
+    const QString path = QFileDialog::getOpenFileName(
+        this, i18n("Choose a browser executable"), QStringLiteral("/usr/bin"));
+    if (path.isEmpty()) {
+        return;
+    }
+    const QStringList engines{i18n("Firefox-based (Zen, Firefox, LibreWolf…)"),
+                              i18n("Chromium-based (Helium, Chrome, Brave…)")};
+    bool ok = false;
+    const QString choice = QInputDialog::getItem(
+        this, i18n("Browser engine"),
+        i18n("Which engine is this browser built on? It decides how accessibility is enabled."),
+        engines, 0, false, &ok);
+    if (!ok) {
+        return;
+    }
+    const QString family =
+        engines.indexOf(choice) == 1 ? QStringLiteral("chromium") : QStringLiteral("firefox");
+    const QString name = QFileInfo(path).fileName();
+    BrowserLaunch::addCustom({name, path, family});
+    launchBrowserAndReport(name, path, family);
+}
+
+void CoworkPanel::launchBrowserAndReport(const QString &name, const QString &command,
+                                         const QString &family)
+{
+    QString err;
+    if (BrowserLaunch::launch({name, command, family}, &err)) {
+        m_status->setMessageType(KMessageWidget::Positive);
+        m_status->setText(i18n("Launched %1 with accessibility enabled. If it was already running, "
+                               "fully quit it and launch again so the setting takes effect.", name));
+    } else {
+        m_status->setMessageType(KMessageWidget::Error);
+        m_status->setText(i18n("Could not launch %1: %2", name, err));
+    }
 }

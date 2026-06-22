@@ -10,6 +10,8 @@ class KMessageWidget;
 class QTreeWidget;
 class QPlainTextEdit;
 class QPushButton;
+class QToolButton;
+class QMenu;
 class QLabel;
 class QCheckBox;
 class QVBoxLayout;
@@ -42,6 +44,9 @@ private:
     void revokeSelected();
     void toggleKill();
     void enableForActiveThread();
+    void rebuildBrowserMenu();
+    void pickCustomBrowser();
+    void launchBrowserAndReport(const QString &name, const QString &command, const QString &family);
 
     CoreClient *m_core = nullptr;
     QString m_activeThread;
@@ -52,6 +57,8 @@ private:
     KMessageWidget *m_status = nullptr;
     QLabel *m_activeLabel = nullptr;
     QPushButton *m_enableBtn = nullptr;
+    QToolButton *m_browserBtn = nullptr;
+    QMenu *m_browserMenu = nullptr;
     QVBoxLayout *m_capsLayout = nullptr;                 // holds the capability toggles
     QHash<QString, QCheckBox *> m_policyChecks;          // capability key -> switch
     QTreeWidget *m_grants = nullptr;
