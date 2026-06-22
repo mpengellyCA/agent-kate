@@ -470,6 +470,11 @@ void AgentDock::wireAgentPanel(int agentId, AgentPanel *panel)
             [this, agentId](bool dormant) { m_roster->setAgentDormant(agentId, dormant); });
     connect(panel, &AgentPanel::attentionChanged, this,
             [this, agentId](bool on) { m_roster->setAgentAttention(agentId, on); });
+    connect(panel, &AgentPanel::threadIdChanged, this, [this, panel](const QString &threadId) {
+        if (m_stack->currentWidget() == panel) {
+            Q_EMIT activeThreadChanged(threadId);
+        }
+    });
 }
 
 bool AgentDock::hasThread(const QString &threadId) const

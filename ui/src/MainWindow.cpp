@@ -370,6 +370,17 @@ void MainWindow::setupUi()
     connect(m_lsp, &LspManager::serverStatusChanged, this, &MainWindow::updateLspStatus);
 
     connect(m_agent, &AgentDock::agentActivated, this, &MainWindow::onAgentActivated);
+    // A fresh agent's thread id arrives after activation (async session start), so
+    // re-point the thread-keyed panels when it lands — otherwise "Enable Cowork for
+    // this agent" stays greyed out and Git Log keeps the stale thread.
+    connect(m_agent, &AgentDock::activeThreadChanged, this, [this](const QString &threadId) {
+        if (m_coworkPanel) {
+            m_coworkPanel->setActiveThread(threadId, QString());
+        }
+        if (m_logViewer) {
+            m_logViewer->setActiveSource(m_activeProject, threadId);
+        }
+    });
     connect(m_agent, &AgentDock::projectFocused, this,
             [this](const QString &path) { m_tree->setRoot(path); });
     connect(m_agent, &AgentDock::openTerminalRequested, this,

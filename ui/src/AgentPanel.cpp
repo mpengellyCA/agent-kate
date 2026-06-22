@@ -1090,6 +1090,7 @@ bool AgentPanel::eventFilter(QObject *obj, QEvent *event)
 void AgentPanel::setDormant(const QString &threadId, const QString &title, bool isolated)
 {
     m_threadId = threadId;
+    Q_EMIT threadIdChanged(m_threadId);
     m_dormant = true;
     m_isolated = isolated;
     loadTranscript();
@@ -1891,6 +1892,7 @@ void AgentPanel::onSendClicked()
                              return;
                          }
                          m_threadId = result.value(QStringLiteral("threadId")).toString();
+                         Q_EMIT threadIdChanged(m_threadId);
                          // Apply the user's chosen compaction strategy now
                          // that the thread exists on the server.
                          pushCompactStrategy();

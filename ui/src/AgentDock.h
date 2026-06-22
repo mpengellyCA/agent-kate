@@ -58,6 +58,10 @@ Q_SIGNALS:
     void statusMessage(const QString &text);
     void openDiff(const QString &title, const QString &diffText);
     void agentActivated(int agentId, const QString &projectPath);
+    // Emitted when the CURRENTLY-shown agent's thread id is assigned/changes (e.g. a
+    // freshly-created agent's session starting). agentActivated fires on selection,
+    // before a fresh agent has a thread; this closes that gap for thread-keyed panels.
+    void activeThreadChanged(const QString &threadId);
     void projectFocused(const QString &projectPath);
     // Emitted when a project is explicitly CLOSED (not merely switched away
     // from). Consumers tied to a project — e.g. its terminal tabs — tear down.

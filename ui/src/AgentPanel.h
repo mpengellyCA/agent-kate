@@ -80,6 +80,10 @@ public:
 Q_SIGNALS:
     void statusMessage(const QString &text);
     void titleChanged(const QString &title);
+    // Emitted when this panel's backing thread id is assigned or changes — a fresh
+    // agent gets its id asynchronously when its session starts, after activation, so
+    // consumers keyed on the thread (Cowork panel, Git Log) must refresh on this.
+    void threadIdChanged(const QString &threadId);
     void stateChanged(const QString &dotColorHex);
     // Human-readable one-line status (isolation / worktree branch / idle), used
     // as the roster card's subtitle. Tracks the same state as stateChanged.
