@@ -725,6 +725,18 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
             .writeEntry("model", m_modelCombo->currentData().toString());
     });
 
+    // Cowork desktop access. Wiring the agentkate-cowork MCP server into the agent is
+    // fixed at start (it is written into the MCP config when the claude process
+    // launches), so this is a start-time choice like the combos above. Deliberately
+    // NOT sticky: standing desktop access by default would be a footgun — the user
+    // opts in per agent. Making the tools available is harmless on its own; every
+    // action is still gated by the consent prompts and the Cowork panel toggles.
+    m_coworkCheck = new QCheckBox(QStringLiteral("See && control my desktop (Cowork)"), this);
+    m_coworkCheck->setToolTip(QStringLiteral(
+        "Give this agent the Cowork desktop tools (see windows, screenshot, read the\n"
+        "screen, click controls, type) from its very first message. Fixed once the\n"
+        "agent starts. Every action still needs your consent or a Cowork panel toggle."));
+
     // Compaction strategy. Keeping a thread resumable cheaply needs a
     // condensed summary on disk — otherwise the next resume re-caches the
     // whole transcript. The five options encode (when, model) combos; the
@@ -866,6 +878,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
         form->addRow(QStringLiteral("Isolation"), m_isolationCombo);
         form->addRow(QStringLiteral("Effort"), m_effortCombo);
         form->addRow(QStringLiteral("Model"), m_modelCombo);
+        form->addRow(QStringLiteral("Desktop"), m_coworkCheck);
         auto *action = new QWidgetAction(menu);
         action->setDefaultWidget(panel);
         menu->addAction(action);
@@ -1421,11 +1434,13 @@ void AgentPanel::refresh()
             actions.first()->setEnabled(running); // "Hot Opus (live thread)"
         }
     }
-    // Permission, isolation, effort and model are fixed once a thread exists.
+    // Permission, isolation, effort, model and desktop access are fixed once a
+    // thread exists (they are baked into the agent's launch).
     m_modeCombo->setEnabled(m_threadId.isEmpty());
     m_isolationCombo->setEnabled(m_threadId.isEmpty());
     m_effortCombo->setEnabled(m_threadId.isEmpty());
     m_modelCombo->setEnabled(m_threadId.isEmpty());
+    m_coworkCheck->setEnabled(m_threadId.isEmpty());
 
     // Offer promotion while a thread runs non-isolated in the workspace.
     m_promoteBar->setVisible(!m_threadId.isEmpty() && !m_isolated && !m_promoting);
@@ -1881,6 +1896,8 @@ void AgentPanel::onSendClicked()
                                   m_effortCombo->currentData().toString()},
                                  {QStringLiteral("model"),
                                   m_modelCombo->currentData().toString()},
+                                 {QStringLiteral("coworkEnabled"),
+                                  m_coworkCheck->isChecked()},
                                  {QStringLiteral("attachments"), attachments}},
                      [this](const QJsonObject &result, const QJsonObject &error) {
                          if (!error.isEmpty()) {

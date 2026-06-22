@@ -237,6 +237,7 @@ private:
     QComboBox *m_isolationCombo = nullptr;
     QComboBox *m_effortCombo = nullptr;
     QComboBox *m_modelCombo = nullptr;
+    QCheckBox *m_coworkCheck = nullptr; // start this agent with the Cowork desktop tools wired in
     // Compaction strategy + strip flag — controls how the thread's transcript
     // is condensed to keep resume cost down. Both are sticky to last used.
     QComboBox *m_compactCombo = nullptr;
