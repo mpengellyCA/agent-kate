@@ -56,6 +56,11 @@ add_custom_target(akcore ALL
     USES_TERMINAL
 )
 
+# Enable CTest at the top level so `ctest` in the build root aggregates the
+# tests registered in subdirectories (e.g. ui/tests). Must precede the
+# add_subdirectory() calls that register tests.
+enable_testing()
+
 # --- C++/Qt UI (agentkate) -------------------------------------------------
 # The UI subdirectory pulls in ECM/KDEInstallDirs, which must be the first
 # install-dirs module to load so KDE_INSTALL_* aren't seeded from CMAKE_INSTALL_*.

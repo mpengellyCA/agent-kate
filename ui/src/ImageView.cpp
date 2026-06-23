@@ -8,6 +8,7 @@
 #include <QResizeEvent>
 #include <QScrollArea>
 #include <QSet>
+#include <QTimer>
 #include <QToolBar>
 #include <QVBoxLayout>
 
@@ -48,6 +49,20 @@ ImageView::ImageView(const QString &path, QWidget *parent)
     m_scroll->setWidget(m_imageLabel);
     m_scroll->setWidgetResizable(false);
     m_scroll->setAlignment(Qt::AlignCenter);
+
+    // Coalesce the storm of resize events from a splitter/window drag: each
+    // frame gets a cheap nearest-neighbour rescale (computed in resizeEvent),
+    // and this one-shot fires ~80 ms after the drag settles to repaint the
+    // final size once at full smooth quality. Smooth-scaling a full-resolution
+    // source on every event is the doc-view resize stall this avoids.
+    m_settleTimer = new QTimer(this);
+    m_settleTimer->setSingleShot(true);
+    m_settleTimer->setInterval(80);
+    connect(m_settleTimer, &QTimer::timeout, this, [this] {
+        if (m_fit) {
+            applyScale(true);
+        }
+    });
 
     auto *toolbar = new QToolBar;
     toolbar->setIconSize(QSize(16, 16));
@@ -114,30 +129,44 @@ void ImageView::zoomBy(double factor)
     applyScale();
 }
 
-void ImageView::applyScale()
+QSize ImageView::computeTarget() const
+{
+    if (m_image.isNull()) {
+        return {};
+    }
+    if (m_fit) {
+        const QSize avail = m_scroll->viewport()->size();
+        const QSize target = m_image.size().scaled(avail, Qt::KeepAspectRatio);
+        return target.isEmpty() ? m_image.size() : target;
+    }
+    return m_image.size() * m_scale;
+}
+
+void ImageView::applyScale(bool smooth)
 {
     if (m_image.isNull()) {
         return;
     }
-    QSize target;
-    if (m_fit) {
-        const QSize avail = m_scroll->viewport()->size();
-        target = m_image.size().scaled(avail, Qt::KeepAspectRatio);
-        if (target.isEmpty()) {
-            target = m_image.size();
-        }
-    } else {
-        target = m_image.size() * m_scale;
-    }
-    m_imageLabel->setPixmap(QPixmap::fromImage(
-        m_image.scaled(target, Qt::KeepAspectRatio, Qt::SmoothTransformation)));
+    const QSize target = computeTarget();
+    m_imageLabel->setPixmap(QPixmap::fromImage(m_image.scaled(
+        target, Qt::KeepAspectRatio,
+        smooth ? Qt::SmoothTransformation : Qt::FastTransformation)));
     m_imageLabel->resize(target);
+    m_lastTarget = target;
+    m_lastSmooth = smooth;
 }
 
 void ImageView::resizeEvent(QResizeEvent *event)
 {
     QWidget::resizeEvent(event);
-    if (m_fit) {
-        applyScale();
+    if (!m_fit) {
+        return;
     }
+    // Nothing to do if the fitted size is unchanged and already smooth (e.g. a
+    // resize that didn't alter the constraining dimension).
+    if (computeTarget() == m_lastTarget && m_lastSmooth) {
+        return;
+    }
+    applyScale(false);        // cheap immediate frame
+    m_settleTimer->start();   // one smooth repaint once the drag stops
 }

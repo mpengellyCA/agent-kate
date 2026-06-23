@@ -2,6 +2,7 @@
 #include "RecentProjects.h"
 #include "AgentPanel.h"
 #include "AgentRoster.h"
+#include "shell/PanelStack.h"
 #include "AutoOrganizeDialog.h"
 #include "TagEditorDialog.h"
 #include "ipc/CoreClient.h"
@@ -28,7 +29,7 @@
 AgentDock::AgentDock(CoreClient *core, QWidget *parent)
     : QObject(parent)
     , m_core(core)
-    , m_stack(new QStackedWidget(parent))
+    , m_stack(new PanelStack(parent))
     , m_roster(new AgentRoster(parent))
     , m_dialogParent(parent)
 {

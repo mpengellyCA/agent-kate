@@ -116,8 +116,15 @@ CoworkPanel::CoworkPanel(CoreClient *core, QWidget *parent)
     // Capability switchboard: flip a capability ON to pre-authorize it for any
     // cowork-enabled agent — no per-action prompt while on (the kill-switch + audit
     // log remain the safety net). Populated from cowork.getPolicy.
-    auto *capsBox = new QGroupBox(i18n("What agents may do (on = allowed without asking)"), this);
+    // The group title is the widest non-eliding element on this panel; a
+    // QGroupBox title never wraps, so it pins the right pane's minimum width.
+    // Keep it short and move the qualifier into a wrapping hint inside the box.
+    auto *capsBox = new QGroupBox(i18n("What agents may do"), this);
     m_capsLayout = new QVBoxLayout(capsBox);
+    auto *capsHint = new QLabel(i18n("On = allowed without asking."), capsBox);
+    capsHint->setWordWrap(true);
+    capsHint->setStyleSheet(QStringLiteral("color: palette(mid); font-size: small;"));
+    m_capsLayout->addWidget(capsHint);
     layout->addWidget(capsBox);
 
     // Pointer motion defaults: sane USER-set bounds the core clamps every agent
@@ -161,6 +168,7 @@ CoworkPanel::CoworkPanel(CoreClient *core, QWidget *parent)
 
     auto *settleRow = new QHBoxLayout;
     auto *settleLabel = new QLabel(i18n("Settle before click (ms)"), this);
+    settleLabel->setWordWrap(true);
     m_pointerSettle = new QSpinBox(this);
     m_pointerSettle->setRange(0, 500);
     m_pointerSettle->setValue(savedSettle);
@@ -205,6 +213,7 @@ CoworkPanel::CoworkPanel(CoreClient *core, QWidget *parent)
     // Which browser an agent opens when it calls desktop_open_browser itself.
     auto *prefRow = new QHBoxLayout;
     auto *prefLabel = new QLabel(i18n("Agent's default browser:"), this);
+    prefLabel->setWordWrap(true);
     m_agentBrowserCombo = new QComboBox(this);
     m_agentBrowserCombo->setToolTip(i18n(
         "When an agent opens a browser on its own, it uses this one. The agent can "

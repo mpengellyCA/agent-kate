@@ -247,6 +247,11 @@ SearchPanel::SearchPanel(CoreClient *core, QWidget *parent)
     m_exclude = new QLineEdit(this);
     m_exclude->setPlaceholderText(i18n("Files to exclude (e.g. build/**, *.min.js)"));
     m_exclude->setClearButtonEnabled(true);
+    // Two side-by-side fields would otherwise pin the left pane's minimum width
+    // to the sum of their natural widths. Ignore their width hint so the row
+    // compresses with the pane (the fields stay usable and scroll internally).
+    m_include->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+    m_exclude->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
     row2->addWidget(m_include, 1);
     row2->addWidget(m_exclude, 1);
     outer->addLayout(row2);

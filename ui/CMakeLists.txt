@@ -55,6 +55,7 @@ add_executable(agentkate
     src/RecentProjects.cpp
     src/shell/SideBar.cpp
     src/shell/ShellLayout.cpp
+    src/shell/PanelStack.cpp
     src/shell/StubPanel.cpp
     src/cowork/CoworkPanel.cpp
     src/cowork/CoworkPortal.cpp
@@ -161,3 +162,18 @@ install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/org.kde.agentkate.metainfo.xml
 # Install the UI binary. akcore lives next to it (installed by the top-level
 # CMakeLists) so applicationDirPath() finds the core after `make install`.
 install(TARGETS agentkate RUNTIME DESTINATION ${KDE_INSTALL_BINDIR})
+
+# --- Tests -----------------------------------------------------------------
+# Focused QtTest coverage for the panel-shell sizing fix (plan 10). Guarded on
+# Qt6::Test so release/packaging builds without it still configure cleanly. Runs
+# headless under the offscreen QPA platform.
+find_package(Qt6 6.6 QUIET COMPONENTS Test)
+if(Qt6Test_FOUND)
+    enable_testing()
+    add_executable(PanelStackTest tests/PanelStackTest.cpp src/shell/PanelStack.cpp)
+    target_include_directories(PanelStackTest PRIVATE src)
+    target_link_libraries(PanelStackTest PRIVATE Qt6::Widgets Qt6::Test)
+    add_test(NAME PanelStackTest COMMAND PanelStackTest)
+    set_tests_properties(PanelStackTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+endif()
