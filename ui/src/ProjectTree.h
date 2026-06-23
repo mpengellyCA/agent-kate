@@ -1,5 +1,7 @@
 #pragma once
 
+#include "state/Reactive.h"
+
 #include <QHash>
 #include <QJsonObject>
 #include <QString>
@@ -65,6 +67,9 @@ private:
     // Git status decoration.
     void refreshGitStatus();
     void scheduleGitRefresh();
+    // Push a freshly-changed status map into the delegate and repaint ONLY the
+    // rows whose status actually changed, instead of the whole viewport.
+    void applyGitStatuses(const QHash<QString, int> &statuses);
 
     // Operations
     void actNewFile(const QString &targetDir);
@@ -103,4 +108,10 @@ private:
     QTimer *m_gitTimer = nullptr;
     QString m_root;
     bool m_syncWithEditor = false;
+
+    // Canonical path → status map. refreshGitStatus()'s reply set()s it; an
+    // identical snapshot is dropped silently (no signal, no repaint), so the
+    // git-tree emblems stop flickering while an agent edits. A genuinely changed
+    // map fires the subscriber once, which repaints only the changed rows.
+    Reactive<QHash<QString, int>> m_gitStatuses;
 };

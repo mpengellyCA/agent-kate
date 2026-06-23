@@ -22,9 +22,12 @@ import (
 	"agentkate/internal/agent"
 	"agentkate/internal/compact"
 	"agentkate/internal/coop"
+	"agentkate/internal/cowork"
 	"agentkate/internal/gitstatus"
 	"agentkate/internal/ipc"
+	"agentkate/internal/kde"
 	"agentkate/internal/permission"
+	"agentkate/internal/safe"
 	"agentkate/internal/search"
 	"agentkate/internal/session"
 	"agentkate/internal/skills"
@@ -126,13 +129,14 @@ func analyzeCleanupCandidates(d handlerDeps, project string) []gitstatus.Cleanup
 		cands = append(cands, gitstatus.AnalyzeCandidate(wt, snap, running, title, last))
 	}
 
-	// Orphaned: session records the cache no longer tracks whose dir is gone.
+	// Session records the live cache no longer tracks. Two kinds surface here:
+	// orphaned isolated worktrees (dir gone — removal prunes git bookkeeping),
+	// and dormant direct-workspace agents (no live snapshot this session).
+	// AnalyzeCandidate classifies each: the former orphaned, the latter
+	// record-only. Both are removable; the direct ones only archive the session.
 	for _, rec := range d.sessions.List(project) {
 		if seen[rec.ThreadID] {
 			continue
-		}
-		if !rec.Worktree.Isolated {
-			continue // direct-mode threads have no dedicated worktree to clean
 		}
 		running := d.sup.Running(rec.ThreadID)
 		cands = append(cands,
@@ -225,46 +229,89 @@ func runCore() {
 	coldCompacts := &exitCompactTracker{ctx: exitCompactCtx}
 
 	// The agent supervisor relays every thread event to the UI as a
-	// notification, so the agent panel can render the conversation live.
-	sup := agent.NewSupervisor("", log, func(threadID string, event json.RawMessage) {
-		srv.Notify("agent.event", agentEventParams{ThreadID: threadID, Event: event})
-		var probe struct {
-			Type  string `json:"type"`
-			Phase string `json:"phase"`
-		}
-		if json.Unmarshal(event, &probe) != nil {
+	// notification, so the agent panel can render the conversation live. Events
+	// arrive pre-coalesced as an ordered batch; we forward the whole batch in a
+	// single notification and run the per-event side effects in order.
+	sup := agent.NewSupervisor("", log, func(threadID string, events []json.RawMessage) {
+		if len(events) == 0 {
 			return
 		}
-		// Bump LastTurnAt on each turn completion. This is the staleness
-		// signal for the compaction layer — if the summary is older than the
-		// last turn, it needs to be refreshed before resume.
-		if probe.Type == "result" {
-			_ = sessions.Update(threadID, func(r *session.Record) {
-				r.LastTurnAt = time.Now()
-			})
-			return
-		}
-		// When a thread exits, drop its cooperation locks and presence, and
-		// mark it dormant so it can be resumed later. If the thread is
-		// configured for a cold-exit compaction strategy, fire it in the
-		// background — Hot-Opus is a separate pre-reap flow.
-		if probe.Type == "_lifecycle" && (probe.Phase == "exited" || probe.Phase == "interrupted") {
-			coopState.ClearOwner(threadID)
-			_ = sessions.Update(threadID, func(r *session.Record) {
-				r.Status = session.StatusDormant
-			})
-			// Cold-exit compaction runs only on a normal exit; a user interrupt
-			// is meant to be immediate, so we don't spend a turn summarising it.
-			if probe.Phase == "exited" {
-				if rec, ok := sessions.Get(threadID); ok {
-					strat := compact.Strategy(rec.CompactStrategy).Resolve()
-					if strat.RunsOnExit() && strat != compact.ExitOpusHot {
-						coldCompacts.spawn(log, sessions, summaries, rec, strat)
+		srv.Notify("agent.event", agentEventParams{ThreadID: threadID, Events: events})
+		for _, event := range events {
+			var probe struct {
+				Type  string `json:"type"`
+				Phase string `json:"phase"`
+			}
+			if json.Unmarshal(event, &probe) != nil {
+				continue
+			}
+			// Bump LastTurnAt on each turn completion. This is the staleness
+			// signal for the compaction layer — if the summary is older than the
+			// last turn, it needs to be refreshed before resume.
+			if probe.Type == "result" {
+				_ = sessions.Update(threadID, func(r *session.Record) {
+					r.LastTurnAt = time.Now()
+				})
+				continue
+			}
+			// When a thread exits, drop its cooperation locks and presence, and
+			// mark it dormant so it can be resumed later. If the thread is
+			// configured for a cold-exit compaction strategy, fire it in the
+			// background — Hot-Opus is a separate pre-reap flow.
+			if probe.Type == "_lifecycle" && (probe.Phase == "exited" || probe.Phase == "interrupted") {
+				coopState.ClearOwner(threadID)
+				_ = sessions.UpdateQuiet(threadID, func(r *session.Record) {
+					r.Status = session.StatusDormant
+				})
+				// Cold-exit compaction runs only on a normal exit; a user
+				// interrupt is meant to be immediate, so we don't spend a turn
+				// summarising it.
+				if probe.Phase == "exited" {
+					if rec, ok := sessions.Get(threadID); ok {
+						strat := compact.Strategy(rec.CompactStrategy).Resolve()
+						if strat.RunsOnExit() && strat != compact.ExitOpusHot {
+							coldCompacts.spawn(log, sessions, summaries, rec, strat)
+						}
 					}
 				}
 			}
 		}
 	})
+
+	// --- KDE Plasma Cowork (opt-in desktop see/control; off by default) --------
+	// The shared D-Bus client and consent authority are constructed eagerly so the
+	// capability probe (cowork.status) is accurate, but no thread can use them until
+	// it is opted in (session.Record.CoworkEnabled) and the user grants consent.
+	kdeClient, kerr := kde.New(log)
+	if kerr != nil {
+		log.Warn("cowork: KDE session bus unavailable; desktop features disabled", "err", kerr)
+		kdeClient = nil
+	}
+	coworkSvc, coworkWarn, cerr := cowork.New(cowork.DefaultGrantsPath(), cowork.DefaultAuditPath(), cowork.DefaultPolicyPath(), kdeClient, coworkNotifier{srv}, log)
+	if cerr != nil {
+		log.Error("cowork: consent store init failed; desktop features disabled", "err", cerr)
+		coworkSvc = nil
+		if kdeClient != nil {
+			_ = kdeClient.Close()
+		}
+	}
+	for _, w := range coworkWarn {
+		log.Warn("cowork startup warning", "warning", w)
+	}
+	if coworkSvc != nil {
+		coworkSvc.StartSweeper(30 * time.Second)
+		// Teach the anti-escalation guards Agent Kate's own identity so a free pointer can
+		// never click our consent/kill-switch UI (plan 09 §7). The AK window is owned by
+		// the UI (Qt) process, which spawns akcore as a child (CoreClient QProcess) — so
+		// our PARENT pid is the window owner; our own pid is added belt-and-suspenders.
+		// We seed both plausible resourceClass spellings (the Wayland app_id may be the
+		// reverse-DNS desktop name or the bare component name) so the geometric class
+		// match holds whichever KWin reports.
+		coworkSvc.SetSelfIdentity(
+			[]string{"org.kde.agentkate", "agentkate"},
+			[]int{os.Getppid(), os.Getpid()},
+		)
+	}
 
 	deps := handlerDeps{
 		srv:        srv,
@@ -277,11 +324,65 @@ func runCore() {
 		summaries:  summaries,
 		skills:     skillCatalog,
 		gitCache:   gitCache,
+		cowork:     coworkSvc,
 		socketPath: *socket,
 		exePath:    exePath,
 		log:        log,
 	}
 	registerHandlers(deps)
+
+	// gracefulShutdown runs the ordered teardown: compact live (Hot-Opus)
+	// threads, stop every agent, drain any cold-exit compactions, then close the
+	// file watchers. It is guarded by a sync.Once so the RPC-driven path (which
+	// streams progress to a UI dialog) and the signal/disconnect fallback path
+	// can both call it without doing the work twice.
+	var shutdownOnce sync.Once
+	gracefulShutdown := func(progress shutdownProgressFn) {
+		shutdownOnce.Do(func() {
+			running := 0
+			for _, rec := range sessions.List("") {
+				if sup.Running(rec.ThreadID) {
+					running++
+				}
+			}
+			progress("preparing", "", 0, running)
+			// Hot-Opus compaction runs while the threads are still live and
+			// cache-warm; it emits its own per-agent "compacting" progress.
+			runHotCompactsAtShutdown(deps, progress)
+			progress("stopping", "", 0, running)
+			sup.StopAll()
+			// Cold-exit compactions were spawned from the exit lifecycle as each
+			// thread reaped; drain them (bounded) before we let the process exit.
+			progress("draining", "", 0, 0)
+			coldCompacts.drain(cancelExitCompacts, exitCompactCap, log)
+			progress("watchers", "", 0, 0)
+			_ = gitCache.Close()
+			// Tear down any live Cowork portal/screencast sessions, revoke
+			// non-durable grants, and release the D-Bus connection.
+			if coworkSvc != nil {
+				progress("cowork", "", 0, 0)
+				_ = coworkSvc.Close()
+			}
+			progress("done", "", 0, running)
+		})
+	}
+
+	// app.shutdown lets the UI request a graceful, observable teardown while the
+	// IPC server is still alive, so it can stream shutdown.progress to a dialog.
+	// When done it cancels the serve context, which exits the process; the
+	// fallback path below then re-invokes gracefulShutdown as a guarded no-op.
+	srv.Handle("app.shutdown", func(_ context.Context, _ json.RawMessage) (any, error) {
+		gracefulShutdown(func(phase, detail string, index, total int) {
+			srv.Notify("shutdown.progress", map[string]any{
+				"phase":  phase,
+				"detail": detail,
+				"index":  index,
+				"total":  total,
+			})
+		})
+		stop()
+		return map[string]any{"ok": true}, nil
+	})
 
 	// Rehydrate the git cache and thread registry with every persisted thread
 	// that still has a worktree on disk, so the dashboard shows dormant threads
@@ -301,15 +402,12 @@ func runCore() {
 	})
 
 	serveErr := srv.Serve(ctx)
-	// Run Hot-Opus compacts in parallel for any thread configured for them
-	// while the live process is still cache-warm; cold strategies fire from
-	// the exit lifecycle handler after the process terminates.
-	runHotCompactsAtShutdown(deps)
-	// StopAll now blocks until every thread has been reaped, so by the time it
-	// returns every cold-exit compaction has been spawned and registered with
-	// coldCompacts. Drain them (bounded) before we let the process exit.
-	sup.StopAll()
-	coldCompacts.drain(cancelExitCompacts, exitCompactCap, log)
+	// Fallback teardown for the paths that don't go through app.shutdown (UI
+	// disconnect, SIGINT/SIGTERM). Guarded by the same sync.Once, so if the UI
+	// already drove a graceful shutdown this is a no-op.
+	gracefulShutdown(func(phase, detail string, index, total int) {
+		log.Info("shutdown progress", "phase", phase, "index", index, "total", total)
+	})
 	if serveErr != nil {
 		log.Error("ipc server stopped", "err", serveErr)
 		os.Exit(1)
@@ -319,9 +417,13 @@ func runCore() {
 
 // --- IPC parameter / result types ------------------------------------------
 
+// agentEventParams is the wire shape of an "agent.event" notification. Events
+// are delivered as an ordered batch (the core coalesces the per-line
+// stream-json flood); the UI iterates Events in order. A batch always carries
+// at least one event.
 type agentEventParams struct {
-	ThreadID string          `json:"threadId"`
-	Event    json.RawMessage `json:"event"`
+	ThreadID string            `json:"threadId"`
+	Events   []json.RawMessage `json:"events"`
 }
 
 type agentStartParams struct {
@@ -332,6 +434,7 @@ type agentStartParams struct {
 	Model          string             `json:"model"`     // claude --model id; "" = Claude Code default
 	Isolation      string             `json:"isolation"` // worktree.Mode*; "" = auto
 	Attachments    []agent.Attachment `json:"attachments"`
+	CoworkEnabled  bool               `json:"coworkEnabled"` // opt into the KDE Cowork desktop tools
 }
 
 type agentSendParams struct {
@@ -370,6 +473,7 @@ type handlerDeps struct {
 	summaries  *compact.Store
 	skills     *skills.Catalog
 	gitCache   *gitstatus.Cache
+	cowork     *cowork.Service // nil if KDE/consent init failed; handlers guard
 	socketPath string
 	exePath    string
 	log        *slog.Logger
@@ -377,7 +481,10 @@ type handlerDeps struct {
 
 // registerHandlers wires the JSON-RPC methods the core serves.
 func registerHandlers(d handlerDeps) {
-	d.srv.Handle("handshake", func(_ context.Context, _ json.RawMessage) (any, error) {
+	d.srv.Handle("handshake", func(ctx context.Context, _ json.RawMessage) (any, error) {
+		// Tag this connection as the UI (the first UI becomes the primary that runs
+		// Cowork portal sessions) — the Cowork keystone (08 §C).
+		d.srv.MarkUI(ctx)
 		d.log.Info("handshake received")
 		return map[string]any{
 			"name":    "akcore",
@@ -385,6 +492,9 @@ func registerHandlers(d handlerDeps) {
 			"pid":     os.Getpid(),
 		}, nil
 	})
+
+	// Cowork (KDE desktop see/control) RPCs. No-op if the service is unavailable.
+	registerCoworkHandlers(d)
 
 	// --- agent threads -----------------------------------------------------
 	d.srv.Handle("agent.start", func(_ context.Context, raw json.RawMessage) (any, error) {
@@ -399,7 +509,7 @@ func registerHandlers(d handlerDeps) {
 		// always reaches the UI before any streamed event for the thread.
 		threadID := agent.NewThreadID()
 		sessionID := session.NewID()
-		go startAgentThread(d, threadID, sessionID, p)
+		safe.Go("agent.startThread", func() { startAgentThread(d, threadID, sessionID, p) })
 		return map[string]any{"threadId": threadID, "sessionId": sessionID}, nil
 	})
 
@@ -420,7 +530,7 @@ func registerHandlers(d handlerDeps) {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams,
 				"thread has no Claude Code session to resume")
 		}
-		go resumeAgentThread(d, rec)
+		safe.Go("agent.resumeThread", func() { resumeAgentThread(d, rec) })
 		return map[string]any{"threadId": rec.ThreadID, "sessionId": rec.SessionID}, nil
 	})
 
@@ -468,7 +578,7 @@ func registerHandlers(d handlerDeps) {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams,
 				"this thread already runs in an isolated worktree")
 		}
-		go promoteAgentThread(d, rec)
+		safe.Go("agent.promoteThread", func() { promoteAgentThread(d, rec) })
 		return map[string]any{"threadId": rec.ThreadID}, nil
 	})
 
@@ -1038,7 +1148,7 @@ func registerHandlers(d handlerDeps) {
 		if err := d.summaries.Put(sum); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
 		}
-		_ = d.sessions.Update(p.ThreadID, func(r *session.Record) {
+		_ = d.sessions.UpdateQuiet(p.ThreadID, func(r *session.Record) {
 			r.SummaryUpdatedAt = sum.Created
 		})
 		d.log.Info("compaction complete",
@@ -1284,14 +1394,15 @@ func registerHandlers(d handlerDeps) {
 		var wg sync.WaitGroup
 		for i, e := range exts {
 			wg.Add(1)
-			go func(i int, id string) {
+			i, id := i, e.ID
+			safe.Go("vsix.latestVersion", func() {
 				defer wg.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
 				if v, err := d.extensions.LatestVersion(lctx, id); err == nil {
 					latest[i] = v
 				}
-			}(i, e.ID)
+			})
 		}
 		wg.Wait()
 		for i, e := range exts {
@@ -1814,14 +1925,15 @@ func registerHandlers(d handlerDeps) {
 		if p.Path == "" {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "path is required")
 		}
-		// Resolve owning worktree + relative path, mirroring git.file.
+		// Resolve owning worktree + thread + relative path, mirroring git.file.
 		var wt worktree.Worktree
-		var relPath string
+		var threadID, relPath string
 		if p.ThreadID != "" {
 			if rec, ok := d.threads.get(p.ThreadID); ok {
 				if rel, err := filepath.Rel(rec.Path, p.Path); err == nil &&
 					!strings.HasPrefix(rel, "..") {
 					wt = rec
+					threadID = p.ThreadID
 					relPath = filepath.ToSlash(rel)
 				}
 			}
@@ -1838,14 +1950,27 @@ func registerHandlers(d handlerDeps) {
 			} else if rec, ok := d.sessions.Get(s.ThreadID); ok {
 				wt = rec.Worktree
 			}
+			threadID = s.ThreadID
 			relPath = rel
 		}
 		if wt.Path == "" {
 			return map[string]any{"lines": []gitstatus.BlameLine{}}, nil
 		}
-		lines, err := gitstatus.Blame(wt, relPath)
-		if err != nil {
+		// Prefer the cache (keyed on the snapshot generation, busted on HEAD
+		// move or save) so a repeated blame for an unchanged file never re-shells
+		// `git blame`. Fall back to a direct compute only when the thread is not
+		// cache-registered.
+		var lines []gitstatus.BlameLine
+		if cached, ok, err := d.gitCache.BlameFor(threadID, relPath); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		} else if ok {
+			lines = cached
+		} else {
+			l, err := gitstatus.Blame(wt, relPath)
+			if err != nil {
+				return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+			}
+			lines = l
 		}
 		if lines == nil {
 			lines = []gitstatus.BlameLine{}
@@ -1946,14 +2071,28 @@ func registerHandlers(d handlerDeps) {
 		} else {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "git.log requires threadId or repoRoot")
 		}
-		entries, err := gitstatus.Log(wt, gitstatus.LogOptions{
+		opts := gitstatus.LogOptions{
 			Skip:   p.Skip,
 			Limit:  p.Limit,
 			Path:   p.Path,
 			Branch: p.Branch,
-		})
-		if err != nil {
+		}
+		// The unfiltered HEAD graph for a registered thread goes through the
+		// cache, which keeps one history walk per (thread, HEAD) so deep scroll
+		// pages slice a precomputed array instead of re-walking git each time.
+		// Path / branch-scoped views and the workspace (repoRoot) view fall
+		// through to the bare walk — identical results either way.
+		var entries []gitstatus.LogEntry
+		if cached, ok, err := d.gitCache.LogPageFor(p.ThreadID, opts); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		} else if ok {
+			entries = cached
+		} else {
+			e, err := gitstatus.Log(wt, opts)
+			if err != nil {
+				return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+			}
+			entries = e
 		}
 		if entries == nil {
 			entries = []gitstatus.LogEntry{}
@@ -2208,8 +2347,9 @@ func startAgentThread(d handlerDeps, threadID, sessionID string, p agentStartPar
 	wt.Number = d.sessions.NextNumber(p.WorkspacePath)
 	d.threads.put(threadID, wt)
 	d.gitCache.Register(wt)
+	d.gitCache.Activate(threadID) // an agent is about to run here — watch it live
 
-	mcpConfig, err := writeMCPConfig(d.exePath, d.socketPath, threadID, wt.Path)
+	mcpConfig, err := writeMCPConfig(d.exePath, d.socketPath, threadID, wt.Path, p.CoworkEnabled)
 	if err != nil {
 		emitLifecycle(d.srv, threadID, "error", "mcp config: "+err.Error(), &wt)
 		return
@@ -2230,6 +2370,7 @@ func startAgentThread(d handlerDeps, threadID, sessionID string, p agentStartPar
 		Model:          model,
 		Attachments:    p.Attachments,
 		SessionID:      sessionID,
+		CoworkEnabled:  p.CoworkEnabled,
 	}); err != nil {
 		os.Remove(mcpConfig)
 		emitLifecycle(d.srv, threadID, "error", err.Error(), &wt)
@@ -2253,6 +2394,7 @@ func startAgentThread(d handlerDeps, threadID, sessionID string, p agentStartPar
 		Title:          summarizePrompt(p.Prompt),
 		Created:        time.Now(),
 		Status:         session.StatusRunning,
+		CoworkEnabled:  p.CoworkEnabled,
 	}); err != nil {
 		d.log.Warn("could not persist thread record", "thread", threadID, "err", err)
 	}
@@ -2278,8 +2420,9 @@ func resumeAgentThread(d handlerDeps, rec session.Record) {
 	}
 	d.threads.put(rec.ThreadID, rec.Worktree)
 	d.gitCache.Register(rec.Worktree)
+	d.gitCache.Activate(rec.ThreadID) // resuming — this thread is active again, watch it
 
-	mcpConfig, err := writeMCPConfig(d.exePath, d.socketPath, rec.ThreadID, rec.Worktree.Path)
+	mcpConfig, err := writeMCPConfig(d.exePath, d.socketPath, rec.ThreadID, rec.Worktree.Path, rec.CoworkEnabled)
 	if err != nil {
 		emitLifecycle(d.srv, rec.ThreadID, "error", "mcp config: "+err.Error(), &rec.Worktree)
 		return
@@ -2299,6 +2442,7 @@ func resumeAgentThread(d handlerDeps, rec session.Record) {
 		PermissionMode: rec.PermissionMode,
 		Effort:         rec.Effort,
 		Model:          rec.Model,
+		CoworkEnabled:  rec.CoworkEnabled,
 	}
 	var sessionIDForRecord string
 	var detail string
@@ -2328,7 +2472,7 @@ func resumeAgentThread(d handlerDeps, rec session.Record) {
 		return
 	}
 
-	_ = d.sessions.Update(rec.ThreadID, func(r *session.Record) {
+	_ = d.sessions.UpdateQuiet(rec.ThreadID, func(r *session.Record) {
 		r.Status = session.StatusRunning
 		if current {
 			// The summary is now baked into the new session; clear our
@@ -2371,9 +2515,10 @@ func promoteAgentThread(d handlerDeps, rec session.Record) {
 	}
 
 	rec.Worktree = iso
-	_ = d.sessions.Update(rec.ThreadID, func(r *session.Record) { r.Worktree = iso })
+	_ = d.sessions.UpdateQuiet(rec.ThreadID, func(r *session.Record) { r.Worktree = iso })
 	d.threads.put(rec.ThreadID, iso)
 	d.gitCache.Register(iso)
+	d.gitCache.Activate(rec.ThreadID) // re-point the watch onto the new isolated worktree
 	d.log.Info("agent thread promoted", "thread", rec.ThreadID, "branch", iso.Branch)
 	emitLifecycle(d.srv, rec.ThreadID, "promoted",
 		"promoted to an isolated worktree on "+iso.Branch, &iso)
@@ -2466,7 +2611,7 @@ func runHotCompactIfConfigured(d handlerDeps, threadID string) {
 		d.log.Warn("could not store hot summary", "thread", threadID, "err", err)
 		return
 	}
-	_ = d.sessions.Update(threadID, func(r *session.Record) {
+	_ = d.sessions.UpdateQuiet(threadID, func(r *session.Record) {
 		r.SummaryUpdatedAt = sum.Created
 	})
 	d.log.Info("hot-opus compact complete",
@@ -2477,8 +2622,8 @@ func runHotCompactIfConfigured(d handlerDeps, threadID string) {
 // thread configured for it, before the supervisor terminates them all.
 // Each compact has its own 2-minute timeout, so a stuck thread cannot
 // hold up shutdown of the others.
-func runHotCompactsAtShutdown(d handlerDeps) {
-	var wg sync.WaitGroup
+func runHotCompactsAtShutdown(d handlerDeps, progress shutdownProgressFn) {
+	var targets []session.Record
 	for _, rec := range d.sessions.List("") {
 		if !d.sup.Running(rec.ThreadID) {
 			continue
@@ -2486,14 +2631,36 @@ func runHotCompactsAtShutdown(d handlerDeps) {
 		if compact.Strategy(rec.CompactStrategy).Resolve() != compact.ExitOpusHot {
 			continue
 		}
+		targets = append(targets, rec)
+	}
+	total := len(targets)
+	if total == 0 {
+		return
+	}
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	done := 0
+	for _, rec := range targets {
 		wg.Add(1)
-		go func(threadID string) {
+		rec := rec
+		safe.Go("shutdown.hotCompact", func() {
 			defer wg.Done()
-			runHotCompactIfConfigured(d, threadID)
-		}(rec.ThreadID)
+			runHotCompactIfConfigured(d, rec.ThreadID)
+			// Report completion as each finishes so the shutdown dialog can show
+			// "Compacting context for resume (i of N)".
+			mu.Lock()
+			done++
+			progress("compacting", rec.Title, done, total)
+			mu.Unlock()
+		})
 	}
 	wg.Wait()
 }
+
+// shutdownProgressFn reports graceful-shutdown progress. phase is a stable code
+// (preparing|compacting|stopping|draining|watchers|done) the UI maps to text;
+// detail is an optional agent title; index/total drive the "(i of N)" counter.
+type shutdownProgressFn func(phase, detail string, index, total int)
 
 // exitCompactCap bounds how long shutdown waits for cold-exit compactions to
 // finish. A cold `claude --resume` usually lands in a few seconds; the cap is
@@ -2521,10 +2688,10 @@ type exitCompactTracker struct {
 func (e *exitCompactTracker) spawn(log *slog.Logger, sessions *session.Store,
 	summaries *compact.Store, rec session.Record, strategy compact.Strategy) {
 	e.wg.Add(1)
-	go func() {
+	safe.Go("shutdown.exitCompact", func() {
 		defer e.wg.Done()
 		runExitCompact(e.ctx, e.claudeBin, log, sessions, summaries, rec, strategy)
-	}()
+	})
 }
 
 // drain waits for all spawned cold-exit compactions to finish, bounded by cap.
@@ -2547,10 +2714,10 @@ func (e *exitCompactTracker) drain(cancel context.CancelFunc, cap time.Duration,
 // WaitGroup drained in time, false on timeout.
 func waitWithDeadline(wg *sync.WaitGroup, d time.Duration) bool {
 	done := make(chan struct{})
-	go func() {
+	safe.Go("shutdown.waitWithDeadline", func() {
 		wg.Wait()
 		close(done)
-	}()
+	})
 	select {
 	case <-done:
 		return true
@@ -2586,7 +2753,7 @@ func runExitCompact(ctx context.Context, claudeBin string, log *slog.Logger,
 		log.Warn("could not store summary", "thread", rec.ThreadID, "err", err)
 		return
 	}
-	_ = sessions.Update(rec.ThreadID, func(r *session.Record) {
+	_ = sessions.UpdateQuiet(rec.ThreadID, func(r *session.Record) {
 		r.SummaryUpdatedAt = sum.Created
 	})
 	log.Info("exit compaction complete",
@@ -2653,26 +2820,44 @@ func emitLifecycle(srv *ipc.Server, threadID, phase, detail string, wt *worktree
 	if err != nil {
 		return
 	}
-	srv.Notify("agent.event", agentEventParams{ThreadID: threadID, Event: b})
+	// Single lifecycle event, but sent in the same batch shape as the supervisor
+	// relay so the UI has exactly one wire contract to parse.
+	srv.Notify("agent.event", agentEventParams{
+		ThreadID: threadID,
+		Events:   []json.RawMessage{b},
+	})
 }
 
 // writeMCPConfig writes a per-thread --mcp-config file that points `claude` at
-// this binary's Cooperation MCP bridge subcommand.
-func writeMCPConfig(exePath, socketPath, threadID, workspace string) (string, error) {
-	cfg := map[string]any{
-		"mcpServers": map[string]any{
-			"cooperation": map[string]any{
-				"type":    "stdio",
-				"command": exePath,
-				"args": []string{
-					"mcp",
-					"--socket", socketPath,
-					"--thread", threadID,
-					"--workspace", workspace,
-				},
+// this binary's Cooperation MCP bridge subcommand, plus the opt-in Cowork desktop
+// bridge when the thread enabled it (a second `akcore mcp ... --cowork` server).
+func writeMCPConfig(exePath, socketPath, threadID, workspace string, coworkEnabled bool) (string, error) {
+	servers := map[string]any{
+		"cooperation": map[string]any{
+			"type":    "stdio",
+			"command": exePath,
+			"args": []string{
+				"mcp",
+				"--socket", socketPath,
+				"--thread", threadID,
+				"--workspace", workspace,
 			},
 		},
 	}
+	if coworkEnabled {
+		servers["cowork"] = map[string]any{
+			"type":    "stdio",
+			"command": exePath,
+			"args": []string{
+				"mcp",
+				"--socket", socketPath,
+				"--thread", threadID,
+				"--workspace", workspace,
+				"--cowork",
+			},
+		}
+	}
+	cfg := map[string]any{"mcpServers": servers}
 	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return "", err

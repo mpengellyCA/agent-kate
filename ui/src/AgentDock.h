@@ -3,6 +3,7 @@
 #include <QHash>
 #include <QList>
 #include <QObject>
+#include <QSet>
 #include <QString>
 #include <QStringList>
 
@@ -41,6 +42,14 @@ public:
     // threadId of the currently-active agent panel, empty if none / not started.
     QString currentThreadId() const;
 
+    // Number of agents with a live process (used to decide whether app shutdown
+    // needs the graceful stop-and-compact dialog).
+    int runningAgentCount() const;
+
+    // Persist the focused agent's thread so the next launch can land back in it.
+    // Called on app shutdown to capture a thread that started while focused.
+    void persistLastActiveSessions();
+
     // Worktree directory for the given agent, derived from the last git.snapshot.
     // Empty if the agent has no worktree yet (not started / not promoted).
     QString worktreePathForAgent(int agentId) const;
@@ -49,6 +58,10 @@ Q_SIGNALS:
     void statusMessage(const QString &text);
     void openDiff(const QString &title, const QString &diffText);
     void agentActivated(int agentId, const QString &projectPath);
+    // Emitted when the CURRENTLY-shown agent's thread id is assigned/changes (e.g. a
+    // freshly-created agent's session starting). agentActivated fires on selection,
+    // before a fresh agent has a thread; this closes that gap for thread-keyed panels.
+    void activeThreadChanged(const QString &threadId);
     void projectFocused(const QString &projectPath);
     // Emitted when a project is explicitly CLOSED (not merely switched away
     // from). Consumers tied to a project — e.g. its terminal tabs — tear down.
@@ -74,6 +87,14 @@ private:
     void closeOtherProjects(const QString &keepPath);
     void wireAgentPanel(int agentId, AgentPanel *panel);
     void restoreThreads(const QString &project);
+    // After a project's threads are restored on initial open, focus the
+    // last-active one (dormant, not resumed) and prune the blank starter agent.
+    void restoreInitialFocus(const QString &project);
+    // Per-project last-active thread memory (KConfig), read on open / written on
+    // activation. setLastActiveThread never clears: a blank starter agent must
+    // not erase the remembered real session.
+    void setLastActiveThread(const QString &project, const QString &threadId);
+    QString lastActiveThread(const QString &project) const;
     // Pull git.snapshot and push each thread's worktree Number into the
     // roster, so the #N badge stays in sync with WorktreeDashboard.
     void refreshAgentNumbers();
@@ -102,5 +123,10 @@ private:
     // threadId → worktree path, refreshed from each git.snapshot. Lets the
     // roster resolve an agent's worktree dir without a fresh RPC round-trip.
     QHash<QString, QString> m_worktreePathByThread;
+    // Projects whose initial thread-restore should jump focus to the last-active
+    // agent, plus the blank starter agent created for each (pruned once we land
+    // in the restored session). Populated in addProject, drained in restore.
+    QSet<QString> m_pendingFocusProjects;
+    QHash<QString, int> m_initialAgentByProject;
     int m_counter = 0;
 };

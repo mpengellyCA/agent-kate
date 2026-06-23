@@ -1,0 +1,159 @@
+// Plan 10 phase 2 — the virtualized chat transcript (model/view) replaces the
+// per-message-widget feed. These tests pin the contracts the panel relies on:
+//  * append-only growth + row count,
+//  * a tool row's result mutating in place (done flag, dataChanged for one row),
+//  * the delegate's per-(row,width) height cache: same width is cached, a width
+//    change re-measures, and a model mutation (stableId bump) busts the entry —
+//    which is what makes window-edge resize O(visible rows).
+
+#include "TranscriptDelegate.h"
+#include "TranscriptModel.h"
+
+#include <QSignalSpy>
+#include <QStyleOptionViewItem>
+#include <QtTest>
+
+class TranscriptModelTest : public QObject
+{
+    Q_OBJECT
+private Q_SLOTS:
+    void appendsGrowRowCount();
+    void toolResultMutatesInPlace();
+    void toolsVisibilityToggles();
+    void findStatePropagates();
+    void widthChangeEstimatesThenMeasuresExact();
+    void heightCacheInvalidatesOnMutation();
+};
+
+void TranscriptModelTest::appendsGrowRowCount()
+{
+    TranscriptModel m;
+    QCOMPARE(m.rowCount(), 0);
+    m.appendNote(QStringLiteral("session started"), QStringLiteral("sys"));
+    m.appendMessage(QStringLiteral("Agent Kate"), QStringLiteral("#1a7f6b"),
+                    QStringLiteral("hello <b>world</b>"), QStringLiteral("hello world"),
+                    false, QStringLiteral("10:00"));
+    const int tool = m.appendTool(QStringLiteral("Bash"), QStringLiteral("ls -la"),
+                                  QStringLiteral("{\"command\":\"ls -la\"}"), true);
+    QCOMPARE(m.rowCount(), 3);
+    QCOMPARE(tool, 2);
+    QCOMPARE(TranscriptModel::Kind(m.data(m.index(0), TranscriptModel::KindRole).toInt()),
+             TranscriptModel::Note);
+    QCOMPARE(TranscriptModel::Kind(m.data(m.index(1), TranscriptModel::KindRole).toInt()),
+             TranscriptModel::Message);
+    QCOMPARE(m.data(m.index(2), TranscriptModel::ToolNameRole).toString(),
+             QStringLiteral("Bash"));
+    // A fresh tool row is not yet done.
+    QVERIFY(!m.data(m.index(2), TranscriptModel::ToolDoneRole).toBool());
+}
+
+void TranscriptModelTest::toolResultMutatesInPlace()
+{
+    TranscriptModel m;
+    m.appendNote(QStringLiteral("n"), QStringLiteral("sys"));
+    const int row = m.appendTool(QStringLiteral("Read"), QStringLiteral("file.cpp"),
+                                 QStringLiteral("{}"), true);
+    QSignalSpy spy(&m, &QAbstractItemModel::dataChanged);
+    m.setToolResult(row, QStringLiteral("the output"), QStringLiteral("the output"), false);
+    QCOMPARE(m.rowCount(), 2); // no new rows — mutation in place
+    QVERIFY(m.data(m.index(row), TranscriptModel::ToolDoneRole).toBool());
+    QCOMPARE(m.data(m.index(row), TranscriptModel::ToolResultRole).toString(),
+             QStringLiteral("the output"));
+    QCOMPARE(spy.count(), 1);
+    const auto args = spy.takeFirst();
+    QCOMPARE(args.at(0).toModelIndex().row(), row); // only that row changed
+    QCOMPARE(args.at(1).toModelIndex().row(), row);
+}
+
+void TranscriptModelTest::toolsVisibilityToggles()
+{
+    TranscriptModel m;
+    m.appendMessage(QStringLiteral("You"), QStringLiteral("#888"),
+                    QStringLiteral("hi"), QStringLiteral("hi"), false, QString());
+    const int t = m.appendTool(QStringLiteral("Bash"), QStringLiteral("x"),
+                               QStringLiteral("{}"), true);
+    m.setToolsVisible(false);
+    QVERIFY(!m.data(m.index(t), TranscriptModel::ToolVisibleRole).toBool());
+    m.setToolsVisible(true);
+    QVERIFY(m.data(m.index(t), TranscriptModel::ToolVisibleRole).toBool());
+}
+
+void TranscriptModelTest::findStatePropagates()
+{
+    TranscriptModel m;
+    m.appendMessage(QStringLiteral("Agent Kate"), QStringLiteral("#1a7f6b"),
+                    QStringLiteral("find the needle here"),
+                    QStringLiteral("find the needle here"), false, QString());
+    QSignalSpy spy(&m, &QAbstractItemModel::dataChanged);
+    m.setFind(QStringLiteral("needle"), 0);
+    QCOMPARE(m.findNeedle(), QStringLiteral("needle"));
+    QCOMPARE(m.findCurrentRow(), 0);
+    QCOMPARE(spy.count(), 1); // a repaint was requested
+}
+
+void TranscriptModelTest::widthChangeEstimatesThenMeasuresExact()
+{
+    TranscriptModel m;
+    // A long body so wrapping at different widths yields different heights.
+    QString body;
+    for (int i = 0; i < 40; ++i) {
+        body += QStringLiteral("word%1 ").arg(i);
+    }
+    m.appendMessage(QStringLiteral("Agent Kate"), QStringLiteral("#1a7f6b"), body, body,
+                    false, QStringLiteral("10:00"));
+
+    TranscriptDelegate d;
+    QStyleOptionViewItem opt;
+    opt.font = QFont();
+    opt.palette = QPalette();
+
+    opt.rect = QRect(0, 0, 200, 0);
+    const int hNarrow = d.sizeHint(opt, m.index(0)).height();
+    QVERIFY(hNarrow > 0);
+    QVERIFY(!d.hasStaleHeights());
+    // Same width again — served from cache, identical, still not stale.
+    QCOMPARE(d.sizeHint(opt, m.index(0)).height(), hNarrow);
+    QVERIFY(!d.hasStaleHeights());
+
+    // The virtualization contract: on a WIDTH CHANGE sizeHint returns the cached
+    // height as a cheap estimate (no QTextDocument rebuild) and flags that a
+    // settle-time exact re-measure is due. This is what keeps an interactive
+    // resize O(N hash lookups) instead of O(N text layouts).
+    opt.rect = QRect(0, 0, 600, 0);
+    const int hEstimate = d.sizeHint(opt, m.index(0)).height();
+    QCOMPARE(hEstimate, hNarrow);         // estimate == old height (not re-laid out)
+    QVERIFY(d.hasStaleHeights());         // re-measure is queued
+
+    // The settle pass measures the visible rows exactly: now the wider row wraps
+    // to fewer lines and is strictly shorter, and the cache is refreshed.
+    const int hExact = d.measureExact(m.index(0), 600, opt);
+    QVERIFY2(hExact < hNarrow, "wider row must be shorter once measured exactly");
+    d.clearStaleFlag();
+    // After the exact measure, asking again at 600 is a cache hit at the right
+    // height with no new stale flag.
+    QCOMPARE(d.sizeHint(opt, m.index(0)).height(), hExact);
+    QVERIFY(!d.hasStaleHeights());
+}
+
+void TranscriptModelTest::heightCacheInvalidatesOnMutation()
+{
+    TranscriptModel m;
+    const int row = m.appendTool(QStringLiteral("Bash"), QStringLiteral("echo hi"),
+                                 QStringLiteral("{\"command\":\"echo hi\"}"), true);
+    TranscriptDelegate d;
+    QStyleOptionViewItem opt;
+    opt.font = QFont();
+    opt.palette = QPalette();
+    opt.rect = QRect(0, 0, 500, 0);
+
+    const int collapsed = d.sizeHint(opt, m.index(row)).height();
+    // Expanding the tool row must grow it — proves the stableId bump on mutation
+    // busts the cached collapsed height.
+    m.setExpanded(row, true);
+    m.setToolResult(row, QStringLiteral("a\nb\nc\nd"), QStringLiteral("a\nb\nc\nd"), false);
+    const int expanded = d.sizeHint(opt, m.index(row)).height();
+    QVERIFY2(expanded > collapsed, "expanded tool row must be taller than collapsed");
+}
+
+QTEST_MAIN(TranscriptModelTest)
+#include "TranscriptModelTest.moc"

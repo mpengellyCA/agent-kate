@@ -2,6 +2,7 @@
 #include "RecentProjects.h"
 #include "AgentPanel.h"
 #include "AgentRoster.h"
+#include "shell/PanelStack.h"
 #include "AutoOrganizeDialog.h"
 #include "TagEditorDialog.h"
 #include "ipc/CoreClient.h"
@@ -18,14 +19,17 @@
 #include <QPointer>
 #include <QSet>
 #include <QStackedWidget>
+#include <QTimer>
 #include <QVector>
 
+#include <KConfigGroup>
 #include <KLocalizedString>
+#include <KSharedConfig>
 
 AgentDock::AgentDock(CoreClient *core, QWidget *parent)
     : QObject(parent)
     , m_core(core)
-    , m_stack(new QStackedWidget(parent))
+    , m_stack(new PanelStack(parent))
     , m_roster(new AgentRoster(parent))
     , m_dialogParent(parent)
 {
@@ -68,6 +72,9 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
     connect(m_roster, &AgentRoster::agentActivated, this, [this](int id) {
         if (Entry *e = entryById(id)) {
             m_stack->setCurrentWidget(e->panel);
+            // Remember where we are so the next launch lands here. No-op for a
+            // blank starter agent (empty thread) — see setLastActiveThread.
+            setLastActiveThread(e->project, e->panel->threadId());
             emit agentActivated(e->id, e->project);
         }
     });
@@ -107,7 +114,12 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
                     }
                     for (const Entry &e : m_agents) {
                         if (e.panel->threadId() == threadId) {
-                            closeAgent(e.id);
+                            // Never delete a panel synchronously from inside a
+                            // core notification handler — the panel may be the
+                            // very object the core is mid-emit on. Defer the
+                            // teardown to the next event-loop turn.
+                            const int id = e.id;
+                            QTimer::singleShot(0, this, [this, id] { closeAgent(id); });
                             break;
                         }
                     }
@@ -170,7 +182,8 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
                                      ? i18n("Committed the agent's changes")
                                      : i18n("Committed to %1", branch));
                          }
-                     });
+                     },
+                     this);
     });
     connect(m_roster, &AgentRoster::prRequested, this, [this](int id) {
         Entry *e = entryById(id);
@@ -196,7 +209,8 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
                              emit statusMessage(i18n("Pull request opened: %1",
                                  result.value(QStringLiteral("url")).toString()));
                          }
-                     });
+                     },
+                     this);
     });
     connect(m_roster, &AgentRoster::landRequested, this, [this](int id) {
         Entry *e = entryById(id);
@@ -239,7 +253,8 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
                                  i18n("Merge into local main"),
                                  i18n("Merged %1 into %2.", branch, into));
                          }
-                     });
+                     },
+                     this);
     });
     connect(m_roster, &AgentRoster::discardRequested, this, [this](int id) {
         Entry *e = entryById(id);
@@ -265,7 +280,8 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
                          } else {
                              emit statusMessage(i18n("Discarded the agent's worktree"));
                          }
-                     });
+                     },
+                     this);
     });
     // Tagging. add/remove apply optimistically and roll back on error (like
     // rename); the full editor sends the whole set via agent.setTags. Each
@@ -324,8 +340,13 @@ void AgentDock::addProject(const QString &path)
 {
     const bool wasOpen = m_projects.contains(path);
     ensureProject(path);
+    // Always create a starter agent so the UI is never empty (and as a fallback
+    // if nothing is restored). On a first open we may later jump focus to the
+    // last-active restored session and prune this starter — see restoreThreads.
     addAgent(path);
     if (!wasOpen) {
+        m_pendingFocusProjects.insert(path);
+        m_initialAgentByProject.insert(path, m_agents.constLast().id);
         restoreThreads(path); // bring back this project's dormant threads
     }
 }
@@ -355,6 +376,17 @@ void AgentDock::applyChatSettings()
     for (const Entry &e : m_agents) {
         e.panel->applyChatSettings();
     }
+}
+
+int AgentDock::runningAgentCount() const
+{
+    int n = 0;
+    for (const Entry &e : m_agents) {
+        if (e.panel->isRunning()) {
+            ++n;
+        }
+    }
+    return n;
 }
 
 QString AgentDock::currentThreadId() const
@@ -439,6 +471,11 @@ void AgentDock::wireAgentPanel(int agentId, AgentPanel *panel)
             [this, agentId](bool dormant) { m_roster->setAgentDormant(agentId, dormant); });
     connect(panel, &AgentPanel::attentionChanged, this,
             [this, agentId](bool on) { m_roster->setAgentAttention(agentId, on); });
+    connect(panel, &AgentPanel::threadIdChanged, this, [this, panel](const QString &threadId) {
+        if (m_stack->currentWidget() == panel) {
+            Q_EMIT activeThreadChanged(threadId);
+        }
+    });
 }
 
 bool AgentDock::hasThread(const QString &threadId) const
@@ -494,7 +531,70 @@ void AgentDock::restoreThreads(const QString &project)
                          }
                      }
                      refreshAgentNumbers();
-                 });
+                     // First restore for this project: land in the last-active
+                     // session instead of the blank starter agent.
+                     if (m_pendingFocusProjects.remove(project)) {
+                         restoreInitialFocus(project);
+                     }
+                 },
+                 this);
+}
+
+void AgentDock::restoreInitialFocus(const QString &project)
+{
+    const int starterId = m_initialAgentByProject.take(project);
+    const QString wantThread = lastActiveThread(project);
+    if (wantThread.isEmpty()) {
+        return; // nothing remembered — keep the fresh starter agent focused
+    }
+    Entry *target = entryByThread(wantThread);
+    if (!target || target->id == starterId) {
+        return; // remembered thread wasn't restored (removed?) — keep starter
+    }
+    // Focus the last-active agent in its dormant state. We deliberately do NOT
+    // resume() it — the user decides when to spend the re-cache cost.
+    m_roster->setCurrentAgent(target->id);
+    // Prune the never-used starter so we land cleanly in the restored session
+    // rather than leaving a stray empty "Agent N" beside it.
+    if (Entry *starter = entryById(starterId)) {
+        if (starter->panel->threadId().isEmpty()) {
+            closeAgent(starterId);
+        }
+    }
+}
+
+void AgentDock::setLastActiveThread(const QString &project, const QString &threadId)
+{
+    // Never clear: activating a blank starter agent (empty thread) must not
+    // erase the remembered real session for this project.
+    if (project.isEmpty() || threadId.isEmpty()) {
+        return;
+    }
+    KSharedConfig::openConfig()
+        ->group(QStringLiteral("Agent"))
+        .group(QStringLiteral("LastActive"))
+        .group(project)
+        .writeEntry(QStringLiteral("threadId"), threadId);
+}
+
+QString AgentDock::lastActiveThread(const QString &project) const
+{
+    return KSharedConfig::openConfig()
+        ->group(QStringLiteral("Agent"))
+        .group(QStringLiteral("LastActive"))
+        .group(project)
+        .readEntry(QStringLiteral("threadId"), QString());
+}
+
+void AgentDock::persistLastActiveSessions()
+{
+    // Capture the focused agent's thread at shutdown — covers a thread that
+    // started while focused and so never fired a fresh activation write.
+    if (auto *w = qobject_cast<AgentPanel *>(m_stack->currentWidget())) {
+        if (Entry *e = entryByPanel(w)) {
+            setLastActiveThread(e->project, e->panel->threadId());
+        }
+    }
 }
 
 void AgentDock::refreshAgentNumbers()
@@ -531,7 +631,8 @@ void AgentDock::refreshAgentNumbers()
                          }
                          m_roster->setAgentNumber(e.id, byThread.value(tid, 0));
                      }
-                 });
+                 },
+                 this);
 }
 
 void AgentDock::removeAgentEntry(int agentId)
@@ -541,6 +642,9 @@ void AgentDock::removeAgentEntry(int agentId)
             AgentPanel *panel = m_agents.at(i).panel;
             m_agents.removeAt(i);
             m_stack->removeWidget(panel);
+            // Sever any core->panel wiring before tearing it down so no further
+            // core notifications or in-flight replies reach the doomed panel.
+            QObject::disconnect(m_core, nullptr, panel, nullptr);
             panel->deleteLater(); // ~AgentPanel stops its agent
             m_roster->removeAgent(agentId);
             return;
@@ -647,7 +751,8 @@ void AgentDock::renameAgent(int agentId)
                      } else {
                          emit statusMessage(i18n("Renamed agent to “%1”", title));
                      }
-                 });
+                 },
+                 this);
 }
 
 AgentDock::Entry *AgentDock::entryById(int agentId)
@@ -730,7 +835,8 @@ void AgentDock::mutateTag(int agentId, const QString &tag, bool add)
                              error.value(QStringLiteral("message")).toString()));
                      }
                      // On success the core's agent.tagsChanged converges us.
-                 });
+                 },
+                 this);
 }
 
 // editTags opens the full tag editor and, on accept, replaces the agent's tag
@@ -781,7 +887,8 @@ void AgentDock::editTags(int agentId)
                          emit statusMessage(i18n("Tag update failed: %1",
                              error.value(QStringLiteral("message")).toString()));
                      }
-                 });
+                 },
+                 this);
 }
 
 // autoOrganize asks the core for Sonnet's proposed tags for the project, then
@@ -811,7 +918,8 @@ void AgentDock::autoOrganize(const QString &projectPath)
                      self->showOrganizeProposals(
                          projectPath,
                          result.value(QStringLiteral("proposals")).toArray());
-                 });
+                 },
+                 this);
 }
 
 void AgentDock::showOrganizeProposals(const QString &projectPath,

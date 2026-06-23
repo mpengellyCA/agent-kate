@@ -53,6 +53,11 @@ type Record struct {
 	CompactStrip     bool      `json:"compactStrip,omitempty"`
 	SummaryUpdatedAt time.Time `json:"summaryUpdatedAt,omitempty"`
 	LastTurnAt       time.Time `json:"lastTurnAt,omitempty"`
+
+	// CoworkEnabled opts this thread into the KDE Plasma Cowork MCP server
+	// (desktop see/control). Off by default; only the UI may flip it
+	// (cowork.setEnabled). See docs/plans/08-kde-cowork/.
+	CoworkEnabled bool `json:"coworkEnabled,omitempty"`
 }
 
 // Store is the on-disk set of thread records, mirrored in memory.
@@ -200,9 +205,23 @@ func (s *Store) Put(rec Record) error {
 	return s.flush()
 }
 
-// Update mutates an existing record in place and persists. It is a no-op if no
-// record has that thread id.
+// Update mutates an existing record in place and persists, advancing Updated to
+// now — use it for changes that count as activity. It is a no-op if no record
+// has that thread id.
 func (s *Store) Update(threadID string, fn func(*Record)) error {
+	return s.update(threadID, fn, true)
+}
+
+// UpdateQuiet mutates and persists like Update but leaves Updated untouched. Use
+// it for background/lifecycle bookkeeping that isn't user activity — status
+// transitions on exit/resume, worktree promotion, compaction summaries — so the
+// Updated timestamp stays a faithful "last active" clock rather than being bumped
+// every launch and shutdown.
+func (s *Store) UpdateQuiet(threadID string, fn func(*Record)) error {
+	return s.update(threadID, fn, false)
+}
+
+func (s *Store) update(threadID string, fn func(*Record), bump bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rec, ok := s.recs[threadID]
@@ -210,7 +229,9 @@ func (s *Store) Update(threadID string, fn func(*Record)) error {
 		return nil
 	}
 	fn(&rec)
-	rec.Updated = time.Now()
+	if bump {
+		rec.Updated = time.Now()
+	}
 	s.recs[threadID] = rec
 	return s.flush()
 }

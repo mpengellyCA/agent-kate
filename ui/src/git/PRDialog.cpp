@@ -93,7 +93,8 @@ void PRDialog::loadDraft()
                      m_createBtn->setEnabled(true);
                      m_title->setFocus();
                      m_title->selectAll();
-                 });
+                 },
+                 this);
 }
 
 void PRDialog::onCreateClicked()
@@ -123,5 +124,6 @@ void PRDialog::onCreateClicked()
                      }
                      emit prOpened(result.value(QStringLiteral("url")).toString());
                      accept();
-                 });
+                 },
+                 this);
 }

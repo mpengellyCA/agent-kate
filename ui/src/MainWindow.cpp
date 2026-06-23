@@ -7,12 +7,15 @@
 #include "ProblemsPanel.h"
 #include "ProjectTree.h"
 #include "ReferencesPanel.h"
+#include "ShutdownDialog.h"
 #include "SearchPanel.h"
 #include "SessionBrowserDialog.h"
 #include "SkillsDialog.h"
 #include "TerminalPanel.h"
 #include "WelcomeDialog.h"
 #include "WorktreeDashboard.h"
+#include "cowork/CoworkPanel.h"
+#include "cowork/CoworkPortal.h"
 #include "shell/ShellLayout.h"
 #include "shell/SideBar.h"
 #include "shell/StubPanel.h"
@@ -144,6 +147,9 @@ void MainWindow::setupUi()
     m_terminal = new TerminalPanel(this);
     m_worktreeDashboard = new WorktreeDashboard(m_core, this);
     m_logViewer = new LogViewer(m_core, this);
+    m_coworkPanel = new CoworkPanel(m_core, this);
+    // CoworkPortal services the core's portal requests using this window's surface.
+    m_coworkPortal = new CoworkPortal(m_core, this, this);
 
     connect(problems, &ProblemsPanel::activated, this,
             [this](const QString &path, int line) {
@@ -215,6 +221,8 @@ void MainWindow::setupUi()
                                 i18n("Live agent presence and file locks from the Cooperation MCP."),
                                 this),
                   QStringLiteral("right"));
+    registerPanel(m_keyCowork, QIcon::fromTheme(QStringLiteral("video-display")),
+                  i18n("Cowork"), m_coworkPanel, QStringLiteral("right"));
     registerPanel(m_keyInspector, QIcon::fromTheme(QStringLiteral("view-statistics")),
                   i18n("AI Inspector"),
                   new StubPanel(i18n("AI Inspector"),
@@ -362,6 +370,17 @@ void MainWindow::setupUi()
     connect(m_lsp, &LspManager::serverStatusChanged, this, &MainWindow::updateLspStatus);
 
     connect(m_agent, &AgentDock::agentActivated, this, &MainWindow::onAgentActivated);
+    // A fresh agent's thread id arrives after activation (async session start), so
+    // re-point the thread-keyed panels when it lands — otherwise "Enable Cowork for
+    // this agent" stays greyed out and Git Log keeps the stale thread.
+    connect(m_agent, &AgentDock::activeThreadChanged, this, [this](const QString &threadId) {
+        if (m_coworkPanel) {
+            m_coworkPanel->setActiveThread(threadId, QString());
+        }
+        if (m_logViewer) {
+            m_logViewer->setActiveSource(m_activeProject, threadId);
+        }
+    });
     connect(m_agent, &AgentDock::projectFocused, this,
             [this](const QString &path) { m_tree->setRoot(path); });
     connect(m_agent, &AgentDock::openTerminalRequested, this,
@@ -1301,15 +1320,12 @@ void MainWindow::setupCore()
     connect(m_core, &CoreClient::failed, this, [](const QString &msg) {
         qWarning().noquote() << "[core]" << msg;
     });
+    // The UI handshake (claiming the "ui" role) is now sent by CoreClient as the first
+    // frame on connect, so by the time connected() fires the role is already being
+    // established ahead of any UI-only query. Just do the post-connect work here.
     connect(m_core, &CoreClient::connected, this, [this] {
-        m_core->call(QStringLiteral("handshake"), {},
-                     [this](const QJsonObject &, const QJsonObject &error) {
-                         if (!error.isEmpty()) {
-                             return;
-                         }
-                         pushOpenFilesToCore();
-                         reloadExtensionServers();
-                     });
+        pushOpenFilesToCore();
+        reloadExtensionServers();
     });
 
     const QString corePath =
@@ -1340,6 +1356,9 @@ void MainWindow::onAgentActivated(int agentId, const QString &projectPath)
     }
     if (m_worktreeDashboard) {
         m_worktreeDashboard->setActiveProject(projectPath);
+    }
+    if (m_coworkPanel) {
+        m_coworkPanel->setActiveThread(m_agent->currentThreadId(), QString());
     }
     if (m_openWorktreeTerminalAct) {
         m_openWorktreeTerminalAct->setEnabled(
@@ -1491,6 +1510,24 @@ void MainWindow::closeEvent(QCloseEvent *event)
     persistShellState();
     if (m_terminal) {
         m_terminal->saveSession();
+    }
+    // Remember the focused agent per project so the next launch lands back in it.
+    if (m_agent) {
+        m_agent->persistLastActiveSessions();
+    }
+    // Graceful, observable shutdown: while agents are live, run the stop-and
+    // -compact dialog before tearing down so every agent is compacted and
+    // resumable. The modal dialog drives app.shutdown and pumps progress events
+    // until the core reports done; then we re-enter and take the normal path.
+    if (!m_shutdownComplete && m_core && m_core->isConnected() && m_agent
+        && m_agent->runningAgentCount() > 0) {
+        event->ignore();
+        ShutdownDialog dlg(m_core, this);
+        dlg.exec();
+        m_shutdownComplete = true;
+        // Re-close on the next loop turn so this handler fully unwinds first.
+        QMetaObject::invokeMethod(this, &QWidget::close, Qt::QueuedConnection);
+        return;
     }
     KMainWindow::closeEvent(event);
 }

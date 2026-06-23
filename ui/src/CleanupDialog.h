@@ -4,6 +4,7 @@
 #pragma once
 
 #include <QAbstractTableModel>
+#include <QDateTime>
 #include <QDialog>
 #include <QJsonObject>
 #include <QList>
@@ -35,6 +36,7 @@ struct CleanupCandidate {
     int dirtyCount = 0;
     int unpushedCommits = 0;
     int stashCount = 0;
+    QDateTime lastActivity; // last agent response; drives the 48h auto-check
     QString diffStat;
     bool removable = false;
     QString recommendation; // phase 2; "" in phase 1

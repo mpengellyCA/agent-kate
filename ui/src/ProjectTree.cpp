@@ -218,6 +218,14 @@ ProjectTree::ProjectTree(CoreClient *core, QWidget *parent)
     m_gitTimer->setInterval(150);
     connect(m_gitTimer, &QTimer::timeout, this, &ProjectTree::refreshGitStatus);
 
+    // The git snapshot is the canonical state: refreshGitStatus()'s reply
+    // set()s it, and the subscriber runs ONLY when the map truly changed. An
+    // identical snapshot is dropped, so repeated git.invalidated bursts no
+    // longer repaint every visible row — killing the emblem flicker.
+    m_gitStatuses.subscribe(this, [this](const QHash<QString, int> &statuses) {
+        applyGitStatuses(statuses);
+    });
+
     // Restore the persisted "sync with editor" preference.
     const KConfigGroup grp = KSharedConfig::openConfig()->group(QLatin1String("Files"));
     m_syncToggle->setChecked(grp.readEntry("syncWithEditor", false));
@@ -295,7 +303,7 @@ void ProjectTree::setRoot(const QString &path)
         m_pathLabel->clear();
         m_pathLabel->setToolTip(QString());
         m_stack->setCurrentIndex(0); // placeholder
-        m_gitDelegate->setStatuses({});
+        m_gitStatuses.set({}); // clears the delegate via the subscriber
         return;
     }
     const QModelIndex srcIdx = m_model->setRootPath(path);
@@ -457,9 +465,51 @@ void ProjectTree::refreshGitStatus()
                 }
                 break; // only one snapshot matches the active worktree
             }
-            m_gitDelegate->setStatuses(std::move(map));
-            m_tree->viewport()->update();
+            // set() diffs against the current snapshot: an identical map is a
+            // no-op (no subscriber, no repaint). Only a genuinely changed map
+            // fires applyGitStatuses(), which repaints just the changed rows.
+            m_gitStatuses.set(std::move(map));
         });
+}
+
+void ProjectTree::applyGitStatuses(const QHash<QString, int> &statuses)
+{
+    // Diff against the delegate's current map BEFORE replacing it, so we know
+    // exactly which absolute paths flipped status (added, removed, or changed
+    // code). Only those rows need repainting — a blanket viewport()->update()
+    // is what caused the flicker.
+    const QHash<QString, int> &previous = m_gitDelegate->statuses();
+    QStringList changedPaths;
+    for (auto it = statuses.constBegin(); it != statuses.constEnd(); ++it) {
+        if (previous.value(it.key(), GitStatusDelegate::Clean) != it.value()) {
+            changedPaths << it.key();
+        }
+    }
+    for (auto it = previous.constBegin(); it != previous.constEnd(); ++it) {
+        if (!statuses.contains(it.key())) {
+            changedPaths << it.key(); // cleared since the last snapshot
+        }
+    }
+
+    if (!m_gitDelegate->setStatuses(statuses)) {
+        return; // map was identical after all — nothing to repaint
+    }
+
+    // Repaint only the rows whose status changed, mapping each absolute path
+    // back through the file system model (and the filter proxy) to a view index.
+    // Paths not currently realised in the lazily-loaded model resolve to an
+    // invalid index and are skipped; they pick up the new emblem when their
+    // folder is expanded (directoryLoaded nudges the viewport).
+    for (const QString &path : std::as_const(changedPaths)) {
+        const QModelIndex src = m_model->index(path);
+        if (!src.isValid()) {
+            continue;
+        }
+        const QModelIndex idx = viewIndex(src);
+        if (idx.isValid()) {
+            m_tree->update(idx);
+        }
+    }
 }
 
 void ProjectTree::onActivated(const QModelIndex &idx)
@@ -630,11 +680,10 @@ void ProjectTree::onContextMenu(const QPoint &pos)
 
     QAction *refresh =
         menu.addAction(QIcon::fromTheme(QStringLiteral("view-refresh")), i18n("Refresh"));
-    connect(refresh, &QAction::triggered, this, [this] {
-        const QString r = m_root;
-        m_model->setRootPath(QString());
-        setRoot(r);
-    });
+    // Re-pull the git snapshot only. Tearing down and re-rooting the
+    // QFileSystemModel here would collapse the tree and drop the user's
+    // expansion/selection; refreshGitStatus() refreshes the decoration in place.
+    connect(refresh, &QAction::triggered, this, &ProjectTree::refreshGitStatus);
 
     QAction *hidden = menu.addAction(i18n("Show Hidden Files"));
     hidden->setCheckable(true);

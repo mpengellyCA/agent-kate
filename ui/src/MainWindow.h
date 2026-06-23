@@ -21,6 +21,8 @@ class SearchPanel;
 class TerminalPanel;
 class WorktreeDashboard;
 class LogViewer;
+class CoworkPanel;
+class CoworkPortal;
 class SideBar;
 class ShellLayout;
 class QAction;
@@ -88,6 +90,9 @@ private:
     void restoreEditorSession(const QString &projectPath);
 
     CoreClient *m_core = nullptr;
+    // Set once the graceful stop-and-compact shutdown has run, so the re-entered
+    // closeEvent takes the normal teardown path instead of re-showing the dialog.
+    bool m_shutdownComplete = false;
     EditorArea *m_editor = nullptr;
     ProjectTree *m_tree = nullptr;
     AgentDock *m_agent = nullptr;
@@ -96,6 +101,8 @@ private:
     SearchPanel *m_search = nullptr;
     WorktreeDashboard *m_worktreeDashboard = nullptr;
     LogViewer *m_logViewer = nullptr;
+    CoworkPanel *m_coworkPanel = nullptr;
+    CoworkPortal *m_coworkPortal = nullptr;
     QLabel *m_gitStatusLabel = nullptr; // status-bar git widget for the active editor
 
     ShellLayout *m_shell = nullptr;
@@ -127,6 +134,7 @@ private:
     QString m_keyWorktrees = QStringLiteral("worktrees");
     QString m_keyGitLog = QStringLiteral("gitlog");
     QString m_keyCoop = QStringLiteral("coop");
+    QString m_keyCowork = QStringLiteral("cowork");
     QString m_keyInspector = QStringLiteral("inspector");
     QString m_keyTerminal = QStringLiteral("terminal");
     QString m_keyReferences = QStringLiteral("references");

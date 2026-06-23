@@ -4,6 +4,7 @@
 #include <QHash>
 #include <QJsonObject>
 #include <QObject>
+#include <QPointer>
 #include <QString>
 
 #include <functional>
@@ -29,7 +30,14 @@ public:
     void start(const QString &coreBinaryPath);
 
     // Issue a JSON-RPC request. cb may be null for fire-and-forget.
-    void call(const QString &method, const QJsonObject &params, ReplyCallback cb = nullptr);
+    //
+    // If context is non-null, the reply callback is lifetime-guarded: should the
+    // context QObject be destroyed before the reply arrives, the callback is
+    // DROPPED (never invoked). Pass the object that owns the captured state — a
+    // transient widget, model, etc. — so a late reply cannot touch freed memory.
+    // A null context (the default) keeps the legacy behaviour: always invoked.
+    void call(const QString &method, const QJsonObject &params, ReplyCallback cb = nullptr,
+              QObject *context = nullptr);
 
     bool isConnected() const;
 
@@ -53,5 +61,13 @@ private:
     QByteArray m_buf;
     int m_nextId = 1;
     int m_connectAttempts = 0;
-    QHash<int, ReplyCallback> m_pending;
+
+    // A pending reply slot. When guarded, the callback is invoked only if its
+    // context is still alive; a null context after destruction means DROP.
+    struct PendingReply {
+        ReplyCallback cb;
+        QPointer<QObject> context;
+        bool guarded = false;
+    };
+    QHash<int, PendingReply> m_pending;
 };

@@ -1,11 +1,13 @@
 #pragma once
 
 #include <QImage>
+#include <QSize>
 #include <QString>
 #include <QWidget>
 
 class QLabel;
 class QScrollArea;
+class QTimer;
 
 // ImageView displays a raster image inside an editor tab — used in place of a
 // KTextEditor view when the user opens a file format that would otherwise be
@@ -23,7 +25,10 @@ public:
     static bool canDisplay(const QString &path);
 
 private:
-    void applyScale();
+    QSize computeTarget() const;
+    // smooth=false uses a cheap nearest-neighbour scale for live resize frames;
+    // a debounced settle pass repaints once at full SmoothTransformation quality.
+    void applyScale(bool smooth = true);
     void zoomBy(double factor);
     void setFitToWindow(bool on);
 
@@ -33,6 +38,9 @@ private:
     QImage m_image;
     QLabel *m_imageLabel = nullptr;
     QScrollArea *m_scroll = nullptr;
+    QTimer *m_settleTimer = nullptr;
+    QSize m_lastTarget;
+    bool m_lastSmooth = false;
     double m_scale = 1.0;
     bool m_fit = true;
 };

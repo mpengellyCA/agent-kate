@@ -15,6 +15,7 @@ daily dogfooding. Each item has its own grounded plan file with the relevant
 | 5 | Prompt queue, send-now, model switching (incl. Fable) | Core (Go) + UI | [05-queue-models-midsession.md](05-queue-models-midsession.md) | L |
 | 6 | Fix auto-compaction on exit | Core (Go) | [06-compaction-shutdown.md](06-compaction-shutdown.md) | M |
 | 7 | Document & media viewing (PDF/CSV/Office/AV) | Editor (C++) | [07-document-media-viewing.md](07-document-media-viewing.md) | M–L |
+| 8 | KDE Plasma Cowork (share/see/control the desktop, consent-gated) | Core (Go) + UI (C++) | [08-kde-cowork/](08-kde-cowork/README.md) | L (phased v1/v2/v3) |
 
 Size key: **S** ≈ <½ day, **M** ≈ 1–2 days, **L** ≈ 3–5 days.
 

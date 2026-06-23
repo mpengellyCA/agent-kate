@@ -6,6 +6,7 @@ package agent
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -19,13 +20,26 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"agentkate/internal/safe"
 )
 
-// EventFunc receives one event for a thread. An event is either a raw
-// stream-json object emitted by `claude`, or a synthetic object injected by
-// this package — synthetic types begin with an underscore (_stderr,
-// _lifecycle) so the UI can tell them apart.
-type EventFunc func(threadID string, event json.RawMessage)
+// EventFunc receives a coalesced batch of events for a thread, in the order
+// `claude` produced them. Each event is either a raw stream-json object emitted
+// by `claude`, or a synthetic object injected by this package — synthetic types
+// begin with an underscore (_stderr, _lifecycle) so the UI can tell them apart.
+//
+// Events are buffered per thread and flushed as one batch either on a short
+// timer or when a semantic boundary (a result, a tool_use, or a synthetic
+// event) is reached — whichever comes first. Batching the delivery collapses
+// the per-line stream-json flood into far fewer notifications without changing
+// event content or ordering.
+type EventFunc func(threadID string, events []json.RawMessage)
+
+// coalesceWindow is how long a thread's event buffer may sit before a timer
+// flush. Short enough to stay imperceptible in the UI, long enough to fold a
+// burst of partial assistant deltas into a single notification.
+const coalesceWindow = 25 * time.Millisecond
 
 // Supervisor owns the set of running agent threads.
 type Supervisor struct {
@@ -43,8 +57,9 @@ type Supervisor struct {
 	reapWG sync.WaitGroup
 }
 
-// NewSupervisor creates a supervisor. emit is invoked for every thread event.
-// An empty claudeBin defaults to "claude" (resolved via PATH).
+// NewSupervisor creates a supervisor. emit is invoked with a coalesced batch of
+// thread events (see EventFunc). An empty claudeBin defaults to "claude"
+// (resolved via PATH).
 func NewSupervisor(claudeBin string, log *slog.Logger, emit EventFunc) *Supervisor {
 	if claudeBin == "" {
 		claudeBin = "claude"
@@ -79,6 +94,7 @@ type StartOptions struct {
 	Attachments    []Attachment // files attached to the opening message
 	SessionID      string       // Claude Code session id (a UUID)
 	Resume         bool         // true: --resume the session; false: --session-id a new one
+	CoworkEnabled  bool         // opt this thread into the KDE Cowork desktop MCP server
 }
 
 // buildUserContent assembles a stream-json user message content array from the
@@ -128,6 +144,96 @@ type Thread struct {
 	pgid        int         // process-group id (== leader pid); signalled by Interrupt
 	interrupted bool        // set by Interrupt so reap() reports a user-interrupt
 	hotCompact  *hotCompact // when non-nil, the next assistant turn is captured for a summary
+
+	co *coalescer // batches this thread's events before they reach the emit callback
+}
+
+// coalescer buffers a thread's events and flushes them to the supervisor's
+// emit callback as a single batch, preserving production order. A flush fires
+// on a short timer (coalesceWindow) or immediately when a semantic boundary
+// (result / tool_use / synthetic event) is buffered, whichever comes first.
+//
+// All buffered events feed one emit call, so ordering within and across flushes
+// matches the order add() was called — which, because pumpStdout reads the
+// stream sequentially, is the order `claude` produced them.
+type coalescer struct {
+	threadID string
+	emit     EventFunc
+
+	mu      sync.Mutex
+	pending []json.RawMessage
+	timer   *time.Timer // non-nil while a flush is scheduled
+}
+
+func newCoalescer(threadID string, emit EventFunc) *coalescer {
+	return &coalescer{threadID: threadID, emit: emit}
+}
+
+// add appends one event to the buffer. boundary forces an immediate flush
+// (used for result / tool_use / synthetic events); otherwise a timer flush is
+// scheduled. dedup, when true, drops this event if a byte-identical event is
+// already buffered in the current batch — a provably content-safe way to
+// collapse the repeated partial assistant snapshots `claude --verbose` emits.
+func (c *coalescer) add(raw json.RawMessage, boundary, dedup bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if dedup && len(c.pending) > 0 {
+		// Drop only when the IMMEDIATELY-PRECEDING buffered event is byte-equal:
+		// that is the exact `claude --verbose` partial-snapshot pattern. Scanning
+		// the whole batch could drop a legitimately-repeated, non-adjacent
+		// identical event.
+		if bytes.Equal(c.pending[len(c.pending)-1], raw) {
+			return
+		}
+	}
+	c.pending = append(c.pending, raw)
+	if boundary {
+		c.flushLocked()
+		return
+	}
+	if c.timer == nil {
+		// AfterFunc runs its callback on its own goroutine; route the flush
+		// through safe.Go so a panic there is recovered rather than crashing
+		// the process.
+		c.timer = time.AfterFunc(coalesceWindow, func() {
+			safe.Go("agent.coalesceFlush", c.flush)
+		})
+	}
+}
+
+// flush delivers any buffered events. Called by the timer and by pumpStdout
+// when the stream ends.
+func (c *coalescer) flush() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.flushLocked()
+}
+
+// flushLocked drains the buffer and delivers it to emit. The caller holds
+// c.mu, and emit runs while the lock is held: this serialises batch delivery
+// so two concurrent producers (pumpStdout, pumpStderr, reap) can never reorder
+// their batches. emit never re-enters the coalescer, so holding the lock across
+// it cannot deadlock.
+func (c *coalescer) flushLocked() {
+	batch := c.takeLocked()
+	if len(batch) > 0 {
+		c.emit(c.threadID, batch)
+	}
+}
+
+// takeLocked detaches the current buffer and clears the pending state. Caller
+// holds c.mu.
+func (c *coalescer) takeLocked() []json.RawMessage {
+	if c.timer != nil {
+		c.timer.Stop()
+		c.timer = nil
+	}
+	if len(c.pending) == 0 {
+		return nil
+	}
+	batch := c.pending
+	c.pending = nil
+	return batch
 }
 
 // hotCompact tracks an in-flight Hot-Opus compaction: assistant text is
@@ -172,15 +278,21 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 	if mode == "" {
 		mode = "acceptEdits"
 	}
+	// The Cooperation MCP is always allowed; the opt-in Cowork desktop server is
+	// added only when the thread enabled it. Consent for individual desktop
+	// actions is enforced server-side (the cowork consent authority), NOT by this
+	// allow-list — so --permission-mode cannot bypass it.
+	allowedTools := "mcp__cooperation"
+	if opts.CoworkEnabled {
+		allowedTools += ",mcp__cowork"
+	}
 	args := []string{
 		"--print",
 		"--output-format", "stream-json",
 		"--input-format", "stream-json",
 		"--verbose",
 		"--permission-mode", mode,
-		// The Cooperation MCP is always allowed so every agent can see and
-		// coordinate with its collaborators without a permission prompt.
-		"--allowedTools", "mcp__cooperation",
+		"--allowedTools", allowedTools,
 	}
 	// Reasoning effort is optional: an empty value leaves Claude Code on
 	// whatever default the user has configured.
@@ -244,6 +356,7 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 		meter:     newToolMeter(s.log, id),
 		usage:     newUsageMeter(s.log, id),
 	}
+	t.co = newCoalescer(t.ID, s.emit)
 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start %s: %w", s.claudeBin, err)
@@ -260,10 +373,10 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 	// once the thread id is known to the UI; here we only log.
 	s.log.Info("agent process spawned", "thread", t.ID, "dir", opts.WorkDir, "pid", cmd.Process.Pid)
 
-	go s.pumpStdout(t, stdout)
-	go s.pumpStderr(t, stderr)
+	safe.Go("agent.pumpStdout", func() { s.pumpStdout(t, stdout) })
+	safe.Go("agent.pumpStderr", func() { s.pumpStderr(t, stderr) })
 	s.reapWG.Add(1)
-	go s.reap(t)
+	safe.Go("agent.reap", func() { s.reap(t) })
 
 	// A fresh thread gets its opening turn now. A resumed thread has no opening
 	// prompt — it waits for the user's next message instead.
@@ -319,7 +432,7 @@ func (s *Supervisor) Stop(threadID string) error {
 		return nil
 	}
 	// reap() handles the clean exit; this is only a backstop.
-	go func() {
+	safe.Go("agent.stopKillBackstop", func() {
 		time.Sleep(5 * time.Second)
 		t.mu.Lock()
 		stillAlive := t.alive
@@ -327,7 +440,7 @@ func (s *Supervisor) Stop(threadID string) error {
 		if stillAlive && proc != nil {
 			_ = proc.Kill()
 		}
-	}()
+	})
 	return nil
 }
 
@@ -378,7 +491,7 @@ func (s *Supervisor) Interrupt(threadID string) error {
 
 	// Signal backstop: escalate only if the in-band abort + EOF didn't land.
 	// Much shorter than Stop's 5s grace because the intent here is immediate.
-	go func() {
+	safe.Go("agent.interruptBackstop", func() {
 		time.Sleep(2 * time.Second)
 		if !s.Running(threadID) {
 			return
@@ -395,7 +508,7 @@ func (s *Supervisor) Interrupt(threadID string) error {
 		} else if proc != nil {
 			_ = proc.Kill()
 		}
-	}()
+	})
 	return nil
 }
 
@@ -444,8 +557,48 @@ func (s *Supervisor) pumpStdout(t *Thread, r io.Reader) {
 		// billed for (per-turn usage). Both observe; neither alters the stream.
 		t.meter.Observe(raw)
 		t.usage.Observe(raw)
-		s.emit(t.ID, json.RawMessage(raw))
+		boundary, dedup := classifyEvent(raw)
+		t.co.add(json.RawMessage(raw), boundary, dedup)
 	}
+	// Drain whatever is still buffered when the stream ends so a trailing
+	// partial batch is never stranded behind its timer.
+	t.co.flush()
+}
+
+// classifyEvent inspects one stream-json event to decide whether it should
+// force an immediate coalescer flush (a semantic boundary) and whether it is a
+// candidate for byte-identical dedup within a batch.
+//
+// Boundaries are kept conservative: a `result` (turn end) and any assistant
+// turn carrying a tool_use block (the UI renders a tool card and may gate on
+// it) flush right away so latency-sensitive UI never waits on the timer.
+// Plain assistant text events are dedup candidates because `claude --verbose`
+// can repeat an identical partial snapshot; only exact duplicates are dropped,
+// so no content is ever lost.
+func classifyEvent(raw json.RawMessage) (boundary, dedup bool) {
+	var head struct {
+		Type    string `json:"type"`
+		Message struct {
+			Content []struct {
+				Type string `json:"type"`
+			} `json:"content"`
+		} `json:"message"`
+	}
+	if json.Unmarshal(raw, &head) != nil {
+		return false, false
+	}
+	switch head.Type {
+	case "result":
+		return true, false
+	case "assistant":
+		for _, blk := range head.Message.Content {
+			if blk.Type == "tool_use" {
+				return true, false
+			}
+		}
+		return false, true
+	}
+	return false, false
 }
 
 // observeHotCompact pulls assistant text out of one stream-json event into
@@ -542,7 +695,7 @@ func (s *Supervisor) pumpStderr(t *Thread, r io.Reader) {
 			continue
 		}
 		s.log.Debug("agent stderr", "thread", t.ID, "line", line)
-		s.emitSynthetic(t.ID, "_stderr", line)
+		s.emitSynthetic(t, "_stderr", line)
 	}
 }
 
@@ -583,7 +736,7 @@ func (s *Supervisor) reap(t *Thread) {
 		detail = "exited: " + err.Error()
 	}
 	s.log.Info("agent thread ended", "thread", t.ID, "phase", phase, "detail", detail)
-	s.emitLifecycle(t.ID, phase, detail)
+	s.emitLifecycle(t, phase, detail)
 }
 
 func (s *Supervisor) thread(id string) *Thread {
@@ -603,16 +756,20 @@ func (s *Supervisor) Running(threadID string) bool {
 	return t.alive
 }
 
-func (s *Supervisor) emitLifecycle(threadID, phase, detail string) {
-	s.emitObj(threadID, map[string]any{"type": "_lifecycle", "phase": phase, "detail": detail})
+func (s *Supervisor) emitLifecycle(t *Thread, phase, detail string) {
+	s.emitObj(t, map[string]any{"type": "_lifecycle", "phase": phase, "detail": detail})
 }
 
-func (s *Supervisor) emitSynthetic(threadID, typ, text string) {
-	s.emitObj(threadID, map[string]any{"type": typ, "text": text})
+func (s *Supervisor) emitSynthetic(t *Thread, typ, text string) {
+	s.emitObj(t, map[string]any{"type": typ, "text": text})
 }
 
-func (s *Supervisor) emitObj(threadID string, obj map[string]any) {
+// emitObj buffers a synthetic event through the thread's coalescer. Synthetic
+// events (_stderr, _lifecycle) are low-frequency and order-significant, so each
+// is treated as a flush boundary: it ships with whatever stream events preceded
+// it, in order, rather than waiting on the timer.
+func (s *Supervisor) emitObj(t *Thread, obj map[string]any) {
 	if b, err := json.Marshal(obj); err == nil {
-		s.emit(threadID, json.RawMessage(b))
+		t.co.add(json.RawMessage(b), true, false)
 	}
 }

@@ -100,7 +100,19 @@ void CoreClient::tryConnect()
 void CoreClient::onSocketConnected()
 {
     m_connectAttempts = 0;
-    emit connected();
+    // Claim the UI role and only announce the connection once it is established. The core
+    // dispatches each request on its own goroutine, so merely sending the handshake first
+    // does not guarantee it is *processed* before the panels' UI-only queries (getPolicy,
+    // listGrants, listAudit, …) that fire on connected(). Waiting for the handshake reply
+    // does: the reply is sent after the connection is marked "ui", so every connected()
+    // consumer runs after the role is set. Without this, those queries race the handshake,
+    // are rejected, and panels are left empty until some later notification refreshes them
+    // — which for the Cowork capability toggles never happened (only a policy change
+    // re-fetches them), so the switchboard stayed blank. The callback fires on both success
+    // and error, so a handshake failure still surfaces the connection rather than hanging.
+    call(QStringLiteral("handshake"), {}, [this](const QJsonObject &, const QJsonObject &) {
+        emit connected();
+    });
 }
 
 bool CoreClient::isConnected() const
@@ -108,11 +120,13 @@ bool CoreClient::isConnected() const
     return m_socket->state() == QLocalSocket::ConnectedState;
 }
 
-void CoreClient::call(const QString &method, const QJsonObject &params, ReplyCallback cb)
+void CoreClient::call(const QString &method, const QJsonObject &params, ReplyCallback cb,
+                      QObject *context)
 {
     const int id = m_nextId++;
     if (cb) {
-        m_pending.insert(id, std::move(cb));
+        m_pending.insert(id, PendingReply{std::move(cb), QPointer<QObject>(context),
+                                          context != nullptr});
     }
     send(QJsonObject{
         {QStringLiteral("jsonrpc"), QStringLiteral("2.0")},
@@ -160,10 +174,15 @@ void CoreClient::handleFrame(const QJsonObject &frame)
         && (frame.contains(QStringLiteral("result"))
             || frame.contains(QStringLiteral("error")))) {
         const int id = frame.value(QStringLiteral("id")).toInt();
-        const ReplyCallback cb = m_pending.take(id);
-        if (cb) {
-            cb(frame.value(QStringLiteral("result")).toObject(),
-               frame.value(QStringLiteral("error")).toObject());
+        const PendingReply pending = m_pending.take(id);
+        if (pending.cb) {
+            // Lifetime guard: if the registrant supplied a context that has since
+            // been destroyed, drop the reply rather than dereference freed state.
+            if (pending.guarded && pending.context.isNull()) {
+                return;
+            }
+            pending.cb(frame.value(QStringLiteral("result")).toObject(),
+                       frame.value(QStringLiteral("error")).toObject());
         }
         return;
     }

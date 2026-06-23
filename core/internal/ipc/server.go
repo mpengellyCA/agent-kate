@@ -9,11 +9,22 @@ import (
 	"net"
 	"os"
 	"sync"
+	"time"
+
+	"agentkate/internal/safe"
 )
 
 // maxFrameBytes caps a single inbound JSON-RPC line. Agent stream-json events
 // can be sizable; 16 MiB is generous headroom.
 const maxFrameBytes = 16 * 1024 * 1024
+
+// outboundBuffer is the depth of each connection's outbound frame queue. A slow
+// UI client may fall this far behind before backpressure kicks in.
+const outboundBuffer = 1024
+
+// writeDeadline bounds a single write+flush so a dead-but-not-closed client
+// cannot park the writer goroutine forever.
+const writeDeadline = 30 * time.Second
 
 // Handler processes one request and returns a result to be JSON-marshalled, or
 // an error. An *RPCError is sent verbatim; any other error becomes a
@@ -26,10 +37,11 @@ type Server struct {
 	socketPath string
 	log        *slog.Logger
 
-	mu        sync.RWMutex
-	handlers  map[string]Handler
-	conns     map[*conn]struct{}
-	onAllGone func()
+	mu          sync.RWMutex
+	handlers    map[string]Handler
+	conns       map[*conn]struct{}
+	onAllGone   func()
+	primaryConn *conn // the first UI to handshake; runs portal sessions (Cowork keystone)
 }
 
 // NewServer creates a server bound to socketPath. Call Handle to register
@@ -66,12 +78,18 @@ func (s *Server) Serve(ctx context.Context) error {
 		return err
 	}
 	defer os.Remove(s.socketPath)
+	// Defense in depth: restrict the socket to the owning user. $XDG_RUNTIME_DIR is
+	// already 0700, so this does not stop a same-uid process (see 08 §F Option A),
+	// but it does stop other users on a shared host.
+	if err := os.Chmod(s.socketPath, 0o600); err != nil {
+		s.log.Warn("ipc socket chmod failed", "err", err)
+	}
 	s.log.Info("ipc listening", "socket", s.socketPath)
 
-	go func() {
+	safe.Go("ipc.listenerCloser", func() {
 		<-ctx.Done()
 		ln.Close()
-	}()
+	})
 
 	for {
 		c, err := ln.Accept()
@@ -87,17 +105,32 @@ func (s *Server) Serve(ctx context.Context) error {
 }
 
 func (s *Server) serveConn(ctx context.Context, netConn net.Conn) {
-	c := &conn{netConn: netConn, w: bufio.NewWriter(netConn)}
+	c := &conn{
+		netConn: netConn,
+		w:       bufio.NewWriter(netConn),
+		out:     make(chan *Frame, outboundBuffer),
+		done:    make(chan struct{}),
+		log:     s.log,
+	}
 	s.mu.Lock()
 	s.conns[c] = struct{}{}
 	n := len(s.conns)
 	s.mu.Unlock()
 	s.log.Info("ui connected", "clients", n)
 
-	go func() {
+	// One dedicated writer goroutine per connection drains the outbound queue
+	// and performs the blocking write+flush in isolation, so a slow client can
+	// never wedge the producers (per-agent pumps, the fs-watcher loop).
+	safe.Go("ipc.connWriter", func() { c.writeLoop() })
+
+	safe.Go("ipc.serveConn", func() {
 		defer func() {
+			c.close() // stops the writer goroutine; idempotent
 			s.mu.Lock()
 			delete(s.conns, c)
+			if s.primaryConn == c {
+				s.primaryConn = nil // a Cowork portal request will now fail closed until a UI reconnects
+			}
 			remaining := len(s.conns)
 			s.mu.Unlock()
 			netConn.Close()
@@ -116,12 +149,12 @@ func (s *Server) serveConn(ctx context.Context, netConn net.Conn) {
 			}
 			// Scanner reuses its buffer; copy before handing to a goroutine.
 			frame := append([]byte(nil), line...)
-			go s.dispatch(ctx, c, frame)
+			safe.Go("ipc.dispatch", func() { s.dispatch(ctx, c, frame) })
 		}
 		if err := sc.Err(); err != nil {
 			s.log.Warn("connection read error", "err", err)
 		}
-	}()
+	})
 }
 
 func (s *Server) dispatch(ctx context.Context, c *conn, raw []byte) {
@@ -137,6 +170,11 @@ func (s *Server) dispatch(ctx context.Context, c *conn, raw []byte) {
 	s.mu.RLock()
 	h, ok := s.handlers[f.Method]
 	s.mu.RUnlock()
+
+	// Carry the calling connection's identity (role/threadId/primary) so the Cowork
+	// consent handlers can enforce UI-only RPCs and per-thread binding. Other
+	// handlers ignore it (Cowork keystone, 08 §C).
+	ctx = context.WithValue(ctx, connCtxKey{}, c)
 
 	// Notification (no id): run the handler, discard the result.
 	if f.ID == nil {
@@ -167,7 +205,7 @@ func (s *Server) dispatch(ctx context.Context, c *conn, raw []byte) {
 			resp.Result = b
 		}
 	}
-	c.send(&resp, s.log)
+	c.enqueue(&resp)
 }
 
 // Notify broadcasts a notification to every connected UI client.
@@ -188,31 +226,263 @@ func (s *Server) Notify(method string, params any) {
 	s.mu.RUnlock()
 
 	for _, c := range conns {
-		c.send(&f, s.log)
+		c.enqueue(&f)
 	}
 }
 
-// conn is one connected UI client. send is serialised by mu so response and
-// notification writers do not interleave.
+// conn is one connected UI client. Frames are produced concurrently (per-agent
+// pumps, the fs-watcher loop, request handlers) but written by a single
+// dedicated goroutine draining out, so producers never block on socket I/O and
+// frames for this connection never interleave.
 type conn struct {
 	netConn net.Conn
-	mu      sync.Mutex
 	w       *bufio.Writer
+	log     *slog.Logger
+
+	out  chan *Frame   // bounded outbound queue, drained by writeLoop
+	done chan struct{} // closed once to stop the writer; guarded by closeOnce
+
+	closeOnce sync.Once
+
+	// Cowork keystone identity (08 §C). idMu guards these; they are set once at
+	// handshake/attach and read by Cowork consent handlers via ConnFromContext.
+	idMu      sync.RWMutex
+	role      string // "" (unknown) | "ui" | "bridge"
+	connTID   string // for bridge conns: the bound thread id (trust-on-first-use)
+	isPrimary bool   // the one UI that runs portal sessions
 }
 
-func (c *conn) send(f *Frame, log *slog.Logger) {
+func (c *conn) getRole() string {
+	c.idMu.RLock()
+	defer c.idMu.RUnlock()
+	return c.role
+}
+
+func (c *conn) getThreadID() string {
+	c.idMu.RLock()
+	defer c.idMu.RUnlock()
+	return c.connTID
+}
+
+func (c *conn) getPrimary() bool {
+	c.idMu.RLock()
+	defer c.idMu.RUnlock()
+	return c.isPrimary
+}
+
+// enqueue queues f for delivery to this client. It never blocks a shared
+// producer on a slow client.
+//
+// Backpressure policy distinguishes the two frame kinds:
+//   - Responses (non-nil ID) are awaited by a blocking Client.Call and MUST be
+//     delivered. They are sent with a guaranteed (blocking) send that only gives
+//     up if the connection is closing; the writer's deadline disconnects a dead
+//     client, which unblocks the send. Responses originate on the per-request
+//     dispatch goroutine, so blocking there delays only that one reply, never the
+//     shared per-agent/fs-watcher producers.
+//   - Notifications (nil ID) are coalescing/best-effort — UI state is re-derived
+//     from snapshots — so when the queue is full we shed the OLDEST notification
+//     to keep the client as current as possible. We NEVER shed a response: if the
+//     head of the queue is a response, we put it back and drop this incoming
+//     notification instead.
+//
+// enqueue is safe to call after the connection has begun closing: every send is
+// guarded by a select on done, so there is no send-on-closed-channel panic and
+// no goroutine leak.
+func (c *conn) enqueue(f *Frame) {
+	if f.ID != nil {
+		// Response: must deliver. Block (bounded by writer drain / deadline).
+		select {
+		case <-c.done:
+		case c.out <- f:
+		}
+		return
+	}
+	for {
+		select {
+		case <-c.done:
+			return // connection closing; drop silently
+		case c.out <- f:
+			return
+		default:
+		}
+		// Queue full: shed the oldest *notification*, then retry.
+		select {
+		case <-c.done:
+			return
+		case old := <-c.out:
+			if old.ID != nil {
+				// Oldest is a response we must keep. A slot is now free (we just
+				// popped it), so put it back — and drop this incoming
+				// notification instead of the response.
+				select {
+				case <-c.done:
+				case c.out <- old:
+				}
+				return
+			}
+			c.log.Warn("ipc outbound queue full, dropping oldest notification")
+		default:
+			// Drained concurrently between the two selects; loop and retry the
+			// enqueue (which will now usually succeed).
+		}
+	}
+}
+
+// writeLoop is the single writer goroutine for this connection. It drains out,
+// marshals each frame, and performs the blocking write+flush under a deadline.
+// Any write/flush/marshal error (including a deadline timeout from a dead client
+// that never closed its socket) tears the connection down.
+func (c *conn) writeLoop() {
+	for {
+		select {
+		case <-c.done:
+			return
+		case f := <-c.out:
+			if !c.writeFrame(f) {
+				// Unblock serveConn's reader (which owns lifecycle cleanup) and
+				// stop this writer.
+				c.netConn.Close()
+				c.close()
+				return
+			}
+		}
+	}
+}
+
+// writeFrame marshals and writes a single frame under a write deadline.
+// It returns false on any error, signalling the connection should be dropped.
+func (c *conn) writeFrame(f *Frame) bool {
 	b, err := json.Marshal(f)
 	if err != nil {
-		log.Warn("frame marshal failed", "err", err)
-		return
+		c.log.Warn("frame marshal failed", "err", err)
+		return true // a bad frame must not kill the connection
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	// Bound the write so a dead-but-not-closed client cannot park us forever.
+	if err := c.netConn.SetWriteDeadline(time.Now().Add(writeDeadline)); err != nil {
+		c.log.Warn("set write deadline failed", "err", err)
+		return false
+	}
 	if _, err := c.w.Write(append(b, '\n')); err != nil {
-		log.Warn("frame write failed", "err", err)
-		return
+		c.log.Warn("frame write failed", "err", err)
+		return false
 	}
 	if err := c.w.Flush(); err != nil {
-		log.Warn("frame flush failed", "err", err)
+		c.log.Warn("frame flush failed", "err", err)
+		return false
 	}
+	return true
+}
+
+// close signals the writer goroutine to stop. It is idempotent and safe to call
+// from either the reader's cleanup path or the writer itself.
+func (c *conn) close() {
+	c.closeOnce.Do(func() { close(c.done) })
+}
+
+// --- Cowork keystone: per-connection identity (08 §C) ----------------------------
+//
+// The Cowork consent model must distinguish the UI (which may answer grant prompts,
+// press the kill-switch, run portals) from an agent's MCP bridge (which may only
+// REQUEST consent-gated capabilities, never grant them) and bind each bridge to a
+// single thread so it cannot spend another thread's grant. Identity is injected into
+// the request context in dispatch; handlers retrieve it via ConnFromContext.
+//
+// Same-uid honesty: a malicious local process can still forge a handshake on the raw
+// socket (Option A, 08 §F). This gate stops the realistic prompt-injection path (the
+// agent acting through its own bridge) and cross-thread grant theft, not a determined
+// raw-socket forger — for which the audit log + kill-switch provide detection.
+
+type connCtxKey struct{}
+
+// ConnRef exposes the calling connection's identity to handlers that need it.
+type ConnRef struct{ c *conn }
+
+// ConnFromContext returns the calling connection's identity, or nil if absent
+// (e.g. an internally-synthesized call).
+func ConnFromContext(ctx context.Context) *ConnRef {
+	if c, ok := ctx.Value(connCtxKey{}).(*conn); ok && c != nil {
+		return &ConnRef{c}
+	}
+	return nil
+}
+
+// Role is "" (not yet identified), "ui", or "bridge".
+func (r *ConnRef) Role() string { return r.c.getRole() }
+
+// ThreadID is the bound thread for a bridge connection ("" otherwise).
+func (r *ConnRef) ThreadID() string { return r.c.getThreadID() }
+
+// IsPrimaryUI reports whether this is the UI that runs portal sessions.
+func (r *ConnRef) IsPrimaryUI() bool { return r.c.getPrimary() }
+
+// MarkUI tags this connection as the UI. The first UI to call becomes primary
+// (runs portal sessions). Called from the existing `handshake` handler.
+func (s *Server) MarkUI(ctx context.Context) {
+	ref := ConnFromContext(ctx)
+	if ref == nil {
+		return
+	}
+	c := ref.c
+	s.mu.Lock()
+	primary := false
+	if s.primaryConn == nil {
+		s.primaryConn = c
+		primary = true
+	}
+	s.mu.Unlock()
+	c.idMu.Lock()
+	c.role = "ui"
+	c.isPrimary = primary
+	c.idMu.Unlock()
+}
+
+// BindBridge tags this connection as an agent bridge for threadID on first use, and
+// reports whether the binding is consistent (a bridge may not switch threads). A UI
+// connection may never act as a bridge.
+func (s *Server) BindBridge(ctx context.Context, threadID string) (ok bool, reason string) {
+	ref := ConnFromContext(ctx)
+	if ref == nil {
+		return false, "no connection identity"
+	}
+	c := ref.c
+	c.idMu.Lock()
+	defer c.idMu.Unlock()
+	if c.role == "ui" {
+		return false, "UI connection may not invoke agent capabilities"
+	}
+	if c.role == "" {
+		c.role = "bridge"
+		c.connTID = threadID
+		return true, ""
+	}
+	if c.connTID != threadID {
+		return false, "thread mismatch: connection is bound to a different thread"
+	}
+	return true, ""
+}
+
+// RequireUI reports whether the caller is the UI (for grant responses, kill-switch,
+// revoke, enable — never an agent).
+func (s *Server) RequireUI(ctx context.Context) bool {
+	ref := ConnFromContext(ctx)
+	return ref != nil && ref.Role() == "ui"
+}
+
+// NotifyPrimaryUI sends a notification only to the primary UI (portal requests).
+// Returns false if there is no primary UI connected (caller should fail closed).
+func (s *Server) NotifyPrimaryUI(method string, params any) bool {
+	b, err := json.Marshal(params)
+	if err != nil {
+		s.log.Warn("notify-primary marshal failed", "method", method, "err", err)
+		return false
+	}
+	s.mu.RLock()
+	c := s.primaryConn
+	s.mu.RUnlock()
+	if c == nil {
+		return false
+	}
+	c.enqueue(&Frame{JSONRPC: "2.0", Method: method, Params: json.RawMessage(b)})
+	return true
 }

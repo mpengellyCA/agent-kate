@@ -1,15 +1,16 @@
 #include "SideBar.h"
 
+#include "PanelStack.h"
+
 #include <KConfigGroup>
 
-#include <QStackedWidget>
 #include <QWidget>
 
 SideBar::SideBar(KMultiTabBar::KMultiTabBarPosition pos, QWidget *parent)
     : QObject(parent)
     , m_pos(pos)
     , m_bar(new KMultiTabBar(pos, parent))
-    , m_stack(new QStackedWidget(parent))
+    , m_stack(new PanelStack(parent))
 {
     m_bar->setStyle(KMultiTabBar::VSNET);
     // The panel stack starts collapsed; placing it inside a QSplitter that

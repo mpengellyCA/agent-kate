@@ -49,6 +49,123 @@ void LogModel::appendPage(const QVector<UiLogEntry> &page)
     endInsertRows();
 }
 
+void LogModel::recomputeMaxLane()
+{
+    int maxLane = 0;
+    for (const UiLogEntry &e : m_rows) {
+        if (e.lane > maxLane) {
+            maxLane = e.lane;
+        }
+        for (int l : e.lanesIn) {
+            if (l > maxLane) {
+                maxLane = l;
+            }
+        }
+        for (int l : e.lanesOut) {
+            if (l > maxLane) {
+                maxLane = l;
+            }
+        }
+    }
+    m_maxLane = maxLane;
+}
+
+bool LogModel::applyHead(const QVector<UiLogEntry> &freshFirstPage)
+{
+    // An empty fresh page means the history vanished (branch reset to nothing,
+    // detached with no commits): only a reset can represent that faithfully.
+    if (freshFirstPage.isEmpty()) {
+        if (m_rows.isEmpty()) {
+            return true; // already empty — nothing to do, no reset needed.
+        }
+        reset();
+        return false;
+    }
+    // Nothing loaded yet — there's no state to preserve, so just adopt the page
+    // as the initial load. appendPage() emits a clean beginInsertRows.
+    if (m_rows.isEmpty()) {
+        appendPage(freshFirstPage);
+        return true;
+    }
+
+    // Find how many commits were PREPENDED: the largest k such that the fresh
+    // page's tail (from index k) lines up by sha with our current top rows.
+    // k == 0 means the tops already share an anchor (no new commits, maybe only
+    // decoration changed); k == freshFirstPage.size() with no overlap means the
+    // histories diverged.
+    const int fresh = freshFirstPage.size();
+    int k = -1;
+    for (int cand = 0; cand <= fresh; ++cand) {
+        // Does freshFirstPage[cand .. cand+n-1] match m_rows[0 .. n-1] by sha,
+        // for as many rows as both sides cover within this fresh page?
+        const int n = qMin(fresh - cand, m_rows.size());
+        if (n <= 0) {
+            // The fresh page is entirely new commits sitting on top of ours and
+            // its last entry's parent should be our first sha; we can't see that
+            // here, so require at least one shared anchor below to be safe.
+            continue;
+        }
+        bool aligned = true;
+        for (int i = 0; i < n; ++i) {
+            if (freshFirstPage.at(cand + i).sha != m_rows.at(i).sha) {
+                aligned = false;
+                break;
+            }
+        }
+        if (aligned) {
+            k = cand;
+            break;
+        }
+    }
+
+    // No alignment at any offset → genuine divergence (rewrite / force-push /
+    // different branch). Reset and let the caller refetch.
+    if (k < 0) {
+        reset();
+        return false;
+    }
+
+    // Case A: k new commits were prepended. Insert just those at the top; the
+    // existing rows (and the selection/scroll anchored to them) keep their
+    // identity and shift down by k.
+    if (k > 0) {
+        beginInsertRows({}, 0, k - 1);
+        // Prepend in one shot, preserving order.
+        m_rows = freshFirstPage.mid(0, k) + m_rows;
+        endInsertRows();
+    }
+
+    // Case B (and the shared tail of case A): decoration may have moved on rows
+    // both sides hold. After the prepend the old rows live at [k ..], so compare
+    // freshFirstPage[k + i] against m_rows[k + i] and emit dataChanged for any
+    // that differ by refs/lanes — this catches a branch ref hopping to another
+    // commit, or lane reshuffles, without a new commit object appearing.
+    int firstChanged = -1;
+    int lastChanged = -1;
+    const int compareCount = qMin(fresh - k, m_rows.size() - k);
+    for (int i = 0; i < compareCount; ++i) {
+        const int row = k + i;
+        const UiLogEntry &incoming = freshFirstPage.at(row);
+        if (m_rows.at(row) != incoming) {
+            m_rows[row] = incoming;
+            if (firstChanged < 0) {
+                firstChanged = row;
+            }
+            lastChanged = row;
+        }
+    }
+
+    // Lanes/refs may have grown or shrunk the busiest row; keep m_maxLane honest
+    // so the graph column sizes correctly after the merge.
+    recomputeMaxLane();
+
+    if (firstChanged >= 0) {
+        Q_EMIT dataChanged(index(firstChanged, 0),
+                           index(lastChanged, ColumnCount - 1));
+    }
+    return true;
+}
+
 QString LogModel::shaAt(int row) const
 {
     if (row < 0 || row >= m_rows.size()) {

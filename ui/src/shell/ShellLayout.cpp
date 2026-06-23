@@ -26,6 +26,10 @@ ShellLayout::ShellLayout(const Slots &s, QWidget *parent)
     m_outer = new QSplitter(Qt::Horizontal, this);
     m_outer->setChildrenCollapsible(false);
     m_outer->setHandleWidth(2);
+    // Non-opaque resize: a handle drag rubber-bands and relayouts the heavy
+    // child (chat / document) once on release instead of every pixel — smooth
+    // regardless of content weight. See docs/plans/10-panel-responsiveness.md.
+    m_outer->setOpaqueResize(false);
 
     if (s.leftStack) {
         m_outer->addWidget(s.leftStack);
@@ -37,10 +41,12 @@ ShellLayout::ShellLayout(const Slots &s, QWidget *parent)
     m_centreV = new QSplitter(Qt::Vertical, m_outer);
     m_centreV->setChildrenCollapsible(false);
     m_centreV->setHandleWidth(2);
+    m_centreV->setOpaqueResize(false);
 
     m_centreH = new QSplitter(Qt::Horizontal, m_centreV);
     m_centreH->setChildrenCollapsible(false);
     m_centreH->setHandleWidth(2);
+    m_centreH->setOpaqueResize(false);
     if (s.editor) {
         m_centreH->addWidget(s.editor);
     }

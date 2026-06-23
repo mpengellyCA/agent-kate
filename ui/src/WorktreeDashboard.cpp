@@ -23,13 +23,15 @@
 #include <QPalette>
 #include <QPushButton>
 #include <QResizeEvent>
+#include <QSignalBlocker>
 #include <QTableView>
 #include <QVBoxLayout>
 
 namespace {
-// Poll cadence while visible. The cache on the core side coalesces concurrent
-// reads, so 1 Hz is cheap even with many threads.
-constexpr int kPollIntervalMs = 1000;
+// Slow fallback poll cadence while visible. The dashboard refreshes reactively
+// on the core's git.invalidated notification (diff-suppressed in applySnapshot),
+// so this timer only backstops anything the watcher misses — no need for 1 Hz.
+constexpr int kPollIntervalMs = 20000;
 } // namespace
 
 WorktreeModel::WorktreeModel(QObject *parent)
@@ -173,8 +175,13 @@ void WorktreeModel::setRows(QList<WorktreeRow> rows)
         const QString &oldId = m_rows[i].threadId;
         const QString &newId = rows[j].threadId;
         if (oldId == newId) {
-            m_rows[i] = std::move(rows[j]);
-            emit dataChanged(index(i, 0), index(i, ColCount - 1));
+            // Same thread: only touch the row (and repaint it) when a
+            // load-bearing field actually changed. An identical row is left
+            // untouched so the QTableView never repaints it.
+            if (m_rows[i] != rows[j]) {
+                m_rows[i] = std::move(rows[j]);
+                emit dataChanged(index(i, 0), index(i, ColCount - 1));
+            }
             ++i;
             ++j;
         } else if (oldId < newId) {
@@ -303,6 +310,17 @@ WorktreeDashboard::WorktreeDashboard(CoreClient *core, QWidget *parent)
             &WorktreeDashboard::discardSelected);
     connect(m_cleanupBtn, &QPushButton::clicked, this,
             &WorktreeDashboard::analyzeAndCleanup);
+
+    // Drive the table from the canonical snapshot. set() drops an identical
+    // payload (see refresh()), so this fires only when the snapshot truly
+    // changed — an unchanged poll produces no setRows() and no repaint.
+    m_snapshot.subscribe(this, [this](const QList<WorktreeRow> &rows) {
+        applySnapshot(rows);
+    });
+    // The snapshot starts empty and an all-empty first reply is dropped by
+    // set(), so applySnapshot() would not run to reveal the empty-state hint.
+    // Show it up front; later snapshots keep it in sync via applySnapshot().
+    updatePlaceholder();
 }
 
 void WorktreeDashboard::analyzeAndCleanup()
@@ -597,7 +615,13 @@ void WorktreeDashboard::updatePlaceholder()
 
 void WorktreeDashboard::refresh()
 {
-    if (m_inFlight || !m_core->isConnected()) {
+    if (m_inFlight) {
+        // A snapshot is already in flight; remember that fresher data arrived so
+        // we re-issue once the reply lands rather than dropping this invalidation.
+        m_refreshPending = true;
+        return;
+    }
+    if (!m_core->isConnected()) {
         return;
     }
     m_inFlight = true;
@@ -640,19 +664,54 @@ void WorktreeDashboard::refresh()
                          r.error = o.value(QStringLiteral("error")).toString();
                          rows.append(r);
                      }
-                     m_model->setRows(std::move(rows));
-                     updatePlaceholder();
-                     // Row data (esp. dirty count) may have changed under the
-                     // current selection without the selection model firing —
-                     // refresh the action enablement to match.
-                     const WorktreeRow *sel = selectedRow();
-                     m_commitBtn->setEnabled(sel != nullptr);
-                     const bool merging =
-                         sel != nullptr && sel->isolated && sel->ahead > 0;
-                     m_landBtn->setEnabled(merging);
-                     m_prBtn->setEnabled(merging);
-                     m_discardBtn->setEnabled(sel != nullptr && sel->dirty > 0);
-                 });
+                     // Route through the Reactive snapshot: an identical list
+                     // is dropped here, so applySnapshot() (and thus setRows /
+                     // any repaint) runs only on a genuine change.
+                     m_snapshot.set(std::move(rows));
+                     // Catch up on any invalidation that arrived mid-flight.
+                     if (m_refreshPending) {
+                         m_refreshPending = false;
+                         refresh();
+                     }
+                 },
+                 this);
+}
+
+void WorktreeDashboard::applySnapshot(const QList<WorktreeRow> &rows)
+{
+    // Remember which thread is selected so we can re-select it after the
+    // model swap; the merge inside setRows can shift row indices.
+    const WorktreeRow *prev = selectedRow();
+    const QString selectedThread = prev ? prev->threadId : QString();
+
+    m_model->setRows(rows);
+
+    // Re-select the same thread by id. Block the selection model so the swap
+    // does not transiently fire selectionChanged (which would flicker the
+    // toolbar button state); we refresh enablement explicitly below.
+    {
+        QSignalBlocker block(m_view->selectionModel());
+        if (!selectedThread.isEmpty()) {
+            for (int row = 0; row < m_model->rowCount(); ++row) {
+                const WorktreeRow *r = m_model->rowAt(row);
+                if (r && r->threadId == selectedThread) {
+                    m_view->selectRow(row);
+                    break;
+                }
+            }
+        }
+    }
+
+    updatePlaceholder();
+    // Row data (esp. dirty count) may have changed under the current
+    // selection without the selection model firing — refresh the action
+    // enablement to match.
+    const WorktreeRow *sel = selectedRow();
+    m_commitBtn->setEnabled(sel != nullptr);
+    const bool merging = sel != nullptr && sel->isolated && sel->ahead > 0;
+    m_landBtn->setEnabled(merging);
+    m_prBtn->setEnabled(merging);
+    m_discardBtn->setEnabled(sel != nullptr && sel->dirty > 0);
 }
 
 void WorktreeDashboard::onNotification(const QString &method, const QJsonObject &)

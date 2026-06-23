@@ -13,6 +13,7 @@ import (
 
 	"agentkate/internal/coop"
 	"agentkate/internal/ipc"
+	"agentkate/internal/safe"
 )
 
 const (
@@ -27,6 +28,7 @@ type mcpBridge struct {
 	client    *ipc.Client
 	thread    string
 	workspace string
+	cowork    bool // serve the opt-in Cowork desktop tool set instead of Cooperation
 	log       *slog.Logger
 
 	mu  sync.Mutex // guards out across concurrent handlers
@@ -39,6 +41,7 @@ func runMCPBridge(args []string) {
 	socket := fs.String("socket", "", "core IPC socket path")
 	thread := fs.String("thread", "", "agent thread id")
 	workspace := fs.String("workspace", "", "workspace path")
+	coworkMode := fs.Bool("cowork", false, "serve the opt-in KDE Cowork desktop tools instead of Cooperation")
 	_ = fs.Parse(args)
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -54,6 +57,7 @@ func runMCPBridge(args []string) {
 		client:    client,
 		thread:    *thread,
 		workspace: *workspace,
+		cowork:    *coworkMode,
 		log:       log,
 		out:       bufio.NewWriter(os.Stdout),
 	}
@@ -75,7 +79,8 @@ func (b *mcpBridge) serve() {
 		}
 		// Handle concurrently: a pending permission request must not block
 		// other MCP traffic (pings, further tool calls).
-		go b.handle(&f)
+		frame := f
+		safe.Go("mcp.handle", func() { b.handle(&frame) })
 	}
 }
 
@@ -93,14 +98,14 @@ func (b *mcpBridge) handle(f *ipc.Frame) {
 		b.reply(f, map[string]any{
 			"protocolVersion": protocol,
 			"capabilities":    map[string]any{"tools": map[string]any{}},
-			"serverInfo":      map[string]any{"name": mcpServerName, "version": version},
+			"serverInfo":      map[string]any{"name": b.serverName(), "version": version},
 		})
 	case "notifications/initialized":
 		// notification — no response
 	case "ping":
 		b.reply(f, map[string]any{})
 	case "tools/list":
-		b.reply(f, map[string]any{"tools": toolDefs()})
+		b.reply(f, map[string]any{"tools": b.advertisedTools()})
 	case "tools/call":
 		b.handleToolCall(f)
 	default:
@@ -119,6 +124,16 @@ func (b *mcpBridge) handleToolCall(f *ipc.Frame) {
 		b.replyError(f, ipc.CodeInvalidParams, err.Error())
 		return
 	}
+	// desktop_screenshot returns an MCP image content block, not text.
+	if b.cowork && p.Name == "desktop_screenshot" {
+		content, err := b.runScreenshot(p.Arguments)
+		if err != nil {
+			b.reply(f, toolResult(err.Error(), true))
+			return
+		}
+		b.reply(f, map[string]any{"content": content, "isError": false})
+		return
+	}
 	text, err := b.runTool(p.Name, p.Arguments)
 	if err != nil {
 		b.reply(f, toolResult(err.Error(), true))
@@ -128,6 +143,9 @@ func (b *mcpBridge) handleToolCall(f *ipc.Frame) {
 }
 
 func (b *mcpBridge) runTool(name string, args json.RawMessage) (string, error) {
+	if b.cowork {
+		return b.runCoworkTool(name, args)
+	}
 	switch name {
 	case "whoami":
 		return fmt.Sprintf("thread: %s\nworkspace: %s", b.thread, b.workspace), nil

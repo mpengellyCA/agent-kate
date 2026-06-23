@@ -92,6 +92,43 @@ func TestUpdate(t *testing.T) {
 	}
 }
 
+// TestUpdateQuietLeavesUpdated guards the staleness clock: lifecycle bookkeeping
+// (dormant-on-exit, running-on-resume, compaction) must persist the mutation
+// without advancing Updated, or every launch/shutdown would mask a dormant agent.
+func TestUpdateQuietLeavesUpdated(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "threads.json")
+	store, _ := NewStore(path)
+	store.Put(sampleRecord("t-q"))
+	before, _ := store.Get("t-q")
+
+	if err := store.UpdateQuiet("t-q", func(r *Record) { r.Status = StatusDormant }); err != nil {
+		t.Fatalf("UpdateQuiet: %v", err)
+	}
+	got, _ := store.Get("t-q")
+	if got.Status != StatusDormant {
+		t.Fatalf("status = %q after UpdateQuiet, want dormant", got.Status)
+	}
+	if !got.Updated.Equal(before.Updated) {
+		t.Fatalf("Updated changed: %v -> %v", before.Updated, got.Updated)
+	}
+	// The quiet mutation must still survive a reopen.
+	reopened, err := NewStore(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if r, _ := reopened.Get("t-q"); r.Status != StatusDormant {
+		t.Fatalf("status = %q after reopen, want dormant", r.Status)
+	}
+
+	// Update (non-quiet) still advances the clock, so real activity registers.
+	if err := store.Update("t-q", func(r *Record) { r.Title = "worked" }); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if r, _ := store.Get("t-q"); !r.Updated.After(before.Updated) {
+		t.Fatalf("Update did not advance Updated: %v", r.Updated)
+	}
+}
+
 func TestTagsRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "threads.json")
 	store, _ := NewStore(path)

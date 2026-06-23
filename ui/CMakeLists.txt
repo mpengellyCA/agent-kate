@@ -7,7 +7,17 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(Qt6 6.6 REQUIRED COMPONENTS Core Gui Widgets Network)
+find_package(Qt6 6.6 REQUIRED COMPONENTS Core Gui Widgets Network DBus)
+
+# Optional: libpipewire-0.3 powers the SPIKE-1 screencast-stream consumer that keeps a
+# stream "consumed" so KWin honours absolute pointer motion (plan 09, true cursor
+# control). The build stays green without it — all libpipewire code is guarded by
+# AK_HAVE_PIPEWIRE and the feature simply degrades.
+find_package(PkgConfig)
+if(PkgConfig_FOUND)
+    pkg_check_modules(PipeWire IMPORTED_TARGET libpipewire-0.3)
+endif()
+
 find_package(KF6 6.0 REQUIRED COMPONENTS
     TextEditor          # the Kate editor engine
     SyntaxHighlighting
@@ -26,6 +36,7 @@ find_package(KF6 6.0 REQUIRED COMPONENTS
 
 add_executable(agentkate
     src/main.cpp
+    src/state/Reactive.cpp
     src/MainWindow.cpp
     src/EditorArea.cpp
     src/DiffView.cpp
@@ -44,7 +55,13 @@ add_executable(agentkate
     src/RecentProjects.cpp
     src/shell/SideBar.cpp
     src/shell/ShellLayout.cpp
+    src/shell/PanelStack.cpp
     src/shell/StubPanel.cpp
+    src/cowork/CoworkPanel.cpp
+    src/cowork/CoworkPortal.cpp
+    src/cowork/ConsentDialog.cpp
+    src/cowork/ControlConsentDialog.cpp
+    src/cowork/BrowserLaunch.cpp
     src/TerminalPanel.cpp
     src/SearchPanel.cpp
     src/SessionBrowserDialog.cpp
@@ -56,8 +73,11 @@ add_executable(agentkate
     src/TagEditorDialog.cpp
     src/AutoOrganizeDialog.cpp
     src/AgentPanel.cpp
+    src/TranscriptModel.cpp
+    src/TranscriptDelegate.cpp
     src/WorktreeDashboard.cpp
     src/CleanupDialog.cpp
+    src/ShutdownDialog.cpp
     src/git/BlameController.cpp
     src/git/CommitDetailPanel.cpp
     src/git/CommitDialog.cpp
@@ -86,6 +106,7 @@ target_link_libraries(agentkate PRIVATE
     Qt6::Gui
     Qt6::Widgets
     Qt6::Network
+    Qt6::DBus
     KF6::TextEditor
     KF6::SyntaxHighlighting
     KF6::XmlGui
@@ -102,6 +123,17 @@ target_link_libraries(agentkate PRIVATE
     KF6::KIOWidgets
     KF6::Archive
 )
+
+# SPIKE-1 cursor-control consumer: link libpipewire and flip AK_HAVE_PIPEWIRE only when
+# the dev package is present. Absent, CoworkPortal still compiles (all libpipewire code is
+# #ifdef AK_HAVE_PIPEWIRE) and the screencast-consumer defense is simply omitted.
+if(TARGET PkgConfig::PipeWire)
+    target_compile_definitions(agentkate PRIVATE AK_HAVE_PIPEWIRE)
+    target_link_libraries(agentkate PRIVATE PkgConfig::PipeWire)
+    message(STATUS "agentkate: libpipewire-0.3 found — cowork cursor-control consumer enabled")
+else()
+    message(STATUS "agentkate: libpipewire-0.3 not found — cowork cursor-control consumer disabled")
+endif()
 
 # Place the UI binary in the build root so it sits next to akcore; the UI
 # locates the core relative to its own executable directory.
@@ -132,3 +164,27 @@ install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/org.kde.agentkate.metainfo.xml
 # Install the UI binary. akcore lives next to it (installed by the top-level
 # CMakeLists) so applicationDirPath() finds the core after `make install`.
 install(TARGETS agentkate RUNTIME DESTINATION ${KDE_INSTALL_BINDIR})
+
+# --- Tests -----------------------------------------------------------------
+# Focused QtTest coverage for the panel-shell sizing fix (plan 10). Guarded on
+# Qt6::Test so release/packaging builds without it still configure cleanly. Runs
+# headless under the offscreen QPA platform.
+find_package(Qt6 6.6 QUIET COMPONENTS Test)
+if(Qt6Test_FOUND)
+    enable_testing()
+    add_executable(PanelStackTest tests/PanelStackTest.cpp src/shell/PanelStack.cpp)
+    target_include_directories(PanelStackTest PRIVATE src)
+    target_link_libraries(PanelStackTest PRIVATE Qt6::Widgets Qt6::Test)
+    add_test(NAME PanelStackTest COMMAND PanelStackTest)
+    set_tests_properties(PanelStackTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    # Plan 10 phase 2: the virtualized chat transcript model + delegate.
+    add_executable(TranscriptModelTest tests/TranscriptModelTest.cpp
+        src/TranscriptModel.cpp src/TranscriptDelegate.cpp)
+    target_include_directories(TranscriptModelTest PRIVATE src)
+    target_link_libraries(TranscriptModelTest PRIVATE Qt6::Widgets Qt6::Test)
+    add_test(NAME TranscriptModelTest COMMAND TranscriptModelTest)
+    set_tests_properties(TranscriptModelTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+endif()

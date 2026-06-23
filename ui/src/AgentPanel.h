@@ -9,8 +9,11 @@
 #include <QWidget>
 
 class CoreClient;
-class ToolCard;
+class TranscriptModel;
+class TranscriptDelegate;
 class WorkingIndicator;
+class QListView;
+class QModelIndex;
 class QAbstractButton;
 class QCheckBox;
 class QComboBox;
@@ -49,6 +52,8 @@ public:
     void setWorkspace(const QString &path);
     QString threadId() const { return m_threadId; }
     bool isIsolated() const { return m_isolated; }
+    // A live agent has a thread and a running process (not dormant/resumable).
+    bool isRunning() const { return !m_threadId.isEmpty() && !m_dormant; }
 
     // Pre-pick the start model by its id ("opus", "sonnet", …) before the first
     // start. No-op once a thread exists (the combo is frozen then) or if the id
@@ -78,6 +83,10 @@ public:
 Q_SIGNALS:
     void statusMessage(const QString &text);
     void titleChanged(const QString &title);
+    // Emitted when this panel's backing thread id is assigned or changes — a fresh
+    // agent gets its id asynchronously when its session starts, after activation, so
+    // consumers keyed on the thread (Cowork panel, Git Log) must refresh on this.
+    void threadIdChanged(const QString &threadId);
     void stateChanged(const QString &dotColorHex);
     // Human-readable one-line status (isolation / worktree branch / idle), used
     // as the roster card's subtitle. Tracks the same state as stateChanged.
@@ -119,6 +128,7 @@ private:
     // Rebuild the "queued messages" chip bar from m_sendQueue.
     void rebuildQueueChips();
     void onStopClicked();
+    void onInterruptClicked();
     void onChangesClicked();
     void onPromoteClicked();
     void onAttachClicked();
@@ -149,9 +159,8 @@ private:
     void onQuestionSubmit();
     void refresh();
 
-    // The conversation feed.
-    void appendToFeed(QWidget *entry);
-    // addMessageCard renders one role-tagged card. `plainText` is the raw
+    // The conversation feed — a virtualized model/view (plan 10 phase 2).
+    // addMessageCard appends one role-tagged message row. `plainText` is the raw
     // (Markdown / plain) source kept for copy + search; pass empty when none.
     // `replayed` cards (transcript restore) carry no live timestamp.
     void addMessageCard(const QString &role, const QString &accentHex,
@@ -159,6 +168,12 @@ private:
                         bool replayed = false);
     void addNote(const QString &html, const QString &kind);
     void scrollFeedToBottom();
+    // Show the whole-message + code-block copy menu for a feed row.
+    void showFeedContextMenu(const QModelIndex &idx, const QPoint &globalPos);
+    // After an interactive resize settles, re-measure exactly the rows currently
+    // visible in the view (the rest keep their cheap estimate until shown). This
+    // is what keeps resize cost O(visible rows) — see TranscriptDelegate.
+    void remeasureVisibleRows();
 
     // Jump-to-latest floating button: reposition over the feed viewport and
     // toggle visibility based on the sticky-bottom state.
@@ -196,15 +211,22 @@ private:
     qlonglong m_sessionOutTokens = 0;
 
     QLabel *m_header = nullptr;
-    QScrollArea *m_feedScroll = nullptr;
-    QWidget *m_feed = nullptr;
-    QVBoxLayout *m_feedLayout = nullptr;
+    // Virtualized transcript: a QListView over a TranscriptModel, painted by a
+    // TranscriptDelegate. Replaces the old QScrollArea + per-message-widget feed
+    // so resize cost is O(visible rows) and memory stays flat for long chats.
+    QListView *m_view = nullptr;
+    TranscriptModel *m_model = nullptr;
+    TranscriptDelegate *m_delegate = nullptr;
     bool m_stickBottom = true; // auto-scroll until the user scrolls upward
     // Floating "jump to latest" button over the feed viewport, shown when the
     // feed is scrolled up away from the bottom.
     QToolButton *m_jumpBtn = nullptr;
     bool m_jumpUnread = false; // a card arrived while detached from the bottom
-    QHash<QString, ToolCard *> m_toolCards; // keyed by tool_use id
+    QHash<QString, int> m_toolRows; // tool_use id -> model row
+    // Coalesces interactive resize into a single exact re-measure of the visible
+    // rows once the drag settles (~80ms), mirroring the ImageView/RichTextView
+    // debounce from phase 1.
+    QTimer *m_resizeSettle = nullptr;
 
     // Debounced draft autosave for the composer.
     QTimer *m_draftTimer = nullptr;
@@ -213,16 +235,7 @@ private:
     QFrame *m_findBar = nullptr;
     QLineEdit *m_findEdit = nullptr;
     QLabel *m_findStatus = nullptr;
-    // Registry of searchable message bodies: the body QLabel, its plain-text
-    // source, and the original (un-highlighted) HTML to restore.
-    struct Searchable {
-        QLabel *body = nullptr;
-        QString plain;
-        QString html;
-        QWidget *card = nullptr;
-    };
-    QList<Searchable> m_searchables;
-    QList<int> m_findHits; // indices into m_searchables that currently match
+    QList<int> m_findHits; // model rows that currently match the needle
     int m_findIndex = -1;
     WorkingIndicator *m_working = nullptr;
     QPlainTextEdit *m_input = nullptr;
@@ -230,6 +243,7 @@ private:
     QComboBox *m_isolationCombo = nullptr;
     QComboBox *m_effortCombo = nullptr;
     QComboBox *m_modelCombo = nullptr;
+    QCheckBox *m_coworkCheck = nullptr; // start this agent with the Cowork desktop tools wired in
     // Compaction strategy + strip flag — controls how the thread's transcript
     // is condensed to keep resume cost down. Both are sticky to last used.
     QComboBox *m_compactCombo = nullptr;
@@ -242,6 +256,7 @@ private:
     QMenu *m_compactNowMenu = nullptr;
     QPushButton *m_sendBtn = nullptr;
     QPushButton *m_stopBtn = nullptr;
+    QPushButton *m_interruptBtn = nullptr;
     QPushButton *m_diffBtn = nullptr;
     QPushButton *m_attachBtn = nullptr;
 

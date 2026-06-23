@@ -27,11 +27,49 @@
 #include <QPushButton>
 #include <QScrollBar>
 #include <QShortcut>
+#include <QSignalBlocker>
 #include <QSplitter>
 #include <QStackedWidget>
 #include <QStringList>
 #include <QTableView>
 #include <QVBoxLayout>
+
+namespace
+{
+// Decode the "entries" array of a git.log reply into model rows. Shared by the
+// paginated loader and the in-place HEAD refresh so both speak the same shape.
+QVector<UiLogEntry> parseLogEntries(const QJsonArray &entries)
+{
+    QVector<UiLogEntry> page;
+    page.reserve(entries.size());
+    for (const QJsonValue &v : entries) {
+        const QJsonObject o = v.toObject();
+        UiLogEntry e;
+        e.sha = o.value(QStringLiteral("sha")).toString();
+        e.shortSha = o.value(QStringLiteral("shortSha")).toString();
+        e.subject = o.value(QStringLiteral("subject")).toString();
+        e.author = o.value(QStringLiteral("author")).toString();
+        e.authorEmail = o.value(QStringLiteral("authorEmail")).toString();
+        e.authorTime = QDateTime::fromString(
+            o.value(QStringLiteral("authorTime")).toString(), Qt::ISODate);
+        for (const QJsonValue &p : o.value(QStringLiteral("parents")).toArray()) {
+            e.parents << p.toString();
+        }
+        for (const QJsonValue &r : o.value(QStringLiteral("refs")).toArray()) {
+            e.refs << r.toString();
+        }
+        e.lane = o.value(QStringLiteral("lane")).toInt();
+        for (const QJsonValue &l : o.value(QStringLiteral("lanesIn")).toArray()) {
+            e.lanesIn << l.toInt();
+        }
+        for (const QJsonValue &l : o.value(QStringLiteral("lanesOut")).toArray()) {
+            e.lanesOut << l.toInt();
+        }
+        page.append(std::move(e));
+    }
+    return page;
+}
+} // namespace
 
 LogViewer::LogViewer(CoreClient *core, QWidget *parent)
     : QWidget(parent)
@@ -226,6 +264,10 @@ void LogViewer::reloadFromFirstPage()
     m_pageInFlight = false;
     m_model->reset();
     m_detail->clear();
+    // A full reload (branch switch / refresh / source change) throws away the
+    // old first-page baseline; clearing it keeps the next HEAD refresh from
+    // comparing the new source's page against a stale one.
+    m_firstPage.set({});
     if ((m_source.threadId.isEmpty() && m_source.repoRoot.isEmpty())
         || !m_core->isConnected()) {
         updateEmptyState();
@@ -258,7 +300,7 @@ void LogViewer::loadNextPage()
         }
     }
     m_core->call(QStringLiteral("git.log"), params,
-                 [this, token](const QJsonObject &result, const QJsonObject &error) {
+                 [this, token, skip](const QJsonObject &result, const QJsonObject &error) {
                      if (token != m_loadToken) {
                          return;
                      }
@@ -275,48 +317,136 @@ void LogViewer::loadNextPage()
                          updateEmptyState();
                          return;
                      }
-                     QVector<UiLogEntry> page;
-                     page.reserve(entries.size());
-                     for (const QJsonValue &v : entries) {
-                         const QJsonObject o = v.toObject();
-                         UiLogEntry e;
-                         e.sha = o.value(QStringLiteral("sha")).toString();
-                         e.shortSha = o.value(QStringLiteral("shortSha")).toString();
-                         e.subject = o.value(QStringLiteral("subject")).toString();
-                         e.author = o.value(QStringLiteral("author")).toString();
-                         e.authorEmail =
-                             o.value(QStringLiteral("authorEmail")).toString();
-                         e.authorTime = QDateTime::fromString(
-                             o.value(QStringLiteral("authorTime")).toString(),
-                             Qt::ISODate);
-                         for (const QJsonValue &p :
-                              o.value(QStringLiteral("parents")).toArray()) {
-                             e.parents << p.toString();
-                         }
-                         for (const QJsonValue &r :
-                              o.value(QStringLiteral("refs")).toArray()) {
-                             e.refs << r.toString();
-                         }
-                         e.lane = o.value(QStringLiteral("lane")).toInt();
-                         for (const QJsonValue &l :
-                              o.value(QStringLiteral("lanesIn")).toArray()) {
-                             e.lanesIn << l.toInt();
-                         }
-                         for (const QJsonValue &l :
-                              o.value(QStringLiteral("lanesOut")).toArray()) {
-                             e.lanesOut << l.toInt();
-                         }
-                         page.append(std::move(e));
-                     }
+                     const QVector<UiLogEntry> page = parseLogEntries(entries);
                      const bool wasEmpty = m_model->loadedCount() == 0;
                      m_model->appendPage(page);
                      m_graphDelegate->setMaxLane(m_model->maxLane());
                      m_view->resizeColumnToContents(LogModel::ColGraph);
                      if (wasEmpty) {
+                         // Seed the first-page baseline so the next HEAD refresh
+                         // can short-circuit on an identical page (skip == 0
+                         // means this reply *is* the first page).
+                         if (skip == 0) {
+                             m_firstPage.set(page);
+                         }
                          m_stack->setCurrentIndex(0);
                          m_view->selectRow(0);
                      }
-                 });
+                 },
+                 this);
+}
+
+void LogViewer::refreshHead()
+{
+    // If we have nothing loaded yet (e.g. the very first invalidation races the
+    // initial load, or a previous source was empty) there is no user state to
+    // preserve — fall back to the normal first-page load.
+    if (m_model->loadedCount() == 0) {
+        reloadFromFirstPage();
+        return;
+    }
+    if ((m_source.threadId.isEmpty() && m_source.repoRoot.isEmpty())
+        || !m_core->isConnected()) {
+        return;
+    }
+    // Bump the load token so any in-flight loadNextPage() (which captured an
+    // older "skip" offset) is dropped when its reply lands — otherwise it would
+    // append at a stale offset after we prepend new commits, duplicating or
+    // gapping rows. Our own reply below carries this fresh token.
+    const int token = ++m_loadToken;
+    m_pageInFlight = false;
+    QJsonObject params{{QStringLiteral("skip"), 0},
+                       {QStringLiteral("limit"), kPageSize}};
+    if (!m_source.threadId.isEmpty()) {
+        params.insert(QStringLiteral("threadId"), m_source.threadId);
+    } else {
+        params.insert(QStringLiteral("repoRoot"), m_source.repoRoot);
+        if (!m_source.branch.isEmpty()) {
+            params.insert(QStringLiteral("branch"), m_source.branch);
+        }
+    }
+    m_core->call(
+        QStringLiteral("git.log"), params,
+        [this, token](const QJsonObject &result, const QJsonObject &error) {
+            if (token != m_loadToken) {
+                return;
+            }
+            if (!error.isEmpty()) {
+                return;
+            }
+            const QJsonArray entries =
+                result.value(QStringLiteral("entries")).toArray();
+            const QVector<UiLogEntry> page = parseLogEntries(entries);
+
+            // Gate on the Reactive: an identical first page (the page didn't
+            // actually change, only the working tree did) is dropped, so we skip
+            // the merge, the repaint and the selection/scroll dance entirely.
+            // operator== on UiLogEntry keys on sha + refs + lanes, so a no-op
+            // working-tree save compares equal here and short-circuits.
+            if (page == m_firstPage.get()) {
+                return;
+            }
+            m_firstPage.set(page);
+
+            // Capture user state anchored to STABLE ids (sha), not row numbers,
+            // so a prepend that shifts every row down by k can't drop the
+            // selection or jump the viewport:
+            //   * selectedSha — re-select the same commit afterwards.
+            //   * topSha — the commit at the top of the viewport; we scroll it
+            //     back to the top so the visible window stays put even when new
+            //     commits are inserted above it.
+            const QModelIndex cur = m_view->selectionModel()->currentIndex();
+            const QString selectedSha =
+                cur.isValid() ? m_model->shaAt(cur.row()) : QString();
+            QScrollBar *bar = m_view->verticalScrollBar();
+            const int savedScroll = bar ? bar->value() : 0;
+            const QModelIndex topIdx =
+                m_view->indexAt(m_view->viewport()->rect().topLeft());
+            const QString topSha =
+                topIdx.isValid() ? m_model->shaAt(topIdx.row()) : QString();
+
+            const bool merged = m_model->applyHead(page);
+            m_graphDelegate->setMaxLane(m_model->maxLane());
+            m_view->resizeColumnToContents(LogModel::ColGraph);
+
+            if (!merged) {
+                // Histories diverged: applyHead() already reset the model.
+                // reloadFromFirstPage() clears the stale first-page baseline and
+                // refetches cleanly from scratch.
+                reloadFromFirstPage();
+                return;
+            }
+
+            updateEmptyState();
+
+            // Restore selection by sha (its row index may have shifted when new
+            // commits were prepended). Block the selection model so re-selecting
+            // the same commit doesn't re-trigger the detail fetch needlessly.
+            if (!selectedSha.isEmpty()) {
+                const int row = m_model->rowForSha(selectedSha);
+                if (row >= 0) {
+                    const QModelIndex idx = m_model->index(row, 0);
+                    QSignalBlocker block(m_view->selectionModel());
+                    m_view->selectionModel()->setCurrentIndex(
+                        idx,
+                        QItemSelectionModel::ClearAndSelect
+                            | QItemSelectionModel::Rows);
+                }
+            }
+            // Restore the viewport. If we still know which commit was at the top,
+            // pin it back there so prepended commits push above the fold rather
+            // than shoving the user's view down; otherwise fall back to the raw
+            // scrollbar offset. setValue() clamps to the new maximum itself.
+            const int topRow =
+                topSha.isEmpty() ? -1 : m_model->rowForSha(topSha);
+            if (topRow >= 0) {
+                m_view->scrollTo(m_model->index(topRow, 0),
+                                 QAbstractItemView::PositionAtTop);
+            } else if (bar) {
+                bar->setValue(savedScroll);
+            }
+        },
+        this);
 }
 
 void LogViewer::onSelectionChanged()
@@ -338,19 +468,24 @@ void LogViewer::onSelectionChanged()
 void LogViewer::onNotification(const QString &method, const QJsonObject &params)
 {
     if (method == QLatin1String("git.log.invalidated")) {
+        // A real history change (HEAD moved / commit landed / refs moved) for
+        // the thread we're showing. Merge the new first page in place instead
+        // of nuking selection + scroll + loaded pages.
         const QString id = params.value(QStringLiteral("threadId")).toString();
         if (!id.isEmpty() && id == m_source.threadId) {
-            reloadFromFirstPage();
+            refreshHead();
         }
         return;
     }
     if (method == QLatin1String("git.invalidated")) {
-        // A new worktree may have just been registered for the active
-        // agent. Try to upgrade from workspace → thread.
+        // A plain git.invalidated fires on every working-tree change — most
+        // often an agent file save. A dirty working tree does NOT change
+        // history, so when we already have a resolved thread there is nothing
+        // to reload; reacting here is exactly the full-reset flicker we are
+        // killing. We only use this signal to upgrade from the workspace view
+        // to the agent's thread once a worktree first appears.
         if (m_source.threadId.isEmpty()) {
             resolveThreadForProject();
-        } else {
-            reloadFromFirstPage();
         }
     }
 }

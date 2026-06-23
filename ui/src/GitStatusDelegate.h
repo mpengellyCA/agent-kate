@@ -35,8 +35,15 @@ public:
     explicit GitStatusDelegate(QFileSystemModel *fsModel, QObject *parent = nullptr);
 
     // Replace the path → status map. Keys are absolute, native-separated paths.
-    void setStatuses(QHash<QString, int> statuses);
+    // Returns true only when the new map differs from the current one, so the
+    // caller can skip a repaint when the snapshot is unchanged (the common case
+    // while an agent edits and git.invalidated fires several times a second).
+    bool setStatuses(QHash<QString, int> statuses);
     bool hasStatuses() const { return !m_statuses.isEmpty(); }
+
+    // Current path → status map, so callers can diff old vs new keys and repaint
+    // only the rows that actually changed.
+    const QHash<QString, int> &statuses() const { return m_statuses; }
 
     void paint(QPainter *painter, const QStyleOptionViewItem &option,
                const QModelIndex &index) const override;

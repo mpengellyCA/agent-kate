@@ -10,3 +10,7 @@ Terminal=false
 MimeType=text/plain;inode/directory;
 StartupNotify=true
 StartupWMClass=agentkate
+# Allow the fast no-dialog KWin screenshot path used by the Cowork feature. Only
+# effective for the installed app; the build-dir dogfood loop falls back to the
+# XDG Screenshot portal. See docs/plans/08-kde-cowork/.
+X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2

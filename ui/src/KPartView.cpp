@@ -99,7 +99,17 @@ KPartView::KPartView(const QString &path, QWidget *parent)
         return;
     }
 
-    m_layout->addWidget(m_part->widget());
+    // Okular (and other document parts) report a wide minimumSizeHint. Hosted
+    // in the non-collapsible centre splitter, that would pin the editor pane's
+    // width whenever a document is open. The part is a scroll area, so it
+    // reflows happily into whatever width it is given — let the layout ignore
+    // its width hint so the pane can still be dragged narrow.
+    QWidget *partWidget = m_part->widget();
+    partWidget->setMinimumWidth(0);
+    QSizePolicy sp = partWidget->sizePolicy();
+    sp.setHorizontalPolicy(QSizePolicy::Ignored);
+    partWidget->setSizePolicy(sp);
+    m_layout->addWidget(partWidget);
     m_part->openUrl(QUrl::fromLocalFile(m_path));
 }
 

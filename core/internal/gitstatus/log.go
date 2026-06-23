@@ -6,6 +6,7 @@ package gitstatus
 import (
 	"container/heap"
 	"errors"
+	"sort"
 	"strings"
 	"time"
 
@@ -58,30 +59,46 @@ const (
 // Lane allocation runs over commits actually present in the page; lanes whose
 // "next expected commit" lies past the page boundary stay open at the bottom
 // of the rail — exactly the visualization we want for "continues below."
+//
+// Log itself is uncached: it walks the full history for every call. The Cache's
+// LogPageFor wraps it with a per-(thread, HEAD) cache for the common HEAD-graph
+// case so deep scrolling no longer re-walks from the top each page. This bare
+// entry point is still used for path / branch-filtered requests (which the
+// cache deliberately skips) and by callers without a registered thread.
 func Log(wt worktree.Worktree, opts LogOptions) ([]LogEntry, error) {
+	walked, refsBySHA, err := walkLog(wt, opts)
+	if err != nil || walked == nil {
+		return nil, err
+	}
+	return pageLog(walked, refsBySHA, opts), nil
+}
+
+// walkLog performs the expensive half of a log query: open the repo, resolve
+// the starting commit, and walk the FULL history from it (honouring an optional
+// Path filter), collecting the commits in iterator order plus the ref map.
+//
+// Crucially it ignores Skip/Limit so the result is paginable by slicing — the
+// cache keeps one walk per (thread, HEAD) and every page reuses it. A nil
+// commit slice with a nil error means "nothing to show" (empty/unborn repo or
+// unknown branch); callers turn that into an empty page.
+func walkLog(wt worktree.Worktree, opts LogOptions) ([]*object.Commit, map[string][]string, error) {
 	if wt.Path == "" {
-		return nil, nil
-	}
-	if opts.Limit <= 0 {
-		opts.Limit = defaultLogLimit
-	}
-	if opts.Limit > maxLogLimit {
-		opts.Limit = maxLogLimit
+		return nil, nil, nil
 	}
 
 	repo, err := openRepo(wt.Path)
 	if err != nil {
 		if errors.Is(err, git.ErrRepositoryNotExists) {
-			return nil, nil
+			return nil, nil, nil
 		}
-		return nil, err
+		return nil, nil, err
 	}
 
 	from, err := resolveLogStart(repo, opts.Branch)
 	if err != nil {
 		// Empty repo or unknown branch — return an empty page rather than
 		// error, so the UI just shows "no commits yet".
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	iterOpts := &git.LogOptions{From: from}
@@ -93,37 +110,60 @@ func Log(wt worktree.Worktree, opts LogOptions) ([]LogEntry, error) {
 	}
 	iter, err := repo.Log(iterOpts)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer iter.Close()
 
-	collected := make([]*object.Commit, 0, opts.Limit)
-	skipped := 0
+	walked := make([]*object.Commit, 0, defaultLogLimit)
 	for {
 		c, err := iter.Next()
 		if err != nil {
 			break
 		}
-		if skipped < opts.Skip {
-			skipped++
-			continue
-		}
-		collected = append(collected, c)
-		if len(collected) >= opts.Limit {
-			break
-		}
+		walked = append(walked, c)
 	}
-	if len(collected) == 0 {
-		return nil, nil
+	if len(walked) == 0 {
+		return nil, nil, nil
+	}
+	return walked, collectRefs(repo), nil
+}
+
+// pageLog turns a full walk + ref map (from walkLog) into one rendered page,
+// applying Skip/Limit by slicing and then running the same per-page topo-sort +
+// lane assignment the uncached path always did. Slicing the cached walk instead
+// of re-walking git is the whole point of the cache; the per-page layout is
+// computed over exactly the page's commits, so the output is byte-for-byte
+// identical to the old single-shot Log.
+func pageLog(walked []*object.Commit, refsBySHA map[string][]string, opts LogOptions) []LogEntry {
+	limit := opts.Limit
+	if limit <= 0 {
+		limit = defaultLogLimit
+	}
+	if limit > maxLogLimit {
+		limit = maxLogLimit
 	}
 
-	refsBySHA := collectRefs(repo)
+	skip := opts.Skip
+	if skip < 0 {
+		skip = 0
+	}
+	if skip >= len(walked) {
+		return nil
+	}
+	end := skip + limit
+	if end > len(walked) {
+		end = len(walked)
+	}
+	collected := walked[skip:end]
+	if len(collected) == 0 {
+		return nil
+	}
 
 	if opts.Path != "" {
 		// Path-filtered view: render as a linear list. The git parent of one
 		// filtered commit is rarely the previous filtered commit, so drawing
 		// edges would lie.
-		return buildLinearList(collected, refsBySHA), nil
+		return buildLinearList(collected, refsBySHA)
 	}
 
 	ordered := topoSortCommits(collected)
@@ -141,7 +181,7 @@ func Log(wt worktree.Worktree, opts LogOptions) ([]LogEntry, error) {
 	for i, c := range ordered {
 		out[i] = newLogEntry(c, rows[i], refsBySHA)
 	}
-	return out, nil
+	return out
 }
 
 // resolveLogStart returns the SHA the log should walk from: an explicit branch
@@ -196,6 +236,12 @@ func collectRefs(repo *git.Repository) map[string][]string {
 		out[sha] = append(out[sha], label)
 		return nil
 	})
+	// Deterministic order so an unchanged ref set always serialises identically —
+	// otherwise the UI's order-sensitive UiLogEntry compare sees a spurious change
+	// and repaints the row (defeating the Tier-2 diff suppression).
+	for sha := range out {
+		sort.Strings(out[sha])
+	}
 	return out
 }
 
