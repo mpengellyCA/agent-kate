@@ -18,9 +18,5 @@ compile_commands.json
 # Agent worktrees (created at runtime under .agentkate/)
 /.agentkate/
 
-# Packaging outputs / makepkg scratch (scripts/package.sh)
-/dist/pkg/
-/dist/src/
-/dist/PKGBUILD
-/dist/*.pkg.tar.*
-/dist/agentkate-*/
+# Packaging / build outputs (scripts/package.sh, make-dist.sh)
+/dist/
