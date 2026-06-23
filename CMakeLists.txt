@@ -15,17 +15,21 @@ list(APPEND CMAKE_MODULE_PATH ${ECM_MODULE_PATH})
 include(KDEInstallDirs)
 include(ECMInstallIcons)
 
-# --- Derived version: MAJOR.MINOR.<commits-on-main> ------------------------
-# MAJOR.MINOR come from project() above; the patch component is the number of
-# first-parent commits on the current branch, so every commit that lands on
-# main bumps the version automatically. Override with -DAGENTKATE_VERSION=...
-# (packaging passes the version explicitly, since the unpacked source tarball
-# it builds from has no .git directory).
+# --- Derived version: MAJOR.MINOR.<total-commits> --------------------------
+# MAJOR.MINOR come from project() above; the patch component is the total number
+# of commits reachable from HEAD (git rev-list --count). This makes the version
+# monotonic and merge-strategy independent: every commit raises it by one, and a
+# branch that has been merged into main is always <= main (main contains every
+# merged branch's commits plus the merge). NB: --first-parent must NOT be used —
+# with merge-commit PRs it skips the merged branch's commits, so main would count
+# only +1 per PR and feature-branch builds would out-number main.
+# Override with -DAGENTKATE_VERSION=... (packaging passes the version explicitly,
+# since the unpacked source tarball it builds from has no .git directory).
 if(NOT AGENTKATE_VERSION)
     find_package(Git QUIET)
     if(GIT_FOUND)
         execute_process(
-            COMMAND ${GIT_EXECUTABLE} rev-list --count --first-parent HEAD
+            COMMAND ${GIT_EXECUTABLE} rev-list --count HEAD
             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
             OUTPUT_VARIABLE _ak_commit_count
             OUTPUT_STRIP_TRAILING_WHITESPACE
