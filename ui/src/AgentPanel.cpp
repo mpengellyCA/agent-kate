@@ -1,4 +1,6 @@
 #include "AgentPanel.h"
+#include "TranscriptDelegate.h"
+#include "TranscriptModel.h"
 #include "ipc/CoreClient.h"
 
 #include <KConfigGroup>
@@ -41,15 +43,17 @@
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLayout>
+#include <QListView>
 #include <QPaintEvent>
 #include <QPainter>
 #include <QPalette>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QRadioButton>
-#include <QScrollArea>
+#include <QAbstractItemView>
 #include <QScrollBar>
 #include <QSignalBlocker>
+#include <QStyleOptionViewItem>
 #include <QMenu>
 #include <QTextDocument>
 #include <QTimer>
@@ -66,17 +70,8 @@ bool isDark(const QWidget *w)
     return w->palette().color(QPalette::Base).lightness() < 128;
 }
 
-// noteColor picks a palette-aware colour for a quiet status line.
-QString noteColor(const QString &kind, bool dark)
-{
-    if (kind == QLatin1String("ok")) {
-        return dark ? QStringLiteral("#5fd38a") : QStringLiteral("#1a7f37");
-    }
-    if (kind == QLatin1String("err")) {
-        return dark ? QStringLiteral("#ff8a80") : QStringLiteral("#c01c28");
-    }
-    return dark ? QStringLiteral("#9a9aa3") : QStringLiteral("#6b6b72"); // sys / dim
-}
+// (Note colouring now lives in TranscriptDelegate, which paints the feed —
+// see noteColor() there.)
 
 // markdownToHtml renders an assistant message (Markdown) to an HTML fragment.
 // Default-coloured text carries no explicit colour, so it inherits the card's
@@ -172,142 +167,6 @@ void clearLayout(QLayout *layout)
     }
 }
 } // namespace
-
-// ToolCard is a collapsible card for one tool call: its header is the minimal
-// summary, and clicking it reveals the full input and result.
-class ToolCard : public QFrame
-{
-public:
-    ToolCard(const QString &tool, const QString &summary, const QString &detail,
-             QWidget *parent)
-        : QFrame(parent)
-        , m_tool(tool)
-        , m_summary(summary)
-        , m_detailText(detail.trimmed())
-    {
-        setObjectName(QStringLiteral("toolCard"));
-        setStyleSheet(QStringLiteral(
-            "QFrame#toolCard { border: 1px solid palette(mid); border-radius: 7px; }"
-            "QToolButton#toolHeader { border: none; text-align: left; padding: 5px 8px; }"));
-
-        auto *outer = new QVBoxLayout(this);
-        outer->setContentsMargins(2, 2, 2, 2);
-        outer->setSpacing(0);
-
-        // Header row: the expander button, plus a borderless copy button that
-        // copies the tool's input + result to the clipboard.
-        auto *headerRow = new QHBoxLayout;
-        headerRow->setContentsMargins(0, 0, 0, 0);
-        headerRow->setSpacing(0);
-        m_header = new QToolButton(this);
-        m_header->setObjectName(QStringLiteral("toolHeader"));
-        m_header->setCheckable(true);
-        m_header->setCursor(Qt::PointingHandCursor);
-        m_header->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-        updateHeader();
-        headerRow->addWidget(m_header, 1);
-
-        m_copyBtn = new QToolButton(this);
-        m_copyBtn->setAutoRaise(true);
-        m_copyBtn->setIcon(QIcon::fromTheme(QStringLiteral("edit-copy")));
-        m_copyBtn->setCursor(Qt::PointingHandCursor);
-        m_copyBtn->setToolTip(i18n("Copy tool input and output"));
-        connect(m_copyBtn, &QToolButton::clicked, this, [this] {
-            QString out = m_tool;
-            if (!m_detailText.isEmpty()) {
-                out += QStringLiteral("\n\n") + m_detailText;
-            }
-            if (!m_fullResult.isEmpty()) {
-                out += QStringLiteral("\n\n") + m_fullResult;
-            }
-            QGuiApplication::clipboard()->setText(out);
-        });
-        headerRow->addWidget(m_copyBtn);
-        outer->addLayout(headerRow);
-
-        m_detail = new QWidget(this);
-        auto *dv = new QVBoxLayout(m_detail);
-        dv->setContentsMargins(10, 2, 10, 8);
-        dv->setSpacing(6);
-        if (!m_detailText.isEmpty()) {
-            auto *in = new QLabel(m_detailText, m_detail);
-            in->setWordWrap(true);
-            in->setTextInteractionFlags(Qt::TextSelectableByMouse);
-            in->setStyleSheet(QStringLiteral("font-family: monospace; font-size: small;"));
-            dv->addWidget(in);
-        }
-        m_result = new QLabel(m_detail);
-        m_result->setWordWrap(true);
-        m_result->setTextInteractionFlags(Qt::TextSelectableByMouse);
-        m_result->setStyleSheet(QStringLiteral(
-            "font-family: monospace; font-size: small;"));
-        m_result->setForegroundRole(QPalette::WindowText);
-        m_result->setVisible(false);
-        dv->addWidget(m_result);
-        // "Show full output" expander, hidden until the result is truncated.
-        m_expandBtn = new QToolButton(m_detail);
-        m_expandBtn->setAutoRaise(true);
-        m_expandBtn->setCursor(Qt::PointingHandCursor);
-        m_expandBtn->setVisible(false);
-        connect(m_expandBtn, &QToolButton::clicked, m_expandBtn, [this] {
-            m_result->setText(m_fullResult.isEmpty() ? i18n("(no output)") : m_fullResult);
-            m_expandBtn->setVisible(false);
-        });
-        dv->addWidget(m_expandBtn, 0, Qt::AlignLeft);
-        m_detail->setVisible(false);
-        outer->addWidget(m_detail);
-
-        connect(m_header, &QToolButton::toggled, m_header, [this](bool on) {
-            m_detail->setVisible(on);
-            updateHeader();
-        });
-    }
-
-    void setResult(const QString &text)
-    {
-        m_fullResult = text.trimmed();
-        QString shown = m_fullResult;
-        bool truncated = false;
-        if (shown.size() > 4000) {
-            shown = shown.left(4000);
-            truncated = true;
-        }
-        m_result->setText(shown.isEmpty() ? i18n("(no output)") : shown);
-        m_result->setVisible(true);
-        if (truncated) {
-            const int moreLines =
-                m_fullResult.mid(4000).count(QLatin1Char('\n')) + 1;
-            m_expandBtn->setText(i18np("Show full output (%1 more line)",
-                                       "Show full output (%1 more lines)", moreLines));
-            m_expandBtn->setVisible(true);
-        } else {
-            m_expandBtn->setVisible(false);
-        }
-        m_done = true;
-        updateHeader();
-    }
-
-private:
-    void updateHeader()
-    {
-        const QString arrow =
-            m_header->isChecked() ? QStringLiteral("▾") : QStringLiteral("▸");
-        const QString mark = m_done ? QStringLiteral("✓") : QStringLiteral("⋯");
-        m_header->setText(QStringLiteral("%1  %2  🔧 %3   %4")
-                              .arg(arrow, mark, m_tool, m_summary));
-    }
-
-    QToolButton *m_header = nullptr;
-    QToolButton *m_copyBtn = nullptr;
-    QToolButton *m_expandBtn = nullptr;
-    QWidget *m_detail = nullptr;
-    QLabel *m_result = nullptr;
-    QString m_tool;
-    QString m_summary;
-    QString m_detailText;
-    QString m_fullResult;
-    bool m_done = false;
-};
 
 // WorkingIndicator is the animated "Agent Kate at work" status: a rotating spinner
 // and a personable, activity-aware line, shown while the agent computes.
@@ -452,24 +311,41 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     m_header->setStyleSheet(
         QStringLiteral("padding: 9px 12px; border-bottom: 1px solid palette(mid);"));
 
-    // --- conversation feed: a scrollable column of cards ------------------
-    m_feed = new QWidget;
-    m_feedLayout = new QVBoxLayout(m_feed);
-    m_feedLayout->setContentsMargins(4, 4, 4, 4);
-    m_feedLayout->setSpacing(8);
-    m_feedLayout->addStretch(1); // trailing stretch keeps cards top-aligned
-
-    m_feedScroll = new QScrollArea(this);
-    m_feedScroll->setWidget(m_feed);
-    m_feedScroll->setWidgetResizable(true);
-    m_feedScroll->setFrameShape(QFrame::NoFrame);
-    m_feedScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    // --- conversation feed: a virtualized model/view (plan 10 phase 2) -----
+    // A QListView over a TranscriptModel, painted by a TranscriptDelegate that
+    // draws each row's cached HTML via a QTextDocument with a per-(row,width)
+    // height cache. The view only measures the rows it shows, so a resize costs
+    // O(visible rows) instead of relaying out the whole transcript.
+    m_model = new TranscriptModel(this);
+    m_delegate = new TranscriptDelegate(this);
+    m_view = new QListView(this);
+    m_view->setModel(m_model);
+    m_view->setItemDelegate(m_delegate);
+    m_view->setUniformItemSizes(false);
+    m_view->setWordWrap(true);
+    m_view->setSelectionMode(QAbstractItemView::NoSelection);
+    m_view->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    m_view->setFocusPolicy(Qt::NoFocus);
+    m_view->setFrameShape(QFrame::NoFrame);
+    m_view->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    m_view->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+    m_view->setResizeMode(QListView::Adjust); // re-layout rows on viewport resize
+    m_view->setMouseTracking(true);
+    m_view->setContextMenuPolicy(Qt::CustomContextMenu);
+    m_view->viewport()->setAttribute(Qt::WA_Hover);
+    connect(m_view, &QListView::customContextMenuRequested, this,
+            [this](const QPoint &pos) {
+                const QModelIndex idx = m_view->indexAt(pos);
+                if (idx.isValid()) {
+                    showFeedContextMenu(idx, m_view->viewport()->mapToGlobal(pos));
+                }
+            });
 
     // Sticky-bottom: the feed auto-scrolls to keep the latest entry in view.
     // Scrolling upward releases the stick; scrolling back to the bottom reclaims
-    // it. rangeChanged covers the case where a card's wrapped height arrives a
+    // it. rangeChanged covers the case where a row's measured height arrives a
     // frame after insertion (long tool output, markdown reflow, …).
-    QScrollBar *bar = m_feedScroll->verticalScrollBar();
+    QScrollBar *bar = m_view->verticalScrollBar();
     connect(bar, &QScrollBar::valueChanged, this, [this, bar](int v) {
         m_stickBottom = (v >= bar->maximum() - 48);
         updateJumpButton();
@@ -482,18 +358,26 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     });
 
     // --- "jump to latest" floating button over the feed viewport -----------
-    m_jumpBtn = new QToolButton(m_feedScroll->viewport());
+    m_jumpBtn = new QToolButton(m_view->viewport());
     m_jumpBtn->setIcon(QIcon::fromTheme(QStringLiteral("go-down")));
     m_jumpBtn->setToolTip(i18n("Jump to latest"));
     m_jumpBtn->setCursor(Qt::PointingHandCursor);
     m_jumpBtn->setAutoRaise(false);
     m_jumpBtn->setVisible(false);
-    m_feedScroll->viewport()->installEventFilter(this); // reposition on resize
+    m_view->viewport()->installEventFilter(this); // reposition on resize
     connect(m_jumpBtn, &QToolButton::clicked, this, [this] {
         m_jumpUnread = false;
         scrollFeedToBottom();
         updateJumpButton();
     });
+
+    // Settle-time exact re-measure after an interactive resize: during the drag
+    // every row hands back a cheap cached estimate; once it stops, refine just
+    // the visible rows so heights are pixel-correct without an O(N) layout storm.
+    m_resizeSettle = new QTimer(this);
+    m_resizeSettle->setSingleShot(true);
+    m_resizeSettle->setInterval(80);
+    connect(m_resizeSettle, &QTimer::timeout, this, &AgentPanel::remeasureVisibleRows);
 
     m_working = new WorkingIndicator(this);
 
@@ -953,7 +837,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     body->setContentsMargins(12, 12, 12, 12);
     body->setSpacing(10);
     body->addWidget(m_findBar);
-    body->addWidget(m_feedScroll, 1);
+    body->addWidget(m_view, 1);
     body->addWidget(m_working);
     body->addWidget(m_permBar);
     body->addWidget(m_questionBox);
@@ -1028,18 +912,20 @@ void AgentPanel::applyChatSettings()
             : QStringLiteral("Describe a task for the agent…   (Ctrl+Enter to send)"));
 
     const bool showTools = cfg.readEntry("showTools", true);
-    for (ToolCard *card : std::as_const(m_toolCards)) {
-        card->setVisible(showTools);
-    }
+    m_model->setToolsVisible(showTools);
 }
 
 bool AgentPanel::eventFilter(QObject *obj, QEvent *event)
 {
     // Keep the floating "jump to latest" button anchored to the bottom-right
     // of the feed viewport as it resizes.
-    if (m_feedScroll && obj == m_feedScroll->viewport()
+    if (m_view && obj == m_view->viewport()
         && event->type() == QEvent::Resize) {
         positionJumpButton();
+        // Defer the exact row re-measure until the resize settles.
+        if (m_resizeSettle) {
+            m_resizeSettle->start();
+        }
         return QWidget::eventFilter(obj, event);
     }
     // File/attachment drops onto the chat input must attach as context, not
@@ -1490,22 +1376,15 @@ void AgentPanel::refresh()
 
 // --- conversation feed ------------------------------------------------------
 
-void AgentPanel::appendToFeed(QWidget *entry)
-{
-    // Insert before the trailing stretch. The scrollbar's rangeChanged handler
-    // takes care of riding the bottom when m_stickBottom is true.
-    m_feedLayout->insertWidget(m_feedLayout->count() - 1, entry);
-}
-
 void AgentPanel::scrollFeedToBottom()
 {
     m_stickBottom = true;
-    QScrollBar *bar = m_feedScroll->verticalScrollBar();
+    QScrollBar *bar = m_view->verticalScrollBar();
     bar->setValue(bar->maximum());
-    // A second tick after the event loop has processed layout — long cards or
-    // markdown reflow can push the maximum further than the value we just set.
+    // A second tick after the event loop has measured the freshly-inserted rows —
+    // a long row's height can push the maximum further than the value just set.
     QTimer::singleShot(0, this, [this] {
-        QScrollBar *b = m_feedScroll->verticalScrollBar();
+        QScrollBar *b = m_view->verticalScrollBar();
         b->setValue(b->maximum());
     });
 }
@@ -1514,97 +1393,12 @@ void AgentPanel::addMessageCard(const QString &role, const QString &accentHex,
                                 const QString &bodyHtml, const QString &plainText,
                                 bool replayed)
 {
-    auto *card = new QFrame(m_feed);
-    card->setObjectName(QStringLiteral("msgCard"));
-    card->setStyleSheet(QStringLiteral(
-        "QFrame#msgCard { background: palette(alternate-base); border-radius: 8px; }"));
-    auto *v = new QVBoxLayout(card);
-    v->setContentsMargins(12, 9, 12, 11);
-    v->setSpacing(3);
+    const QString ts = replayed
+        ? QString()
+        : QLocale().toString(QTime::currentTime(), QLocale::ShortFormat);
+    m_model->appendMessage(role, accentHex, bodyHtml, plainText, replayed, ts);
 
-    // Role row: the accent-coloured role label, a stretch, then a dim
-    // right-aligned timestamp for live cards (omitted on transcript replay,
-    // where the original send time is unknown).
-    auto *roleRow = new QHBoxLayout;
-    roleRow->setContentsMargins(0, 0, 0, 0);
-    roleRow->setSpacing(6);
-    auto *roleLabel = new QLabel(role, card);
-    roleLabel->setStyleSheet(
-        QStringLiteral("color: %1; font-weight: bold;").arg(accentHex));
-    roleRow->addWidget(roleLabel);
-    roleRow->addStretch(1);
-    if (!replayed) {
-        auto *timeLabel = new QLabel(
-            QLocale().toString(QTime::currentTime(), QLocale::ShortFormat), card);
-        timeLabel->setStyleSheet(
-            QStringLiteral("color: palette(mid); font-size: small;"));
-        roleRow->addWidget(timeLabel);
-    }
-    v->addLayout(roleRow);
-
-    auto *bodyLabel = new QLabel(bodyHtml, card);
-    bodyLabel->setTextFormat(Qt::RichText);
-    bodyLabel->setWordWrap(true);
-    bodyLabel->setTextInteractionFlags(Qt::TextSelectableByMouse
-                                       | Qt::LinksAccessibleByMouse);
-    bodyLabel->setOpenExternalLinks(true);
-    // QLabel's minimumSizeHint with word-wrap includes the widest unbreakable
-    // token (inline <code>, long URLs, paths in numbered list items). That
-    // propagates up and prevents the panel from ever shrinking below the
-    // widest line. Ignoring the horizontal sizeHint lets the parent's width
-    // drive wrapping instead.
-    // Horizontal Ignored: don't let widest unbreakable token pin the panel's
-    // min width. Vertical Preferred (not MinimumExpanding) so the label takes
-    // exactly its wrapped height — MinimumExpanding made the label gobble any
-    // vertical slack and render text vcentered, looking like growing padding.
-    QSizePolicy bp(QSizePolicy::Ignored, QSizePolicy::Preferred, QSizePolicy::Label);
-    bp.setHeightForWidth(true);
-    bodyLabel->setSizePolicy(bp);
-    bodyLabel->setMinimumWidth(0);
-    bodyLabel->setAlignment(Qt::AlignLeft | Qt::AlignTop);
-    v->addWidget(bodyLabel);
-
-    // Register the body for in-conversation search and highlight restore.
-    if (!plainText.isEmpty()) {
-        m_searchables.append(Searchable{bodyLabel, plainText, bodyHtml, card});
-    }
-
-    // Right-click → copy the whole message, and any fenced code block within it.
-    const QString src = plainText;
-    card->setContextMenuPolicy(Qt::CustomContextMenu);
-    connect(card, &QWidget::customContextMenuRequested, card,
-            [this, card, src](const QPoint &pos) {
-                QMenu menu(card);
-                QAction *copyMsg = menu.addAction(
-                    QIcon::fromTheme(QStringLiteral("edit-copy")), i18n("Copy message"));
-                connect(copyMsg, &QAction::triggered, this, [src] {
-                    QGuiApplication::clipboard()->setText(src);
-                });
-                // Extract ```-fenced code spans straight from the Markdown
-                // source (don't parse the rendered HTML).
-                static const QRegularExpression fence(
-                    QStringLiteral("```[^\\n]*\\n(.*?)```"),
-                    QRegularExpression::DotMatchesEverythingOption);
-                QStringList blocks;
-                auto it = fence.globalMatch(src);
-                while (it.hasNext()) {
-                    blocks << it.next().captured(1);
-                }
-                if (!blocks.isEmpty()) {
-                    QAction *copyCode = menu.addAction(
-                        QIcon::fromTheme(QStringLiteral("edit-copy")),
-                        i18np("Copy code block", "Copy %1 code blocks", blocks.size()));
-                    connect(copyCode, &QAction::triggered, this, [blocks] {
-                        QGuiApplication::clipboard()->setText(
-                            blocks.join(QStringLiteral("\n\n")));
-                    });
-                }
-                menu.exec(card->mapToGlobal(pos));
-            });
-
-    appendToFeed(card);
-
-    // A fresh card while the user is scrolled up flags unread content on the
+    // A fresh row while the user is scrolled up flags unread content on the
     // jump-to-latest button.
     if (!m_stickBottom) {
         m_jumpUnread = true;
@@ -1614,27 +1408,97 @@ void AgentPanel::addMessageCard(const QString &role, const QString &accentHex,
 
 void AgentPanel::addNote(const QString &html, const QString &kind)
 {
-    auto *note = new QLabel(html, m_feed);
-    note->setTextFormat(Qt::RichText);
-    note->setWordWrap(true);
-    QSizePolicy np(QSizePolicy::Ignored, QSizePolicy::Preferred, QSizePolicy::Label);
-    np.setHeightForWidth(true);
-    note->setSizePolicy(np);
-    note->setMinimumWidth(0);
-    note->setAlignment(Qt::AlignLeft | Qt::AlignTop);
-    note->setStyleSheet(QStringLiteral("color: %1; font-size: small; padding: 1px 8px;")
-                            .arg(noteColor(kind, isDark(this))));
-    appendToFeed(note);
+    m_model->appendNote(html, kind);
+    if (!m_stickBottom) {
+        m_jumpUnread = true;
+        updateJumpButton();
+    }
+}
+
+void AgentPanel::showFeedContextMenu(const QModelIndex &idx, const QPoint &globalPos)
+{
+    if (TranscriptModel::Kind(idx.data(TranscriptModel::KindRole).toInt())
+        != TranscriptModel::Message) {
+        return;
+    }
+    const QString src = idx.data(TranscriptModel::PlainRole).toString();
+    if (src.isEmpty()) {
+        return;
+    }
+    QMenu menu(this);
+    QAction *copyMsg = menu.addAction(
+        QIcon::fromTheme(QStringLiteral("edit-copy")), i18n("Copy message"));
+    connect(copyMsg, &QAction::triggered, this, [src] {
+        QGuiApplication::clipboard()->setText(src);
+    });
+    // Extract ```-fenced code spans straight from the Markdown source (don't
+    // parse the rendered HTML).
+    static const QRegularExpression fence(
+        QStringLiteral("```[^\\n]*\\n(.*?)```"),
+        QRegularExpression::DotMatchesEverythingOption);
+    QStringList blocks;
+    auto it = fence.globalMatch(src);
+    while (it.hasNext()) {
+        blocks << it.next().captured(1);
+    }
+    if (!blocks.isEmpty()) {
+        QAction *copyCode = menu.addAction(
+            QIcon::fromTheme(QStringLiteral("edit-copy")),
+            i18np("Copy code block", "Copy %1 code blocks", blocks.size()));
+        connect(copyCode, &QAction::triggered, this, [blocks] {
+            QGuiApplication::clipboard()->setText(blocks.join(QStringLiteral("\n\n")));
+        });
+    }
+    menu.exec(globalPos);
+}
+
+void AgentPanel::remeasureVisibleRows()
+{
+    if (!m_view || !m_delegate || !m_delegate->hasStaleHeights()) {
+        return;
+    }
+    m_delegate->clearStaleFlag();
+    const int width = m_view->viewport()->width();
+    if (width <= 0 || m_model->count() == 0) {
+        return;
+    }
+    QStyleOptionViewItem opt;
+    opt.initFrom(m_view);
+    opt.font = m_view->font();
+    // Walk the rows intersecting the viewport and measure each exactly. A small
+    // overscan above/below keeps scrolling smooth right after a resize.
+    const QModelIndex top = m_view->indexAt(QPoint(2, 2));
+    int first = top.isValid() ? top.row() : 0;
+    first = qMax(0, first - 4);
+    const int vh = m_view->viewport()->height();
+    bool changed = false;
+    for (int row = first; row < m_model->count(); ++row) {
+        const QModelIndex idx = m_model->index(row);
+        QRect r = m_view->visualRect(idx);
+        // Stop once we are a screenful past the bottom of the viewport.
+        if (r.isValid() && r.top() > vh + 8) {
+            break;
+        }
+        opt.rect = QRect(0, 0, width, 0);
+        m_delegate->measureExact(idx, width, opt);
+        changed = true;
+    }
+    if (changed) {
+        // Relayout with the corrected visible-row heights. Off-screen rows keep
+        // their cheap estimate until they scroll into view (then sizeHint
+        // measures them exactly on first sight).
+        m_view->doItemsLayout();
+    }
 }
 
 // --- jump-to-latest floating button ----------------------------------------
 
 void AgentPanel::positionJumpButton()
 {
-    if (!m_jumpBtn || !m_feedScroll) {
+    if (!m_jumpBtn || !m_view) {
         return;
     }
-    QWidget *vp = m_feedScroll->viewport();
+    QWidget *vp = m_view->viewport();
     const QSize sz = m_jumpBtn->sizeHint();
     const int margin = 12;
     m_jumpBtn->move(vp->width() - sz.width() - margin,
@@ -1721,11 +1585,9 @@ void AgentPanel::clearDraft()
 
 void AgentPanel::clearFindHighlights()
 {
-    for (const Searchable &s : std::as_const(m_searchables)) {
-        if (s.body) {
-            s.body->setText(s.html);
-        }
-    }
+    // The delegate paints the highlight from the model's find state; clearing it
+    // restores every row's stored HTML on the next repaint.
+    m_model->setFind(QString(), -1);
     m_findHits.clear();
     m_findIndex = -1;
 }
@@ -1756,43 +1618,27 @@ void AgentPanel::runFind(int direction)
         return;
     }
     const QString needle = m_findEdit->text();
-    clearFindHighlights();
     if (needle.isEmpty()) {
+        clearFindHighlights();
         if (m_findStatus) {
             m_findStatus->clear();
         }
         return;
     }
-    // Highlight every match by re-rendering the body with a palette-highlight
-    // span wrapped around each hit (escaping the source first).
-    for (int i = 0; i < m_searchables.size(); ++i) {
-        const Searchable &s = m_searchables.at(i);
-        if (!s.plain.contains(needle, Qt::CaseInsensitive)) {
-            continue;
+    // Recompute the matching rows: a message row matches if its plain source
+    // contains the needle. The delegate paints the per-row highlight from the
+    // model's find state, so no HTML rewriting happens here.
+    m_findHits.clear();
+    for (int row = 0; row < m_model->count(); ++row) {
+        const TranscriptModel::Item &it = m_model->itemAt(row);
+        if (it.kind == TranscriptModel::Message
+            && it.plain.contains(needle, Qt::CaseInsensitive)) {
+            m_findHits.append(row);
         }
-        m_findHits.append(i);
-        if (!s.body) {
-            continue;
-        }
-        QString escaped = s.plain.toHtmlEscaped();
-        const QString escNeedle = needle.toHtmlEscaped();
-        QString out;
-        int from = 0;
-        for (;;) {
-            const int at = escaped.indexOf(escNeedle, from, Qt::CaseInsensitive);
-            if (at < 0) {
-                out += escaped.mid(from);
-                break;
-            }
-            out += escaped.mid(from, at - from);
-            out += QStringLiteral("<span style='background:palette(highlight); "
-                                  "color:palette(highlighted-text)'>")
-                   + escaped.mid(at, escNeedle.length()) + QStringLiteral("</span>");
-            from = at + escNeedle.length();
-        }
-        s.body->setText(out.replace(QLatin1Char('\n'), QStringLiteral("<br>")));
     }
     if (m_findHits.isEmpty()) {
+        m_findIndex = -1;
+        m_model->setFind(needle, -1);
         if (m_findStatus) {
             m_findStatus->setText(i18n("No matches"));
         }
@@ -1803,12 +1649,11 @@ void AgentPanel::runFind(int direction)
     } else {
         m_findIndex = (m_findIndex + direction + m_findHits.size()) % m_findHits.size();
     }
-    const Searchable &cur = m_searchables.at(m_findHits.at(m_findIndex));
-    if (cur.card) {
-        m_stickBottom = false;
-        m_feedScroll->ensureWidgetVisible(cur.card);
-        updateJumpButton();
-    }
+    const int curRow = m_findHits.at(m_findIndex);
+    m_model->setFind(needle, curRow);
+    m_stickBottom = false;
+    m_view->scrollTo(m_model->index(curRow), QAbstractItemView::PositionAtCenter);
+    updateJumpButton();
     if (m_findStatus) {
         m_findStatus->setText(i18nc("current match / total matches", "%1 / %2",
                                     m_findIndex + 1, m_findHits.size()));
@@ -2673,16 +2518,18 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
                 }
                 const QString detail = QString::fromUtf8(
                     QJsonDocument(input).toJson(QJsonDocument::Indented));
-                auto *card = new ToolCard(name, summary, detail, m_feed);
                 const bool show = KSharedConfig::openConfig()
                                       ->group(QStringLiteral("Agent"))
                                       .readEntry("showTools", true);
-                card->setVisible(show);
+                const int row = m_model->appendTool(name, summary, detail, show);
                 const QString id = b.value(QStringLiteral("id")).toString();
                 if (!id.isEmpty()) {
-                    m_toolCards.insert(id, card);
+                    m_toolRows.insert(id, row);
                 }
-                appendToFeed(card);
+                if (!m_stickBottom) {
+                    m_jumpUnread = true;
+                    updateJumpButton();
+                }
                 m_working->setActivity(activityFor(name));
             }
         }
@@ -2694,8 +2541,19 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             const QJsonObject b = bv.toObject();
             if (b.value(QStringLiteral("type")).toString() == QLatin1String("tool_result")) {
                 const QString id = b.value(QStringLiteral("tool_use_id")).toString();
-                if (ToolCard *card = m_toolCards.value(id, nullptr)) {
-                    card->setResult(toolResultText(b.value(QStringLiteral("content"))));
+                const int row = m_toolRows.value(id, -1);
+                if (row >= 0) {
+                    // Clip very long results to keep the row cheap to lay out;
+                    // the "Show full output" affordance expands them on demand.
+                    const QString full =
+                        toolResultText(b.value(QStringLiteral("content"))).trimmed();
+                    QString shown = full;
+                    bool truncated = false;
+                    if (shown.size() > 4000) {
+                        shown = shown.left(4000);
+                        truncated = true;
+                    }
+                    m_model->setToolResult(row, shown, full, truncated);
                 }
             }
         }

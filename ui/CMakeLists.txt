@@ -73,6 +73,8 @@ add_executable(agentkate
     src/TagEditorDialog.cpp
     src/AutoOrganizeDialog.cpp
     src/AgentPanel.cpp
+    src/TranscriptModel.cpp
+    src/TranscriptDelegate.cpp
     src/WorktreeDashboard.cpp
     src/CleanupDialog.cpp
     src/ShutdownDialog.cpp
@@ -175,5 +177,14 @@ if(Qt6Test_FOUND)
     target_link_libraries(PanelStackTest PRIVATE Qt6::Widgets Qt6::Test)
     add_test(NAME PanelStackTest COMMAND PanelStackTest)
     set_tests_properties(PanelStackTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    # Plan 10 phase 2: the virtualized chat transcript model + delegate.
+    add_executable(TranscriptModelTest tests/TranscriptModelTest.cpp
+        src/TranscriptModel.cpp src/TranscriptDelegate.cpp)
+    target_include_directories(TranscriptModelTest PRIVATE src)
+    target_link_libraries(TranscriptModelTest PRIVATE Qt6::Widgets Qt6::Test)
+    add_test(NAME TranscriptModelTest COMMAND TranscriptModelTest)
+    set_tests_properties(TranscriptModelTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 endif()

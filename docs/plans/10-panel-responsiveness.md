@@ -127,3 +127,112 @@ memory.
 | Test | `ui/tests/PanelStackTest.cpp` (+ CMake) |
 
 Size: **M** (Phase 1). Phase 2 (chat virtualization): **L**, separate pass.
+
+---
+
+## Phase 2 implementation notes (chat virtualization)
+
+Phase 1 killed the *splitter-drag* lag (non-opaque resize + current-page-only
+sizing). Phase 2 targets the remaining cost: **window-edge resize of a long
+chat** and the memory of materializing the whole transcript as live widgets.
+It replaces the `QScrollArea` + per-message-widget feed with a model/view.
+
+### Key fact that shapes the design
+
+There is **no token-by-token streaming**. The core coalesces the stream-json
+flood into ordered *batches* (`onNotification` → `agent.event` carries an
+`events` array). Each `assistant` text block becomes a **whole new card**;
+tool results arrive later as their own `user`/`tool_result` events keyed by
+`tool_use_id`. So "streaming append" = *append new rows in batches* plus *mutate
+the tool row whose result just arrived* — never a per-keystroke mutation of the
+last row. This means a plain append-only model with a targeted `dataChanged`
+for tool results is sufficient; no partial-text accumulation buffer is needed.
+
+### Model — `TranscriptModel` (`QAbstractListModel`)
+
+One row per feed entry. Row struct `TranscriptItem`:
+
+| field | purpose |
+|---|---|
+| `kind` (Note / Message / Tool) | selects delegate paint path |
+| `role` / `accentHex` | message header label + colour |
+| `html` | pre-rendered body (markdown rendered **once** via `markdownToHtml`); for notes this is the note HTML |
+| `plain` | raw markdown/source — copy + code-block extraction + search |
+| `replayed` | suppress the live timestamp |
+| `timestamp` | short local time string for live cards |
+| tool: `toolName`, `summary`, `detail` (input JSON), `result`, `resultTruncated`, `fullResult` | tool card |
+| tool: `expanded` | per-row collapse flag (default false) |
+| tool: `done` | ✓ vs ⋯ marker |
+| `toolVisible` | honours the `showTools` setting |
+| `noteKind` | colour bucket for notes |
+
+Public ops (mirror the old feed API): `appendMessage`, `appendNote`,
+`appendTool` (returns row), `setToolResult(row, …)`, `setExpanded(row, on)`,
+`setToolsVisible(bool)`, plus accessors for find/copy. Each mutation emits
+`dataChanged` for exactly its row (or `begin/endInsertRows` for appends), so a
+mutation re-measures **one** row, not the feed.
+
+Tool rows are addressed by `tool_use id` via a `QHash<QString,int>` kept in the
+panel (replaces `m_toolCards`).
+
+### View — `QListView` + `TranscriptDelegate` (`QStyledItemDelegate`)
+
+- `setUniformItemSizes(false)`, `setWordWrap(true)`, `setSelectionMode(NoSelection)`,
+  horizontal scrollbar off, `setResizeMode(Adjust)` so a viewport-width change
+  re-lays the visible rows.
+- The delegate builds a `QTextDocument` from the row's cached HTML, sets its
+  `textWidth` to the row's content width, and `documentLayout()->draw()`s it —
+  same engine `QLabel` used, so markdown/code fidelity is preserved. The role
+  header + timestamp + tool header line are drawn above the body.
+- **Height cache**: `QHash<quintptr,CacheEntry>` keyed by a per-row stable id
+  (model supplies a monotonic `idAt(row)`), storing `{width, height}`. `sizeHint`
+  returns the cached height when the width matches; otherwise it measures the
+  `QTextDocument` once and caches. → resize is **O(visible rows)**: only the
+  rows the view actually asks `sizeHint` for (the visible window) get re-measured.
+  The cache is invalidated for a row on `dataChanged` (model bumps that row's id)
+  and wholesale on a model reset.
+- The view connects `dataChanged`/`rowsInserted`/`modelReset` and on a width
+  change calls `doItemsLayout()` so heights refresh.
+
+### Feature mapping (each preserved feature → new mechanism)
+
+1. **Streaming append** → `begin/endInsertRows`; sticky-bottom rides it.
+2. **Sticky-bottom + jump button** → unchanged logic, but driven off the
+   `QListView`'s own vertical scrollbar (rangeChanged/valueChanged). `m_jumpBtn`
+   reparented to the view's viewport; `scrollToBottom()` via `scrollTo(lastIndex)`.
+3. **Tool cards** (collapse/expand, copy, default-collapsed) → `expanded` flag
+   toggled on click in the delegate's `editorEvent` (hit-test the header rect) →
+   `setExpanded` → `dataChanged` re-measures that one row. A copy hit-rect in the
+   header copies tool input+result. Permission affordances stay where they are
+   (the `m_permBar` is **not** part of the feed — unchanged).
+4. **Copy** → right-click context menu on the view: map position→index, offer
+   "Copy message" (plain) and "Copy N code blocks" (same ```-fence regex over
+   `plain`). Tool-row copy via the header copy hit-rect.
+5. **Find** → iterate model rows; a row matches if `plain` contains the needle.
+   Highlight = the delegate wraps matches in a highlight span when painting the
+   current needle (model carries the active needle + current-hit row); scroll-to
+   via `scrollTo(index)`. No re-render of stored HTML needed.
+6. **Markdown/code fidelity** → `markdownToHtml` reused verbatim, rendered once
+   into `html`, painted via `QTextDocument`. Never re-parsed on resize.
+7. **Links external** → delegate `editorEvent` hit-tests anchors
+   (`documentLayout()->anchorAt`) and opens via `QDesktopServices`.
+8. **Notes / replay** → `appendNote`; `loadTranscript` replays through the same
+   `renderEvent`, which now appends model rows.
+9. **Selectable text** → per-row selection within a delegate is heavy; instead
+   the row context-menu "Copy message" + the tool copy button cover copy needs,
+   and double-click on a message row copies it. **Compromise noted**: live
+   drag-select across the transcript is dropped (it never worked across cards
+   anyway — each card was an independent QLabel). Copy paths fully preserved.
+
+### Staging
+
+1. Add `TranscriptModel` + `TranscriptDelegate` (new files), wired to CMake and
+   the test target. Build.
+2. Stand up the `QListView` in the panel **alongside** the old feed, route
+   `addMessageCard`/`addNote`/tool creation to the model, hide the old scroll
+   area. Build + smoke.
+3. Remove the dead per-widget feed (`m_feed`, `m_feedLayout`, `addMessageCard`'s
+   widget body, `ToolCard`, `m_searchables`/`Searchable`). Build + smoke.
+4. Add `TranscriptModelTest` (row count, tool-result mutation, height-cache
+   invalidation on width change, code-block extraction). `ctest`.
+
