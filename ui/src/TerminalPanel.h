@@ -17,6 +17,7 @@ class TerminalPanel : public QWidget
     Q_OBJECT
 public:
     explicit TerminalPanel(QWidget *parent = nullptr);
+    ~TerminalPanel() override;
 
     // Switch to a project: hides tabs from other projects, shows ones from
     // this project, creating a first tab if none exist yet for it. Existing
@@ -73,4 +74,8 @@ private:
     QString m_workdir;
     bool m_konsoleMissing = false;
     QWidget *m_addButton = nullptr;
+    // Set in the destructor, before the base ~QWidget deletes our children. The
+    // parts' destroyed-handlers reach back into m_tabs, which is itself being
+    // torn down during shutdown — this flag tells them to stand down.
+    bool m_shuttingDown = false;
 };

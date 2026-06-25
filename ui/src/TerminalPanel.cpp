@@ -93,6 +93,17 @@ TerminalPanel::TerminalPanel(QWidget *parent)
     // the home directory.
 }
 
+TerminalPanel::~TerminalPanel()
+{
+    // The base ~QWidget (running after this body) deletes m_tabs and, through
+    // it, every container and its Konsole part. Each part's destroyed-handler
+    // calls back into m_tabs, which by then is mid-destruction — a use-after-
+    // free. Qt's automatic disconnect of this-context connections only happens
+    // later in ~QObject, too late to help. Flag the teardown so the handlers
+    // bail out instead.
+    m_shuttingDown = true;
+}
+
 void TerminalPanel::setWorkingDirectory(const QString &dir)
 {
     if (dir.isEmpty() || dir == m_workdir) {
@@ -394,6 +405,9 @@ QWidget *TerminalPanel::createSession(const QString &cwd)
     // Graceful exit: when the shell exits, the part is destroyed — close the
     // (now dead) tab so no blank terminal lingers.
     connect(part, &QObject::destroyed, this, [this, container] {
+        if (m_shuttingDown) {
+            return; // m_tabs is being torn down with us — don't touch it.
+        }
         const int idx = m_tabs->indexOf(container);
         if (idx >= 0) {
             m_tabs->removeTab(idx);
