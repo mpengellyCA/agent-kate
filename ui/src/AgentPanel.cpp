@@ -65,6 +65,14 @@ namespace {
 // Custom drag MIME carrying per-hit line ranges, mirrored in SearchPanel.cpp.
 constexpr char kAttachMime[] = "application/x-agentkate-attachment+json";
 
+// Tool-result clipping. The transcript shows the first kToolResultDisplayClip
+// chars inline and reveals more via "Show full output". The retained copy is
+// itself capped at kToolResultStoreCap so a single huge result (a big Read, a
+// verbose command, an AT-SPI page dump) cannot grow the in-RAM transcript
+// without bound — the on-disk transcript always keeps the true full text.
+constexpr int kToolResultDisplayClip = 4000;
+constexpr int kToolResultStoreCap = 128 * 1024;
+
 bool isDark(const QWidget *w)
 {
     return w->palette().color(QPalette::Base).lightness() < 128;
@@ -2521,10 +2529,10 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
                 const bool show = KSharedConfig::openConfig()
                                       ->group(QStringLiteral("Agent"))
                                       .readEntry("showTools", true);
-                const int row = m_model->appendTool(name, summary, detail, show);
+                const int key = m_model->appendTool(name, summary, detail, show);
                 const QString id = b.value(QStringLiteral("id")).toString();
                 if (!id.isEmpty()) {
-                    m_toolRows.insert(id, row);
+                    m_toolRows.insert(id, key);
                 }
                 if (!m_stickBottom) {
                     m_jumpUnread = true;
@@ -2541,19 +2549,24 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             const QJsonObject b = bv.toObject();
             if (b.value(QStringLiteral("type")).toString() == QLatin1String("tool_result")) {
                 const QString id = b.value(QStringLiteral("tool_use_id")).toString();
-                const int row = m_toolRows.value(id, -1);
-                if (row >= 0) {
+                const int key = m_toolRows.value(id, -1);
+                if (key >= 0) {
                     // Clip very long results to keep the row cheap to lay out;
                     // the "Show full output" affordance expands them on demand.
-                    const QString full =
+                    QString full =
                         toolResultText(b.value(QStringLiteral("content"))).trimmed();
-                    QString shown = full;
-                    bool truncated = false;
-                    if (shown.size() > 4000) {
-                        shown = shown.left(4000);
-                        truncated = true;
+                    const bool truncated = full.size() > kToolResultDisplayClip;
+                    QString shown = truncated ? full.left(kToolResultDisplayClip) : full;
+                    // Cap the retained copy so a giant result can't bloat the
+                    // transcript; the on-disk transcript keeps the true full text.
+                    if (full.size() > kToolResultStoreCap) {
+                        full.truncate(kToolResultStoreCap);
                     }
-                    m_model->setToolResult(row, shown, full, truncated);
+                    m_model->setToolResult(key, shown, full, truncated);
+                    // A tool_use has exactly one tool_result; the mapping is dead
+                    // once applied. Dropping it bounds m_toolRows and lets the key
+                    // fall away with the row when it is eventually evicted.
+                    m_toolRows.remove(id);
                 }
             }
         }

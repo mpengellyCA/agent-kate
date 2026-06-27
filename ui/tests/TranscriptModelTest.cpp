@@ -23,6 +23,7 @@ private Q_SLOTS:
     void findStatePropagates();
     void widthChangeEstimatesThenMeasuresExact();
     void heightCacheInvalidatesOnMutation();
+    void evictionBoundsRamAndKeysResolve();
 };
 
 void TranscriptModelTest::appendsGrowRowCount()
@@ -153,6 +154,41 @@ void TranscriptModelTest::heightCacheInvalidatesOnMutation()
     m.setToolResult(row, QStringLiteral("a\nb\nc\nd"), QStringLiteral("a\nb\nc\nd"), false);
     const int expanded = d.sizeHint(opt, m.index(row)).height();
     QVERIFY2(expanded > collapsed, "expanded tool row must be taller than collapsed");
+}
+
+// The in-RAM feed is capped (kMaxRows = 5000) so a long session can't grow the
+// model without bound. The contract that protects correctness across eviction:
+// deferred references (a tool_result landing after a round-trip) use the stable
+// key from appendTool, which must (a) resolve to the right row even after the
+// front has been evicted and m_base has moved, and (b) become a safe no-op once
+// its own row is gone — never a write to a wrongly-shifted row.
+void TranscriptModelTest::evictionBoundsRamAndKeysResolve()
+{
+    TranscriptModel m;
+    // A tool appended early, before the feed overflows its cap.
+    const int earlyKey = m.appendTool(QStringLiteral("Bash"), QStringLiteral("old"),
+                                      QStringLiteral("{}"), true);
+    // Push well past the cap so the early row is evicted off the front.
+    for (int i = 0; i < 6000; ++i) {
+        m.appendNote(QStringLiteral("n"), QStringLiteral("sys"));
+    }
+    QVERIFY2(m.rowCount() <= 5000, "in-RAM feed must be capped, not grow without bound");
+    QVERIFY(m.rowCount() > 0);
+
+    // Delivering a result to the now-evicted tool is a safe no-op.
+    m.setToolResult(earlyKey, QStringLiteral("late"), QStringLiteral("late"), false);
+
+    // A tool appended after eviction still resolves by key (m_base != 0 now).
+    const int liveKey = m.appendTool(QStringLiteral("Read"), QStringLiteral("live"),
+                                     QStringLiteral("{}"), true);
+    const int liveRow = m.rowCount() - 1;
+    QSignalSpy spy(&m, &QAbstractItemModel::dataChanged);
+    m.setToolResult(liveKey, QStringLiteral("done"), QStringLiteral("done"), false);
+    QCOMPARE(spy.count(), 1);
+    QCOMPARE(spy.takeFirst().at(0).toModelIndex().row(), liveRow); // exactly the live row
+    QCOMPARE(m.data(m.index(liveRow), TranscriptModel::ToolResultRole).toString(),
+             QStringLiteral("done"));
+    QVERIFY(m.data(m.index(liveRow), TranscriptModel::ToolDoneRole).toBool());
 }
 
 QTEST_MAIN(TranscriptModelTest)

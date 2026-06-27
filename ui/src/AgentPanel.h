@@ -222,7 +222,7 @@ private:
     // feed is scrolled up away from the bottom.
     QToolButton *m_jumpBtn = nullptr;
     bool m_jumpUnread = false; // a card arrived while detached from the bottom
-    QHash<QString, int> m_toolRows; // tool_use id -> model row
+    QHash<QString, int> m_toolRows; // tool_use id -> stable transcript key
     // Coalesces interactive resize into a single exact re-measure of the visible
     // rows once the drag settles (~80ms), mirroring the ImageView/RichTextView
     // debounce from phase 1.

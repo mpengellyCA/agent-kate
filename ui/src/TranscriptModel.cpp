@@ -3,9 +3,35 @@
 
 #include "TranscriptModel.h"
 
+namespace {
+// The in-RAM feed is capped at this many rows; once it grows past the cap the
+// oldest rows are evicted (the full conversation stays on disk and reloads on
+// reopen). Generous enough that ordinary sessions never reach it, low enough
+// that a marathon session cannot grow the model into an OOM.
+constexpr int kMaxRows = 5000;
+} // namespace
+
 TranscriptModel::TranscriptModel(QObject *parent)
     : QAbstractListModel(parent)
 {
+}
+
+int TranscriptModel::rowForKey(int key) const
+{
+    const int row = key - m_base;
+    return (row >= 0 && row < m_items.size()) ? row : -1;
+}
+
+void TranscriptModel::enforceCap()
+{
+    const int over = m_items.size() - kMaxRows;
+    if (over <= 0) {
+        return;
+    }
+    beginRemoveRows({}, 0, over - 1);
+    m_items.remove(0, over);
+    endRemoveRows();
+    m_base += over;
 }
 
 int TranscriptModel::appendMessage(const QString &role, const QString &accentHex,
@@ -22,10 +48,12 @@ int TranscriptModel::appendMessage(const QString &role, const QString &accentHex
     it.timestamp = timestamp;
     it.stableId = m_nextId++;
     const int row = m_items.size();
+    const int key = m_base + row;
     beginInsertRows({}, row, row);
     m_items.append(it);
     endInsertRows();
-    return row;
+    enforceCap();
+    return key;
 }
 
 int TranscriptModel::appendNote(const QString &html, const QString &noteKind)
@@ -36,10 +64,12 @@ int TranscriptModel::appendNote(const QString &html, const QString &noteKind)
     it.noteKind = noteKind;
     it.stableId = m_nextId++;
     const int row = m_items.size();
+    const int key = m_base + row;
     beginInsertRows({}, row, row);
     m_items.append(it);
     endInsertRows();
-    return row;
+    enforceCap();
+    return key;
 }
 
 int TranscriptModel::appendTool(const QString &toolName, const QString &summary,
@@ -53,17 +83,20 @@ int TranscriptModel::appendTool(const QString &toolName, const QString &summary,
     it.toolVisible = visible;
     it.stableId = m_nextId++;
     const int row = m_items.size();
+    const int key = m_base + row;
     beginInsertRows({}, row, row);
     m_items.append(it);
     endInsertRows();
-    return row;
+    enforceCap();
+    return key;
 }
 
-void TranscriptModel::setToolResult(int row, const QString &shown,
+void TranscriptModel::setToolResult(int key, const QString &shown,
                                     const QString &fullResult, bool truncated)
 {
-    if (row < 0 || row >= m_items.size()) {
-        return;
+    const int row = rowForKey(key);
+    if (row < 0) {
+        return; // the tool row scrolled out of the in-RAM window before its result landed
     }
     Item &it = m_items[row];
     it.toolResult = shown;

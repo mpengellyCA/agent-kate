@@ -18,6 +18,13 @@
 // events, each assistant text block is a whole new message row, and a tool's
 // result arrives later keyed by its tool_use id. So the model is append-only
 // plus a targeted setToolResult / setExpanded.
+//
+// The in-RAM feed is capped: once it grows past kMaxRows the oldest rows are
+// evicted (the full conversation is always re-readable from the on-disk
+// transcript), so a long session cannot grow the model without bound. Because
+// eviction shifts every row's position, a deferred reference to a tool row — the
+// tool_result that lands after a network round-trip — must use the *stable key*
+// returned by the append* calls, never a raw row index.
 class TranscriptModel : public QAbstractListModel
 {
     Q_OBJECT
@@ -79,7 +86,10 @@ public:
     explicit TranscriptModel(QObject *parent = nullptr);
 
     // --- feed construction (mirrors the old addMessageCard / addNote API) ---
-    // Returns the row index of the new item.
+    // Returns a stable key identifying the new item. The key survives row
+    // eviction (unlike a row index); hold it to address the row later, e.g. to
+    // deliver a tool_result. Numerically equal to the row index until the first
+    // eviction.
     int appendMessage(const QString &role, const QString &accentHex,
                       const QString &bodyHtml, const QString &plain, bool replayed,
                       const QString &timestamp);
@@ -87,11 +97,16 @@ public:
     int appendTool(const QString &toolName, const QString &summary,
                    const QString &detail, bool visible);
 
-    // Fill in a tool row's result once its tool_result event arrives.
-    void setToolResult(int row, const QString &shown, const QString &fullResult,
+    // Fill in a tool row's result once its tool_result event arrives. `key` is
+    // the stable key from appendTool (a tool_result arrives after a round-trip,
+    // by which time eviction may have shifted positions); a no-op if that row
+    // has already been evicted.
+    void setToolResult(int key, const QString &shown, const QString &fullResult,
                        bool truncated);
     // Expand the truncated result to its full text in place (the old
-    // "Show full output" affordance).
+    // "Show full output" affordance). `row` is a *current* position: these are
+    // called synchronously by the delegate from a live QModelIndex, so no
+    // eviction can intervene and no key translation is needed.
     void expandToolResult(int row);
     void setExpanded(int row, bool on);
     void setToolsVisible(bool on);
@@ -113,8 +128,18 @@ private:
     // Bump a row's stable id and emit dataChanged so the delegate re-measures it.
     void touched(int row);
 
+    // Translate a stable key (from append*) to the item's current position, or
+    // -1 if the row has since been evicted.
+    int rowForKey(int key) const;
+    // Evict oldest rows once the feed grows past kMaxRows, keeping in-RAM size
+    // bounded. Called after every append.
+    void enforceCap();
+
     QList<Item> m_items;
     quintptr m_nextId = 1;
+    // Number of rows evicted off the front so far; the absolute key of m_items[0]
+    // is m_base. key - m_base == current row index.
+    int m_base = 0;
     QString m_findNeedle;
     int m_findRow = -1;
 };

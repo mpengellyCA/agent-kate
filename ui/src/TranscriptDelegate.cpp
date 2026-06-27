@@ -32,6 +32,12 @@ constexpr int kToolHeaderH = 28;  // clickable header height
 constexpr int kToolCopyW = 26;    // copy hit zone on the right of the header
 constexpr int kDetailPadX = 10;
 
+// The height cache is keyed by the model's per-row stableId, which the model
+// bumps on every mutation (so the old entry is never looked up again) — left
+// unchecked it grows for the life of the panel. Cap it; when full we drop the
+// whole cache and the currently-visible rows re-measure lazily (cheap).
+constexpr int kHeightCacheCap = 16384;
+
 // noteColor mirrors AgentPanel.cpp's palette-aware dim/ok/err colours.
 QColor noteColor(const QString &kind, bool dark)
 {
@@ -334,6 +340,9 @@ QSize TranscriptDelegate::sizeHint(const QStyleOptionViewItem &opt,
     // view only asks for rows it is about to show).
     const int h = layoutRow(idx, width, opt, nullptr, QRect(), this,
                             &TranscriptDelegate::buildBodyDoc);
+    if (m_heightCache.size() >= kHeightCacheCap) {
+        m_heightCache.clear();
+    }
     m_heightCache.insert(id, CacheEntry{width, h});
     return QSize(width, h);
 }
@@ -344,6 +353,9 @@ int TranscriptDelegate::measureExact(const QModelIndex &idx, int width,
     const int h = layoutRow(idx, width, opt, nullptr, QRect(), this,
                             &TranscriptDelegate::buildBodyDoc);
     const quintptr id = idx.data(TranscriptModel::StableIdRole).value<quintptr>();
+    if (m_heightCache.size() >= kHeightCacheCap) {
+        m_heightCache.clear();
+    }
     m_heightCache.insert(id, CacheEntry{width, h});
     return h;
 }
