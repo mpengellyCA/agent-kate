@@ -156,7 +156,12 @@ ecm_install_icons(
     DESTINATION ${KDE_INSTALL_ICONDIR}
     THEME hicolor
 )
-install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/org.kde.agentkate.desktop
+# Configure the .desktop at build time so Exec carries the absolute install path
+# (@KDE_INSTALL_FULL_BINDIR@) — required for KWin to authorize the no-dialog ScreenShot2
+# capture used by Cowork (it matches /proc/<pid>/exe against this Exec). See the template.
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/org.kde.agentkate.desktop.in
+               ${CMAKE_CURRENT_BINARY_DIR}/org.kde.agentkate.desktop @ONLY)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/org.kde.agentkate.desktop
         DESTINATION ${KDE_INSTALL_APPDIR})
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/org.kde.agentkate.metainfo.xml
         DESTINATION ${KDE_INSTALL_METAINFODIR})

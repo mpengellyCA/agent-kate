@@ -1,0 +1,21 @@
+[Desktop Entry]
+Type=Application
+Name=Agent Kate
+GenericName=Multi-Agent Coding Arena
+Comment=Native KDE multi-agent coding arena built on the Kate editor engine
+# Exec MUST be an absolute path: KWin authorizes the no-dialog ScreenShot2 path below by
+# matching /proc/<pid>/exe against a .desktop whose Exec first token canonicalises to that
+# same path (QFileInfo, no $PATH lookup). A bare "agentkate" never matches, so the grant
+# would silently do nothing. @KDE_INSTALL_FULL_BINDIR@ expands at install time (e.g.
+# /usr/bin). See docs/plans/08-kde-cowork/02-capture.md.
+Exec=@KDE_INSTALL_FULL_BINDIR@/agentkate %F
+Icon=agentkate
+Categories=Development;IDE;TextEditor;Qt;KDE;
+Terminal=false
+MimeType=text/plain;inode/directory;
+StartupNotify=true
+StartupWMClass=agentkate
+# Allow the fast no-dialog KWin screenshot path used by the Cowork feature. Only effective
+# for the installed app (absolute Exec above); the build-dir dogfood loop falls back to the
+# XDG Screenshot portal. See docs/plans/08-kde-cowork/.
+X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2

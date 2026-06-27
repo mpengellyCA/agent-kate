@@ -8,9 +8,12 @@
 #include <QBuffer>
 #include <QDBusArgument>
 #include <QDBusConnection>
+#include <QDBusConnectionInterface>
 #include <QDBusInterface>
 #include <QDBusMessage>
 #include <QDBusObjectPath>
+#include <QDBusPendingCallWatcher>
+#include <QDBusPendingReply>
 #include <QDBusReply>
 #include <QDBusUnixFileDescriptor>
 #include <QDBusVariant>
@@ -18,9 +21,13 @@
 #include <QImage>
 #include <QJsonValue>
 #include <QRandomGenerator>
+#include <QSocketNotifier>
 #include <QUrl>
 #include <QWidget>
 
+#include <cerrno>
+#include <fcntl.h>
+#include <memory>
 #include <unistd.h>
 
 #ifdef AK_HAVE_PIPEWIRE
@@ -31,6 +38,70 @@
 namespace {
 constexpr auto kPortalService = "org.freedesktop.portal.Desktop";
 constexpr auto kPortalPath = "/org/freedesktop/portal/desktop";
+
+// KWin's native screenshot interface (no portal dialog). Capture methods take a unix
+// pipe write-fd; KWin streams the raw image into it and returns a {width,height,stride,
+// format} results map (format is a QImage::Format value).
+constexpr auto kKWinService = "org.kde.KWin";
+constexpr auto kScreenShot2Path = "/org/kde/KWin/ScreenShot2";
+constexpr auto kScreenShot2Iface = "org.kde.KWin.ScreenShot2";
+
+// In-flight ScreenShot2 capture: the raw pixel bytes drained off the pipe plus the
+// returned geometry. Both the pipe drain (QSocketNotifier) and the D-Bus reply
+// (QDBusPendingCallWatcher) complete independently; we assemble the image once both land.
+struct KWinShot {
+    int readFd = -1;
+    QByteArray buf;
+    QVariantMap results;
+    bool gotResults = false;
+    bool gotEof = false;
+    bool error = false;
+    bool done = false;
+    QSocketNotifier *notifier = nullptr;
+    QDBusPendingCallWatcher *watcher = nullptr;
+};
+
+// Map a cowork Target to the ScreenShot2 method + its leading args (everything before the
+// options map and the pipe fd). CaptureWindow takes the KWin internalId UUID exactly as
+// listWindows reports it (braces and all); CaptureArea takes x,y (i) and w,h (u).
+void kwinCaptureCall(const QJsonObject &req, QString &method, QVariantList &leading)
+{
+    const QJsonObject t = req.value(QStringLiteral("target")).toObject();
+    const QString kind = t.value(QStringLiteral("kind")).toString();
+    if (kind == QLatin1String("window")) {
+        const QString wid = t.value(QStringLiteral("windowId")).toString();
+        if (!wid.isEmpty()) {
+            method = QStringLiteral("CaptureWindow");
+            leading = {wid};
+        } else {
+            method = QStringLiteral("CaptureActiveWindow");
+        }
+    } else if (kind == QLatin1String("region")) {
+        // cowork.Rect has no JSON tags, so it serialises as X/Y/W/H.
+        const QJsonObject r = t.value(QStringLiteral("region")).toObject();
+        const int x = r.value(QStringLiteral("X")).toInt();
+        const int y = r.value(QStringLiteral("Y")).toInt();
+        const int w = r.value(QStringLiteral("W")).toInt();
+        const int h = r.value(QStringLiteral("H")).toInt();
+        if (w > 0 && h > 0) {
+            method = QStringLiteral("CaptureArea");
+            leading = {x, y, uint(w), uint(h)};
+        } else {
+            method = QStringLiteral("CaptureActiveScreen");
+        }
+    } else if (kind == QLatin1String("screen")) {
+        const QString name = t.value(QStringLiteral("screen")).toString();
+        if (!name.isEmpty()) {
+            method = QStringLiteral("CaptureScreen");
+            leading = {name};
+        } else {
+            method = QStringLiteral("CaptureActiveScreen");
+        }
+    } else {
+        // "any"/empty/unknown → the active screen (the default cowork screenshot target).
+        method = QStringLiteral("CaptureActiveScreen");
+    }
+}
 
 // org.a11y.Status lives on the session bus and reports whether accessibility is
 // enabled; toolkits read it to decide whether to export an AT-SPI tree. Chromium
@@ -290,6 +361,160 @@ void CoworkPortal::onNotification(const QString &method, const QJsonObject &para
 
 void CoworkPortal::handleScreenshot(const QJsonObject &req)
 {
+    // Prefer KWin's native ScreenShot2: it is fast, raises no dialog, and targets the
+    // exact window/screen/region. interactive=true keeps the XDG portal's native picker;
+    // every other case tries ScreenShot2 first and falls back to the portal if it is not
+    // authorized/available (e.g. an un-installed build-dir binary, or — as on this
+    // system — a frontend xdg-desktop-portal that doesn't expose the Screenshot portal).
+    if (!req.value(QStringLiteral("interactive")).toBool() && startKWinScreenshot(req)) {
+        return;
+    }
+    startPortalScreenshot(req);
+}
+
+bool CoworkPortal::startKWinScreenshot(const QJsonObject &req)
+{
+    QDBusConnection bus = QDBusConnection::sessionBus();
+    if (!bus.isConnected()) {
+        return false;
+    }
+    QDBusConnectionInterface *iface = bus.interface();
+    if (!iface || !iface->isServiceRegistered(QString::fromLatin1(kKWinService))) {
+        return false; // not a KWin session → let the portal path handle it
+    }
+
+    QString method;
+    QVariantList leading;
+    kwinCaptureCall(req, method, leading);
+    qInfo("cowork: trying KWin ScreenShot2 %s", qUtf8Printable(method));
+
+    int fds[2];
+    if (::pipe2(fds, O_CLOEXEC) != 0) {
+        return false;
+    }
+    // Only the READ end is non-blocking (we drain it from the Qt event loop). The write
+    // end stays blocking so KWin's synchronous image write into the pipe always succeeds.
+    ::fcntl(fds[0], F_SETFL, ::fcntl(fds[0], F_GETFL) | O_NONBLOCK);
+
+    QDBusMessage msg = QDBusMessage::createMethodCall(
+        QString::fromLatin1(kKWinService), QString::fromLatin1(kScreenShot2Path),
+        QString::fromLatin1(kScreenShot2Iface), method);
+    QVariantList args = leading;
+    args << QVariant::fromValue(QVariantMap());                   // options: defaults
+    args << QVariant::fromValue(QDBusUnixFileDescriptor(fds[1])); // dups fds[1] internally
+    msg.setArguments(args);
+    QDBusPendingCall pending = bus.asyncCall(msg);
+    // The QDBusUnixFileDescriptor holds its own dup and asyncCall keeps the message alive
+    // until sent, so close OUR write end now: the read end only sees EOF once EVERY write
+    // end (ours + KWin's) is closed, and KWin closes its copy when the capture finishes.
+    ::close(fds[1]);
+
+    const QString corrId = req.value(QStringLiteral("corrId")).toString();
+    const int maxDim = req.value(QStringLiteral("maxDim")).toInt(1568);
+    const QString format = req.value(QStringLiteral("format")).toString(QStringLiteral("png"));
+
+    auto ctx = std::make_shared<KWinShot>();
+    ctx->readFd = fds[0];
+    ctx->notifier = new QSocketNotifier(fds[0], QSocketNotifier::Read, this);
+    ctx->watcher = new QDBusPendingCallWatcher(pending, this);
+
+    // Assemble once the geometry reply has landed AND we have the pixels for it. The reply
+    // carries {width,height,stride,format}; without it we cannot interpret the bytes.
+    auto finalize = [this, ctx, req, corrId, maxDim, format]() {
+        if (ctx->done || !ctx->gotResults) {
+            return;
+        }
+        const uint w = ctx->results.value(QStringLiteral("width")).toUInt();
+        const uint h = ctx->results.value(QStringLiteral("height")).toUInt();
+        const uint stride = ctx->results.value(QStringLiteral("stride")).toUInt();
+        const uint fmt = ctx->results.value(QStringLiteral("format")).toUInt();
+        const bool badGeom = w == 0 || h == 0 || fmt < 1 || fmt > 30;
+        const qint64 need = qint64(stride) * qint64(h);
+        // On a SUCCESSFUL capture we still need the pixels: keep waiting until either the
+        // pipe hits EOF or we have already buffered a full frame. We must NOT wait on EOF
+        // when the reply errored (or the geometry is bogus): an unauthorized/denied call can
+        // leave KWin holding its dup of the pipe write-end, so EOF never comes — blocking on
+        // it would hang the whole portal round-trip until akcore times out (125 s).
+        if (!ctx->error && !badGeom && !ctx->gotEof && qint64(ctx->buf.size()) < need) {
+            return; // still streaming a valid capture
+        }
+        ctx->done = true;
+        ctx->notifier->setEnabled(false);
+        ctx->notifier->deleteLater();
+        ctx->watcher->deleteLater();
+        if (ctx->readFd >= 0) {
+            ::close(ctx->readFd);
+            ctx->readFd = -1;
+        }
+        // Denied (unauthorized exe), malformed, or truncated → fall back to the portal.
+        if (ctx->error || badGeom || qint64(ctx->buf.size()) < need) {
+            qWarning("cowork: KWin ScreenShot2 unusable (error=%d w=%u h=%u stride=%u fmt=%u "
+                     "bytes=%lld need=%lld) → portal fallback",
+                     int(ctx->error), w, h, stride, fmt, qint64(ctx->buf.size()), need);
+            startPortalScreenshot(req);
+            return;
+        }
+        qInfo("cowork: KWin ScreenShot2 captured %ux%u (fmt=%u, %lld bytes)", w, h, fmt,
+              qint64(ctx->buf.size()));
+        QImage img(reinterpret_cast<const uchar *>(ctx->buf.constData()), int(w), int(h),
+                   int(stride), QImage::Format(fmt));
+        // copy() detaches into QImage-owned memory before ctx->buf is freed.
+        replyWithImage(corrId, maxDim, format, img.copy());
+    };
+
+    connect(ctx->notifier, &QSocketNotifier::activated, this, [ctx, finalize]() {
+        char tmp[1 << 16];
+        for (;;) {
+            const ssize_t n = ::read(ctx->readFd, tmp, sizeof(tmp));
+            if (n > 0) {
+                ctx->buf.append(tmp, int(n));
+                if (ctx->buf.size() > (256 << 20)) { // runaway-producer guard (~256 MiB)
+                    ctx->error = true;
+                    ctx->gotEof = true;
+                    ctx->notifier->setEnabled(false);
+                    break;
+                }
+                continue;
+            }
+            if (n == 0) { // EOF: KWin closed its write end → capture streamed in full
+                ctx->gotEof = true;
+                ctx->notifier->setEnabled(false);
+                break;
+            }
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break; // drained for now; wait for the next activation
+            }
+            ctx->error = true;
+            ctx->gotEof = true;
+            ctx->notifier->setEnabled(false);
+            break;
+        }
+        finalize();
+    });
+
+    connect(ctx->watcher, &QDBusPendingCallWatcher::finished, this,
+            [ctx, finalize](QDBusPendingCallWatcher *w) {
+                QDBusPendingReply<QVariantMap> reply = *w;
+                if (reply.isError()) {
+                    qWarning("cowork: KWin ScreenShot2 reply error: %s: %s",
+                             qUtf8Printable(reply.error().name()),
+                             qUtf8Printable(reply.error().message()));
+                    ctx->error = true;
+                } else {
+                    ctx->results = reply.value();
+                }
+                ctx->gotResults = true;
+                finalize();
+            });
+
+    return true;
+}
+
+void CoworkPortal::startPortalScreenshot(const QJsonObject &req)
+{
     const QString corrId = req.value(QStringLiteral("corrId")).toString();
     int maxDim = req.value(QStringLiteral("maxDim")).toInt(1568);
     const QString format = req.value(QStringLiteral("format")).toString(QStringLiteral("png"));
@@ -348,14 +573,23 @@ void CoworkPortal::finishScreenshot(const QString &corrId, int maxDim, const QSt
     const QString uri = results.value(QStringLiteral("uri")).toString();
     const QString path = QUrl(uri).toLocalFile();
     QImage img(path);
+    // The portal saved a full-resolution PNG to disk; it may contain secrets, so we do
+    // not keep it once the pixels are decoded into memory (img is independent of the file).
+    if (!path.isEmpty()) {
+        QFile::remove(path);
+    }
     if (img.isNull()) {
         replyResult(corrId, QStringLiteral("screenshot"), false,
                     QStringLiteral("could not read the captured image"));
-        if (!path.isEmpty()) {
-            QFile::remove(path);
-        }
         return;
     }
+    replyWithImage(corrId, maxDim, format, img);
+}
+
+void CoworkPortal::replyWithImage(const QString &corrId, int maxDim, const QString &format,
+                                  const QImage &src)
+{
+    QImage img = src;
     if (maxDim > 0 && (img.width() > maxDim || img.height() > maxDim)) {
         img = img.scaled(maxDim, maxDim, Qt::KeepAspectRatio, Qt::SmoothTransformation);
     }
@@ -366,12 +600,6 @@ void CoworkPortal::finishScreenshot(const QString &corrId, int maxDim, const QSt
     buf.open(QIODevice::WriteOnly);
     img.save(&buf, jpeg ? "JPEG" : "PNG", jpeg ? 85 : -1);
     buf.close();
-
-    // The portal saved a full-resolution PNG to disk; it may contain secrets, so we
-    // do not keep it once the (downscaled) bytes are in hand.
-    if (!path.isEmpty()) {
-        QFile::remove(path);
-    }
 
     QJsonObject extra{
         {QStringLiteral("pngB64"), QString::fromLatin1(bytes.toBase64())},

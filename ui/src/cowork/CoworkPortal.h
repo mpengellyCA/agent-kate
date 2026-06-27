@@ -16,6 +16,7 @@
 
 class CoreClient;
 class QWidget;
+class QImage;
 
 // PortalResponseWaiter listens for the org.freedesktop.portal.Request "Response"
 // signal on one request object path, re-emits it as a Qt signal, then self-destructs.
@@ -50,6 +51,19 @@ private Q_SLOTS:
 
 private:
     void handleScreenshot(const QJsonObject &req);
+    // KWin's native ScreenShot2 capture — the fast, no-dialog path that targets the exact
+    // window/screen/region. Authorized via X-KDE-DBUS-Restricted-Interfaces in the
+    // installed .desktop (which needs an ABSOLUTE Exec; build-dir dogfood builds are not
+    // authorized). Returns false if it cannot even be dispatched (no bus / KWin absent /
+    // pipe failure); on an async denial or a malformed/truncated buffer it falls back to
+    // the XDG Screenshot portal itself. startPortalScreenshot is that fallback (the former
+    // body of handleScreenshot). On the user's system the frontend xdg-desktop-portal may
+    // not even expose org.freedesktop.portal.Screenshot, so ScreenShot2 is the path that
+    // actually works — see docs/plans/08-kde-cowork/02-capture.md.
+    bool startKWinScreenshot(const QJsonObject &req);
+    void startPortalScreenshot(const QJsonObject &req);
+    // Scale to maxDim, encode as png/jpeg, and reply — shared by both capture paths.
+    void replyWithImage(const QString &corrId, int maxDim, const QString &format, const QImage &img);
     void handleLaunchBrowser(const QJsonObject &req);
     // Chromium-family browsers only export their accessibility tree over AT-SPI when
     // org.a11y.Status reports accessibility enabled AT LAUNCH (Firefox activates
