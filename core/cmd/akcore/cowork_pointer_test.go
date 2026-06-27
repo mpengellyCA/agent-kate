@@ -211,3 +211,80 @@ func TestScrollOpAxes(t *testing.T) {
 
 func f64(v float64) *float64 { return &v }
 func iptr(v int) *int        { return &v }
+
+func TestClampRelDelta(t *testing.T) {
+	if got := clampRelDelta(500); got != 500 {
+		t.Fatalf("in-range value changed: %v", got)
+	}
+	if got := clampRelDelta(relMaxDelta + 1); got != relMaxDelta {
+		t.Fatalf("over-cap not clamped: %v", got)
+	}
+	if got := clampRelDelta(-relMaxDelta - 1); got != -relMaxDelta {
+		t.Fatalf("under-cap not clamped: %v", got)
+	}
+	// A non-finite delta would wedge the compositor pointer — must scrub to 0.
+	if got := clampRelDelta(math.NaN()); got != 0 {
+		t.Fatalf("NaN not scrubbed: %v", got)
+	}
+	if got := clampRelDelta(math.Inf(1)); got != 0 {
+		t.Fatalf("+Inf not scrubbed: %v", got)
+	}
+	if got := clampRelDelta(math.Inf(-1)); got != 0 {
+		t.Fatalf("-Inf not scrubbed: %v", got)
+	}
+}
+
+func TestRelMoveOpShape(t *testing.T) {
+	op := relMoveOp(12, -7)
+	if op["t"] != "move_rel" || op["dx"].(float64) != 12 || op["dy"].(float64) != -7 {
+		t.Fatalf("relative move op malformed: %+v", op)
+	}
+	// A relative move carries deltas — never an absolute target, never a lone delay.
+	if _, ok := op["x"]; ok {
+		t.Fatalf("relative move must not carry an absolute x: %+v", op)
+	}
+	if _, ok := op["delayMs"]; ok {
+		t.Fatalf("a single relMoveOp must not carry delay: %+v", op)
+	}
+	// Clamped at construction.
+	if op := relMoveOp(relMaxDelta+9999, 0); op["dx"].(float64) != relMaxDelta {
+		t.Fatalf("relMoveOp did not clamp dx: %+v", op)
+	}
+}
+
+func TestRelMoveOpsStepping(t *testing.T) {
+	ops := relMoveOps(100, 40, 4)
+	if len(ops) != 4 {
+		t.Fatalf("want 4 sub-nudges, got %d", len(ops))
+	}
+	// op[0] carries no delay (the UI ignores it anyway); each later op does.
+	if _, ok := ops[0]["delayMs"]; ok {
+		t.Fatalf("op[0] must have no delay")
+	}
+	var sx, sy float64
+	for i, op := range ops {
+		if op["t"] != "move_rel" {
+			t.Fatalf("op[%d] not move_rel: %+v", i, op)
+		}
+		if i > 0 {
+			if _, ok := op["delayMs"]; !ok {
+				t.Fatalf("op[%d] missing inter-step delay", i)
+			}
+		}
+		sx += op["dx"].(float64)
+		sy += op["dy"].(float64)
+	}
+	// The sub-deltas must sum to the requested total — a split turn, not a scaled one.
+	if math.Abs(sx-100) > 1e-9 || math.Abs(sy-40) > 1e-9 {
+		t.Fatalf("sub-deltas should sum to (100,40), got (%v,%v)", sx, sy)
+	}
+}
+
+func TestRelMoveOpsStepClamp(t *testing.T) {
+	if n := len(relMoveOps(10, 0, 100000)); n != pointerMaxSteps {
+		t.Fatalf("steps should cap at %d, got %d", pointerMaxSteps, n)
+	}
+	if n := len(relMoveOps(5, 5, 0)); n != 1 {
+		t.Fatalf("steps<1 should yield a single op, got %d", n)
+	}
+}

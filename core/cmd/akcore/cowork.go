@@ -587,6 +587,31 @@ func registerCoworkHandlers(d handlerDeps) {
 		return res, err
 	})
 
+	// Relative pointer motion: raw dx/dy deltas, the input a pointer-grabbing game (mouse-
+	// look) reads. Distinct from cowork.movePointer (absolute targeting): no screencast
+	// stream, no self-target guard (no landing point), and the position mirror is left
+	// unchanged — a grab makes the true cursor position unknowable. steps>1 splits the
+	// delta into smooth, timed sub-nudges.
+	d.srv.Handle("cowork.movePointerRelative", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID string  `json:"threadId"`
+			DX       float64 `json:"dx"`
+			DY       float64 `json:"dy"`
+			Steps    int     `json:"steps"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		if err := requirePointerControl(d, ctx, p.ThreadID); err != nil {
+			return nil, err
+		}
+		dx, dy := clampRelDelta(p.DX), clampRelDelta(p.DY)
+		ops := relMoveOps(dx, dy, p.Steps)
+		desc := fmt.Sprintf("relative pointer move (%+.0f,%+.0f)", dx, dy)
+		// No guard (no absolute target); mirror deliberately NOT committed (see relMoveOp).
+		return runPointerAction(d, ctx, p.ThreadID, pointerTarget(desc), desc, ops, nil)
+	})
+
 	d.srv.Handle("cowork.pointerClick", func(ctx context.Context, raw json.RawMessage) (any, error) {
 		var p struct {
 			ThreadID   string               `json:"threadId"`

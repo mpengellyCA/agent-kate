@@ -226,7 +226,10 @@ func coworkToolDefs() []map[string]any {
 				"top-level fps (author 'frame 0 down, frame 6 up'); pick one per event. holdMs sets " +
 				"a tap's dwell between its down and up; repeat/repeatEveryMs auto-repeat an event. " +
 				"Coordinates for move/click/scroll are absolute desktop pixels — the same space as " +
-				"desktop_screenshot and desktop_list_elements bounds. PRECISION CEILING: input is " +
+				"desktop_screenshot and desktop_list_elements bounds. For grab-mode GAME mouse-look " +
+				"(Minecraft etc.) use move_rel (relative dx,dy deltas) instead of move — a sequence of " +
+				"timed move_rel nudges turns the camera, where absolute move only fights the game's " +
+				"cursor re-centering. PRECISION CEILING: input is " +
 				"millisecond-scheduled and repeatable, reliable to the right frame bucket at 30–60 " +
 				"fps (16–33 ms/frame) — great for holds, combos, modifier-drags, and charged inputs " +
 				"— but it is NOT sub-frame-deterministic, so do not rely on single-ms frame-perfect " +
@@ -234,7 +237,7 @@ func coworkToolDefs() []map[string]any {
 				"simultaneity is not possible: events fire serially, back-to-back with ~0 gap when " +
 				"they share a time, so OVERLAP inputs by using held half-events rather than two " +
 				"events at the same instant. CAPABILITY: keyboard events need the 'input_inject' " +
-				"toggle; pointer events (move/click/scroll/button) need 'pointer_control'; a mixed " +
+				"toggle; pointer events (move/move_rel/click/scroll/button) need 'pointer_control'; a mixed " +
 				"script needs both (or an approval covering both). Refuses any click/scroll point " +
 				"inside an Agent Kate window.",
 			"inputSchema": map[string]any{
@@ -327,6 +330,28 @@ func coworkToolDefs() []map[string]any {
 			},
 		},
 		{
+			"name": "desktop_move_pointer_relative",
+			"description": "Move the pointer by a RELATIVE delta (raw dx,dy) instead of to an " +
+				"absolute point. This is the input a pointer-GRABBING game wants for mouse-look: a " +
+				"first-person game (e.g. Minecraft) hides and locks the cursor and reads raw motion " +
+				"deltas to turn the camera, so absolute desktop_move_pointer barely turns it (the game " +
+				"keeps re-centering the cursor and fights you). dx>0 looks right, dx<0 left, dy>0 down, " +
+				"dy<0 up; the turn scales with magnitude × the game's sensitivity, so calibrate with a " +
+				"screenshot. steps>1 splits the delta into smooth, evenly-timed sub-nudges. For a " +
+				"precisely TIMED look+key+click sequence (strafe-and-turn, flick-shots) use " +
+				"desktop_play_input with 'move_rel' events instead. Does NOT change the tracked cursor " +
+				"position (a grab makes it unknowable). Capability 'pointer_control'.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"dx":    map[string]any{"type": "integer", "description": "Relative x delta in pixels, positive = right (capped at ±10000)."},
+					"dy":    map[string]any{"type": "integer", "description": "Relative y delta in pixels, positive = down (capped at ±10000)."},
+					"steps": map[string]any{"type": "integer", "description": "Optional: split the delta into this many smooth, evenly-timed sub-nudges (default 1)."},
+				},
+				"required": []string{"dx", "dy"},
+			},
+		},
+		{
 			"name": "desktop_scroll",
 			"description": "Scroll the wheel — vertically and/or horizontally — in mouse-wheel " +
 				"notches (sign sets direction: positive dy scrolls down, positive dx scrolls " +
@@ -411,11 +436,12 @@ func playInputEventSchema() map[string]any {
 				"enum": []string{
 					"key", "key_down", "key_up",
 					"button", "button_down", "button_up",
-					"move", "click", "scroll", "wait",
+					"move", "move_rel", "click", "scroll", "wait",
 				},
 				"description": "Event kind. key/key_down/key_up press a key (whole tap or held " +
-					"half); button/button_down/button_up a mouse button; move/click move/click at x,y; " +
-					"scroll the wheel; wait pauses the clock.",
+					"half); button/button_down/button_up a mouse button; move moves to absolute x,y; " +
+					"move_rel nudges by a relative dx,dy delta (mouse-look for grab-mode games); " +
+					"click clicks at x,y; scroll the wheel; wait pauses the clock.",
 			},
 			"key": map[string]any{
 				"type": "string",
@@ -430,8 +456,8 @@ func playInputEventSchema() map[string]any {
 			},
 			"x":     map[string]any{"type": "integer", "description": "Absolute desktop x pixel (for move/click; optional for scroll). Same space as desktop_screenshot."},
 			"y":     map[string]any{"type": "integer", "description": "Absolute desktop y pixel (for move/click; optional for scroll)."},
-			"dx":    map[string]any{"type": "integer", "description": "Scroll notches, positive = right (for scroll)."},
-			"dy":    map[string]any{"type": "integer", "description": "Scroll notches, positive = down (for scroll)."},
+			"dx":    map[string]any{"type": "integer", "description": "scroll: notches right; move_rel: relative x-pixel delta, positive = look right (capped ±10000)."},
+			"dy":    map[string]any{"type": "integer", "description": "scroll: notches down; move_rel: relative y-pixel delta, positive = look down (capped ±10000)."},
 			"count": map[string]any{"type": "integer", "description": "Click count for a click event (2 = double-click)."},
 			"holdMs": map[string]any{
 				"type":        "integer",
@@ -734,6 +760,25 @@ func (b *mcpBridge) runCoworkTool(name string, args json.RawMessage) (string, er
 			Action string `json:"action"`
 		}
 		if err := b.client.CallTimeout("cowork.movePointer", params, &res, 50*time.Second); err != nil {
+			return "", err
+		}
+		return "Done: " + res.Action + ".", nil
+
+	case "desktop_move_pointer_relative":
+		var a struct {
+			DX    int `json:"dx"`
+			DY    int `json:"dy"`
+			Steps int `json:"steps"`
+		}
+		_ = json.Unmarshal(args, &a)
+		params := map[string]any{"threadId": b.thread, "dx": a.DX, "dy": a.DY}
+		if a.Steps > 0 {
+			params["steps"] = a.Steps
+		}
+		var res struct {
+			Action string `json:"action"`
+		}
+		if err := b.client.CallTimeout("cowork.movePointerRelative", params, &res, 50*time.Second); err != nil {
 			return "", err
 		}
 		return "Done: " + res.Action + ".", nil

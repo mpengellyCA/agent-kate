@@ -428,3 +428,67 @@ func eqStrings(a, b []string) bool {
 	}
 	return true
 }
+
+func TestTimelineMoveRelative(t *testing.T) {
+	a, b := 0, 50
+	script := timelineScript{Events: []timelineEvent{
+		{Type: "move_rel", DX: 120, DY: -30, AtMs: &a},
+		{Type: "move_rel", DX: 120, DY: 0, AtMs: &b},
+	}}
+	// haveStart=false on purpose: relative motion needs no known start, unlike scroll/click.
+	plan, err := buildTimelineOps(script, point{}, false, trivialProfile(), fixedRNG())
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if !plan.HasPointer || plan.HasKey {
+		t.Fatalf("move_rel should set HasPointer only: pointer=%v key=%v", plan.HasPointer, plan.HasKey)
+	}
+	// No absolute landing point ⇒ never a self-target guard point, never a tracked position.
+	if len(plan.GuardPts) != 0 {
+		t.Fatalf("move_rel must add no guard points, got %d", len(plan.GuardPts))
+	}
+	if plan.HaveFinal {
+		t.Fatalf("move_rel must not establish a tracked absolute position")
+	}
+	if len(plan.Ops) != 2 {
+		t.Fatalf("want 2 move_rel ops, got %d: %v", len(plan.Ops), opStream(plan.Ops))
+	}
+	if plan.Ops[0]["t"] != "move_rel" || plan.Ops[0]["dx"].(float64) != 120 || plan.Ops[0]["dy"].(float64) != -30 {
+		t.Fatalf("op[0] malformed: %+v", plan.Ops[0])
+	}
+	if _, ok := plan.Ops[0]["x"]; ok {
+		t.Fatalf("move_rel op must not carry an absolute x: %+v", plan.Ops[0])
+	}
+	// Second nudge fires 50ms after the first (global delta lowering).
+	if plan.Ops[1]["delayMs"] != 50 {
+		t.Fatalf("op[1] should be +50ms, got %v", plan.Ops[1]["delayMs"])
+	}
+}
+
+func TestTimelineMoveRelativeOverlapWithHeldKey(t *testing.T) {
+	// The strafe-and-turn shape: hold W while nudging the view right, then release.
+	d0, d1, d2, d3 := 0, 20, 40, 60
+	script := timelineScript{Events: []timelineEvent{
+		{Type: "key_down", Key: "w", AtMs: &d0},
+		{Type: "move_rel", DX: 80, DY: 0, AtMs: &d1},
+		{Type: "move_rel", DX: 80, DY: 0, AtMs: &d2},
+		{Type: "key_up", Key: "w", AtMs: &d3},
+	}}
+	plan, err := buildTimelineOps(script, point{}, true, trivialProfile(), fixedRNG())
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if !plan.HasKey || !plan.HasPointer {
+		t.Fatalf("mixed script should need both caps: key=%v pointer=%v", plan.HasKey, plan.HasPointer)
+	}
+	// key down, two nudges, key up = 4 ops in time order.
+	if len(plan.Ops) != 4 {
+		t.Fatalf("want 4 ops, got %d: %v", len(plan.Ops), opStream(plan.Ops))
+	}
+	if plan.Ops[0]["t"] != "key" || plan.Ops[0]["state"].(uint32) != 1 {
+		t.Fatalf("op[0] should be the W key-down: %+v", plan.Ops[0])
+	}
+	if plan.Ops[3]["t"] != "key" || plan.Ops[3]["state"].(uint32) != 0 {
+		t.Fatalf("op[3] should be the W key-up: %+v", plan.Ops[3])
+	}
+}

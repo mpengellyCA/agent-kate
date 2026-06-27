@@ -30,7 +30,8 @@ type timelineEvent struct {
 	// Type is the event kind:
 	//   key|key_down|key_up         — keyboard tap / half-events (hold across other events)
 	//   button|button_down|button_up — pointer button at the CURRENT cursor (bare)
-	//   move                         — positioned motion (no side effect, not guarded)
+	//   move                         — positioned absolute motion (no side effect, not guarded)
+	//   move_rel                     — raw relative dx/dy delta (mouse-look; not guarded/mirrored)
 	//   click                        — positioned click (move→press→release ×Count)
 	//   scroll                       — wheel, optionally positioned (X,Y) else at the cursor
 	//   wait                         — pure delay (advances the cursor, emits nothing)
@@ -39,8 +40,8 @@ type timelineEvent struct {
 	Button string `json:"button"`
 	X      int    `json:"x"`
 	Y      int    `json:"y"`
-	DX     int    `json:"dx"`
-	DY     int    `json:"dy"`
+	DX     int    `json:"dx"` // scroll notches (scroll) OR relative pixel delta (move_rel)
+	DY     int    `json:"dy"` // scroll notches (scroll) OR relative pixel delta (move_rel)
 	Count  int    `json:"count"`
 	HoldMs int    `json:"holdMs"` // tap dwell between down and up (clamped, never rejected)
 
@@ -369,6 +370,15 @@ func buildTimelineOps(
 			haveLast = true
 			descParts = append(descParts, fmt.Sprintf("move→(%d,%d)", to.X, to.Y))
 			// Motion over AK windows is allowed — NOT a guard point.
+
+		case "move_rel":
+			plan.HasPointer = true
+			// Raw relative delta (dx,dy) — mouse-look for a pointer-grabbing game. It has no
+			// absolute landing point, so it is NOT a guard point, needs no screencast, and
+			// deliberately leaves lastPos/haveLast untouched (a grab makes the true cursor
+			// position unknowable). Sequence several with afterMs/atMs/frame for a turn.
+			sub = []map[string]any{relMoveOp(float64(ev.DX), float64(ev.DY))}
+			descParts = append(descParts, fmt.Sprintf("nudge(%+d,%+d)", ev.DX, ev.DY))
 
 		case "click":
 			bc, err := buttonCodeFor(ev.Button)

@@ -260,6 +260,59 @@ func scrollOp(axis, steps int) map[string]any {
 	return map[string]any{"t": "axis_discrete", "axis": axis, "steps": steps}
 }
 
+// relMaxDelta bounds a single relative-motion delta per axis. Mouse-look turns are modest
+// (even a full in-game spin is a few thousand px), so this caps abuse without clipping a
+// real turn.
+const relMaxDelta = 10000.0
+
+// clampRelDelta bounds one axis of a relative delta to [-relMaxDelta, relMaxDelta] and
+// scrubs NaN/Inf to 0 — a non-finite delta would wedge the compositor's pointer.
+func clampRelDelta(v float64) float64 {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0
+	}
+	if v > relMaxDelta {
+		return relMaxDelta
+	}
+	if v < -relMaxDelta {
+		return -relMaxDelta
+	}
+	return v
+}
+
+// relMoveOp builds one RELATIVE pointer-motion op: a raw dx/dy delta with no absolute
+// target. Pointer-grabbing games read these as mouse-look. Unlike absolute "move" it needs
+// no screencast stream, is never self-target-guarded (it has no landing point), and does
+// NOT update the position mirror — a grab makes the true cursor position unknowable, so we
+// leave the last KNOWN absolute position standing for the next guarded click.
+func relMoveOp(dx, dy float64) map[string]any {
+	return map[string]any{"t": "move_rel", "dx": clampRelDelta(dx), "dy": clampRelDelta(dy)}
+}
+
+// relMoveOps splits a relative delta into `steps` (>=1, capped) evenly-timed sub-deltas so
+// a large turn plays as smooth motion the game integrates frame-by-frame rather than one
+// teleporting jump. The first op carries no delay (the UI ignores op[0]'s delay anyway).
+func relMoveOps(dx, dy float64, steps int) []map[string]any {
+	if steps < 1 {
+		steps = 1
+	}
+	if steps > pointerMaxSteps {
+		steps = pointerMaxSteps
+	}
+	dx, dy = clampRelDelta(dx), clampRelDelta(dy)
+	delay := int(pointerStepDt * 1000)
+	sx, sy := dx/float64(steps), dy/float64(steps)
+	ops := make([]map[string]any, 0, steps)
+	for i := 0; i < steps; i++ {
+		op := relMoveOp(sx, sy)
+		if i > 0 {
+			op["delayMs"] = delay
+		}
+		ops = append(ops, op)
+	}
+	return ops
+}
+
 // dragOps composes move(from)→press(left)→move(to, stepped)→release(left). It threads
 // the intermediate position (the cursor is at `from` once the first leg lands) without
 // mutating the mirror — the caller commits the final position (to) after success.

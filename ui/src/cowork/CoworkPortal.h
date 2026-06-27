@@ -107,6 +107,9 @@ private:
     // Pointer ops for true cursor control. Absolute motion needs a screencast stream
     // (streamNodeId) bound to this session so the compositor can map global pixels.
     void notifyPointerMotionAbsolute(uint streamNodeId, double x, double y);
+    // Relative motion sends raw dx/dy deltas with NO stream — what pointer-grabbing games
+    // (mouse-look) read, and it never needs a screencast map. Absolute is for UI targeting.
+    void notifyPointerMotionRelative(double dx, double dy);
     void notifyAxis(double dx, double dy);
     void notifyAxisDiscrete(uint axis, int steps);
     // Map an absolute global desktop pixel to (streamNodeId, local x/y). Returns false

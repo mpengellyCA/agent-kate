@@ -729,6 +729,7 @@ uint CoworkPortal::deviceTypesFor(const QJsonArray &ops)
         if (t == QLatin1String("key")) {
             types |= 1u; // keyboard
         } else if (t == QLatin1String("btn") || t == QLatin1String("move")
+                   || t == QLatin1String("move_rel")
                    || t == QLatin1String("axis") || t == QLatin1String("axis_discrete")) {
             types |= 2u; // pointer
         }
@@ -956,6 +957,22 @@ void CoworkPortal::notifyPointerMotionAbsolute(uint streamNodeId, double x, doub
     QDBusConnection::sessionBus().asyncCall(msg);
 }
 
+void CoworkPortal::notifyPointerMotionRelative(double dx, double dy)
+{
+    if (m_rdSession.isEmpty()) {
+        return;
+    }
+    // NotifyPointerMotion takes raw dx/dy deltas — no stream node, no global→stream map.
+    // A pointer-grabbing game consumes these as mouse-look; the absolute path's recenter
+    // fight does not apply.
+    QDBusMessage msg = QDBusMessage::createMethodCall(
+        QString::fromLatin1(kPortalService), QString::fromLatin1(kPortalPath),
+        QStringLiteral("org.freedesktop.portal.RemoteDesktop"), QStringLiteral("NotifyPointerMotion"));
+    msg.setArguments({QVariant::fromValue(QDBusObjectPath(m_rdSession)), QVariant::fromValue(QVariantMap()),
+                      dx, dy});
+    QDBusConnection::sessionBus().asyncCall(msg);
+}
+
 void CoworkPortal::notifyAxis(double dx, double dy)
 {
     if (m_rdSession.isEmpty()) {
@@ -1115,6 +1132,10 @@ void CoworkPortal::runOneOp(const QJsonObject &op)
             // absolute move is impossible without a node id, so skip it.
             qWarning("cowork: move (%d,%d) has no containing screencast stream; skipped", gx, gy);
         }
+    } else if (t == QLatin1String("move_rel")) {
+        // Raw relative delta — no stream map needed. Doubles so sub-pixel cadence survives.
+        notifyPointerMotionRelative(op.value(QStringLiteral("dx")).toDouble(),
+                                    op.value(QStringLiteral("dy")).toDouble());
     } else if (t == QLatin1String("axis")) {
         notifyAxis(double(op.value(QStringLiteral("dx")).toInt()),
                    double(op.value(QStringLiteral("dy")).toInt()));
