@@ -26,6 +26,20 @@ const outboundBuffer = 1024
 // cannot park the writer goroutine forever.
 const writeDeadline = 30 * time.Second
 
+// maxInFlightPerConn caps the number of in-flight dispatch goroutines for a
+// single connection. Each inbound frame is handled on its own goroutine; a
+// client that stalls draining its responses makes every handler block in
+// enqueue, so without a cap the reader would spawn goroutines without bound — a
+// goroutine/memory leak systemd-oomd eventually trips on. When the cap is hit
+// the reader blocks, applying backpressure to this connection alone.
+//
+// The bound is deliberately per-connection, not global. Long-blocking handlers
+// (permission.request waits up to 8 minutes for the human's permission.respond)
+// are released by a frame on a DIFFERENT connection — the UI — so a per-conn cap
+// can never deadlock: the UI reader keeps flowing and resolves the waiters. A
+// global cap could be exhausted by agent bridges and starve that very release.
+const maxInFlightPerConn = 256
+
 // Handler processes one request and returns a result to be JSON-marshalled, or
 // an error. An *RPCError is sent verbatim; any other error becomes a
 // CodeInternalError.
@@ -110,6 +124,7 @@ func (s *Server) serveConn(ctx context.Context, netConn net.Conn) {
 		w:       bufio.NewWriter(netConn),
 		out:     make(chan *Frame, outboundBuffer),
 		done:    make(chan struct{}),
+		sem:     make(chan struct{}, maxInFlightPerConn),
 		log:     s.log,
 	}
 	s.mu.Lock()
@@ -149,7 +164,21 @@ func (s *Server) serveConn(ctx context.Context, netConn net.Conn) {
 			}
 			// Scanner reuses its buffer; copy before handing to a goroutine.
 			frame := append([]byte(nil), line...)
-			safe.Go("ipc.dispatch", func() { s.dispatch(ctx, c, frame) })
+			// Bound in-flight dispatch goroutines for this connection: a client
+			// that stalls draining responses makes each handler block in enqueue,
+			// so without this the reader would spawn them without bound. Acquiring
+			// blocks the reader once the cap is hit (backpressure on this conn
+			// only); the token is released when the handler returns. See
+			// maxInFlightPerConn for why this is per-connection, not global.
+			select {
+			case <-c.done:
+				return
+			case c.sem <- struct{}{}:
+			}
+			safe.Go("ipc.dispatch", func() {
+				defer func() { <-c.sem }()
+				s.dispatch(ctx, c, frame)
+			})
 		}
 		if err := sc.Err(); err != nil {
 			s.log.Warn("connection read error", "err", err)
@@ -241,6 +270,7 @@ type conn struct {
 
 	out  chan *Frame   // bounded outbound queue, drained by writeLoop
 	done chan struct{} // closed once to stop the writer; guarded by closeOnce
+	sem  chan struct{} // bounds in-flight dispatch goroutines (maxInFlightPerConn)
 
 	closeOnce sync.Once
 
