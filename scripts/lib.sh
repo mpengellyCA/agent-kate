@@ -38,10 +38,11 @@ require_cmd() {
 }
 
 # Project version: MAJOR.MINOR comes from CMakeLists.txt; the patch component is
-# the number of first-parent commits on the current branch, so every commit that
-# lands on main bumps the version automatically (e.g. 0.1.84). Override with
-# VERSION=...; falls back to the literal CMakeLists version outside a git tree
-# (e.g. when building from an extracted source tarball).
+# the TOTAL number of commits reachable from HEAD (git rev-list --count HEAD), so
+# every commit bumps the version automatically (e.g. 0.1.184). This must match
+# CMakeLists.txt exactly, else the package name/lookup disagrees with the version
+# stamped into the binary. Override with VERSION=...; falls back to the literal
+# CMakeLists version outside a git tree (e.g. building from an extracted tarball).
 project_version() {
     if [[ -n "${VERSION:-}" ]]; then
         printf '%s' "$VERSION"; return
@@ -49,7 +50,11 @@ project_version() {
     local full major minor patch
     full="$(awk -F'[ )]' '/^project\(AgentKate VERSION/ {print $3; exit}' "${ROOT}/CMakeLists.txt")"
     IFS=. read -r major minor _ <<<"$full"
-    if patch="$(git -C "$ROOT" rev-list --count --first-parent HEAD 2>/dev/null)" \
+    # Patch component = TOTAL commits reachable from HEAD, matching CMakeLists.txt's
+    # `git rev-list --count HEAD`. Must NOT use --first-parent: it under-counts (it skips
+    # merged branches' commits), so the package name/lookup here would disagree with the
+    # version CMake stamps into the binary (e.g. 0.1.94 vs 0.1.184). See commit 3d077b8.
+    if patch="$(git -C "$ROOT" rev-list --count HEAD 2>/dev/null)" \
         && [[ -n "$patch" ]]; then
         printf '%s.%s.%s' "$major" "$minor" "$patch"
     else
