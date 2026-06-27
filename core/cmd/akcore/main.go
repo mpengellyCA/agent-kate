@@ -11,6 +11,8 @@ import (
 	"encoding/json"
 	"flag"
 	"log/slog"
+	"net/http"
+	_ "net/http/pprof" // registers /debug/pprof handlers; only served when AKCORE_PPROF is set
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -171,6 +173,20 @@ func runCore() {
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	log.Info("akcore starting", "version", version, "pid", os.Getpid())
+
+	// Optional debug profiling endpoint, off unless AKCORE_PPROF names a listen
+	// address (use a loopback address, e.g. 127.0.0.1:6060). It serves
+	// net/http/pprof for live heap/goroutine/alloc profiles, e.g.
+	//   go tool pprof http://127.0.0.1:6060/debug/pprof/heap
+	// Disabled by default, so it adds no attack surface in normal operation.
+	if addr := os.Getenv("AKCORE_PPROF"); addr != "" {
+		log.Info("pprof endpoint enabled", "addr", addr)
+		safe.Go("akcore.pprof", func() {
+			if err := http.ListenAndServe(addr, nil); err != nil {
+				log.Warn("pprof endpoint stopped", "err", err)
+			}
+		})
+	}
 
 	exePath, err := os.Executable()
 	if err != nil {
