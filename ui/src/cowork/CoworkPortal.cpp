@@ -888,8 +888,11 @@ void CoworkPortal::startRemoteDesktop()
             // SelectSources with InvalidArgument "Remote desktop sessions cannot persist"
             // — a combined RemoteDesktop+ScreenCast session is inherently non-persistent.
             // (Verified live: with persist_mode the call errors before any dialog, which
-            // read as a silent decline.) We re-prompt per new session and lean on the 60s
-            // idle timer to keep an approved session alive across a burst of pointer ops.
+            // read as a silent decline.) We re-prompt per new session; once approved the
+            // session is kept alive for the whole app run (there is no idle timer — see the
+            // header), so a burst of pointer ops, or a long choreography that waits between
+            // events (plan 10), reuses the approved session without re-prompting or being
+            // reaped mid-script.
             portalRequest(QStringLiteral("org.freedesktop.portal.ScreenCast"), QStringLiteral("SelectSources"),
                           {QVariant::fromValue(QDBusObjectPath(m_rdSession))}, scOpts,
                           [this, doStart](uint codeSc, const QVariantMap &) {

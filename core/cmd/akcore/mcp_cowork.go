@@ -172,7 +172,14 @@ func coworkToolDefs() []map[string]any {
 				"or 'playpause' to pause a video, 'left'/'right' to seek, send shortcuts, or " +
 				"type into the already-focused field. To click a link/button or fill a field, " +
 				"PREFER desktop_list_elements + desktop_activate_element/desktop_set_text — " +
-				"they target the element directly without moving the cursor. Highest-risk " +
+				"they target the element directly without moving the cursor. Each event may " +
+				"optionally carry holdMs (hold this tap down that many ms before releasing) and " +
+				"afterMs (wait that many ms before firing it). Besides whole taps you can send " +
+				"half-events — key_down/key_up and button_down/button_up — to HOLD an input " +
+				"across others (e.g. key_down ctrl, button left, key_up ctrl to Ctrl-click); every " +
+				"*_down MUST be balanced by a matching *_up within the same call or it is rejected. " +
+				"For longer interleaved or precisely-timed sequences (held keys while moving, " +
+				"frame-bucketed combos, charged inputs) PREFER desktop_play_input. Highest-risk " +
 				"capability ('input_inject'): it is refused unless the user has switched on the " +
 				"control toggle in the Cowork panel, or approves the action. Optionally pass " +
 				"targetWindowId (from desktop_list_windows) to focus that window first.",
@@ -184,13 +191,69 @@ func coworkToolDefs() []map[string]any {
 						"description": "Ordered input events. Each is a key — " +
 							"{\"type\":\"key\",\"key\":\"space\"} (names: space, enter, tab, escape, " +
 							"left/right/up/down, playpause, play, pause, next, prev, volumeup/down, mute, " +
-							"or a single character) — or a click {\"type\":\"button\",\"button\":\"left\"}.",
+							"or a single character) — or a click {\"type\":\"button\",\"button\":\"left\"}. " +
+							"Each event may add holdMs (hold this tap's down before its up) and afterMs " +
+							"(wait that many ms before it fires). Beyond whole taps, use the half-events " +
+							"key_down/key_up and button_down/button_up to hold an input across others " +
+							"(e.g. {\"type\":\"key_down\",\"key\":\"ctrl\"}, {\"type\":\"button\",\"button\":\"left\"}, " +
+							"{\"type\":\"key_up\",\"key\":\"ctrl\"}); each *_down must be balanced by a *_up " +
+							"in the same call. Omitting the new fields keeps the plain atomic behavior.",
 						"items": map[string]any{"type": "object"},
 					},
 					"targetWindowId": map[string]any{
 						"type":        "string",
 						"description": "Optional KWin internalId to focus before injecting (from desktop_list_windows).",
 					},
+				},
+				"required": []string{"events"},
+			},
+		},
+		{
+			"name": "desktop_play_input",
+			"description": "Run a TIMED CHOREOGRAPHY of interleaved keyboard + pointer events on " +
+				"one millisecond clock — acting AS the user. Use it for the things atomic injection " +
+				"can't do: holding a key while doing something else (hold W to walk while you aim), " +
+				"modifier chords (Ctrl-down → click → Ctrl-up to open a link in a new tab), " +
+				"charged/timed combos, double-taps with a controlled gap, and frame-bucketed " +
+				"sequences. WHEN: for ordinary UI still PREFER desktop_list_elements + " +
+				"desktop_activate_element/desktop_set_text (they target elements directly with no " +
+				"cursor movement); reach for this for games, editors, canvases, and any task that " +
+				"needs held keys, combos, or precisely-timed sequences. HOW: events fire in time " +
+				"order; hold an input across other events with key_down/key_up (and the button " +
+				"equivalents) — every *_down MUST have a matching *_up in the same call or the call " +
+				"is rejected. Place each event in time exactly one of three ways: afterMs (a gap " +
+				"after the previous event), atMs (an absolute offset on the clock), or frame + a " +
+				"top-level fps (author 'frame 0 down, frame 6 up'); pick one per event. holdMs sets " +
+				"a tap's dwell between its down and up; repeat/repeatEveryMs auto-repeat an event. " +
+				"Coordinates for move/click/scroll are absolute desktop pixels — the same space as " +
+				"desktop_screenshot and desktop_list_elements bounds. PRECISION CEILING: input is " +
+				"millisecond-scheduled and repeatable, reliable to the right frame bucket at 30–60 " +
+				"fps (16–33 ms/frame) — great for holds, combos, modifier-drags, and charged inputs " +
+				"— but it is NOT sub-frame-deterministic, so do not rely on single-ms frame-perfect " +
+				"links. A single hold is capped at 10s and the whole timeline at 30s. True " +
+				"simultaneity is not possible: events fire serially, back-to-back with ~0 gap when " +
+				"they share a time, so OVERLAP inputs by using held half-events rather than two " +
+				"events at the same instant. CAPABILITY: keyboard events need the 'input_inject' " +
+				"toggle; pointer events (move/click/scroll/button) need 'pointer_control'; a mixed " +
+				"script needs both (or an approval covering both). Refuses any click/scroll point " +
+				"inside an Agent Kate window.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"events": map[string]any{
+						"type":        "array",
+						"description": "The choreography: events fired in time order on one ms clock.",
+						"items":       playInputEventSchema(),
+					},
+					"fps": map[string]any{
+						"type":        "number",
+						"description": "Frames per second used to compile any event's 'frame' index into ms. Required if any event uses 'frame'.",
+					},
+					"targetWindowId": map[string]any{
+						"type":        "string",
+						"description": "Optional KWin internalId to focus before playing (from desktop_list_windows).",
+					},
+					"profile": pointerProfileSchema(),
 				},
 				"required": []string{"events"},
 			},
@@ -335,6 +398,67 @@ func pointerProfileSchema() map[string]any {
 	}
 }
 
+// playInputEventSchema is the fully-specified schema for one desktop_play_input
+// event, so the agent can author a valid timeline without trial-and-error. The
+// json field names match exactly what the core's cowork.playInput RPC accepts.
+func playInputEventSchema() map[string]any {
+	return map[string]any{
+		"type":        "object",
+		"description": "One event on the timeline. Place it in time with exactly one of afterMs / atMs / frame.",
+		"properties": map[string]any{
+			"type": map[string]any{
+				"type": "string",
+				"enum": []string{
+					"key", "key_down", "key_up",
+					"button", "button_down", "button_up",
+					"move", "click", "scroll", "wait",
+				},
+				"description": "Event kind. key/key_down/key_up press a key (whole tap or held " +
+					"half); button/button_down/button_up a mouse button; move/click move/click at x,y; " +
+					"scroll the wheel; wait pauses the clock.",
+			},
+			"key": map[string]any{
+				"type": "string",
+				"description": "For key events: a single character, or a name — space, enter, tab, " +
+					"escape, left/right/up/down, home/end/pageup/pagedown, modifiers ctrl/shift/alt/super, " +
+					"media playpause/play/pause/next/prev/volumeup/volumedown/mute.",
+			},
+			"button": map[string]any{
+				"type":        "string",
+				"enum":        []string{"left", "right", "middle", "back", "forward"},
+				"description": "For button*/click events: which mouse button.",
+			},
+			"x":     map[string]any{"type": "integer", "description": "Absolute desktop x pixel (for move/click; optional for scroll). Same space as desktop_screenshot."},
+			"y":     map[string]any{"type": "integer", "description": "Absolute desktop y pixel (for move/click; optional for scroll)."},
+			"dx":    map[string]any{"type": "integer", "description": "Scroll notches, positive = right (for scroll)."},
+			"dy":    map[string]any{"type": "integer", "description": "Scroll notches, positive = down (for scroll)."},
+			"count": map[string]any{"type": "integer", "description": "Click count for a click event (2 = double-click)."},
+			"holdMs": map[string]any{
+				"type":        "integer",
+				"description": "For a key/button TAP: dwell between its down and up, in ms (capped at 10000).",
+			},
+			"afterMs": map[string]any{
+				"type": "integer",
+				"description": "Relative scheduling: ms to wait after the previous event fired before " +
+					"this one fires. For a wait event, the pause duration. Mutually exclusive with atMs/frame.",
+			},
+			"atMs": map[string]any{
+				"type":        "integer",
+				"description": "Absolute scheduling: offset on the timeline clock, in ms. Mutually exclusive with afterMs/frame.",
+			},
+			"frame": map[string]any{
+				"type": "integer",
+				"description": "Absolute frame index, compiled to ms via the top-level fps (author " +
+					"'frame 0 down, frame 6 up'). Requires top-level fps. Mutually exclusive with afterMs/atMs.",
+			},
+			"repeat":        map[string]any{"type": "integer", "description": "Fire this event N times."},
+			"repeatEveryMs": map[string]any{"type": "integer", "description": "Ms between repeat copies."},
+			"profile":       pointerProfileSchema(),
+		},
+		"required": []string{"type"},
+	}
+}
+
 // pointerRefSchema is an optional reference frame for the x,y of a pointer action.
 func pointerRefSchema() map[string]any {
 	return map[string]any{
@@ -416,6 +540,41 @@ func (b *mcpBridge) runCoworkTool(name string, args json.RawMessage) (string, er
 			return "Input sent.", nil
 		}
 		return fmt.Sprintf("Sent input: %s.", res.Actions), nil
+
+	case "desktop_play_input":
+		var a struct {
+			Events         json.RawMessage `json:"events"`
+			FPS            float64         `json:"fps"`
+			TargetWindowID string          `json:"targetWindowId"`
+			Profile        json.RawMessage `json:"profile"`
+		}
+		_ = json.Unmarshal(args, &a)
+		params := map[string]any{"threadId": b.thread}
+		if len(a.Events) > 0 {
+			params["events"] = a.Events
+		}
+		if a.FPS > 0 {
+			params["fps"] = a.FPS
+		}
+		if a.TargetWindowID != "" {
+			params["targetWindowId"] = a.TargetWindowID
+		}
+		if len(a.Profile) > 0 {
+			params["profile"] = a.Profile
+		}
+		var res struct {
+			OK      bool   `json:"ok"`
+			Actions string `json:"actions"`
+		}
+		// 90s > the core's 60s portal wait for a timeline (a script may span up to 30s
+		// of playback) so the core resolves first (staggered ladder).
+		if err := b.client.CallTimeout("cowork.playInput", params, &res, 90*time.Second); err != nil {
+			return "", err
+		}
+		if res.Actions == "" {
+			return "Choreography played.", nil
+		}
+		return fmt.Sprintf("Played choreography: %s.", res.Actions), nil
 
 	case "desktop_list_elements":
 		var a struct {

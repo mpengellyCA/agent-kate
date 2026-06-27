@@ -410,6 +410,149 @@ func registerCoworkHandlers(d handlerDeps) {
 		return map[string]any{"ok": true, "actions": desc}, nil
 	})
 
+	// --- control: choreographed input timeline (R2) — agent bridge → core ---------
+	// Compiles an ordered, time-pinned score of keyboard + pointer events (cowork plan
+	// 10) into one delayMs-bearing op stream the UI replays. It rides the same consent/
+	// guard/audit spine as injectInput + the positioned-pointer tools: a keyboard event
+	// needs input_inject, a pointer event needs pointer_control, a mixed script needs
+	// BOTH (so with both toggles off the user may see up to two prompts — the common
+	// toggles-on path prompts for neither).
+
+	d.srv.Handle("cowork.playInput", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID       string               `json:"threadId"`
+			TargetWindowID string               `json:"targetWindowId"`
+			FPS            float64              `json:"fps"`
+			Profile        *pointerProfilePatch `json:"profile"`
+			Events         []timelineEvent      `json:"events"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		if err := requireCoworkBridge(d, ctx, p.ThreadID); err != nil {
+			return nil, err
+		}
+		if !cw.Available() {
+			return nil, ipc.Errorf(codeCoworkDenied, "desktop integration unavailable (no KDE session bus)")
+		}
+
+		// Compile. Seed the path expansion from the thread's last commanded position so the
+		// first move draws a real path and bare buttons/scrolls can be verified. The
+		// per-event patch wins; otherwise the call-level default; both fold onto the
+		// thread's standing profile, clamped to the user's bounds (reuse pstate.resolve).
+		start, haveStart := pstate.last(p.ThreadID)
+		resolveProfile := func(evPatch *pointerProfilePatch) PointerProfile {
+			patch := evPatch
+			if patch == nil {
+				patch = p.Profile
+			}
+			return pstate.resolve(p.ThreadID, patch)
+		}
+		plan, err := buildTimelineOps(timelineScript{Events: p.Events, FPS: p.FPS}, start, haveStart, resolveProfile, newPointerRNG())
+		if err != nil {
+			// Script-construction / fail-closed errors (bad schedule, unreleased hold,
+			// span overrun, unverifiable bare click) are the caller's mistake.
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+
+		// Resolve the target window's class/title so the self-target guard can refuse
+		// Agent Kate's own UI and the consent prompt(s) can name the window.
+		target := cowork.Target{Kind: cowork.TargetWindow, WindowID: p.TargetWindowID, Label: "the focused window"}
+		if p.TargetWindowID != "" {
+			if wins, err := cw.KDE().ListWindows(4 * time.Second); err == nil {
+				for _, w := range wins {
+					if w.InternalID == p.TargetWindowID {
+						target.ResourceClass = w.ResourceClass
+						if w.Caption != "" {
+							target.Label = w.Caption
+						}
+						break
+					}
+				}
+			}
+		}
+
+		// Authorize each capability the compiled script actually exercises, surfacing the
+		// compact, literal description (never an opaque "play script") as the prompt detail.
+		// Track the primary capability + grant for the audit record below.
+		primaryCap := cowork.CapInputInject
+		var primaryGrant string
+		if plan.HasKey {
+			dec, err := cw.Authorize(ctx, cowork.AuthRequest{
+				ThreadID:       p.ThreadID,
+				Capability:     cowork.CapInputInject,
+				Target:         target,
+				SuggestedScope: cowork.ScopeOnce,
+				ActionPreview: &cowork.ActionDescriptor{
+					Mechanism:   "input_inject",
+					WindowTitle: target.Label,
+					Detail:      plan.Desc,
+				},
+			})
+			if err != nil {
+				return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+			}
+			if !dec.Allow {
+				return nil, ipc.Errorf(codeCoworkDenied, dec.Reason)
+			}
+			primaryGrant = dec.GrantID
+		}
+		if plan.HasPointer {
+			dec, err := cw.Authorize(ctx, cowork.AuthRequest{
+				ThreadID:       p.ThreadID,
+				Capability:     cowork.CapPointerControl,
+				Target:         target,
+				SuggestedScope: cowork.ScopeOnce,
+				ActionPreview: &cowork.ActionDescriptor{
+					Mechanism:   "pointer_control",
+					WindowTitle: target.Label,
+					Detail:      plan.Desc,
+				},
+			})
+			if err != nil {
+				return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+			}
+			if !dec.Allow {
+				return nil, ipc.Errorf(codeCoworkDenied, dec.Reason)
+			}
+			primaryCap = cowork.CapPointerControl
+			primaryGrant = dec.GrantID
+		}
+
+		// Submit-time self-target guard over every click/scroll point. Per plan §3 this is
+		// a submit-time check: we rely on the bounded (≤30s) span rather than re-checking
+		// each op at its fire-time.
+		if len(plan.GuardPts) > 0 {
+			if err := guardPointerTargets(cw, plan.GuardPts); err != nil {
+				cw.AuditRefusal(p.ThreadID, primaryCap, target, err.Error())
+				return nil, ipc.Errorf(codeCoworkDenied, err.Error())
+			}
+		}
+
+		// Focus the target window first so the keystrokes/clicks land on it.
+		if p.TargetWindowID != "" {
+			if err := cw.KDE().ActivateWindow(p.TargetWindowID, 4*time.Second); err != nil {
+				d.log.Warn("cowork: could not focus target window", "id", p.TargetWindowID, "err", err)
+			}
+		}
+
+		// 60s: a timeline may legitimately span up to 30s of playback and the UI replies
+		// only once the whole stream has drained.
+		if _, err := runPortal(d, ctx, "inject", map[string]any{
+			"threadId": p.ThreadID,
+			"ops":      plan.Ops,
+		}, 60*time.Second); err != nil {
+			return nil, err
+		}
+		// Commit the pointer mirror only after a successful play (mirror move/click), so a
+		// later bare click in another call can be verified against where we left the cursor.
+		if plan.HaveFinal {
+			pstate.setLast(p.ThreadID, plan.FinalPos)
+		}
+		cw.AuditCapture(p.ThreadID, primaryCap, target, primaryGrant, hashString(plan.Desc))
+		return map[string]any{"ok": true, "actions": plan.Desc}, nil
+	})
+
 	// --- control: positioned pointer (move/click/scroll/drag) (R2) ----------------
 	// All of these gate on the single pointer_control capability and route through the
 	// same move+notify ops the UI plays. Coordinates are absolute desktop pixels.
