@@ -57,3 +57,38 @@ func TestClearOwner(t *testing.T) {
 		t.Fatal("ClearOwner should drop the owner's presence, claims and open files")
 	}
 }
+
+func TestBoardEviction(t *testing.T) {
+	s := NewState()
+
+	// Post well past the cap; the board must retain only the most recent
+	// maxBoardEntries entries, evicting oldest-first.
+	const n = maxBoardEntries + 250
+	for i := 0; i < n; i++ {
+		s.PostNote("t-1", "note")
+	}
+	notes := s.ReadNotes()
+	if len(notes) != maxBoardEntries {
+		t.Fatalf("ReadNotes len = %d, want %d", len(notes), maxBoardEntries)
+	}
+	// IDs keep climbing across eviction: the oldest survivor is the
+	// (n-cap+1)'th note posted, and the newest is the n'th.
+	if got, want := notes[0].ID, n-maxBoardEntries+1; got != want {
+		t.Fatalf("oldest retained note ID = %d, want %d", got, want)
+	}
+	if got := notes[len(notes)-1].ID; got != n {
+		t.Fatalf("newest note ID = %d, want %d", got, n)
+	}
+
+	// Reviews share the same cap and eviction behaviour.
+	for i := 0; i < n; i++ {
+		s.AddReview("t-1", "summary")
+	}
+	reviews := s.ListReviews()
+	if len(reviews) != maxBoardEntries {
+		t.Fatalf("ListReviews len = %d, want %d", len(reviews), maxBoardEntries)
+	}
+	if got, want := reviews[0].ID, n-maxBoardEntries+1; got != want {
+		t.Fatalf("oldest retained review ID = %d, want %d", got, want)
+	}
+}

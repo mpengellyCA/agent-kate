@@ -10,6 +10,14 @@ import (
 	"time"
 )
 
+// maxBoardEntries caps how many notes and review requests the board keeps in
+// memory. When the count exceeds the cap the oldest entries are evicted
+// (oldest-first); the nextNote/nextRev counters keep climbing, so callers that
+// track the latest-seen ID are unaffected. Without this cap both slices grow for
+// the whole process lifetime — on a long-running arena that is effectively
+// unbounded, one of the leaks systemd-oomd eventually trips on.
+const maxBoardEntries = 500
+
 // OpenFile is one file currently open in the arena.
 type OpenFile struct {
 	Path  string `json:"path"`
@@ -100,6 +108,9 @@ func (s *State) PostNote(author, text string) Note {
 	s.nextNote++
 	n := Note{ID: s.nextNote, Author: author, Text: text, Time: time.Now()}
 	s.notes = append(s.notes, n)
+	if len(s.notes) > maxBoardEntries {
+		s.notes = s.notes[len(s.notes)-maxBoardEntries:]
+	}
 	return n
 }
 
@@ -171,6 +182,9 @@ func (s *State) AddReview(thread, summary string) Review {
 	s.nextRev++
 	r := Review{ID: s.nextRev, Thread: thread, Summary: summary, Time: time.Now()}
 	s.reviews = append(s.reviews, r)
+	if len(s.reviews) > maxBoardEntries {
+		s.reviews = s.reviews[len(s.reviews)-maxBoardEntries:]
+	}
 	return r
 }
 
