@@ -16,6 +16,8 @@ daily dogfooding. Each item has its own grounded plan file with the relevant
 | 6 | Fix auto-compaction on exit | Core (Go) | [06-compaction-shutdown.md](06-compaction-shutdown.md) | M |
 | 7 | Document & media viewing (PDF/CSV/Office/AV) | Editor (C++) | [07-document-media-viewing.md](07-document-media-viewing.md) | M–L |
 | 8 | KDE Plasma Cowork (share/see/control the desktop, consent-gated) | Core (Go) + UI (C++) | [08-kde-cowork/](08-kde-cowork/README.md) | L (phased v1/v2/v3) |
+| 10 | Panel responsiveness & resize performance | UI (C++) | [10-panel-responsiveness.md](10-panel-responsiveness.md) | M (Phase 2: chat virtualization) |
+| 11 | Third-party API providers (Fireworks, OpenRouter) via the Anthropic endpoint | Core (Go) + UI (C++) | [11-third-party-providers.md](11-third-party-providers.md) | M (phased core/persist/UI) |
 
 Size key: **S** ≈ <½ day, **M** ≈ 1–2 days, **L** ≈ 3–5 days.
 

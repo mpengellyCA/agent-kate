@@ -6,6 +6,7 @@
 #include "OutlinePanel.h"
 #include "ProblemsPanel.h"
 #include "ProjectTree.h"
+#include "ProvidersDialog.h"
 #include "ReferencesPanel.h"
 #include "ShutdownDialog.h"
 #include "SearchPanel.h"
@@ -574,6 +575,18 @@ void MainWindow::setupActions()
             ->group(QStringLiteral("Agent"))
             .writeEntry("showTools", on);
         m_agent->applyChatSettings();
+    });
+
+    optionsMenu->addSeparator();
+    auto *providersAct = optionsMenu->addAction(i18n("Configure API &Providers…"));
+    providersAct->setToolTip(i18n(
+        "Configure third-party, Anthropic-compatible API providers (Fireworks, "
+        "OpenRouter, …) that an agent can use in place of Anthropic."));
+    connect(providersAct, &QAction::triggered, this, [this] {
+        ProvidersDialog dlg(this);
+        if (dlg.exec() == QDialog::Accepted) {
+            m_agent->reloadProviders();
+        }
     });
 
     QMenu *viewMenu = menuBar()->addMenu(i18n("&View"));

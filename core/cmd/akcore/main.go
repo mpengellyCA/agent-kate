@@ -451,6 +451,7 @@ type agentStartParams struct {
 	Isolation      string             `json:"isolation"` // worktree.Mode*; "" = auto
 	Attachments    []agent.Attachment `json:"attachments"`
 	CoworkEnabled  bool               `json:"coworkEnabled"` // opt into the KDE Cowork desktop tools
+	Provider       *agent.Provider    `json:"provider,omitempty"` // third-party API routing; nil = Claude direct
 }
 
 type agentSendParams struct {
@@ -534,6 +535,9 @@ func registerHandlers(d handlerDeps) {
 	d.srv.Handle("agent.resume", func(_ context.Context, raw json.RawMessage) (any, error) {
 		var p struct {
 			ThreadID string `json:"threadId"`
+			// Optional: re-supply the provider (with its API token) on resume.
+			// Needed when the key lives in KWallet — the Record never persists it.
+			Provider *agent.Provider `json:"provider,omitempty"`
 		}
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
@@ -546,7 +550,7 @@ func registerHandlers(d handlerDeps) {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams,
 				"thread has no Claude Code session to resume")
 		}
-		safe.Go("agent.resumeThread", func() { resumeAgentThread(d, rec) })
+		safe.Go("agent.resumeThread", func() { resumeAgentThread(d, rec, p.Provider) })
 		return map[string]any{"threadId": rec.ThreadID, "sessionId": rec.SessionID}, nil
 	})
 
@@ -2387,6 +2391,7 @@ func startAgentThread(d handlerDeps, threadID, sessionID string, p agentStartPar
 		Attachments:    p.Attachments,
 		SessionID:      sessionID,
 		CoworkEnabled:  p.CoworkEnabled,
+		Provider:       p.Provider,
 	}); err != nil {
 		os.Remove(mcpConfig)
 		emitLifecycle(d.srv, threadID, "error", err.Error(), &wt)
@@ -2399,7 +2404,7 @@ func startAgentThread(d handlerDeps, threadID, sessionID string, p agentStartPar
 	if permMode == "" {
 		permMode = "acceptEdits"
 	}
-	if err := d.sessions.Put(session.Record{
+	rec := session.Record{
 		ThreadID:       threadID,
 		SessionID:      sessionID,
 		Project:        p.WorkspacePath,
@@ -2411,7 +2416,9 @@ func startAgentThread(d handlerDeps, threadID, sessionID string, p agentStartPar
 		Created:        time.Now(),
 		Status:         session.StatusRunning,
 		CoworkEnabled:  p.CoworkEnabled,
-	}); err != nil {
+	}
+	applyProviderToRecord(&rec, p.Provider)
+	if err := d.sessions.Put(rec); err != nil {
 		d.log.Warn("could not persist thread record", "thread", threadID, "err", err)
 	}
 
@@ -2428,7 +2435,7 @@ func startAgentThread(d handlerDeps, threadID, sessionID string, p agentStartPar
 // summary instead of replaying the full transcript — that is where the
 // compaction savings actually land. Without a current summary the thread
 // resumes on its original session via --resume as before.
-func resumeAgentThread(d handlerDeps, rec session.Record) {
+func resumeAgentThread(d handlerDeps, rec session.Record, provOverride *agent.Provider) {
 	if _, err := os.Stat(rec.Worktree.Path); err != nil {
 		emitLifecycle(d.srv, rec.ThreadID, "error",
 			"worktree no longer exists: "+rec.Worktree.Path, nil)
@@ -2459,6 +2466,12 @@ func resumeAgentThread(d handlerDeps, rec session.Record) {
 		Effort:         rec.Effort,
 		Model:          rec.Model,
 		CoworkEnabled:  rec.CoworkEnabled,
+		Provider:       providerFromRecord(rec),
+	}
+	// A fresh override (the UI re-supplying a KWallet-held token the Record never
+	// stores) takes precedence over the env-var resolution baked into the snapshot.
+	if provOverride.Routed() {
+		opts.Provider = provOverride
 	}
 	var sessionIDForRecord string
 	var detail string
@@ -2539,8 +2552,9 @@ func promoteAgentThread(d handlerDeps, rec session.Record) {
 	emitLifecycle(d.srv, rec.ThreadID, "promoted",
 		"promoted to an isolated worktree on "+iso.Branch, &iso)
 
-	// Bring the thread back up, now inside its isolated worktree.
-	resumeAgentThread(d, rec)
+	// Bring the thread back up, now inside its isolated worktree. The provider
+	// (if any) is rebuilt from the Record; its token re-resolves from the env var.
+	resumeAgentThread(d, rec, nil)
 }
 
 // summarizePrompt makes a short, single-line title from an opening prompt.
@@ -2796,6 +2810,38 @@ func resolveModel(tier string) string {
 		return "claude-fable-5"
 	default:
 		return strings.TrimSpace(tier)
+	}
+}
+
+// applyProviderToRecord copies a provider's NON-SECRET fields onto a session
+// Record so a later resume can rebuild the routing. The API token is deliberately
+// never persisted — it is re-resolved at launch from the provider's env var or
+// re-supplied by the UI. A nil or Claude-direct provider clears the fields.
+func applyProviderToRecord(rec *session.Record, p *agent.Provider) {
+	if !p.Routed() {
+		rec.ProviderID, rec.ProviderName, rec.ProviderBaseURL, rec.ProviderEnvVar, rec.ProviderModels = "", "", "", "", nil
+		return
+	}
+	rec.ProviderID = p.ID
+	rec.ProviderName = p.Name
+	rec.ProviderBaseURL = p.BaseURL
+	rec.ProviderEnvVar = p.EnvVar
+	rec.ProviderModels = p.Models
+}
+
+// providerFromRecord rebuilds the routing provider from a Record's non-secret
+// snapshot. AuthToken is left empty: buildEnv resolves it from EnvVar at launch,
+// or the caller passes a fresher override. Returns nil for Claude direct.
+func providerFromRecord(rec session.Record) *agent.Provider {
+	if rec.ProviderBaseURL == "" {
+		return nil
+	}
+	return &agent.Provider{
+		ID:      rec.ProviderID,
+		Name:    rec.ProviderName,
+		BaseURL: rec.ProviderBaseURL,
+		EnvVar:  rec.ProviderEnvVar,
+		Models:  rec.ProviderModels,
 	}
 }
 

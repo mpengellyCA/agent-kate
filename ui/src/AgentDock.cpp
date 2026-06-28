@@ -378,6 +378,13 @@ void AgentDock::applyChatSettings()
     }
 }
 
+void AgentDock::reloadProviders()
+{
+    for (const Entry &e : m_agents) {
+        e.panel->reloadProviders();
+    }
+}
+
 int AgentDock::runningAgentCount() const
 {
     int n = 0;

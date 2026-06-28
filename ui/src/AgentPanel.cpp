@@ -1,4 +1,5 @@
 #include "AgentPanel.h"
+#include "ProviderConfig.h"
 #include "TranscriptDelegate.h"
 #include "TranscriptModel.h"
 #include "ipc/CoreClient.h"
@@ -587,35 +588,60 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
             .writeEntry("effort", m_effortCombo->currentData().toString());
     });
 
-    // Model selector. Each item carries a tier token; the core resolves it to a
-    // concrete --model id (its resolveModel is the single source of truth, so
-    // the UI never hard-codes versioned model strings). An empty token passes
-    // no --model flag, leaving Claude Code's configured default. Fixed once the
-    // agent starts, like the other setup combos.
-    m_modelCombo = new QComboBox(this);
-    m_modelCombo->addItem(QStringLiteral("Default model"), QString());
-    m_modelCombo->addItem(QStringLiteral("Opus"), QStringLiteral("opus"));
-    m_modelCombo->addItem(QStringLiteral("Sonnet"), QStringLiteral("sonnet"));
-    m_modelCombo->addItem(QStringLiteral("Haiku"), QStringLiteral("haiku"));
-    m_modelCombo->addItem(QStringLiteral("Fable"), QStringLiteral("fable"));
-    m_modelCombo->setToolTip(QStringLiteral(
-        "Model for this agent, fixed once it starts.\n"
-        "Default model leaves Claude Code's own configured model untouched."));
-    // Sticky: the last choice becomes the default for the next agent.
+    // Provider selector. Routes this agent's `claude` harness at a third-party
+    // Anthropic-compatible API (Fireworks, OpenRouter, …) instead of Anthropic's
+    // own. "Claude (direct)" (the default) injects nothing — identical to before.
+    // Fixed once the agent starts, like the other setup combos. Profiles are
+    // managed in Options → Configure API Providers…. The model combo's contents
+    // follow this choice (Claude tiers vs the provider's own model ids).
+    m_providerCombo = new QComboBox(this);
+    m_providerCombo->setToolTip(QStringLiteral(
+        "Which API endpoint this agent talks to, fixed once it starts.\n"
+        "Claude (direct) uses Anthropic. Other entries route the harness at a\n"
+        "third-party Anthropic-compatible API with your stored key.\n"
+        "Manage these in Options ▸ Configure API Providers…"));
     {
+        const QList<ProviderProfile> profiles = ProviderStore::load();
+        for (const ProviderProfile &p : profiles) {
+            m_providerCombo->addItem(p.name, p.id);
+        }
         const QString saved = KSharedConfig::openConfig()
                                   ->group(QStringLiteral("Agent"))
-                                  .readEntry("model", QString());
-        const int savedIdx = m_modelCombo->findData(saved);
+                                  .readEntry("provider", ProviderStore::directId());
+        const int savedIdx = m_providerCombo->findData(saved);
         if (savedIdx >= 0) {
-            m_modelCombo->setCurrentIndex(savedIdx);
+            m_providerCombo->setCurrentIndex(savedIdx);
         }
     }
+    connect(m_providerCombo, &QComboBox::currentIndexChanged, this, [this] {
+        KSharedConfig::openConfig()
+            ->group(QStringLiteral("Agent"))
+            .writeEntry("provider", m_providerCombo->currentData().toString());
+        rebuildModelCombo();
+    });
+
+    // Model selector. For Claude direct each item carries a tier token the core
+    // resolves to a concrete --model id (its resolveModel is the single source of
+    // truth, so the UI never hard-codes versioned model strings); for a provider
+    // the items are that provider's own model ids, sent verbatim. An empty token
+    // passes no --model flag. Fixed once the agent starts. rebuildModelCombo()
+    // populates it to match the selected provider.
+    m_modelCombo = new QComboBox(this);
+    m_modelCombo->setToolTip(QStringLiteral(
+        "Model for this agent, fixed once it starts.\n"
+        "Default leaves the provider's own configured/main model untouched."));
     connect(m_modelCombo, &QComboBox::currentIndexChanged, this, [this] {
+        // Only the Claude-direct tier choice is sticky; a provider's model ids
+        // must not be persisted as the Claude model token.
+        if (m_providerCombo &&
+            m_providerCombo->currentData().toString() != ProviderStore::directId()) {
+            return;
+        }
         KSharedConfig::openConfig()
             ->group(QStringLiteral("Agent"))
             .writeEntry("model", m_modelCombo->currentData().toString());
     });
+    rebuildModelCombo();
 
     // Cowork desktop access. Wiring the agentkate-cowork MCP server into the agent is
     // fixed at start (it is written into the MCP config when the claude process
@@ -769,6 +795,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
         form->addRow(QStringLiteral("Permission"), m_modeCombo);
         form->addRow(QStringLiteral("Isolation"), m_isolationCombo);
         form->addRow(QStringLiteral("Effort"), m_effortCombo);
+        form->addRow(QStringLiteral("Provider"), m_providerCombo);
         form->addRow(QStringLiteral("Model"), m_modelCombo);
         form->addRow(QStringLiteral("Desktop"), m_coworkCheck);
         auto *action = new QWidgetAction(menu);
@@ -907,6 +934,75 @@ void AgentPanel::preselectModel(const QString &modelId)
     if (idx >= 0) {
         m_modelCombo->setCurrentIndex(idx);
     }
+}
+
+void AgentPanel::rebuildModelCombo()
+{
+    if (!m_modelCombo) {
+        return; // provider combo may fire before the model combo is built
+    }
+    const QString providerId = m_providerCombo
+        ? m_providerCombo->currentData().toString()
+        : ProviderStore::directId();
+
+    QSignalBlocker block(m_modelCombo);
+    m_modelCombo->clear();
+
+    if (providerId.isEmpty() || providerId == ProviderStore::directId()) {
+        // Claude tiers — the core's resolveModel maps these to concrete ids.
+        m_modelCombo->addItem(QStringLiteral("Default model"), QString());
+        m_modelCombo->addItem(QStringLiteral("Opus"), QStringLiteral("opus"));
+        m_modelCombo->addItem(QStringLiteral("Sonnet"), QStringLiteral("sonnet"));
+        m_modelCombo->addItem(QStringLiteral("Haiku"), QStringLiteral("haiku"));
+        m_modelCombo->addItem(QStringLiteral("Fable"), QStringLiteral("fable"));
+        const QString saved = KSharedConfig::openConfig()
+                                  ->group(QStringLiteral("Agent"))
+                                  .readEntry("model", QString());
+        const int idx = m_modelCombo->findData(saved);
+        if (idx >= 0) {
+            m_modelCombo->setCurrentIndex(idx);
+        }
+        return;
+    }
+
+    // Provider mode: list the provider's own model ids, sent verbatim as --model.
+    // "Provider default" (empty) passes no --model, letting the provider's main
+    // model (ANTHROPIC_MODEL) take effect.
+    const ProviderProfile p = ProviderStore::byId(providerId);
+    m_modelCombo->addItem(QStringLiteral("Provider default"), QString());
+    QStringList added;
+    for (const QString &slot : ProviderStore::modelSlots()) {
+        const QString model = p.models.value(slot).trimmed();
+        if (model.isEmpty() || added.contains(model)) {
+            continue;
+        }
+        added << model;
+        m_modelCombo->addItem(model, model);
+    }
+}
+
+void AgentPanel::reloadProviders()
+{
+    if (!m_providerCombo || !m_threadId.isEmpty()) {
+        return; // frozen once a thread exists
+    }
+    const QString current = m_providerCombo->currentData().toString();
+    {
+        QSignalBlocker block(m_providerCombo);
+        m_providerCombo->clear();
+        const QList<ProviderProfile> profiles = ProviderStore::load();
+        for (const ProviderProfile &p : profiles) {
+            m_providerCombo->addItem(p.name, p.id);
+        }
+        int idx = m_providerCombo->findData(current);
+        if (idx < 0) {
+            idx = m_providerCombo->findData(ProviderStore::directId());
+        }
+        if (idx >= 0) {
+            m_providerCombo->setCurrentIndex(idx);
+        }
+    }
+    rebuildModelCombo();
 }
 
 void AgentPanel::applyChatSettings()
@@ -1133,8 +1229,20 @@ void AgentPanel::runCompactNow(const QString &model)
 void AgentPanel::doResume()
 {
     addNote(QStringLiteral("resuming the Claude Code session…"), QStringLiteral("sys"));
-    m_core->call(QStringLiteral("agent.resume"),
-                 QJsonObject{{QStringLiteral("threadId"), m_threadId}},
+    QJsonObject params{{QStringLiteral("threadId"), m_threadId}};
+    // Re-attach the provider (with its API token) when this panel started the
+    // thread on one this session — the core never persists the token, so a
+    // KWallet-held key would otherwise be unavailable on resume. When the panel
+    // doesn't know the provider (e.g. after an app restart), the core rebuilds it
+    // from the persisted snapshot and resolves the token from its env var.
+    if (!m_startedProviderId.isEmpty()) {
+        const ProviderProfile prof = ProviderStore::byId(m_startedProviderId);
+        const QJsonObject pj = ProviderStore::toJson(prof);
+        if (!pj.isEmpty()) {
+            params.insert(QStringLiteral("provider"), pj);
+        }
+    }
+    m_core->call(QStringLiteral("agent.resume"), params,
                  [this](const QJsonObject &, const QJsonObject &error) {
                      if (!error.isEmpty()) {
                          addNote(QStringLiteral("Could not resume: %1")
@@ -1333,6 +1441,7 @@ void AgentPanel::refresh()
     m_modeCombo->setEnabled(m_threadId.isEmpty());
     m_isolationCombo->setEnabled(m_threadId.isEmpty());
     m_effortCombo->setEnabled(m_threadId.isEmpty());
+    m_providerCombo->setEnabled(m_threadId.isEmpty());
     m_modelCombo->setEnabled(m_threadId.isEmpty());
     m_coworkCheck->setEnabled(m_threadId.isEmpty());
 
@@ -1693,6 +1802,32 @@ void AgentPanel::onSendClicked()
                 QStringLiteral("err"));
         return;
     }
+
+    // Resolve the API provider for a fresh start up front, while the composer
+    // still holds the message — a missing key aborts cleanly without losing it.
+    // (akcore inherits this UI's environment, so if the key can't be resolved
+    // here it cannot be resolved at launch either.)
+    QJsonObject providerJson;
+    QString startedProviderId;
+    if (m_threadId.isEmpty() && m_providerCombo) {
+        const ProviderProfile prof =
+            ProviderStore::byId(m_providerCombo->currentData().toString());
+        if (prof.routed()) {
+            providerJson = ProviderStore::toJson(prof);
+            if (!providerJson.contains(QStringLiteral("authToken"))) {
+                addNote(QStringLiteral(
+                            "No API key is configured for provider “%1”. Set one in "
+                            "Options ▸ Configure API Providers… (or its %2 environment "
+                            "variable), then try again.")
+                            .arg(prof.name.toHtmlEscaped(),
+                                 prof.envVar.isEmpty() ? QStringLiteral("API key")
+                                                       : prof.envVar.toHtmlEscaped()),
+                        QStringLiteral("err"));
+                return;
+            }
+            startedProviderId = prof.id;
+        }
+    }
     // A turn is in progress: queue the follow-up instead of sending it now.
     // The `claude` CLI buffers a second stdin user message until the current
     // turn ends (verified: it is consumed at the turn boundary, never injected
@@ -1738,20 +1873,20 @@ void AgentPanel::onSendClicked()
         }
         emit titleChanged(title);
 
-        m_core->call(QStringLiteral("agent.start"),
-                     QJsonObject{{QStringLiteral("workspacePath"), m_workspace},
-                                 {QStringLiteral("prompt"), text},
-                                 {QStringLiteral("permissionMode"),
-                                  m_modeCombo->currentData().toString()},
-                                 {QStringLiteral("isolation"),
-                                  m_isolationCombo->currentData().toString()},
-                                 {QStringLiteral("effort"),
-                                  m_effortCombo->currentData().toString()},
-                                 {QStringLiteral("model"),
-                                  m_modelCombo->currentData().toString()},
-                                 {QStringLiteral("coworkEnabled"),
-                                  m_coworkCheck->isChecked()},
-                                 {QStringLiteral("attachments"), attachments}},
+        QJsonObject startParams{
+            {QStringLiteral("workspacePath"), m_workspace},
+            {QStringLiteral("prompt"), text},
+            {QStringLiteral("permissionMode"), m_modeCombo->currentData().toString()},
+            {QStringLiteral("isolation"), m_isolationCombo->currentData().toString()},
+            {QStringLiteral("effort"), m_effortCombo->currentData().toString()},
+            {QStringLiteral("model"), m_modelCombo->currentData().toString()},
+            {QStringLiteral("coworkEnabled"), m_coworkCheck->isChecked()},
+            {QStringLiteral("attachments"), attachments}};
+        if (!providerJson.isEmpty()) {
+            startParams.insert(QStringLiteral("provider"), providerJson);
+        }
+        m_startedProviderId = startedProviderId;
+        m_core->call(QStringLiteral("agent.start"), startParams,
                      [this](const QJsonObject &result, const QJsonObject &error) {
                          if (!error.isEmpty()) {
                              addNote(QStringLiteral("Failed to start agent: %1")

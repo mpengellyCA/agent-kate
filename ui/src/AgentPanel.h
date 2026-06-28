@@ -71,6 +71,11 @@ public:
     // Re-read chat preferences (send key, tool-card visibility) from KConfig.
     void applyChatSettings();
 
+    // Re-read the configured API provider profiles (after the Providers settings
+    // dialog closes) and rebuild the provider picker. No-op once a thread exists,
+    // since the picker is frozen then.
+    void reloadProviders();
+
     // Attach a set of local file paths as context for the next message. Used
     // by drag-and-drop from ProjectTree (and by the Attach… button).
     void attachPaths(const QStringList &paths);
@@ -153,6 +158,9 @@ private:
     // Issue the actual agent.resume call. Called by resume() after any
     // pre-resume compaction has run (or been declined).
     void doResume();
+    // Rebuild the model combo to match the selected provider: Claude tiers for
+    // Claude-direct, or the provider's own model ids otherwise.
+    void rebuildModelCombo();
     void showNextPermission();
     void answerPermission(bool allow);
     void buildQuestionForm(const QJsonObject &req);
@@ -242,7 +250,12 @@ private:
     QComboBox *m_modeCombo = nullptr;
     QComboBox *m_isolationCombo = nullptr;
     QComboBox *m_effortCombo = nullptr;
+    QComboBox *m_providerCombo = nullptr; // third-party API provider (or Claude direct)
     QComboBox *m_modelCombo = nullptr;
+    // Id of the provider this thread was started with, so a same-session resume
+    // can re-attach a KWallet-held API token the core never persists. Empty for
+    // Claude direct.
+    QString m_startedProviderId;
     QCheckBox *m_coworkCheck = nullptr; // start this agent with the Cowork desktop tools wired in
     // Compaction strategy + strip flag — controls how the thread's transcript
     // is condensed to keep resume cost down. Both are sticky to last used.

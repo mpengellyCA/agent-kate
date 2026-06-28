@@ -34,6 +34,12 @@ find_package(KF6 6.0 REQUIRED COMPONENTS
     Archive             # KZip — native .xlsx (OOXML zip) reading in CsvView
 )
 
+# Optional: KF6 Wallet stores third-party API provider keys (plan 11) in the KDE
+# secret service. The build stays green without it — ProviderConfig falls back to
+# resolving keys from environment variables (all KWallet code is guarded by
+# AK_HAVE_KWALLET and the feature simply degrades to env-var-only keys).
+find_package(KF6 6.0 QUIET COMPONENTS Wallet)
+
 add_executable(agentkate
     src/main.cpp
     src/state/Reactive.cpp
@@ -46,6 +52,8 @@ add_executable(agentkate
     src/XlsxReader.cpp
     src/RichTextView.cpp
     src/ExtensionsDialog.cpp
+    src/ProviderConfig.cpp
+    src/ProvidersDialog.cpp
     src/ProblemsPanel.cpp
     src/ReferencesPanel.cpp
     src/OutlinePanel.cpp
@@ -133,6 +141,17 @@ if(TARGET PkgConfig::PipeWire)
     message(STATUS "agentkate: libpipewire-0.3 found — cowork cursor-control consumer enabled")
 else()
     message(STATUS "agentkate: libpipewire-0.3 not found — cowork cursor-control consumer disabled")
+endif()
+
+# Provider key storage: link KF6::Wallet and flip AK_HAVE_KWALLET when present.
+# Absent, ProviderConfig compiles fine (all KWallet code is #ifdef AK_HAVE_KWALLET)
+# and provider keys are resolved from environment variables only.
+if(TARGET KF6::Wallet)
+    target_compile_definitions(agentkate PRIVATE AK_HAVE_KWALLET)
+    target_link_libraries(agentkate PRIVATE KF6::Wallet)
+    message(STATUS "agentkate: KF6Wallet found — provider API keys stored in KWallet")
+else()
+    message(STATUS "agentkate: KF6Wallet not found — provider keys via env vars only")
 endif()
 
 # Place the UI binary in the build root so it sits next to akcore; the UI

@@ -39,6 +39,10 @@ public:
     // Re-apply chat preferences (send key, tool-card visibility) to every panel.
     void applyChatSettings();
 
+    // Re-read configured API provider profiles into every not-yet-started panel's
+    // provider picker (called after the Providers settings dialog closes).
+    void reloadProviders();
+
     // threadId of the currently-active agent panel, empty if none / not started.
     QString currentThreadId() const;
 

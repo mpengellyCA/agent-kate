@@ -95,6 +95,7 @@ type StartOptions struct {
 	SessionID      string       // Claude Code session id (a UUID)
 	Resume         bool         // true: --resume the session; false: --session-id a new one
 	CoworkEnabled  bool         // opt this thread into the KDE Cowork desktop MCP server
+	Provider       *Provider    // optional third-party API routing; nil/empty BaseURL = Claude direct
 }
 
 // buildUserContent assembles a stream-json user message content array from the
@@ -324,6 +325,15 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 
 	cmd := exec.Command(s.claudeBin, args...)
 	cmd.Dir = opts.WorkDir
+	// Route this child at a third-party Anthropic-compatible endpoint when a
+	// provider is selected; buildEnv scrubs any inherited Anthropic credentials
+	// first so a real Claude key is never forwarded to someone else's base URL.
+	// Claude-direct threads get os.Environ() back unchanged.
+	env, err := buildEnv(os.Environ(), opts.Provider)
+	if err != nil {
+		return nil, err
+	}
+	cmd.Env = env
 	// Put the agent in its own process group so Interrupt() can signal the whole
 	// group (claude + any tools / MCP subprocesses it spawns) rather than
 	// orphaning children. The group id equals the leader's pid.
@@ -371,7 +381,11 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 
 	// The "started" lifecycle event is emitted by the orchestration layer
 	// once the thread id is known to the UI; here we only log.
-	s.log.Info("agent process spawned", "thread", t.ID, "dir", opts.WorkDir, "pid", cmd.Process.Pid)
+	provider := ""
+	if opts.Provider.Routed() {
+		provider = opts.Provider.ID // id/base URL only — never the token
+	}
+	s.log.Info("agent process spawned", "thread", t.ID, "dir", opts.WorkDir, "pid", cmd.Process.Pid, "provider", provider)
 
 	safe.Go("agent.pumpStdout", func() { s.pumpStdout(t, stdout) })
 	safe.Go("agent.pumpStderr", func() { s.pumpStderr(t, stderr) })

@@ -58,6 +58,18 @@ type Record struct {
 	// (desktop see/control). Off by default; only the UI may flip it
 	// (cowork.setEnabled). See docs/plans/08-kde-cowork/.
 	CoworkEnabled bool `json:"coworkEnabled,omitempty"`
+
+	// Third-party API provider routing (non-secret snapshot). When
+	// ProviderBaseURL is set, this thread ran the `claude` harness against a
+	// third-party Anthropic-compatible endpoint (Fireworks, OpenRouter, …)
+	// rather than Anthropic's own. The API token is DELIBERATELY not stored: it
+	// is re-resolved at resume from ProviderEnvVar, or re-supplied by the UI.
+	// Empty ProviderBaseURL means Claude direct. See docs/plans/11-third-party-providers.md.
+	ProviderID      string            `json:"providerId,omitempty"`
+	ProviderName    string            `json:"providerName,omitempty"`
+	ProviderBaseURL string            `json:"providerBaseUrl,omitempty"`
+	ProviderEnvVar  string            `json:"providerEnvVar,omitempty"`
+	ProviderModels  map[string]string `json:"providerModels,omitempty"`
 }
 
 // Store is the on-disk set of thread records, mirrored in memory.
