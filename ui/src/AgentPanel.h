@@ -61,6 +61,14 @@ public:
     // isn't an offered choice.
     void preselectModel(const QString &modelId);
 
+    // Pre-pick the other start-time settings before the first start, for the
+    // guided New Agent dialog. All no-ops once a thread exists.
+    void preselectIsolation(const QString &isolation); // "auto" | "isolated" | "workspace"
+    void preselectPermission(const QString &mode);     // permission-mode data value
+    void preselectEffort(const QString &effort);       // "" | low | medium | high | xhigh | max
+    // Pre-fill the composer with a first task (the user still presses Start/Send).
+    void setComposerText(const QString &text);
+
     // Bind this panel to a persisted-but-not-running thread; resume() relaunches
     // it through the core's agent.resume.
     void setDormant(const QString &threadId, const QString &title, bool isolated);

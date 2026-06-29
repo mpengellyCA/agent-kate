@@ -68,6 +68,9 @@ public:
     bool activeAgentHasWorktree() const; // git lifecycle ops are meaningful
 
     void newAgentInActiveProject();
+    // Open the guided New Agent dialog, then create the agent with the chosen
+    // model / sandbox / options and pre-fill the first task into its composer.
+    void newAgentInActiveProjectGuided();
     void renameActiveAgent();
     void resumeActiveAgent();
     void attachToActiveAgent();

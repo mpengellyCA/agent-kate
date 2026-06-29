@@ -46,6 +46,7 @@ add_executable(agentkate
     src/theme/ThemeManager.cpp
     src/AppearanceDialog.cpp
     src/CommandPalette.cpp
+    src/NewAgentDialog.cpp
     src/MainWindow.cpp
     src/EditorArea.cpp
     src/DiffView.cpp
@@ -252,6 +253,7 @@ add_executable(akwidgets-preview EXCLUDE_FROM_ALL
     src/theme/ThemeManager.cpp
     src/AppearanceDialog.cpp
     src/CommandPalette.cpp
+    src/NewAgentDialog.cpp
     src/DiffView.cpp
     src/shell/FlowLayout.cpp
     themes/aktheme.qrc)

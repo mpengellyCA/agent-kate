@@ -1013,9 +1013,9 @@ void MainWindow::setupAgentMenu()
 
     auto *newAct = m_agentMenu->addAction(
         QIcon::fromTheme(QStringLiteral("list-add")), i18n("&New Agent"));
-    newAct->setToolTip(i18n("Start a fresh agent in the current project."));
+    newAct->setToolTip(i18n("Describe a task and start a fresh agent in the current project."));
     connect(newAct, &QAction::triggered, this,
-            [this] { m_agent->newAgentInActiveProject(); });
+            [this] { m_agent->newAgentInActiveProjectGuided(); });
 
     m_agentRenameAct = m_agentMenu->addAction(
         QIcon::fromTheme(QStringLiteral("document-edit")), i18n("&Rename Agent…"));

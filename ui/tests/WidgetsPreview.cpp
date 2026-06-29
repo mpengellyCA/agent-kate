@@ -12,6 +12,7 @@
 #include "AppearanceDialog.h"
 #include "CommandPalette.h"
 #include "DiffView.h"
+#include "NewAgentDialog.h"
 #include "theme/ThemeManager.h"
 
 #include <QAction>
@@ -86,6 +87,12 @@ int main(int argc, char **argv)
         diff->setWindowTitle(QStringLiteral("DiffView (narrow)"));
         diff->resize(w > 0 ? w : 360, 600);
         diff->show();
+        return app.exec();
+    }
+
+    if (mode == QLatin1String("newagent")) {
+        auto *dlg = new NewAgentDialog(QStringLiteral("ak-theme-preview"));
+        dlg->show();
         return app.exec();
     }
 

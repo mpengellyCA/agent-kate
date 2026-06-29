@@ -2,6 +2,7 @@
 #include "RecentProjects.h"
 #include "AgentPanel.h"
 #include "AgentRoster.h"
+#include "NewAgentDialog.h"
 #include "shell/PanelStack.h"
 #include "AutoOrganizeDialog.h"
 #include "TagEditorDialog.h"
@@ -371,6 +372,28 @@ void AgentDock::newAgentInActiveProject()
     if (!project.isEmpty()) {
         addAgent(project);
     }
+}
+
+void AgentDock::newAgentInActiveProjectGuided()
+{
+    const QString project = activeProjectPath();
+    if (project.isEmpty()) {
+        return;
+    }
+    NewAgentDialog dlg(QDir(project).dirName(), m_dialogParent);
+    if (dlg.exec() != QDialog::Accepted) {
+        return;
+    }
+    const NewAgentChoices c = dlg.choices();
+    AgentPanel *panel = addAgent(project, c.modelId);
+    if (!panel) {
+        return;
+    }
+    // The agent isn't started yet, so the combos are still free to set.
+    panel->preselectIsolation(c.isolation);
+    panel->preselectPermission(c.permissionMode);
+    panel->preselectEffort(c.effort);
+    panel->setComposerText(c.task);
 }
 
 void AgentDock::renameActiveAgent()

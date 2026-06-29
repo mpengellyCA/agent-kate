@@ -867,6 +867,48 @@ void AgentPanel::preselectModel(const QString &modelId)
     }
 }
 
+void AgentPanel::preselectIsolation(const QString &isolation)
+{
+    if (isolation.isEmpty() || !m_threadId.isEmpty()) {
+        return;
+    }
+    const int idx = m_isolationCombo->findData(isolation);
+    if (idx >= 0) {
+        m_isolationCombo->setCurrentIndex(idx);
+    }
+}
+
+void AgentPanel::preselectPermission(const QString &mode)
+{
+    if (mode.isEmpty() || !m_threadId.isEmpty()) {
+        return;
+    }
+    const int idx = m_modeCombo->findData(mode);
+    if (idx >= 0) {
+        m_modeCombo->setCurrentIndex(idx);
+    }
+}
+
+void AgentPanel::preselectEffort(const QString &effort)
+{
+    if (!m_threadId.isEmpty()) {
+        return;
+    }
+    const int idx = m_effortCombo->findData(effort);
+    if (idx >= 0) {
+        m_effortCombo->setCurrentIndex(idx);
+    }
+}
+
+void AgentPanel::setComposerText(const QString &text)
+{
+    if (text.isEmpty() || !m_input) {
+        return;
+    }
+    m_input->setPlainText(text);
+    m_input->setFocus();
+}
+
 void AgentPanel::rebuildModelCombo()
 {
     if (!m_modelCombo) {
