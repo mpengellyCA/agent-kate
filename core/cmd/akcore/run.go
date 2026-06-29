@@ -144,6 +144,20 @@ func runCore() {
 	defer cancelExitCompacts()
 	coldCompacts := &exitCompactTracker{ctx: exitCompactCtx}
 
+	// LastTurnAt is only a coarse staleness signal for the compaction layer, but a
+	// naive sessions.Update on every "result" rewrites the whole threads.json
+	// synchronously on this hot relay goroutine — many times a second under load.
+	// Throttle the persistence to at most once per thread per interval; the summary
+	// is always taken after the last turn anyway, so a slightly lagged LastTurnAt
+	// never causes a stale summary to be reused.
+	const lastTurnPersistInterval = 3 * time.Second
+	var lastTurnMu sync.Mutex
+	lastTurnPersisted := map[string]time.Time{}
+	// The Claude Code session id can change mid-session (e.g. an in-session
+	// compaction starts a new one). Persist it whenever it changes so a later
+	// --resume targets the latest session rather than the stale start-time id.
+	lastSessionID := map[string]string{}
+
 	// The agent supervisor relays every thread event to the UI as a
 	// notification, so the agent panel can render the conversation live. Events
 	// arrive pre-coalesced as an ordered batch; we forward the whole batch in a
@@ -155,19 +169,44 @@ func runCore() {
 		srv.Notify("agent.event", agentEventParams{ThreadID: threadID, Events: events})
 		for _, event := range events {
 			var probe struct {
-				Type  string `json:"type"`
-				Phase string `json:"phase"`
+				Type      string `json:"type"`
+				Phase     string `json:"phase"`
+				SessionID string `json:"session_id"`
 			}
 			if json.Unmarshal(event, &probe) != nil {
 				continue
+			}
+			// Persist a changed session id (rare — only on an in-session compaction)
+			// so resume follows it. UpdateQuiet: bookkeeping, not user activity.
+			if probe.SessionID != "" {
+				lastTurnMu.Lock()
+				changed := lastSessionID[threadID] != probe.SessionID
+				if changed {
+					lastSessionID[threadID] = probe.SessionID
+				}
+				lastTurnMu.Unlock()
+				if changed {
+					_ = sessions.UpdateQuiet(threadID, func(r *session.Record) {
+						r.SessionID = probe.SessionID
+					})
+				}
 			}
 			// Bump LastTurnAt on each turn completion. This is the staleness
 			// signal for the compaction layer — if the summary is older than the
 			// last turn, it needs to be refreshed before resume.
 			if probe.Type == "result" {
-				_ = sessions.Update(threadID, func(r *session.Record) {
-					r.LastTurnAt = time.Now()
-				})
+				now := time.Now()
+				lastTurnMu.Lock()
+				due := now.Sub(lastTurnPersisted[threadID]) >= lastTurnPersistInterval
+				if due {
+					lastTurnPersisted[threadID] = now
+				}
+				lastTurnMu.Unlock()
+				if due {
+					_ = sessions.Update(threadID, func(r *session.Record) {
+						r.LastTurnAt = now
+					})
+				}
 				continue
 			}
 			// When a thread exits, drop its cooperation locks and presence, and
@@ -176,6 +215,13 @@ func runCore() {
 			// background — Hot-Opus is a separate pre-reap flow.
 			if probe.Type == "_lifecycle" && (probe.Phase == "exited" || probe.Phase == "interrupted") {
 				coopState.ClearOwner(threadID)
+				srv.NotifyPrimaryUI("coop.changed", map[string]any{})
+				// Drop this thread's throttle bookkeeping so the maps don't grow
+				// for the life of the process across many agents.
+				lastTurnMu.Lock()
+				delete(lastTurnPersisted, threadID)
+				delete(lastSessionID, threadID)
+				lastTurnMu.Unlock()
 				_ = sessions.UpdateQuiet(threadID, func(r *session.Record) {
 					r.Status = session.StatusDormant
 				})

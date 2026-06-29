@@ -137,7 +137,6 @@ type Thread struct {
 	mu          sync.Mutex
 	cmd         *exec.Cmd
 	stdin       io.WriteCloser
-	sessionID   string      // captured from stream-json, for future --resume
 	mcpConfig   string      // temp --mcp-config file to clean up on exit
 	meter       *toolMeter  // measures tool_result sizes for token-cost telemetry
 	usage       *usageMeter // measures per-turn LLM token usage and billed cost
@@ -361,7 +360,6 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 		WorkDir:   opts.WorkDir,
 		cmd:       cmd,
 		stdin:     stdin,
-		sessionID: opts.SessionID,
 		mcpConfig: opts.MCPConfig,
 		meter:     newToolMeter(s.log, id),
 		usage:     newUsageMeter(s.log, id),
@@ -555,15 +553,10 @@ func (s *Supervisor) pumpStdout(t *Thread, r io.Reader) {
 			continue
 		}
 		raw := append([]byte(nil), line...)
-		// Capture the session id wherever it appears, for future --resume.
-		var probe struct {
-			SessionID string `json:"session_id"`
-		}
-		if json.Unmarshal(raw, &probe) == nil && probe.SessionID != "" {
-			t.mu.Lock()
-			t.sessionID = probe.SessionID
-			t.mu.Unlock()
-		}
+		// The live session id (which can change on an in-session compaction) is
+		// captured and persisted to the thread's Record in the supervisor relay
+		// (run.go), so --resume always targets the latest session.
+		//
 		// If a Hot-Opus compaction is in flight, accumulate the assistant
 		// text from this event and complete the channel on the next result.
 		observeHotCompact(t, raw)

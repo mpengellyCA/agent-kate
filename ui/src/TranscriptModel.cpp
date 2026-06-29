@@ -148,13 +148,40 @@ void TranscriptModel::setFind(const QString &needle, int currentRow)
     if (needle == m_findNeedle && currentRow == m_findRow) {
         return;
     }
+    const QString oldNeedle = m_findNeedle;
     m_findNeedle = needle;
     m_findRow = currentRow;
-    // Highlighting is a paint-time concern; it does not change row geometry, so
-    // no stable-id bump (heights are unchanged). Repaint every row.
-    if (!m_items.isEmpty()) {
-        emit dataChanged(index(0), index(m_items.size() - 1),
-                         {Qt::DisplayRole});
+    if (m_items.isEmpty()) {
+        return;
+    }
+    // A Message row whose plain text matches the needle is rendered as highlighted
+    // PLAIN text rather than its rendered-markdown HTML, and the two have different
+    // heights. So a row whose match state flips between the old and new needle must
+    // be re-measured: bump its stable id to evict the delegate's height-cache entry.
+    // (Rows that match both needles, or non-Message rows, keep the same height —
+    // a pure highlight/currentRow change is paint-only.)
+    bool geometryChanged = false;
+    if (oldNeedle != needle) {
+        const auto matches = [](const QString &text, const QString &n) {
+            return !n.isEmpty() && text.contains(n, Qt::CaseInsensitive);
+        };
+        for (int i = 0; i < m_items.size(); ++i) {
+            if (m_items[i].kind != Message) {
+                continue;
+            }
+            if (matches(m_items[i].plain, oldNeedle) != matches(m_items[i].plain, needle)) {
+                m_items[i].stableId = m_nextId++;
+                geometryChanged = true;
+            }
+        }
+    }
+    // A role-less dataChanged makes the view re-query sizeHint (re-measuring the
+    // rows whose stable id we bumped); restrict to a repaint when only the
+    // highlight/current-match moved and no row changed height.
+    if (geometryChanged) {
+        emit dataChanged(index(0), index(m_items.size() - 1));
+    } else {
+        emit dataChanged(index(0), index(m_items.size() - 1), {Qt::DisplayRole});
     }
 }
 

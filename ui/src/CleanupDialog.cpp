@@ -21,6 +21,7 @@
 #include <QProgressDialog>
 #include <QPushButton>
 #include <QTableView>
+#include <QTableWidget>
 #include <QVBoxLayout>
 
 namespace {
@@ -368,6 +369,9 @@ CleanupDialog::CleanupDialog(CoreClient *core, const QString &project, QWidget *
     m_status->setWordWrap(true);
 
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close, this);
+    auto *archivedBtn = new QPushButton(QIcon::fromTheme(QStringLiteral("document-open-recent")),
+                                        i18n("Restore archived…"), this);
+    buttons->addButton(archivedBtn, QDialogButtonBox::ActionRole);
     m_removeBtn = new QPushButton(QIcon::fromTheme(QStringLiteral("edit-delete")),
                                   i18n("Archive && Remove selected"), this);
     buttons->addButton(m_removeBtn, QDialogButtonBox::ActionRole);
@@ -379,10 +383,103 @@ CleanupDialog::CleanupDialog(CoreClient *core, const QString &project, QWidget *
     layout->addWidget(buttons);
 
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
+    connect(archivedBtn, &QPushButton::clicked, this, &CleanupDialog::showArchived);
     connect(m_removeBtn, &QPushButton::clicked, this, &CleanupDialog::onRemoveClicked);
     connect(m_advise, &QCheckBox::toggled, this, [this](bool on) { analyze(on); });
 
     analyze(false);
+}
+
+// showArchived lists the sessions that cleanup.archiveAndRemove set aside (their
+// worktrees are gone, but the transcript was kept) and lets the user bring one
+// back as a dormant workspace thread via cleanup.restore — the recoverable half
+// of the cleanup feature.
+void CleanupDialog::showArchived()
+{
+    m_core->call(
+        QStringLiteral("cleanup.listArchived"), {},
+        [this](const QJsonObject &result, const QJsonObject &error) {
+            if (!error.isEmpty()) {
+                KMessageBox::error(this, i18n("Could not list archived sessions: %1",
+                                              error.value(QStringLiteral("message")).toString()));
+                return;
+            }
+            const QJsonArray archived = result.value(QStringLiteral("archived")).toArray();
+
+            auto *dlg = new QDialog(this);
+            dlg->setAttribute(Qt::WA_DeleteOnClose);
+            dlg->setWindowTitle(i18n("Restore Archived Session"));
+            dlg->resize(560, 360);
+            auto *v = new QVBoxLayout(dlg);
+
+            auto *table = new QTableWidget(archived.size(), 4, dlg);
+            table->setHorizontalHeaderLabels(
+                {i18n("Agent"), i18n("Branch"), i18n("Archived"), i18n("Reason")});
+            table->setSelectionBehavior(QAbstractItemView::SelectRows);
+            table->setSelectionMode(QAbstractItemView::SingleSelection);
+            table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+            table->verticalHeader()->setVisible(false);
+            table->horizontalHeader()->setStretchLastSection(true);
+            for (int row = 0; row < archived.size(); ++row) {
+                const QJsonObject o = archived.at(row).toObject();
+                const QString threadId = o.value(QStringLiteral("threadId")).toString();
+                const int number = o.value(QStringLiteral("number")).toInt();
+                const QString agent = number > 0 ? i18n("Agent #%1", number)
+                                                 : o.value(QStringLiteral("title")).toString();
+                const QDateTime when = QDateTime::fromString(
+                    o.value(QStringLiteral("archivedAt")).toString(), Qt::ISODate);
+                auto *first = new QTableWidgetItem(agent);
+                first->setData(Qt::UserRole, threadId);
+                table->setItem(row, 0, first);
+                table->setItem(row, 1, new QTableWidgetItem(o.value(QStringLiteral("branch")).toString()));
+                table->setItem(row, 2,
+                               new QTableWidgetItem(when.isValid()
+                                                        ? when.toLocalTime().toString(
+                                                              QStringLiteral("yyyy-MM-dd HH:mm"))
+                                                        : QString()));
+                table->setItem(row, 3, new QTableWidgetItem(o.value(QStringLiteral("reason")).toString()));
+            }
+            if (archived.isEmpty()) {
+                auto *empty = new QLabel(i18n("No archived sessions."), dlg);
+                empty->setAlignment(Qt::AlignCenter);
+                v->addWidget(empty, 1);
+            } else {
+                v->addWidget(table, 1);
+            }
+
+            auto *bb = new QDialogButtonBox(QDialogButtonBox::Close, dlg);
+            auto *restoreBtn = new QPushButton(
+                QIcon::fromTheme(QStringLiteral("edit-undo")), i18n("Restore"), dlg);
+            restoreBtn->setEnabled(false);
+            bb->addButton(restoreBtn, QDialogButtonBox::ActionRole);
+            v->addWidget(bb);
+            connect(table, &QTableWidget::itemSelectionChanged, restoreBtn,
+                    [table, restoreBtn] { restoreBtn->setEnabled(!table->selectedItems().isEmpty()); });
+            connect(bb, &QDialogButtonBox::rejected, dlg, &QDialog::reject);
+            connect(restoreBtn, &QPushButton::clicked, dlg, [this, dlg, table] {
+                const int row = table->currentRow();
+                if (row < 0 || !table->item(row, 0)) {
+                    return;
+                }
+                const QString threadId = table->item(row, 0)->data(Qt::UserRole).toString();
+                m_core->call(
+                    QStringLiteral("cleanup.restore"),
+                    QJsonObject{{QStringLiteral("threadId"), threadId}},
+                    [this, dlg](const QJsonObject &, const QJsonObject &err) {
+                        if (!err.isEmpty()) {
+                            KMessageBox::error(dlg, i18n("Restore failed: %1",
+                                                         err.value(QStringLiteral("message")).toString()));
+                            return;
+                        }
+                        emit statusMessage(i18n("Session restored to the workspace"));
+                        emit cleaned();
+                        dlg->accept();
+                    },
+                    this); // lifetime guard on the cleanup.restore reply
+            });
+            dlg->show();
+        },
+        this); // lifetime guard on the cleanup.listArchived reply
 }
 
 void CleanupDialog::analyze(bool advise)
@@ -406,7 +503,8 @@ void CleanupDialog::analyze(bool advise)
                          return;
                      }
                      applyResult(result);
-                 });
+                 },
+                 this); // lifetime guard: dialog is non-modal + WA_DeleteOnClose
 }
 
 void CleanupDialog::applyResult(const QJsonObject &result)
@@ -567,5 +665,6 @@ void CleanupDialog::removeNext()
                      }
                      ++m_queueIndex;
                      removeNext();
-                 });
+                 },
+                 this); // lifetime guard: dialog is non-modal + WA_DeleteOnClose
 }

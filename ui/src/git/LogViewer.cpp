@@ -254,7 +254,8 @@ void LogViewer::resolveThreadForProject()
                      m_source = Source{matchedThread, QString(), QString()};
                      updateLabel();
                      reloadFromFirstPage();
-                 });
+                 },
+                 this); // lifetime guard against late reply after viewer destruction
 }
 
 void LogViewer::reloadFromFirstPage()

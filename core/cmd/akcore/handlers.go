@@ -786,6 +786,7 @@ func registerHandlers(d handlerDeps) {
 			p.Owner = "human"
 		}
 		d.coop.SetOpenFiles(p.Owner, p.Files)
+		d.srv.NotifyPrimaryUI("coop.changed", map[string]any{})
 		return map[string]any{"ok": true}, nil
 	})
 
@@ -801,7 +802,9 @@ func registerHandlers(d handlerDeps) {
 		if p.Author == "" {
 			p.Author = "human"
 		}
-		return d.coop.PostNote(p.Author, p.Text), nil
+		note := d.coop.PostNote(p.Author, p.Text)
+		d.srv.NotifyPrimaryUI("coop.changed", map[string]any{})
+		return note, nil
 	})
 
 	d.srv.Handle("coop.readNotes", func(_ context.Context, _ json.RawMessage) (any, error) {
@@ -820,6 +823,7 @@ func registerHandlers(d handlerDeps) {
 			p.Owner = "human"
 		}
 		d.coop.SetPresence(p.Owner, p.FocusedFile)
+		d.srv.NotifyPrimaryUI("coop.changed", map[string]any{})
 		return map[string]any{"ok": true}, nil
 	})
 
@@ -843,6 +847,7 @@ func registerHandlers(d handlerDeps) {
 			p.Owner = "human"
 		}
 		ok, holder := d.coop.ClaimFile(p.Path, p.Owner)
+		d.srv.NotifyPrimaryUI("coop.changed", map[string]any{})
 		return map[string]any{"ok": ok, "holder": holder}, nil
 	})
 
@@ -858,6 +863,7 @@ func registerHandlers(d handlerDeps) {
 			p.Owner = "human"
 		}
 		d.coop.ReleaseFile(p.Path, p.Owner)
+		d.srv.NotifyPrimaryUI("coop.changed", map[string]any{})
 		return map[string]any{"ok": true}, nil
 	})
 
@@ -875,7 +881,26 @@ func registerHandlers(d handlerDeps) {
 			"summary":  p.Summary,
 			"id":       rev.ID,
 		})
+		d.srv.NotifyPrimaryUI("coop.changed", map[string]any{})
 		return map[string]any{"id": rev.ID}, nil
+	})
+
+	d.srv.Handle("coop.listReviews", func(_ context.Context, _ json.RawMessage) (any, error) {
+		return map[string]any{"reviews": d.coop.ListReviews()}, nil
+	})
+
+	// coop.getState is the UI's one-shot read of the whole cooperation board for
+	// the Cooperation panel: presence, soft-lock claims, open files, notes and the
+	// review backlog. The panel refreshes it whenever a coop.changed notification
+	// fires (any mutation, agent- or human-driven).
+	d.srv.Handle("coop.getState", func(_ context.Context, _ json.RawMessage) (any, error) {
+		return map[string]any{
+			"presence":  d.coop.ListPresence(),
+			"claims":    d.coop.ListClaims(),
+			"openFiles": d.coop.ListOpenFiles(),
+			"notes":     d.coop.ReadNotes(),
+			"reviews":   d.coop.ListReviews(),
+		}, nil
 	})
 
 	// --- per-tool approval -------------------------------------------------
@@ -919,9 +944,13 @@ func registerHandlers(d handlerDeps) {
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
-		d.broker.Resolve(p.RequestID,
+		// Resolve reports whether the decision was actually delivered to a waiting
+		// request; surface it so the UI can tell a real answer from one that hit an
+		// already-timed-out or unknown request (a stale dialog) instead of always
+		// claiming success.
+		delivered := d.broker.Resolve(p.RequestID,
 			permission.Decision{Allow: p.Allow, UpdatedInput: p.UpdatedInput})
-		return map[string]any{"ok": true}, nil
+		return map[string]any{"ok": delivered}, nil
 	})
 
 	// --- VS Code extension reuse -------------------------------------------

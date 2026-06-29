@@ -107,6 +107,7 @@ Q_SIGNALS:
 private:
     void analyze(bool advise);
     void applyResult(const QJsonObject &result);
+    void showArchived();
     void onRemoveClicked();
     void runRemovals(const QList<CleanupCandidate> &targets);
     void removeNext();

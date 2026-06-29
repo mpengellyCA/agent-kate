@@ -22,6 +22,8 @@ class TerminalPanel;
 class WorktreeDashboard;
 class LogViewer;
 class CoworkPanel;
+class CooperationPanel;
+class AiInspectorPanel;
 class CoworkPortal;
 class SideBar;
 class ShellLayout;
@@ -102,6 +104,8 @@ private:
     WorktreeDashboard *m_worktreeDashboard = nullptr;
     LogViewer *m_logViewer = nullptr;
     CoworkPanel *m_coworkPanel = nullptr;
+    CooperationPanel *m_coopPanel = nullptr;
+    AiInspectorPanel *m_inspectorPanel = nullptr;
     CoworkPortal *m_coworkPortal = nullptr;
     QLabel *m_gitStatusLabel = nullptr; // status-bar git widget for the active editor
 

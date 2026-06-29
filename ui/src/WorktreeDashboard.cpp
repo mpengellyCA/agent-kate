@@ -428,7 +428,8 @@ void WorktreeDashboard::landSelected()
                                  refresh();
                              });
                      dlg->show();
-                 });
+                 },
+                 this); // lifetime guard against late reply after dashboard destruction
 }
 
 void WorktreeDashboard::openCommitDialog()
@@ -483,7 +484,8 @@ void WorktreeDashboard::discardSelected()
                      }
                      emit statusMessage(i18n("Discarded uncommitted changes"));
                      refresh();
-                 });
+                 },
+                 this); // lifetime guard against late reply after dashboard destruction
 }
 
 void WorktreeDashboard::removeSelected()
@@ -523,7 +525,8 @@ void WorktreeDashboard::removeSelected()
                      }
                      emit statusMessage(i18n("Worktree removed"));
                      refresh();
-                 });
+                 },
+                 this); // lifetime guard against late reply after dashboard destruction
 }
 
 void WorktreeDashboard::showRowContextMenu(const QPoint &pos)

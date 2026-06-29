@@ -47,11 +47,17 @@ func (c *Client) ActivateWindow(internalID string, timeout time.Duration) error 
 
 	scripting := c.conn.Object("org.kde.KWin", dbus.ObjectPath("/Scripting"))
 	var id int32
-	if err := scripting.Call("org.kde.kwin.Scripting.loadScript", 0, tmp, "akcore_activate_"+nonce).Store(&id); err != nil {
+	pluginName := "akcore_activate_" + nonce
+	if err := scripting.Call("org.kde.kwin.Scripting.loadScript", 0, tmp, pluginName).Store(&id); err != nil {
 		return fmt.Errorf("kde: loadScript: %w", err)
 	}
 	scriptObj := c.conn.Object("org.kde.KWin", dbus.ObjectPath(fmt.Sprintf("/Scripting/Script%d", id)))
-	stop := func() { _ = scriptObj.Call("org.kde.kwin.Script.stop", 0).Err }
+	// stop() halts the script AND unloads it — KWin keeps a Script object alive per
+	// loadScript until unloadScript, so without this each call leaks one in KWin.
+	stop := func() {
+		_ = scriptObj.Call("org.kde.kwin.Script.stop", 0).Err
+		_ = scripting.Call("org.kde.kwin.Scripting.unloadScript", 0, pluginName).Err
+	}
 
 	if runErr := scriptObj.Call("org.kde.kwin.Script.run", 0).Err; runErr != nil {
 		if e2 := scripting.Call("org.kde.kwin.Scripting.start", 0).Err; e2 != nil {

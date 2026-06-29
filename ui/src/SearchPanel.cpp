@@ -378,6 +378,11 @@ void SearchPanel::scheduleSearch()
 
 void SearchPanel::clearResults()
 {
+    // Bump the generation so any in-flight search reply is dropped rather than
+    // rendered into the now-cleared view. This covers a project switch
+    // (setProjectRoot) and the empty-query/disconnected early-returns in
+    // runSearch(), all of which clear results while a search may still be pending.
+    ++m_seq;
     m_results->clear();
 }
 

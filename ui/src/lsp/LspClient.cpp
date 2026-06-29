@@ -36,6 +36,25 @@ void LspClient::setState(State state)
     emit stateChanged(m_state);
 }
 
+void LspClient::flushPending()
+{
+    // The server is gone, so no response will ever arrive for these. Resolve each
+    // live callback with a null result (callers already treat a non-array/empty
+    // result as "no data"; format-on-save then proceeds to save unformatted rather
+    // than dropping the save) and drop queued requests that were never sent.
+    // Iterate over a copy: a callback may re-enter request() and touch m_callbacks.
+    const QHash<int, PendingCallback> pending = m_callbacks;
+    m_callbacks.clear();
+    m_queue.clear();
+    for (auto it = pending.constBegin(); it != pending.constEnd(); ++it) {
+        const PendingCallback &p = it.value();
+        if (!p.cb || (p.guarded && p.context.isNull())) {
+            continue;
+        }
+        p.cb(QJsonValue());
+    }
+}
+
 void LspClient::start(const QString &command, const QStringList &args, const QString &rootPath)
 {
     m_command = command;
@@ -47,12 +66,17 @@ void LspClient::start(const QString &command, const QStringList &args, const QSt
     connect(m_proc, &QProcess::errorOccurred, this, [this, command](QProcess::ProcessError) {
         qWarning().noquote() << "[lsp]" << command << "unavailable:" << m_proc->errorString();
         setState(State::Crashed);
+        flushPending();
     });
     connect(m_proc, &QProcess::finished, this,
             [this](int, QProcess::ExitStatus status) {
                 if (status == QProcess::CrashExit) {
                     setState(State::Crashed);
                 }
+                // Whether it crashed or exited cleanly, no further responses will
+                // arrive — resolve anything still pending so awaiting callers (e.g.
+                // format-on-save) are not wedged.
+                flushPending();
             });
     connect(m_proc, &QProcess::started, this, [this] {
         // Advertise the client features the richer code-intelligence relies on.

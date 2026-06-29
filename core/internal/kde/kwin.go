@@ -104,7 +104,12 @@ func (c *Client) ListWindows(timeout time.Duration) ([]Window, error) {
 	}
 
 	scriptObj := c.conn.Object("org.kde.KWin", dbus.ObjectPath(fmt.Sprintf("/Scripting/Script%d", id)))
-	stop := func() { _ = scriptObj.Call("org.kde.kwin.Script.stop", 0).Err }
+	// stop() halts the script AND unloads it — KWin keeps a Script object alive per
+	// loadScript until unloadScript, so without this each call leaks one in KWin.
+	stop := func() {
+		_ = scriptObj.Call("org.kde.kwin.Script.stop", 0).Err
+		_ = scripting.Call("org.kde.kwin.Scripting.unloadScript", 0, pluginName).Err
+	}
 
 	if runErr := scriptObj.Call("org.kde.kwin.Script.run", 0).Err; runErr != nil {
 		// Fallback: start() runs all pending scripts (older/edge KWin object-path layouts).

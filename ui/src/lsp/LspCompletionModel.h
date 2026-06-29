@@ -62,4 +62,7 @@ private:
     QString m_path;
     QList<Item> m_items;
     bool m_pending = false;
+    // Bumped on every completion request; a reply only applies if it still matches,
+    // so a late/out-of-order response can't overwrite a newer popup with stale items.
+    quint64 m_completionGen = 0;
 };

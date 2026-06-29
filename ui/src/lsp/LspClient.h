@@ -71,6 +71,9 @@ private:
     void onStdout();
     void handleMessage(const QJsonObject &msg);
     void setState(State state);
+    // Resolve every pending request with a null result when the server is gone,
+    // so callers awaiting a reply complete instead of hanging forever.
+    void flushPending();
 
     QProcess *m_proc = nullptr;
     QByteArray m_buf;

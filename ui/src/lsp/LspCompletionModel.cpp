@@ -69,6 +69,7 @@ void LspCompletionModel::completionInvoked(KTextEditor::View *view,
     // Force a sync so the server completes against the current document text.
     m_client->didChange(m_path, view->document()->text());
     m_pending = true;
+    const quint64 gen = ++m_completionGen;
 
     QPointer<LspCompletionModel> self(this);
     m_client->request(
@@ -79,8 +80,9 @@ void LspCompletionModel::completionInvoked(KTextEditor::View *view,
             {QStringLiteral("position"),
              QJsonObject{{QStringLiteral("line"), pos.line()},
                          {QStringLiteral("character"), pos.column()}}}},
-        [self](const QJsonValue &result) {
-            if (self) {
+        [self, gen](const QJsonValue &result) {
+            // Drop a stale/out-of-order reply: only the newest request may apply.
+            if (self && gen == self->m_completionGen) {
                 self->applyCompletions(result);
             }
         });

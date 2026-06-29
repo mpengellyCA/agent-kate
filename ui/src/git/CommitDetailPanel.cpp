@@ -168,7 +168,8 @@ void CommitDetailPanel::loadDetail()
                          return;
                      }
                      applyDetail(result);
-                 });
+                 },
+                 this); // lifetime guard against late reply after panel destruction
 }
 
 void CommitDetailPanel::loadDiff(const QString &path)
@@ -191,7 +192,8 @@ void CommitDetailPanel::loadDiff(const QString &path)
                          patch = result.value(QStringLiteral("patch")).toString();
                      }
                      replaceDiff(patch);
-                 });
+                 },
+                 this); // lifetime guard against late reply after panel destruction
 }
 
 void CommitDetailPanel::applyDetail(const QJsonObject &detail)
@@ -336,6 +338,7 @@ void CommitDetailPanel::showContextMenu(const QPoint &pos)
                          if (!patch.isEmpty()) {
                              QApplication::clipboard()->setText(patch);
                          }
-                     });
+                     },
+                     this); // lifetime guard against late reply after panel destruction
     }
 }

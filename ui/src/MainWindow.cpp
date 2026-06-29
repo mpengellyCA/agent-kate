@@ -15,6 +15,8 @@
 #include "TerminalPanel.h"
 #include "WelcomeDialog.h"
 #include "WorktreeDashboard.h"
+#include "AiInspectorPanel.h"
+#include "CooperationPanel.h"
 #include "cowork/CoworkPanel.h"
 #include "cowork/CoworkPortal.h"
 #include "shell/ShellLayout.h"
@@ -216,20 +218,14 @@ void MainWindow::setupUi()
                   QStringLiteral("right"));
     registerPanel(m_keyGitLog, QIcon::fromTheme(QStringLiteral("vcs-commit")),
                   i18n("Git Log"), m_logViewer, QStringLiteral("right"));
+    m_coopPanel = new CooperationPanel(m_core, this);
     registerPanel(m_keyCoop, QIcon::fromTheme(QStringLiteral("im-user")),
-                  i18n("Cooperation"),
-                  new StubPanel(i18n("Cooperation"),
-                                i18n("Live agent presence and file locks from the Cooperation MCP."),
-                                this),
-                  QStringLiteral("right"));
+                  i18n("Cooperation"), m_coopPanel, QStringLiteral("right"));
     registerPanel(m_keyCowork, QIcon::fromTheme(QStringLiteral("video-display")),
                   i18n("Cowork"), m_coworkPanel, QStringLiteral("right"));
+    m_inspectorPanel = new AiInspectorPanel(m_core, this);
     registerPanel(m_keyInspector, QIcon::fromTheme(QStringLiteral("view-statistics")),
-                  i18n("AI Inspector"),
-                  new StubPanel(i18n("AI Inspector"),
-                                i18n("Tool-call timeline and token spend for the active agent."),
-                                this),
-                  QStringLiteral("right"));
+                  i18n("AI Inspector"), m_inspectorPanel, QStringLiteral("right"));
 
     registerPanel(m_keyTerminal, QIcon::fromTheme(QStringLiteral("utilities-terminal")),
                   i18n("Terminal"), m_terminal, QStringLiteral("bottom"));
@@ -380,6 +376,9 @@ void MainWindow::setupUi()
         }
         if (m_logViewer) {
             m_logViewer->setActiveSource(m_activeProject, threadId);
+        }
+        if (m_inspectorPanel) {
+            m_inspectorPanel->setActiveThread(threadId);
         }
     });
     connect(m_agent, &AgentDock::projectFocused, this,
@@ -1862,7 +1861,8 @@ void MainWindow::reloadExtensionServers()
                      // Apply newly-registered servers to already-open files.
                      m_lsp->rebindOpenDocuments();
                      updateLspStatus();
-                 });
+                 },
+                 this); // lifetime guard so the disconnect-drain can't touch a dead window
 }
 
 void MainWindow::pushOpenFilesToCore()

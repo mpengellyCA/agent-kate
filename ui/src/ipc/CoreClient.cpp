@@ -11,6 +11,16 @@ namespace {
 constexpr int kMaxConnectAttempts = 30; // ~6s at 200ms spacing
 constexpr int kConnectRetryMs = 200;
 
+// A JSON-RPC error object delivered to a reply callback that can never be
+// answered by the core (send failed, or the connection dropped while pending).
+QJsonObject localError(const QString &message)
+{
+    return QJsonObject{
+        {QStringLiteral("code"), -32000},
+        {QStringLiteral("message"), message},
+    };
+}
+
 // Mirrors akcore's default socket location, made unique per UI process.
 QString runtimeSocketPath()
 {
@@ -29,7 +39,7 @@ CoreClient::CoreClient(QObject *parent)
 {
     connect(m_socket, &QLocalSocket::connected, this, &CoreClient::onSocketConnected);
     connect(m_socket, &QLocalSocket::readyRead, this, &CoreClient::onReadyRead);
-    connect(m_socket, &QLocalSocket::disconnected, this, &CoreClient::disconnected);
+    connect(m_socket, &QLocalSocket::disconnected, this, &CoreClient::onDisconnected);
     connect(m_socket, &QLocalSocket::errorOccurred, this,
             [this](QLocalSocket::LocalSocketError) {
                 if (m_socket->state() == QLocalSocket::ConnectedState) {
@@ -124,27 +134,59 @@ void CoreClient::call(const QString &method, const QJsonObject &params, ReplyCal
                       QObject *context)
 {
     const int id = m_nextId++;
+    const bool hadCb = static_cast<bool>(cb);
     if (cb) {
         m_pending.insert(id, PendingReply{std::move(cb), QPointer<QObject>(context),
                                           context != nullptr});
     }
-    send(QJsonObject{
+    const bool sent = send(QJsonObject{
         {QStringLiteral("jsonrpc"), QStringLiteral("2.0")},
         {QStringLiteral("id"), id},
         {QStringLiteral("method"), method},
         {QStringLiteral("params"), params},
     });
+    if (!sent && hadCb) {
+        // The frame never left the process (socket not connected). Resolve the
+        // pending callback now with an error rather than leak the closure until a
+        // reply that can never arrive — every caller already handles the error arg.
+        const PendingReply pending = m_pending.take(id);
+        if (pending.cb && !(pending.guarded && pending.context.isNull())) {
+            pending.cb({}, localError(QStringLiteral("not connected to core")));
+        }
+    }
 }
 
-void CoreClient::send(const QJsonObject &frame)
+bool CoreClient::send(const QJsonObject &frame)
 {
     if (m_socket->state() != QLocalSocket::ConnectedState) {
-        return;
+        return false;
     }
     QByteArray data = QJsonDocument(frame).toJson(QJsonDocument::Compact);
     data.append('\n');
     m_socket->write(data);
     m_socket->flush();
+    return true;
+}
+
+void CoreClient::onDisconnected()
+{
+    // Drain every outstanding reply so closures are not leaked and no caller is
+    // left awaiting a reply that can never come. Guarded callbacks whose context
+    // has already been destroyed are dropped (their captured state is gone); the
+    // rest are invoked once with a synthetic error. Iterate over a copy: a callback
+    // may re-enter call() and insert into m_pending. Also reset the read buffer so a
+    // half-frame left mid-stream cannot corrupt the first frame after a reconnect.
+    const QHash<int, PendingReply> pending = m_pending;
+    m_pending.clear();
+    m_buf.clear();
+    for (auto it = pending.constBegin(); it != pending.constEnd(); ++it) {
+        const PendingReply &p = it.value();
+        if (!p.cb || (p.guarded && p.context.isNull())) {
+            continue;
+        }
+        p.cb({}, localError(QStringLiteral("disconnected from core")));
+    }
+    emit disconnected();
 }
 
 void CoreClient::onReadyRead()

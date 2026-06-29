@@ -71,6 +71,8 @@ add_executable(agentkate
     src/cowork/ConsentDialog.cpp
     src/cowork/ControlConsentDialog.cpp
     src/cowork/BrowserLaunch.cpp
+    src/CooperationPanel.cpp
+    src/AiInspectorPanel.cpp
     src/TerminalPanel.cpp
     src/SearchPanel.cpp
     src/SessionBrowserDialog.cpp

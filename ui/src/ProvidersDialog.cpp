@@ -298,10 +298,11 @@ void ProvidersDialog::saveAndAccept()
     }
 
     ProviderStore::save(m_profiles);
+    // m_pendingKeys only holds keys the user actually edited, so apply each one —
+    // including an emptied field, which setKey() treats as "clear the entry".
+    // Skipping empty values here made a stored key impossible to remove from the UI.
     for (auto it = m_pendingKeys.constBegin(); it != m_pendingKeys.constEnd(); ++it) {
-        if (!it.value().isEmpty()) {
-            ProviderStore::setKey(it.key(), it.value());
-        }
+        ProviderStore::setKey(it.key(), it.value());
     }
     accept();
 }

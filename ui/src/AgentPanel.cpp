@@ -1336,6 +1336,11 @@ void AgentPanel::refresh()
         text += QStringLiteral(" · $%1")
                     .arg(QLocale().toString(m_sessionCostUsd, 'f', 4));
     }
+    // Surface the running token total (the AI Inspector breaks it down per turn).
+    const qlonglong sessionTok = m_sessionInTokens + m_sessionOutTokens;
+    if (sessionTok > 0) {
+        text += QStringLiteral(" · %1 tok").arg(QLocale().toString(sessionTok));
+    }
     m_header->setText(QStringLiteral("<span style='color:%1'>&#9679;</span>&nbsp;&nbsp;%2")
                           .arg(dot, text.toHtmlEscaped()));
     emit stateChanged(dot);

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"agentkate/internal/agent"
 	"agentkate/internal/compact"
@@ -196,9 +197,20 @@ func promoteAgentThread(d handlerDeps, rec session.Record) {
 	}
 
 	iso, err := worktree.Promote(rec.Worktree)
-	if err != nil {
+	if err != nil && !iso.Isolated {
+		// Promote failed before it created the worktree — there is nothing to
+		// adopt, so the record stays as-is and we just report the failure.
 		emitLifecycle(d.srv, rec.ThreadID, "error", "promote: "+err.Error(), &rec.Worktree)
 		return
+	}
+	// A non-nil err with a valid isolated worktree means the worktree WAS created
+	// but re-applying the stash hit a conflict (its markers are on disk for the
+	// user to resolve). Adopt the worktree regardless: dropping it here would leak
+	// the worktree and branch and leave the record pointing at the stale
+	// non-isolated path. We surface the conflict in the lifecycle detail instead.
+	promoteWarning := ""
+	if err != nil {
+		promoteWarning = err.Error()
 	}
 	// Relocate the Claude Code session so `--resume` finds it in the worktree.
 	if err := session.PromoteTranscript(rec.SessionID, rec.ThreadID); err != nil {
@@ -211,9 +223,16 @@ func promoteAgentThread(d handlerDeps, rec session.Record) {
 	d.threads.put(rec.ThreadID, iso)
 	d.gitCache.Register(iso)
 	d.gitCache.Activate(rec.ThreadID) // re-point the watch onto the new isolated worktree
-	d.log.Info("agent thread promoted", "thread", rec.ThreadID, "branch", iso.Branch)
-	emitLifecycle(d.srv, rec.ThreadID, "promoted",
-		"promoted to an isolated worktree on "+iso.Branch, &iso)
+	if promoteWarning != "" {
+		d.log.Warn("agent thread promoted with conflict",
+			"thread", rec.ThreadID, "branch", iso.Branch, "warn", promoteWarning)
+		emitLifecycle(d.srv, rec.ThreadID, "promoted",
+			"promoted to an isolated worktree on "+iso.Branch+" — "+promoteWarning, &iso)
+	} else {
+		d.log.Info("agent thread promoted", "thread", rec.ThreadID, "branch", iso.Branch)
+		emitLifecycle(d.srv, rec.ThreadID, "promoted",
+			"promoted to an isolated worktree on "+iso.Branch, &iso)
+	}
 
 	// Bring the thread back up, now inside its isolated worktree. The provider
 	// (if any) is rebuilt from the Record; its token re-resolves from the env var.
@@ -418,7 +437,12 @@ func summarizePrompt(prompt string) string {
 	}
 	const max = 70
 	if len(s) > max {
-		s = s[:max] + "…"
+		cut := max
+		// Back up to a rune boundary so a multi-byte rune is never split.
+		for cut > 0 && !utf8.RuneStart(s[cut]) {
+			cut--
+		}
+		s = s[:cut] + "…"
 	}
 	return s
 }

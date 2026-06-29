@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Programmatic builds a compact summary of a Claude Code transcript with no
@@ -272,6 +273,11 @@ func trimForDisplay(s string) string {
 func truncate(s string, max int) string {
 	if len(s) <= max {
 		return s
+	}
+	// Back up to a rune boundary so a multi-byte rune is never split (which would
+	// emit invalid UTF-8 into the summary body).
+	for max > 0 && !utf8.RuneStart(s[max]) {
+		max--
 	}
 	return s[:max] + "…"
 }

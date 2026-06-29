@@ -44,7 +44,8 @@ ShutdownDialog::ShutdownDialog(CoreClient *core, QWidget *parent)
     // ok once everything is drained; accept() on the reply as a belt-and-braces
     // companion to the "done" progress event.
     m_core->call(QStringLiteral("app.shutdown"), QJsonObject{},
-                 [this](const QJsonObject &, const QJsonObject &) { accept(); });
+                 [this](const QJsonObject &, const QJsonObject &) { accept(); },
+                 this); // lifetime guard: stack dialog is destroyed when exec() returns
 }
 
 void ShutdownDialog::onProgress(const QString &method, const QJsonObject &params)

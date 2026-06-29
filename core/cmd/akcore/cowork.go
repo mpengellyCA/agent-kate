@@ -34,6 +34,14 @@ const screenshotMaxDim = 1568
 func registerCoworkHandlers(d handlerDeps) {
 	cw := d.cowork
 	if cw == nil {
+		// The service failed to initialise (e.g. consent-store load error). Register
+		// a stand-in cowork.status so the UI's capability probe still gets a reply
+		// and can reach its "desktop integration unavailable" state — without this
+		// the probe returns method-not-found and the panel stays stuck on its
+		// default "checking…" text, silently masking that desktop access is off.
+		d.srv.Handle("cowork.status", func(_ context.Context, _ json.RawMessage) (any, error) {
+			return map[string]any{"available": false, "killed": false, "tampered": false}, nil
+		})
 		return
 	}
 

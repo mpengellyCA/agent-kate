@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // toolMeter measures how many characters each tool returns to the model on a
@@ -248,6 +249,11 @@ func summarizeInput(name string, raw json.RawMessage) string {
 func truncate(s string, max int) string {
 	if len(s) <= max {
 		return s
+	}
+	// Back up to a rune boundary so a multi-byte rune is never split, which would
+	// emit invalid UTF-8 into the log fields.
+	for max > 0 && !utf8.RuneStart(s[max]) {
+		max--
 	}
 	return s[:max] + "…"
 }

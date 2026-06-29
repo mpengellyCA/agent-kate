@@ -51,9 +51,16 @@ QColor noteColor(const QString &kind, bool dark)
 }
 
 // Wrap matches of `needle` in `plain` with a highlight span, escaping first.
-// Used by the find overlay so the highlighted body matches the QLabel days.
-QString highlightedHtml(const QString &plain, const QString &needle)
+// Used by the find overlay so the highlighted body matches the QLabel days. When
+// `current` is set this is the row holding the active match, so its hits use the
+// strong accent highlight; other matching rows use the muted `mid` role so the
+// current match stands out as the focus ring as the user cycles through hits.
+QString highlightedHtml(const QString &plain, const QString &needle, bool current)
 {
+    const QString span = current
+        ? QStringLiteral("<span style='background:palette(highlight); "
+                         "color:palette(highlighted-text)'>")
+        : QStringLiteral("<span style='background:palette(mid); color:palette(text)'>");
     QString escaped = plain.toHtmlEscaped();
     const QString escNeedle = needle.toHtmlEscaped();
     QString out;
@@ -65,9 +72,7 @@ QString highlightedHtml(const QString &plain, const QString &needle)
             break;
         }
         out += escaped.mid(from, at - from);
-        out += QStringLiteral("<span style='background:palette(highlight); "
-                              "color:palette(highlighted-text)'>")
-               + escaped.mid(at, escNeedle.length()) + QStringLiteral("</span>");
+        out += span + escaped.mid(at, escNeedle.length()) + QStringLiteral("</span>");
         from = at + escNeedle.length();
     }
     return out.replace(QLatin1Char('\n'), QStringLiteral("<br>"));
@@ -97,7 +102,8 @@ QTextDocument *TranscriptDelegate::buildBodyDoc(const QModelIndex &idx,
         if (m && !m->findNeedle().isEmpty()) {
             const QString plain = idx.data(TranscriptModel::PlainRole).toString();
             if (plain.contains(m->findNeedle(), Qt::CaseInsensitive)) {
-                html = highlightedHtml(plain, m->findNeedle());
+                html = highlightedHtml(plain, m->findNeedle(),
+                                       idx.row() == m->findCurrentRow());
             }
         }
     }

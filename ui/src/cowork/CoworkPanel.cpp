@@ -261,8 +261,13 @@ CoworkPanel::CoworkPanel(CoreClient *core, QWidget *parent)
 
     connect(m_core, &CoreClient::notification, this, &CoworkPanel::onNotification);
     connect(m_core, &CoreClient::connected, this, &CoworkPanel::refresh);
+    // Push the persisted pointer bounds to the core on every (re)connect. Without
+    // this the core starts each session with unbounded defaults until the user
+    // happens to nudge a slider, silently ignoring stricter saved limits.
+    connect(m_core, &CoreClient::connected, this, &CoworkPanel::savePointerBounds);
     if (m_core->isConnected()) {
         refresh();
+        savePointerBounds();
     }
 }
 
@@ -352,11 +357,12 @@ void CoworkPanel::savePointerBounds()
     cfg.sync();
 
     // Inform the core so it clamps each agent's per-call pointer values to these bounds.
-    // The cowork.setPointerBounds RPC is being added core-side (plan 09); until it ships
-    // this call simply no-ops on the core, which is harmless.
+    // The core's accuracy is a float in 0..1 (1 = straight line, lands exact); the slider
+    // is an integer percent, so scale it — otherwise clampProfile pins every value >1 to
+    // 1.0 and the slider is dead (only 0% would differ).
     m_core->call(QStringLiteral("cowork.setPointerBounds"),
                  {{QStringLiteral("speed"), spd},
-                  {QStringLiteral("accuracy"), acc},
+                  {QStringLiteral("accuracy"), acc / 100.0},
                   {QStringLiteral("settleMs"), settle}},
                  nullptr, this);
 }

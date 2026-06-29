@@ -51,9 +51,10 @@ Q_SIGNALS:
 private:
     void tryConnect();
     void onSocketConnected();
+    void onDisconnected();
     void onReadyRead();
     void handleFrame(const QJsonObject &frame);
-    void send(const QJsonObject &frame);
+    bool send(const QJsonObject &frame);
 
     QProcess *m_proc = nullptr;
     QLocalSocket *m_socket = nullptr;

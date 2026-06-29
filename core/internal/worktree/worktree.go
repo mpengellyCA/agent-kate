@@ -205,6 +205,14 @@ func CommitPaths(wt Worktree, message string, paths []string) error {
 			return err
 		}
 	} else {
+		// Unstage first: a prior Diff() on an isolated worktree stages the whole
+		// tree via `git add -A`, and a path-scoped commit below has no pathspec, so
+		// without this reset the commit would sweep in every file the caller did
+		// NOT select. `git reset -q` returns the index to HEAD without touching the
+		// working tree, so the subsequent add stages exactly the chosen subset.
+		if _, err := git(wt.Path, "reset", "-q"); err != nil {
+			return err
+		}
 		// `git add --` accepts any number of paths; the explicit `--` keeps
 		// pathnames beginning with a dash from being read as options.
 		args := append([]string{"add", "--"}, paths...)
@@ -515,8 +523,18 @@ func Remove(wt Worktree) error {
 		return nil
 	}
 	if _, err := git(wt.RepoRoot, "worktree", "remove", "--force", wt.Path); err != nil {
-		_ = os.RemoveAll(wt.Path)
+		// git's own remove failed (e.g. inconsistent worktree metadata); fall back
+		// to a manual delete + prune, then verify the directory is actually gone so
+		// a genuine failure is reported rather than swallowed as success.
+		if rmErr := os.RemoveAll(wt.Path); rmErr != nil {
+			return fmt.Errorf("worktree remove %s: %w (manual cleanup also failed: %v)",
+				wt.Path, err, rmErr)
+		}
 		_, _ = git(wt.RepoRoot, "worktree", "prune")
+		if _, statErr := os.Stat(wt.Path); statErr == nil {
+			return fmt.Errorf("worktree remove %s: still present after cleanup: %w",
+				wt.Path, err)
+		}
 	}
 	_, _ = git(wt.RepoRoot, "branch", "-D", wt.Branch)
 	return nil
