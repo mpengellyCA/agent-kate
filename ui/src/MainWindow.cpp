@@ -426,6 +426,7 @@ void MainWindow::setupUi()
         if (m_inspectorPanel) {
             m_inspectorPanel->setActiveThread(threadId);
         }
+        updateAgentActions();
     });
     connect(m_agent, &AgentDock::projectFocused, this,
             [this](const QString &path) { m_tree->setRoot(path); });
@@ -582,6 +583,10 @@ void MainWindow::setupActions()
 
     fileMenu->addSeparator();
     fileMenu->addAction(KStandardAction::quit(this, &QWidget::close, this));
+
+    // The Agent menu sits right after File — agents are the primary thing this
+    // app is about, and its actions were previously buried in roster right-clicks.
+    setupAgentMenu();
 
     QMenu *optionsMenu = menuBar()->addMenu(i18n("&Options"));
     QMenu *grouping = optionsMenu->addMenu(i18n("Editor Tabs Grouped By"));
@@ -823,9 +828,12 @@ void MainWindow::setupActions()
     });
 
     // The developer-only View actions are hidden in Simple mode. Collect them
-    // now that all of them exist (terminals, worktree terminal, git blame).
+    // now that all of them exist (terminals, worktree terminal, git blame), plus
+    // the Agent menu's git/worktree lifecycle (built earlier in setupAgentMenu).
     m_advancedActions = {m_blameToggle, newTermAct, focusTermAct, nextTermAct,
-                         prevTermAct, m_openWorktreeTerminalAct};
+                         prevTermAct, m_openWorktreeTerminalAct,
+                         m_agentCommitAct, m_agentPrAct, m_agentMergeAct,
+                         m_agentTerminalAct, m_agentDiscardAct};
 
     m_codeMenu = menuBar()->addMenu(i18n("&Code"));
     QMenu *codeMenu = m_codeMenu;
@@ -995,6 +1003,113 @@ void MainWindow::showCommandPalette()
     }
     m_commandPalette->setActions(actions);
     m_commandPalette->showPalette();
+}
+
+// setupAgentMenu builds the &Agent menu and wires every entry to AgentDock's
+// active-agent surface. Enable-state tracks the active agent (updateAgentActions).
+void MainWindow::setupAgentMenu()
+{
+    m_agentMenu = menuBar()->addMenu(i18n("&Agent"));
+
+    auto *newAct = m_agentMenu->addAction(
+        QIcon::fromTheme(QStringLiteral("list-add")), i18n("&New Agent"));
+    newAct->setToolTip(i18n("Start a fresh agent in the current project."));
+    connect(newAct, &QAction::triggered, this,
+            [this] { m_agent->newAgentInActiveProject(); });
+
+    m_agentRenameAct = m_agentMenu->addAction(
+        QIcon::fromTheme(QStringLiteral("document-edit")), i18n("&Rename Agent…"));
+    connect(m_agentRenameAct, &QAction::triggered, this,
+            [this] { m_agent->renameActiveAgent(); });
+
+    m_agentResumeAct = m_agentMenu->addAction(
+        QIcon::fromTheme(QStringLiteral("media-playback-start")), i18n("Res&ume Agent"));
+    m_agentResumeAct->setToolTip(i18n("Relaunch a paused agent and continue its conversation."));
+    connect(m_agentResumeAct, &QAction::triggered, this,
+            [this] { m_agent->resumeActiveAgent(); });
+
+    m_agentMenu->addSeparator();
+
+    m_agentAttachAct = m_agentMenu->addAction(
+        QIcon::fromTheme(QStringLiteral("mail-attachment")), i18n("&Attach Files…"));
+    m_agentAttachAct->setToolTip(i18n("Give the active agent files as context for its next message."));
+    connect(m_agentAttachAct, &QAction::triggered, this,
+            [this] { m_agent->attachToActiveAgent(); });
+
+    m_agentChangesAct = m_agentMenu->addAction(
+        QIcon::fromTheme(QStringLiteral("vcs-diff")), i18n("Show &Changes"));
+    m_agentChangesAct->setToolTip(i18n("Review the changes the active agent has made."));
+    connect(m_agentChangesAct, &QAction::triggered, this,
+            [this] { m_agent->showActiveAgentChanges(); });
+
+    m_agentStopAct = m_agentMenu->addAction(
+        QIcon::fromTheme(QStringLiteral("process-stop")), i18n("&Stop Agent"));
+    m_agentStopAct->setToolTip(i18n("Stop the running agent (it stays available to resume)."));
+    connect(m_agentStopAct, &QAction::triggered, this,
+            [this] { m_agent->stopActiveAgent(); });
+
+    m_agentMenu->addSeparator();
+
+    // Git / worktree lifecycle — hidden in Simple mode (added to m_advancedActions
+    // in setupActions, which runs after this).
+    m_agentCommitAct = m_agentMenu->addAction(i18n("&Commit Changes…"));
+    connect(m_agentCommitAct, &QAction::triggered, this,
+            [this] { m_agent->commitActiveAgent(); });
+    m_agentPrAct = m_agentMenu->addAction(i18n("Create &Pull Request…"));
+    connect(m_agentPrAct, &QAction::triggered, this,
+            [this] { m_agent->createPullRequestForActiveAgent(); });
+    m_agentMergeAct = m_agentMenu->addAction(i18n("&Merge into Local Main…"));
+    connect(m_agentMergeAct, &QAction::triggered, this,
+            [this] { m_agent->mergeActiveAgent(); });
+    m_agentTerminalAct = m_agentMenu->addAction(
+        QIcon::fromTheme(QStringLiteral("utilities-terminal")),
+        i18n("Open &Terminal in Worktree"));
+    connect(m_agentTerminalAct, &QAction::triggered, this,
+            [this] { m_agent->openActiveAgentTerminal(); });
+
+    m_agentMenu->addSeparator();
+
+    m_agentTagsAct = m_agentMenu->addAction(
+        QIcon::fromTheme(QStringLiteral("tag")), i18n("Edit &Tags…"));
+    connect(m_agentTagsAct, &QAction::triggered, this,
+            [this] { m_agent->editActiveAgentTags(); });
+
+    m_agentDiscardAct = m_agentMenu->addAction(i18n("&Discard Worktree"));
+    m_agentDiscardAct->setToolTip(i18n("Throw away the agent's working copy and its changes."));
+    connect(m_agentDiscardAct, &QAction::triggered, this,
+            [this] { m_agent->discardActiveAgentWorktree(); });
+
+    m_agentCloseAct = m_agentMenu->addAction(i18n("&Close Agent"));
+    connect(m_agentCloseAct, &QAction::triggered, this,
+            [this] { m_agent->closeActiveAgent(); });
+
+    // Keep enable-state fresh whenever the menu opens (covers state changes the
+    // signal-based refresh might miss, e.g. a turn finishing).
+    connect(m_agentMenu, &QMenu::aboutToShow, this, &MainWindow::updateAgentActions);
+    updateAgentActions(); // start in the right enable-state (no active agent yet)
+}
+
+void MainWindow::updateAgentActions()
+{
+    if (!m_agentRenameAct) {
+        return; // menu not built yet
+    }
+    const bool has = m_agent && m_agent->hasActiveAgent();
+    const bool running = m_agent && m_agent->activeAgentRunning();
+    const bool dormant = m_agent && m_agent->activeAgentDormant();
+    const bool worktree = m_agent && m_agent->activeAgentHasWorktree();
+    m_agentRenameAct->setEnabled(has);
+    m_agentResumeAct->setEnabled(dormant);
+    m_agentAttachAct->setEnabled(has && !dormant);
+    m_agentChangesAct->setEnabled(has);
+    m_agentStopAct->setEnabled(running);
+    m_agentCommitAct->setEnabled(worktree);
+    m_agentPrAct->setEnabled(worktree);
+    m_agentMergeAct->setEnabled(worktree);
+    m_agentTerminalAct->setEnabled(worktree);
+    m_agentTagsAct->setEnabled(has);
+    m_agentDiscardAct->setEnabled(worktree);
+    m_agentCloseAct->setEnabled(has);
 }
 
 // setupExperience installs the status-bar Simple/Advanced toggle and applies the
@@ -1632,6 +1747,7 @@ void MainWindow::onAgentActivated(int agentId, const QString &projectPath)
     m_editor->setActiveGroup(groupKey());
     // Reopen the tabs the human had for this project last run (once per run).
     restoreEditorSession(projectPath);
+    updateAgentActions();
 }
 
 QString MainWindow::groupKey() const

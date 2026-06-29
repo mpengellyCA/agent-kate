@@ -86,6 +86,15 @@ public:
     // attachPaths. Used by drops carrying line ranges from the search results.
     void attachItems(const QJsonArray &items);
 
+    // Has a thread id but no live process — resumable (vs isRunning()).
+    bool isDormant() const { return m_dormant; }
+
+    // Public equivalents of the composer-toolbar buttons, so the window's Agent
+    // menu / command palette can drive the active panel.
+    void stop() { onStopClicked(); }
+    void promptAttach() { onAttachClicked(); }
+    void showChanges() { onChangesClicked(); }
+
 Q_SIGNALS:
     void statusMessage(const QString &text);
     void titleChanged(const QString &title);

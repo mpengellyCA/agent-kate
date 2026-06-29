@@ -58,6 +58,29 @@ public:
     // Empty if the agent has no worktree yet (not started / not promoted).
     QString worktreePathForAgent(int agentId) const;
 
+    // --- Active-agent actions, for the window's Agent menu / command palette ---
+    // "Active" = the agent whose panel is currently shown in the stack. These let
+    // the menu drive the same operations the roster's right-click menu does,
+    // without the user having to find the right row.
+    bool hasActiveAgent() const;
+    bool activeAgentRunning() const;     // live process — Stop is meaningful
+    bool activeAgentDormant() const;     // resumable — Resume is meaningful
+    bool activeAgentHasWorktree() const; // git lifecycle ops are meaningful
+
+    void newAgentInActiveProject();
+    void renameActiveAgent();
+    void resumeActiveAgent();
+    void attachToActiveAgent();
+    void showActiveAgentChanges();
+    void stopActiveAgent();
+    void commitActiveAgent();
+    void createPullRequestForActiveAgent();
+    void mergeActiveAgent();
+    void discardActiveAgentWorktree();
+    void editActiveAgentTags();
+    void openActiveAgentTerminal();
+    void closeActiveAgent();
+
 Q_SIGNALS:
     void statusMessage(const QString &text);
     void openDiff(const QString &title, const QString &diffText);
@@ -117,6 +140,11 @@ private:
     Entry *entryById(int agentId);
     Entry *entryByPanel(const AgentPanel *panel);
     Entry *entryByThread(const QString &threadId);
+    // The active panel (top of the stack) and its agent id / project, or
+    // nullptr / -1 / empty when there is no active agent.
+    AgentPanel *activeAgentPanel() const;
+    int activeAgentId() const;
+    QString activeProjectPath() const;
 
     CoreClient *m_core = nullptr;
     QStackedWidget *m_stack = nullptr;

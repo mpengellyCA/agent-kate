@@ -311,6 +311,166 @@ QWidget *AgentDock::activePanel() const
     return m_stack ? m_stack->currentWidget() : nullptr;
 }
 
+AgentPanel *AgentDock::activeAgentPanel() const
+{
+    return qobject_cast<AgentPanel *>(m_stack ? m_stack->currentWidget() : nullptr);
+}
+
+int AgentDock::activeAgentId() const
+{
+    const AgentPanel *p = activeAgentPanel();
+    if (!p) {
+        return -1;
+    }
+    for (const Entry &e : m_agents) {
+        if (e.panel == p) {
+            return e.id;
+        }
+    }
+    return -1;
+}
+
+QString AgentDock::activeProjectPath() const
+{
+    if (const AgentPanel *p = activeAgentPanel()) {
+        for (const Entry &e : m_agents) {
+            if (e.panel == p) {
+                return e.project;
+            }
+        }
+    }
+    return m_projects.isEmpty() ? QString() : m_projects.constLast();
+}
+
+bool AgentDock::hasActiveAgent() const
+{
+    return activeAgentId() >= 0;
+}
+
+bool AgentDock::activeAgentRunning() const
+{
+    const AgentPanel *p = activeAgentPanel();
+    return p && p->isRunning();
+}
+
+bool AgentDock::activeAgentDormant() const
+{
+    const AgentPanel *p = activeAgentPanel();
+    return p && p->isDormant();
+}
+
+bool AgentDock::activeAgentHasWorktree() const
+{
+    const int id = activeAgentId();
+    return id >= 0 && !worktreePathForAgent(id).isEmpty();
+}
+
+void AgentDock::newAgentInActiveProject()
+{
+    const QString project = activeProjectPath();
+    if (!project.isEmpty()) {
+        addAgent(project);
+    }
+}
+
+void AgentDock::renameActiveAgent()
+{
+    const int id = activeAgentId();
+    if (id >= 0) {
+        renameAgent(id);
+    }
+}
+
+void AgentDock::resumeActiveAgent()
+{
+    const int id = activeAgentId();
+    if (Entry *e = entryById(id)) {
+        m_roster->setCurrentAgent(id);
+        e->panel->resume();
+    }
+}
+
+void AgentDock::attachToActiveAgent()
+{
+    if (AgentPanel *p = activeAgentPanel()) {
+        p->promptAttach();
+    }
+}
+
+void AgentDock::showActiveAgentChanges()
+{
+    if (AgentPanel *p = activeAgentPanel()) {
+        p->showChanges();
+    }
+}
+
+void AgentDock::stopActiveAgent()
+{
+    if (AgentPanel *p = activeAgentPanel()) {
+        p->stop();
+    }
+}
+
+void AgentDock::commitActiveAgent()
+{
+    const int id = activeAgentId();
+    if (id >= 0) {
+        m_roster->requestCommit(id);
+    }
+}
+
+void AgentDock::createPullRequestForActiveAgent()
+{
+    const int id = activeAgentId();
+    if (id >= 0) {
+        m_roster->requestPullRequest(id);
+    }
+}
+
+void AgentDock::mergeActiveAgent()
+{
+    const int id = activeAgentId();
+    if (id >= 0) {
+        m_roster->requestMerge(id);
+    }
+}
+
+void AgentDock::discardActiveAgentWorktree()
+{
+    const int id = activeAgentId();
+    if (id >= 0) {
+        m_roster->requestDiscard(id);
+    }
+}
+
+void AgentDock::editActiveAgentTags()
+{
+    const int id = activeAgentId();
+    if (id >= 0) {
+        editTags(id);
+    }
+}
+
+void AgentDock::openActiveAgentTerminal()
+{
+    const int id = activeAgentId();
+    if (id < 0) {
+        return;
+    }
+    const QString path = worktreePathForAgent(id);
+    if (!path.isEmpty()) {
+        Q_EMIT openWorktreeTerminalRequested(path);
+    }
+}
+
+void AgentDock::closeActiveAgent()
+{
+    const int id = activeAgentId();
+    if (id >= 0) {
+        closeAgent(id);
+    }
+}
+
 void AgentDock::openProjectDialog()
 {
     const QString dir = QFileDialog::getExistingDirectory(

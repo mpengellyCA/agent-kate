@@ -56,6 +56,14 @@ public:
     // The models offered by the "+ New Agent" dropdown (id, display label).
     void setModelChoices(const QList<QPair<QString, QString>> &models);
 
+    // Programmatic equivalents of the context-menu git actions, so the window's
+    // Agent menu can act on the active agent through the same wiring (these emit
+    // the same signals the right-click menu does).
+    void requestCommit(int agentId) { Q_EMIT commitRequested(agentId); }
+    void requestPullRequest(int agentId) { Q_EMIT prRequested(agentId); }
+    void requestMerge(int agentId) { Q_EMIT landRequested(agentId); }
+    void requestDiscard(int agentId) { Q_EMIT discardRequested(agentId); }
+
 Q_SIGNALS:
     void openProjectRequested();
     void newAgentRequested(const QString &projectPath);

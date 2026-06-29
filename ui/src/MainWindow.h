@@ -59,6 +59,12 @@ private:
     // palette — the keyboard-first way to reach any feature.
     void showCommandPalette();
 
+    // The &Agent menu surfaces the agent lifecycle (new / rename / resume /
+    // attach / changes / stop / commit / PR / merge / terminal / tags / close)
+    // for the active agent — until now reachable only via roster right-click.
+    void setupAgentMenu();
+    void updateAgentActions(); // refresh enable-state from the active agent
+
     // Experience level — "simple" hides power tooling (the Code menu and the
     // developer-only panels) so a newcomer sees only the essentials; "advanced"
     // restores the full surface. Persisted; new profiles start Simple.
@@ -181,6 +187,21 @@ private:
     bool m_firstRunProfile = false;        // captured before the shell migration
     QMenu *m_codeMenu = nullptr;           // hidden in Simple mode
     QList<QAction *> m_advancedActions;     // dev-only menu actions hidden in Simple
+
+    // Agent menu actions whose enabled-state tracks the active agent.
+    QMenu *m_agentMenu = nullptr;
+    QAction *m_agentRenameAct = nullptr;
+    QAction *m_agentResumeAct = nullptr;
+    QAction *m_agentAttachAct = nullptr;
+    QAction *m_agentChangesAct = nullptr;
+    QAction *m_agentStopAct = nullptr;
+    QAction *m_agentCommitAct = nullptr;
+    QAction *m_agentPrAct = nullptr;
+    QAction *m_agentMergeAct = nullptr;
+    QAction *m_agentTerminalAct = nullptr;
+    QAction *m_agentTagsAct = nullptr;
+    QAction *m_agentDiscardAct = nullptr;
+    QAction *m_agentCloseAct = nullptr;
     QAction *m_simpleAct = nullptr;        // radio sync for the Experience menu
     QAction *m_advancedAct = nullptr;
     QToolButton *m_experienceButton = nullptr; // status-bar Simple/Advanced toggle
