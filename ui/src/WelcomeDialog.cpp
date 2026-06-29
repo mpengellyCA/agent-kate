@@ -121,13 +121,23 @@ WelcomeDialog::WelcomeDialog(QWidget *parent)
     headerText->setSpacing(0);
     auto *title = new QLabel(i18n("<h2 style='margin:0;'>Agent Kate</h2>"), this);
     title->setTextFormat(Qt::RichText);
-    auto *subtitle = new QLabel(i18n("Native multi-agent coding arena"), this);
+    auto *subtitle = new QLabel(i18n("Work alongside AI agents on your projects"), this);
     subtitle->setForegroundRole(QPalette::PlaceholderText);
     headerText->addWidget(title);
     headerText->addWidget(subtitle);
     headerRow->addLayout(headerText, 1);
     headerRow->setAlignment(headerText, Qt::AlignVCenter);
     outer->addLayout(headerRow);
+
+    // A welcoming, jargon-free orientation line for newcomers.
+    auto *intro = new QLabel(
+        i18n("Pick a project below to begin. You can switch between Simple and "
+             "Advanced views any time, and give Agent Kate its own look in "
+             "Options ▸ Appearance."),
+        this);
+    intro->setWordWrap(true);
+    intro->setForegroundRole(QPalette::PlaceholderText);
+    outer->addWidget(intro);
 
     // "Reopen last project" hero row — the single most likely action.
     auto *heroFrame = new QFrame(this);

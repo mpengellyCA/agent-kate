@@ -2063,11 +2063,14 @@ void MainWindow::setupTopToolbar()
     connect(m_editor, &EditorArea::currentFileChanged, this,
             &MainWindow::updateBreadcrumb);
 
-    // Restore the persisted centre-slab mode now that the toolbar actions
-    // exist. Defaults to side-by-side.
+    // Restore the persisted centre-slab mode now that the toolbar actions exist.
+    // A brand-new profile lands chat-forward (the Converse layout) so a newcomer
+    // starts in the conversation, not a code editor; everyone else gets the
+    // remembered mode (default side-by-side).
     const QString mode = KSharedConfig::openConfig()
         ->group(QStringLiteral("View"))
-        .readEntry("centreMode", QStringLiteral("split"));
+        .readEntry("centreMode",
+                   m_firstRunProfile ? QStringLiteral("chat") : QStringLiteral("split"));
     applyCentreMode(mode);
 }
 
