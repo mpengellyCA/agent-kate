@@ -3,6 +3,8 @@
 #include "FileFilterProxyModel.h"
 #include "GitStatusDelegate.h"
 #include "ipc/CoreClient.h"
+#include "shell/ElidingLabel.h"
+#include "shell/FlowLayout.h"
 
 #include <KConfigGroup>
 #include <KIO/CopyJob>
@@ -130,11 +132,17 @@ ProjectTree::ProjectTree(CoreClient *core, QWidget *parent)
     // Header: project heading + small toolbar (filter, sync, hidden toggle,
     // new file, new folder, open terminal, open in Dolphin).
     auto *header = new QWidget(this);
-    auto *headerLayout = new QHBoxLayout(header);
+    // Two stacked rows so a narrow file panel reflows instead of clipping: the
+    // path heading elides in the middle (row 1) and the action buttons wrap onto
+    // extra lines via a flow layout (row 2).
+    auto *headerLayout = new QVBoxLayout(header);
     headerLayout->setContentsMargins(4, 2, 2, 2);
     headerLayout->setSpacing(2);
 
-    m_pathLabel = new QLabel(header);
+    // Row 1: the project heading. Eliding in the middle keeps a long path from
+    // pinning the pane wide — the folder name and the tail stay visible.
+    m_pathLabel = new ElidingLabel(header);
+    m_pathLabel->setElideMode(Qt::ElideMiddle);
     m_pathLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
     m_pathLabel->setToolTip(i18n("Workspace root — right-click any item for actions"));
     m_pathLabel->setForegroundRole(QPalette::PlaceholderText);
@@ -143,14 +151,18 @@ ProjectTree::ProjectTree(CoreClient *core, QWidget *parent)
     m_pathLabel->setFont(headingFont);
     m_pathLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     m_pathLabel->setTextFormat(Qt::PlainText);
-    headerLayout->addWidget(m_pathLabel, 1);
+    headerLayout->addWidget(m_pathLabel);
+
+    // Row 2: the action buttons in a flow layout so they wrap when narrow.
+    auto *buttonRow = new FlowLayout(0, 2, 2);
+    headerLayout->addLayout(buttonRow);
 
     auto makeBtn = [&](const QString &icon, const QString &tip) {
         auto *b = new QToolButton(header);
         b->setIcon(QIcon::fromTheme(icon));
         b->setAutoRaise(true);
         b->setToolTip(tip);
-        headerLayout->addWidget(b);
+        buttonRow->addWidget(b);
         return b;
     };
 

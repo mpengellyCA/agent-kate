@@ -1924,7 +1924,12 @@ void MainWindow::setupTopToolbar()
     m_toolbarSearch->setClearButtonEnabled(true);
     m_toolbarSearch->addAction(QIcon::fromTheme(QStringLiteral("search")),
                                QLineEdit::LeadingPosition);
-    m_toolbarSearch->setFixedWidth(260);
+    // Flexible width instead of a fixed 260px: it shrinks on a narrow window
+    // (down to a usable floor) and the toolbar spills the rest to its overflow
+    // menu, rather than the search box clipping or pinning the window wide.
+    m_toolbarSearch->setMinimumWidth(120);
+    m_toolbarSearch->setMaximumWidth(320);
+    m_toolbarSearch->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
     connect(m_toolbarSearch, &QLineEdit::returnPressed, this, [this] {
         const QString q = m_toolbarSearch->text().trimmed();
         if (q.isEmpty() || !m_search)

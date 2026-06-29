@@ -9,6 +9,7 @@
 #include <QWidget>
 
 class CoreClient;
+class ElidingLabel;
 class FileFilterProxyModel;
 class GitStatusDelegate;
 class QAction;
@@ -100,7 +101,7 @@ private:
     FileFilterProxyModel *m_proxy = nullptr;
     GitStatusDelegate *m_gitDelegate = nullptr;
     QStackedWidget *m_stack = nullptr;
-    QLabel *m_pathLabel = nullptr;
+    ElidingLabel *m_pathLabel = nullptr;
     QLineEdit *m_filterEdit = nullptr;
     QToolButton *m_hiddenToggle = nullptr;
     QToolButton *m_syncToggle = nullptr;

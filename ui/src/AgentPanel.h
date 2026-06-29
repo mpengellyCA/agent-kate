@@ -25,6 +25,7 @@ class QEvent;
 class QMimeData;
 class QPaintEvent;
 class QFrame;
+class FlowLayout;
 class QHBoxLayout;
 class QLabel;
 class QLineEdit;
@@ -275,7 +276,7 @@ private:
 
     // Pending attachments for the next message (each {kind,name,mediaType,…}).
     QWidget *m_attachBar = nullptr;
-    QHBoxLayout *m_attachLayout = nullptr;
+    FlowLayout *m_attachLayout = nullptr;
     KMessageWidget *m_attachNotice = nullptr;
     QJsonArray m_attachments;
 
@@ -297,7 +298,7 @@ private:
     };
     QList<QueuedMsg> m_sendQueue;
     QFrame *m_queueBar = nullptr;
-    QHBoxLayout *m_queueLayout = nullptr;
+    FlowLayout *m_queueLayout = nullptr;
 
     // Promote-to-worktree bar, shown while a thread runs non-isolated.
     QFrame *m_promoteBar = nullptr;

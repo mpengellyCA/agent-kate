@@ -15,6 +15,7 @@
 
 class CommitDetailPanel;
 class CoreClient;
+class ElidingLabel;
 class LogGraphDelegate;
 class QLabel;
 class QPushButton;
@@ -74,7 +75,7 @@ private:
     };
 
     CoreClient *m_core = nullptr;
-    QLabel *m_sourceLabel = nullptr;
+    ElidingLabel *m_sourceLabel = nullptr;
     QPushButton *m_refreshBtn = nullptr;
     QTableView *m_view = nullptr;
     QStackedWidget *m_stack = nullptr;

@@ -1,5 +1,6 @@
 #include "AgentRoster.h"
 #include "AgentCardDelegate.h"
+#include "shell/FlowLayout.h"
 #include "theme/ThemeManager.h"
 
 #include <QAction>
@@ -257,8 +258,9 @@ AgentRoster::AgentRoster(QWidget *parent)
         }
     });
 
-    auto *buttons = new QHBoxLayout;
-    buttons->setSpacing(6);
+    // A flow layout so the two wide text+icon buttons wrap onto a second line
+    // instead of clipping when the roster is dragged narrow.
+    auto *buttons = new FlowLayout(0, 6, 6);
     buttons->addWidget(openButton);
     buttons->addWidget(m_newButton);
 

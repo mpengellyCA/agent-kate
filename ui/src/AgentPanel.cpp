@@ -5,6 +5,7 @@
 #include "TranscriptDelegate.h"
 #include "TranscriptModel.h"
 #include "ipc/CoreClient.h"
+#include "shell/FlowLayout.h"
 #include "theme/ThemeManager.h"
 
 #include <KConfigGroup>
@@ -241,6 +242,11 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     setAcceptDrops(true); // ProjectTree (and external sources) drop file URLs here
     m_header = new QLabel(this);
     m_header->setTextFormat(Qt::RichText);
+    // Rich-text header (can't be an ElidingLabel): let it wrap and shrink so a
+    // long branch/cost/token suffix reflows onto a second line instead of
+    // pinning the panel's minimum width.
+    m_header->setWordWrap(true);
+    m_header->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
     m_header->setStyleSheet(
         QStringLiteral("padding: 9px 12px; border-bottom: 1px solid palette(mid);"));
 
@@ -658,12 +664,10 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
         m_compactNowBtn->setMenu(menu);
     }
 
-    // Attachment chip bar — hidden until files are attached.
+    // Attachment chip bar — hidden until files are attached. A FlowLayout so the
+    // chips wrap onto further rows when the panel is dragged narrow.
     m_attachBar = new QWidget(this);
-    m_attachLayout = new QHBoxLayout(m_attachBar);
-    m_attachLayout->setContentsMargins(0, 0, 0, 0);
-    m_attachLayout->setSpacing(6);
-    m_attachLayout->addStretch(1);
+    m_attachLayout = new FlowLayout(m_attachBar, 0, 6, 6);
     m_attachBar->setVisible(false);
 
     // Inline banner explaining why a dropped/attached file was rejected. More
@@ -678,10 +682,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     // Queue chip bar — shows follow-ups typed while a turn is in progress.
     // Hidden until something is queued. Each chip removes its message on click.
     m_queueBar = new QFrame(this);
-    m_queueLayout = new QHBoxLayout(m_queueBar);
-    m_queueLayout->setContentsMargins(0, 0, 0, 0);
-    m_queueLayout->setSpacing(6);
-    m_queueLayout->addStretch(1);
+    m_queueLayout = new FlowLayout(m_queueBar, 0, 6, 6);
     m_queueBar->setVisible(false);
 
     m_attachBtn = new QPushButton(
@@ -782,12 +783,13 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     // with the existing enable/disable wiring. Hide it from the toolbar.
     m_compactNowBtn->hide();
 
-    auto *buttons = new QHBoxLayout;
+    // FlowLayout so the toolbar's buttons wrap onto a second row when the panel
+    // is dragged narrow instead of clipping. No stretch — a flow layout has none.
+    auto *buttons = new FlowLayout(0, 6, 6);
     buttons->addWidget(setupBtn);
     buttons->addWidget(compactionBtn);
     buttons->addWidget(m_attachBtn);
     buttons->addWidget(m_diffBtn);
-    buttons->addStretch(1);
     buttons->addWidget(m_interruptBtn);
     buttons->addWidget(m_stopBtn);
     buttons->addWidget(m_sendBtn);
@@ -1819,9 +1821,9 @@ void AgentPanel::drainSendQueue()
 // Each chip shows the message (truncated) and removes it on click.
 void AgentPanel::rebuildQueueChips()
 {
-    // Drop existing chip widgets, keeping the trailing stretch.
-    while (m_queueLayout->count() > 1) {
-        QLayoutItem *item = m_queueLayout->takeAt(0);
+    // Drop every existing chip widget (the FlowLayout holds only chips — no
+    // trailing stretch), then re-add one per queued message.
+    while (QLayoutItem *item = m_queueLayout->takeAt(0)) {
         if (QWidget *w = item->widget()) {
             w->deleteLater();
         }
@@ -1845,7 +1847,7 @@ void AgentPanel::rebuildQueueChips()
                 refresh();
             }
         });
-        m_queueLayout->insertWidget(m_queueLayout->count() - 1, chip);
+        m_queueLayout->addWidget(chip);
     }
     m_queueBar->setVisible(!m_sendQueue.isEmpty());
 }
@@ -2005,9 +2007,9 @@ void AgentPanel::paintEvent(QPaintEvent *event)
 
 void AgentPanel::rebuildAttachChips()
 {
-    // Drop existing chip widgets, keeping the trailing stretch.
-    while (m_attachLayout->count() > 1) {
-        QLayoutItem *item = m_attachLayout->takeAt(0);
+    // Drop every existing chip widget (the FlowLayout holds only chips — no
+    // trailing stretch), then re-add one per attachment.
+    while (QLayoutItem *item = m_attachLayout->takeAt(0)) {
         if (QWidget *w = item->widget()) {
             w->deleteLater();
         }
@@ -2037,7 +2039,7 @@ void AgentPanel::rebuildAttachChips()
             m_attachments.removeAt(i);
             rebuildAttachChips();
         });
-        m_attachLayout->insertWidget(m_attachLayout->count() - 1, chip);
+        m_attachLayout->addWidget(chip);
     }
     m_attachBar->setVisible(!m_attachments.isEmpty());
 }

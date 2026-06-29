@@ -4,6 +4,7 @@
 #include "ConsentDialog.h"
 #include "ControlConsentDialog.h"
 #include "ipc/CoreClient.h"
+#include "shell/FlowLayout.h"
 
 #include <KConfigGroup>
 #include <KLocalizedString>
@@ -28,6 +29,7 @@
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QSignalBlocker>
+#include <QSizePolicy>
 #include <QSlider>
 #include <QSpinBox>
 #include <QToolButton>
@@ -101,15 +103,18 @@ CoworkPanel::CoworkPanel(CoreClient *core, QWidget *parent)
     m_status->setText(i18n("Checking desktop integration…"));
     layout->addWidget(m_status);
 
-    // Enable-for-active-agent row.
-    auto *enableRow = new QHBoxLayout;
+    // Enable-for-active-agent row. A FlowLayout so the long "Enable Cowork…"
+    // button wraps below the label when the panel is dragged narrow instead of
+    // clipping. The label keeps rich text (it shows the agent in bold), so it
+    // stays a QLabel with an Ignored width policy rather than an eliding label.
+    auto *enableRow = new FlowLayout(0, -1, -1);
     m_activeLabel = new QLabel(i18n("No active agent."), this);
-    m_activeLabel->setWordWrap(true);
+    m_activeLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
     m_enableBtn = new QPushButton(i18n("Enable Cowork for this agent"), this);
     m_enableBtn->setIcon(QIcon::fromTheme(QStringLiteral("dialog-ok-apply")));
     m_enableBtn->setEnabled(false);
     connect(m_enableBtn, &QPushButton::clicked, this, &CoworkPanel::enableForActiveThread);
-    enableRow->addWidget(m_activeLabel, 1);
+    enableRow->addWidget(m_activeLabel);
     enableRow->addWidget(m_enableBtn);
     layout->addLayout(enableRow);
 
@@ -141,6 +146,7 @@ CoworkPanel::CoworkPanel(CoreClient *core, QWidget *parent)
 
     auto *speedRow = new QHBoxLayout;
     auto *speedLabel = new QLabel(i18n("Speed:"), this);
+    speedLabel->setSizePolicy(QSizePolicy::Ignored, speedLabel->sizePolicy().verticalPolicy());
     m_pointerSpeed = new QComboBox(this);
     m_pointerSpeed->setToolTip(i18n("How fast the agent's pointer travels. 'Instant' "
                                     "teleports straight to the target with no visible motion."));
@@ -169,6 +175,7 @@ CoworkPanel::CoworkPanel(CoreClient *core, QWidget *parent)
     auto *settleRow = new QHBoxLayout;
     auto *settleLabel = new QLabel(i18n("Settle before click (ms)"), this);
     settleLabel->setWordWrap(true);
+    settleLabel->setSizePolicy(QSizePolicy::Ignored, settleLabel->sizePolicy().verticalPolicy());
     m_pointerSettle = new QSpinBox(this);
     m_pointerSettle->setRange(0, 500);
     m_pointerSettle->setValue(savedSettle);
@@ -194,6 +201,7 @@ CoworkPanel::CoworkPanel(CoreClient *core, QWidget *parent)
     auto *browserRow = new QHBoxLayout;
     auto *browserLabel = new QLabel(i18n("Open a browser agents can read:"), this);
     browserLabel->setWordWrap(true);
+    browserLabel->setSizePolicy(QSizePolicy::Ignored, browserLabel->sizePolicy().verticalPolicy());
     m_browserBtn = new QToolButton(this);
     m_browserBtn->setText(i18n("Launch browser"));
     m_browserBtn->setIcon(QIcon::fromTheme(QStringLiteral("internet-web-browser")));
@@ -214,6 +222,7 @@ CoworkPanel::CoworkPanel(CoreClient *core, QWidget *parent)
     auto *prefRow = new QHBoxLayout;
     auto *prefLabel = new QLabel(i18n("Agent's default browser:"), this);
     prefLabel->setWordWrap(true);
+    prefLabel->setSizePolicy(QSizePolicy::Ignored, prefLabel->sizePolicy().verticalPolicy());
     m_agentBrowserCombo = new QComboBox(this);
     m_agentBrowserCombo->setToolTip(i18n(
         "When an agent opens a browser on its own, it uses this one. The agent can "
@@ -236,6 +245,9 @@ CoworkPanel::CoworkPanel(CoreClient *core, QWidget *parent)
     m_grants->setRootIsDecorated(false);
     m_grants->setHeaderLabels({i18n("Agent"), i18n("Can"), i18n("Target"), i18n("Until")});
     m_grants->header()->setSectionResizeMode(QHeaderView::ResizeToContents);
+    // Let the widest column ("Target", index 2) absorb the slack so the table
+    // fits the pane width instead of growing past it.
+    m_grants->header()->setSectionResizeMode(2, QHeaderView::Stretch);
     grantsLayout->addWidget(m_grants);
     m_revokeBtn = new QPushButton(i18n("Revoke selected"), grantsBox);
     m_revokeBtn->setIcon(QIcon::fromTheme(QStringLiteral("edit-delete")));

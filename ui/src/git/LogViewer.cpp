@@ -8,6 +8,7 @@
 #include "LogModel.h"
 #include "RefChipDelegate.h"
 #include "ipc/CoreClient.h"
+#include "shell/ElidingLabel.h"
 
 #include <KLocalizedString>
 
@@ -75,7 +76,10 @@ LogViewer::LogViewer(CoreClient *core, QWidget *parent)
     : QWidget(parent)
     , m_core(core)
 {
-    m_sourceLabel = new QLabel(this);
+    // ElidingLabel so a long "Agent worktree · <sha>" / branch string elides
+    // with an ellipsis instead of pinning the toolbar's minimum width.
+    m_sourceLabel = new ElidingLabel(this);
+    m_sourceLabel->setElideMode(Qt::ElideRight);
     m_sourceLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
 
     m_refreshBtn = new QPushButton(i18nc("@action:button", "Refresh"), this);

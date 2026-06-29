@@ -1,5 +1,6 @@
 #include "DiffView.h"
 
+#include "shell/FlowLayout.h"
 #include "theme/ThemeManager.h"
 
 #include <KConfigGroup>
@@ -13,7 +14,6 @@
 #include <KSyntaxHighlighting/Theme>
 
 #include <QComboBox>
-#include <QHBoxLayout>
 #include <QIcon>
 #include <QLabel>
 #include <QPalette>
@@ -399,6 +399,9 @@ DiffView::DiffView(const QString &unifiedDiff, QWidget *parent)
         totalRemoved += file.removed;
     }
 
+    // Plain QLabel (not ElidingLabel): the summary is short and carries colored
+    // rich text (+N / -N), which an eliding plain-text label can't render. It
+    // stays in the FlowLayout so the controls after it wrap when narrow.
     auto *summary = new QLabel(this);
     summary->setText(
         i18np("%1 file changed · ", "%1 files changed · ", files.size())
@@ -422,9 +425,11 @@ DiffView::DiffView(const QString &unifiedDiff, QWidget *parent)
     m_splitBtn->setToolTip(i18n("Toggle side-by-side view"));
     m_splitBtn->setAutoRaise(true);
 
-    auto *topBar = new QHBoxLayout;
+    // FlowLayout so the toggle, "Jump to:" label and file combo wrap below the
+    // (eliding) summary when the panel is dragged narrow instead of clipping.
+    auto *topBar = new FlowLayout;
     topBar->setContentsMargins(10, 6, 10, 6);
-    topBar->addWidget(summary, 1);
+    topBar->addWidget(summary);
     topBar->addWidget(m_splitBtn);
     topBar->addWidget(new QLabel(i18nc("@label jump-to-file selector", "Jump to:"), this));
     topBar->addWidget(jump);

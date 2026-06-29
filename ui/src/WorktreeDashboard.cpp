@@ -7,6 +7,7 @@
 #include "git/ConflictDialog.h"
 #include "git/PRDialog.h"
 #include "ipc/CoreClient.h"
+#include "shell/FlowLayout.h"
 
 #include <KLocalizedString>
 
@@ -266,11 +267,13 @@ WorktreeDashboard::WorktreeDashboard(CoreClient *core, QWidget *parent)
     m_cleanupBtn = new QPushButton(
         QIcon::fromTheme(QStringLiteral("edit-clear-history")),
         i18nc("@action:button", "Analyze && Clean up…"), this);
-    auto *toolbar = new QHBoxLayout;
+    // FlowLayout so the action buttons wrap onto extra rows when the panel is
+    // dragged narrow instead of clipping. No stretch — the buttons flow
+    // left-to-right and reflow downward as width shrinks.
+    auto *toolbar = new FlowLayout;
     toolbar->setContentsMargins(6, 4, 6, 4);
     toolbar->addWidget(m_cleanupBtn);
     toolbar->addWidget(m_discardBtn);
-    toolbar->addStretch(1);
     toolbar->addWidget(m_commitBtn);
     toolbar->addWidget(m_landBtn);
     toolbar->addWidget(m_prBtn);

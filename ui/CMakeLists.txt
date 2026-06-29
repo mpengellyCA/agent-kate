@@ -69,6 +69,8 @@ add_executable(agentkate
     src/shell/ShellLayout.cpp
     src/shell/PanelStack.cpp
     src/shell/StubPanel.cpp
+    src/shell/FlowLayout.cpp
+    src/shell/ElidingLabel.cpp
     src/cowork/CoworkPanel.cpp
     src/cowork/CoworkPortal.cpp
     src/cowork/ConsentDialog.cpp
@@ -230,6 +232,15 @@ if(Qt6Test_FOUND)
     add_test(NAME MarkdownUtilTest COMMAND MarkdownUtilTest)
     set_tests_properties(MarkdownUtilTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    # The wrapping FlowLayout — verify it reflows to more rows as width shrinks
+    # and that its minimum width is ~one item (so it never pins a panel).
+    add_executable(FlowLayoutTest tests/FlowLayoutTest.cpp src/shell/FlowLayout.cpp)
+    target_include_directories(FlowLayoutTest PRIVATE src)
+    target_link_libraries(FlowLayoutTest PRIVATE Qt6::Widgets Qt6::Test)
+    add_test(NAME FlowLayoutTest COMMAND FlowLayoutTest)
+    set_tests_properties(FlowLayoutTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 endif()
 
 # Dev-only visual harness for the new Appearance dialog + Command Palette. Not a
@@ -239,9 +250,11 @@ add_executable(akwidgets-preview EXCLUDE_FROM_ALL
     tests/WidgetsPreview.cpp
     src/theme/ThemeManager.cpp
     src/AppearanceDialog.cpp
-    src/CommandPalette.cpp)
+    src/CommandPalette.cpp
+    src/DiffView.cpp
+    src/shell/FlowLayout.cpp)
 target_include_directories(akwidgets-preview PRIVATE src)
 target_link_libraries(akwidgets-preview PRIVATE
-    Qt6::Widgets KF6::I18n KF6::ColorScheme KF6::ConfigCore)
+    Qt6::Widgets KF6::I18n KF6::ColorScheme KF6::ConfigCore KF6::SyntaxHighlighting)
 set_target_properties(akwidgets-preview PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})

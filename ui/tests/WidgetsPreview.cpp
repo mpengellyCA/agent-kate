@@ -11,6 +11,7 @@
 
 #include "AppearanceDialog.h"
 #include "CommandPalette.h"
+#include "DiffView.h"
 #include "theme/ThemeManager.h"
 
 #include <QAction>
@@ -18,6 +19,7 @@
 #include <QKeySequence>
 #include <QLabel>
 #include <QMainWindow>
+#include <QString>
 
 static QList<QAction *> sampleActions(QObject *parent)
 {
@@ -56,6 +58,36 @@ int main(int argc, char **argv)
     const QString mode = argc > 1 ? QString::fromUtf8(argv[1]) : QStringLiteral("appearance");
     const QString themeId = argc > 2 ? QString::fromUtf8(argv[2]) : QStringLiteral("midnight");
     ThemeManager::instance()->applyTheme(themeId, /*persist=*/false);
+
+    if (mode == QLatin1String("diff")) {
+        // Host the real DiffView in a deliberately NARROW window so its top-bar
+        // FlowLayout (summary / split toggle / "Jump to:" / file combo) is seen
+        // wrapping onto extra rows instead of clipping.
+        const QString sample = QStringLiteral(
+            "diff --git a/src/main.py b/src/main.py\n"
+            "index 1111111..2222222 100644\n"
+            "--- a/src/main.py\n"
+            "+++ b/src/main.py\n"
+            "@@ -1,3 +1,4 @@\n"
+            " def main():\n"
+            "-    print(\"old\")\n"
+            "+    print(\"new\")\n"
+            "+    print(\"added line\")\n"
+            " \n"
+            "diff --git a/README.md b/README.md\n"
+            "index 3333333..4444444 100644\n"
+            "--- a/README.md\n"
+            "+++ b/README.md\n"
+            "@@ -1,2 +1,2 @@\n"
+            "-# Old Title\n"
+            "+# New Title\n");
+        const int w = argc > 3 ? QString::fromUtf8(argv[3]).toInt() : 360;
+        auto *diff = new DiffView(sample);
+        diff->setWindowTitle(QStringLiteral("DiffView (narrow)"));
+        diff->resize(w > 0 ? w : 360, 600);
+        diff->show();
+        return app.exec();
+    }
 
     if (mode == QLatin1String("palette")) {
         auto *backdrop = new QMainWindow;
