@@ -51,6 +51,7 @@ add_executable(agentkate
     src/CsvView.cpp
     src/XlsxReader.cpp
     src/RichTextView.cpp
+    src/MarkdownUtil.cpp
     src/ExtensionsDialog.cpp
     src/ProviderConfig.cpp
     src/ProvidersDialog.cpp
@@ -81,6 +82,8 @@ add_executable(agentkate
     src/TagEditorDialog.cpp
     src/AutoOrganizeDialog.cpp
     src/AgentPanel.cpp
+    src/AgentChatHelpers.cpp
+    src/AttachmentBuilder.cpp
     src/TranscriptModel.cpp
     src/TranscriptDelegate.cpp
     src/WorktreeDashboard.cpp
@@ -210,5 +213,14 @@ if(Qt6Test_FOUND)
     target_link_libraries(TranscriptModelTest PRIVATE Qt6::Widgets Qt6::Test)
     add_test(NAME TranscriptModelTest COMMAND TranscriptModelTest)
     set_tests_properties(TranscriptModelTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    # Regression guard: QTextDocument::setMarkdown swallows text around raw-HTML
+    # angle brackets (e.g. "Reactive<T>"); the neutralizer escapes them first.
+    add_executable(MarkdownUtilTest tests/MarkdownUtilTest.cpp src/MarkdownUtil.cpp)
+    target_include_directories(MarkdownUtilTest PRIVATE src)
+    target_link_libraries(MarkdownUtilTest PRIVATE Qt6::Gui Qt6::Test)
+    add_test(NAME MarkdownUtilTest COMMAND MarkdownUtilTest)
+    set_tests_properties(MarkdownUtilTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 endif()

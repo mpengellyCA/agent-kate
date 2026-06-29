@@ -25,6 +25,11 @@ Two processes, one repo, connected by a local JSON-RPC bus:
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for detail.
 
+Agent Kate runs **your** agents with **your** credentials at **your** uid — it is
+not a sandbox, and same-uid processes are not isolated from each other. Before
+enabling third-party providers or Cowork desktop control, read the honest
+threat model in [`docs/security-model.md`](docs/security-model.md).
+
 ## Screenshots
 
 Editor, agent chat, and git log side-by-side — one agent working in its own worktree:

@@ -98,9 +98,10 @@ public:
     // it to size its column wide enough to fit the busiest row in the page.
     int maxLane() const { return m_maxLane; }
 
-    // Total rows currently loaded. The viewer treats this as the next "skip"
-    // offset when requesting the next page.
-    int loadedCount() const { return m_rows.size(); }
+    // Total commits paged in so far. The viewer treats this as the next "skip"
+    // offset when requesting the next page, so it must stay monotonic even after
+    // the cap evicts the oldest rows off the bottom — hence the +m_evicted.
+    int loadedCount() const { return m_rows.size() + m_evicted; }
 
     QString shaAt(int row) const;
     QString shortShaAt(int row) const;
@@ -120,6 +121,15 @@ private:
     // when lanes change in place rather than only growing on append.
     void recomputeMaxLane();
 
+    // Evict the oldest rows (the bottom of the list) once m_rows grows past
+    // kMaxRows, emitting beginRemoveRows/endRemoveRows so views stay consistent
+    // and bumping m_evicted so loadedCount() stays monotonic. See the cap note
+    // in the .cpp. Mirrors TranscriptModel::enforceCap().
+    void enforceCap();
+
     QVector<UiLogEntry> m_rows;
     int m_maxLane = 0;
+    // Count of oldest rows trimmed off the bottom by the cap. Kept so the page
+    // "skip" offset (loadedCount()) doesn't rewind onto already-evicted commits.
+    int m_evicted = 0;
 };

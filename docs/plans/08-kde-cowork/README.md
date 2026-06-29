@@ -20,6 +20,8 @@ portals/PipeWire).
 | [06-ui-panel.md](06-ui-panel.md) | Cowork panel, consent dialogs, active-grants, live preview, kill-switch (KDE-native). |
 | [**07-wiring-and-roadmap.md**](07-wiring-and-roadmap.md) | **The reconciled contract**: unified wire surface, collision resolutions, package layout, exact wiring edits, v1/v2/v3 roadmap, spike register, trim list. **Wins on naming/shape conflicts.** |
 | [**08-review-findings.md**](08-review-findings.md) | **Adversarial review gate**: the findings (2 root causes + 2 API dead-ends), remediations, the **amended v1 scope** (adds the per-connection identity keystone), and the **open trust-boundary decision** for the user. **Amends 07 §4.1.** |
+| [09-true-cursor-control.md](09-true-cursor-control.md) | Absolute pointer: move/click/scroll/drag with agent-configurable speed & accuracy (R2). |
+| [10-choreographed-input.md](10-choreographed-input.md) | Timed key/button holds, half-events & a unified input timeline — choreograph key+mouse with per-event timing (R2). |
 | [REFERENCE-skill.md](REFERENCE-skill.md) | API reference (CORRECTED per review §D): D-Bus signatures, options vardicts, AtspiRole table, Go/JS snippets. |
 
 ## v1 walking skeleton (frozen — see 07 §4.1)

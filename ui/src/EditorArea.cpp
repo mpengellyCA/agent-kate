@@ -664,6 +664,23 @@ bool EditorArea::closeTabIn(QTabWidget *tabs, int index, bool interactive)
             widget->deleteLater();
         }
     }
+    // Prune a group once its last tab is gone, so a long session can't
+    // accumulate dead empty QTabWidgets in m_groups. The destructor drains
+    // every group through here too, but it iterates a values() *copy*, so
+    // mutating m_groups (and tearing the now-empty tab widget down) underneath
+    // it is safe. With no group left active, activeTabs() returns nullptr and
+    // updateVisible() falls back to the placeholder — no "keep one" invariant.
+    if (tabs->count() == 0) {
+        const QString key = m_groups.key(tabs);
+        if (!key.isEmpty()) {
+            m_groups.remove(key);
+            if (m_activeGroup == key) {
+                m_activeGroup.clear();
+            }
+            m_stack->removeWidget(tabs);
+            tabs->deleteLater();
+        }
+    }
     updateVisible();
     emit openFilesChanged();
     return true;

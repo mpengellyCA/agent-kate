@@ -1,5 +1,6 @@
 #include "LspHoverProvider.h"
 #include "LspClient.h"
+#include "MarkdownUtil.h"
 
 #include <KTextEditor/Cursor>
 #include <KTextEditor/View>
@@ -83,7 +84,7 @@ QString LspHoverProvider::textHint(KTextEditor::View *view, const KTextEditor::C
             QString tip = trimmed;
             if (hover.markdown) {
                 QTextDocument md;
-                md.setMarkdown(trimmed);
+                md.setMarkdown(agentkate::neutralizeMarkdownRawHtml(trimmed));
                 tip = md.toHtml();
             }
             QToolTip::showText(QCursor::pos(), tip);

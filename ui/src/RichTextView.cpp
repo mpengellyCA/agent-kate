@@ -1,5 +1,7 @@
 #include "RichTextView.h"
 
+#include "MarkdownUtil.h"
+
 #include <KConfigGroup>
 #include <KLocalizedString>
 #include <KMessageWidget>
@@ -45,7 +47,8 @@ KConfigGroup modeConfig(RichTextView::Format format)
 QString markdownToHtml(const QString &md)
 {
     QTextDocument doc;
-    doc.setMarkdown(md, QTextDocument::MarkdownDialectGitHub);
+    doc.setMarkdown(agentkate::neutralizeMarkdownRawHtml(md),
+                    QTextDocument::MarkdownDialectGitHub);
     return doc.toHtml();
 }
 

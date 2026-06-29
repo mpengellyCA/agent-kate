@@ -8,6 +8,16 @@
 #include <QLocale>
 #include <QVariant>
 
+namespace {
+// The in-RAM history is capped at this many rows; once it grows past the cap
+// the oldest commits (which live at the BOTTOM — applyHead prepends newer ones
+// on top, appendPage tacks older ones below) are evicted. The full history
+// stays in git and re-paginates on demand. Generous enough that ordinary
+// browsing never reaches it, low enough that endless "load more" on a deep
+// repo cannot grow the model into an OOM. Mirrors TranscriptModel's kMaxRows.
+constexpr int kMaxRows = 5000;
+} // namespace
+
 LogModel::LogModel(QObject *parent)
     : QAbstractTableModel(parent)
 {
@@ -18,7 +28,28 @@ void LogModel::reset()
     beginResetModel();
     m_rows.clear();
     m_maxLane = 0;
+    m_evicted = 0;
     endResetModel();
+}
+
+void LogModel::enforceCap()
+{
+    const int over = m_rows.size() - kMaxRows;
+    if (over <= 0) {
+        return;
+    }
+    // Evict the oldest commits — the trailing rows — so the most recent history
+    // (and the user's selection/scroll, which anchor near the top) survive. The
+    // evicted count keeps loadedCount() monotonic so the next page's "skip"
+    // offset still lines up with what git would return below the kept rows.
+    const int first = m_rows.size() - over;
+    const int last = m_rows.size() - 1;
+    beginRemoveRows({}, first, last);
+    m_rows.remove(first, over);
+    endRemoveRows();
+    m_evicted += over;
+    // A trimmed-away row may have held the busiest lane; keep the column honest.
+    recomputeMaxLane();
 }
 
 void LogModel::appendPage(const QVector<UiLogEntry> &page)
@@ -47,6 +78,7 @@ void LogModel::appendPage(const QVector<UiLogEntry> &page)
         }
     }
     endInsertRows();
+    enforceCap();
 }
 
 void LogModel::recomputeMaxLane()
@@ -163,6 +195,9 @@ bool LogModel::applyHead(const QVector<UiLogEntry> &freshFirstPage)
         Q_EMIT dataChanged(index(firstChanged, 0),
                            index(lastChanged, ColumnCount - 1));
     }
+    // A prepend (case A) can push the model over the cap; trim the oldest rows
+    // off the bottom so a long-lived viewer can't grow without bound.
+    enforceCap();
     return true;
 }
 

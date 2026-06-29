@@ -1,4 +1,6 @@
 #include "AgentPanel.h"
+#include "AgentChatHelpers.h"
+#include "AttachmentBuilder.h"
 #include "ProviderConfig.h"
 #include "TranscriptDelegate.h"
 #include "TranscriptModel.h"
@@ -81,89 +83,10 @@ bool isDark(const QWidget *w)
 
 // (Note colouring now lives in TranscriptDelegate, which paints the feed —
 // see noteColor() there.)
-
-// markdownToHtml renders an assistant message (Markdown) to an HTML fragment.
-// Default-coloured text carries no explicit colour, so it inherits the card's
-// palette text colour.
-QString markdownToHtml(const QString &md)
-{
-    QTextDocument doc;
-    doc.setMarkdown(md, QTextDocument::MarkdownDialectGitHub);
-    const QString html = doc.toHtml();
-    const int bodyOpen = html.indexOf(QLatin1String("<body"));
-    const int bodyStart = bodyOpen >= 0 ? html.indexOf(QLatin1Char('>'), bodyOpen) + 1 : -1;
-    const int bodyEnd = html.lastIndexOf(QLatin1String("</body>"));
-    if (bodyStart > 0 && bodyEnd > bodyStart) {
-        return html.mid(bodyStart, bodyEnd - bodyStart);
-    }
-    return html;
-}
-
-// permSummary renders a tool's input as a short, human-readable line.
-QString permSummary(const QString &toolName, const QJsonObject &input)
-{
-    if (toolName == QLatin1String("Bash")) {
-        return input.value(QStringLiteral("command")).toString();
-    }
-    if (toolName == QLatin1String("WebFetch")) {
-        return input.value(QStringLiteral("url")).toString();
-    }
-    if (toolName == QLatin1String("WebSearch")) {
-        return input.value(QStringLiteral("query")).toString();
-    }
-    for (const QString &key : {QStringLiteral("file_path"), QStringLiteral("path"),
-                               QStringLiteral("pattern"), QStringLiteral("description")}) {
-        const QString v = input.value(key).toString();
-        if (!v.isEmpty()) {
-            return v;
-        }
-    }
-    return QString::fromUtf8(QJsonDocument(input).toJson(QJsonDocument::Compact));
-}
-
-// toolResultText pulls plain text out of a tool_result content value, which may
-// be a bare string or an array of content blocks.
-QString toolResultText(const QJsonValue &content)
-{
-    if (content.isString()) {
-        return content.toString();
-    }
-    QStringList parts;
-    for (const QJsonValue &v : content.toArray()) {
-        const QJsonObject o = v.toObject();
-        if (o.value(QStringLiteral("type")).toString() == QLatin1String("text")) {
-            parts << o.value(QStringLiteral("text")).toString();
-        }
-    }
-    return parts.join(QLatin1Char('\n'));
-}
-
-// activityFor maps a tool name to a personable status line for the
-// "Agent Kate at work" indicator.
-QString activityFor(const QString &tool)
-{
-    if (tool == QLatin1String("Bash")) {
-        return QStringLiteral("Agent Kate is running commands…");
-    }
-    if (tool == QLatin1String("Edit") || tool == QLatin1String("Write")
-        || tool == QLatin1String("MultiEdit") || tool == QLatin1String("NotebookEdit")) {
-        return QStringLiteral("Agent Kate is writing code…");
-    }
-    if (tool == QLatin1String("Read") || tool == QLatin1String("Grep")
-        || tool == QLatin1String("Glob")) {
-        return QStringLiteral("Agent Kate is combing through the code…");
-    }
-    if (tool == QLatin1String("WebFetch") || tool == QLatin1String("WebSearch")) {
-        return QStringLiteral("Agent Kate is scouring the web…");
-    }
-    if (tool == QLatin1String("Task") || tool == QLatin1String("TodoWrite")) {
-        return QStringLiteral("Agent Kate is mapping out the work…");
-    }
-    if (tool.startsWith(QLatin1String("mcp__"))) {
-        return QStringLiteral("Agent Kate is coordinating with the team…");
-    }
-    return QStringLiteral("Agent Kate is working with %1…").arg(tool);
-}
+//
+// The pure stream-json formatting helpers (markdownToHtml, permSummary,
+// toolResultText, activityFor) now live in AgentChatHelpers; the resume
+// recovery dialog + strategy mapping live there too.
 
 // clearLayout removes and deletes every item (and widget) in a layout.
 void clearLayout(QLayout *layout)
@@ -1255,76 +1178,6 @@ void AgentPanel::doResume()
                  this);
 }
 
-// resumeStrategyModel maps a configured "Compact on Resume" strategy id to the
-// compactNow model it implies, so resume can follow it automatically instead of
-// prompting. Returns "" for non-resume strategies (Exit/Stop strategies, or an
-// unset/unknown id), in which case the caller falls back to asking.
-static QString resumeStrategyModel(const QString &strategy)
-{
-    if (strategy == QLatin1String("resume_opus_cold")) {
-        return QStringLiteral("opus");
-    }
-    if (strategy == QLatin1String("resume_sonnet_cold")) {
-        return QStringLiteral("sonnet");
-    }
-    if (strategy == QLatin1String("resume_haiku_cold")) {
-        return QStringLiteral("haiku");
-    }
-    if (strategy == QLatin1String("resume_local")) {
-        return QStringLiteral("local");
-    }
-    return QString();
-}
-
-// askRecoveryModel pops a modal asking which model should produce a missing
-// compacted summary before resume. Returns "opus"|"sonnet"|"haiku"|"local",
-// or "" if the user cancelled (in which case the caller should resume on the
-// full transcript and pay the re-cache cost knowingly).
-static QString askRecoveryModel(QWidget *parent)
-{
-    QDialog dlg(parent);
-    dlg.setWindowTitle(QObject::tr("Resume — choose compactor"));
-
-    auto *layout = new QVBoxLayout(&dlg);
-    auto *msg = new QLabel(QObject::tr(
-        "This thread has no current compacted summary, so resuming would "
-        "replay its full transcript. Choose which model should produce a "
-        "summary now:"));
-    msg->setWordWrap(true);
-    layout->addWidget(msg);
-
-    QString choice;
-    auto *btnLayout = new QHBoxLayout;
-    auto add = [&](const QString &label, const QString &result, bool recommended) {
-        auto *btn = new QPushButton(label, &dlg);
-        if (recommended) {
-            btn->setDefault(true);
-            QFont f = btn->font();
-            f.setBold(true);
-            btn->setFont(f);
-        }
-        QObject::connect(btn, &QPushButton::clicked, &dlg, [&dlg, &choice, result] {
-            choice = result;
-            dlg.accept();
-        });
-        btnLayout->addWidget(btn);
-    };
-    add(QObject::tr("Opus"), QStringLiteral("opus"), false);
-    add(QObject::tr("Sonnet (recommended)"), QStringLiteral("sonnet"), true);
-    add(QObject::tr("Haiku"), QStringLiteral("haiku"), false);
-    add(QObject::tr("Local"), QStringLiteral("local"), false);
-    layout->addLayout(btnLayout);
-
-    auto *bb = new QDialogButtonBox(QDialogButtonBox::Cancel, &dlg);
-    QObject::connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
-    layout->addWidget(bb);
-
-    if (dlg.exec() == QDialog::Accepted) {
-        return choice;
-    }
-    return QString();
-}
-
 void AgentPanel::resume()
 {
     if (!m_dormant || m_threadId.isEmpty()) {
@@ -1364,9 +1217,9 @@ void AgentPanel::resume()
                      // to asking which model should produce one.
                      const QString strategy =
                          result.value(QStringLiteral("strategy")).toString();
-                     const QString autoModel = resumeStrategyModel(strategy);
+                     const QString autoModel = agentkate::resumeStrategyModel(strategy);
                      const QString model =
-                         autoModel.isEmpty() ? askRecoveryModel(this) : autoModel;
+                         autoModel.isEmpty() ? agentkate::askRecoveryModel(this) : autoModel;
                      if (model.isEmpty()) {
                          addNote(QStringLiteral("Resuming without compaction. "
                                                 "The next turn will pay the full re-cache cost."),
@@ -2016,83 +1869,10 @@ void AgentPanel::attachPaths(const QStringList &paths)
     if (m_attachNotice) {
         m_attachNotice->hide(); // clear any stale rejection from a prior attempt
     }
-    QStringList skipped; // human-readable reasons, shown together at the end
-    static const QHash<QString, QString> imageTypes{
-        {QStringLiteral("png"), QStringLiteral("image/png")},
-        {QStringLiteral("jpg"), QStringLiteral("image/jpeg")},
-        {QStringLiteral("jpeg"), QStringLiteral("image/jpeg")},
-        {QStringLiteral("gif"), QStringLiteral("image/gif")},
-        {QStringLiteral("webp"), QStringLiteral("image/webp")},
-        {QStringLiteral("bmp"), QStringLiteral("image/bmp")}};
-
-    // Existing whole-file attachments, keyed by absolute path, for dedup.
-    QSet<QString> existingPaths;
-    for (const QJsonValue &av : std::as_const(m_attachments)) {
-        const QString p = av.toObject().value(QStringLiteral("path")).toString();
-        if (!p.isEmpty()) {
-            existingPaths.insert(p);
-        }
-    }
-
-    for (const QString &path : paths) {
-        const QFileInfo info(path);
-        if (!info.exists() || info.isDir()) {
-            // Directories aren't attachable as a single blob — skip with a note.
-            if (info.isDir()) {
-                skipped << i18n("%1 — folders can't be attached", info.fileName());
-            }
-            continue;
-        }
-        const QString abs = info.absoluteFilePath();
-        if (existingPaths.contains(abs)) {
-            continue; // already attached — skip quietly
-        }
-        QFile file(path);
-        if (!file.open(QIODevice::ReadOnly)) {
-            skipped << i18n("%1 — could not be read", info.fileName());
-            continue;
-        }
-        const QByteArray bytes = file.readAll();
-        const QString ext = info.suffix().toLower();
-
-        // A path outside the workspace root is allowed (external drops are the
-        // point) but flagged so the chip can hint at it.
-        const bool outside = !m_workspace.isEmpty()
-            && !abs.startsWith(QDir(m_workspace).absolutePath() + QLatin1Char('/'));
-
-        QJsonObject att{{QStringLiteral("name"), info.fileName()},
-                        {QStringLiteral("path"), abs}};
-        if (outside) {
-            att[QStringLiteral("outside")] = true;
-        }
-        if (imageTypes.contains(ext)) {
-            if (bytes.size() > 5 * 1024 * 1024) {
-                skipped << i18n("%1 — image too large to attach (over 5 MB)",
-                                info.fileName());
-                continue;
-            }
-            att[QStringLiteral("kind")] = QStringLiteral("image");
-            att[QStringLiteral("mediaType")] = imageTypes.value(ext);
-            att[QStringLiteral("dataB64")] = QString::fromLatin1(bytes.toBase64());
-        } else {
-            // Binary sniff: a NUL in the first ~8 KB means this isn't text.
-            if (bytes.left(8 * 1024).contains('\0')) {
-                skipped << i18n("%1 — binary file, can't be added as text context",
-                                info.fileName());
-                continue;
-            }
-            QByteArray textBytes = bytes;
-            QString suffix;
-            if (textBytes.size() > 256 * 1024) {
-                textBytes.truncate(256 * 1024);
-                suffix = QStringLiteral("\n… (truncated)");
-            }
-            att[QStringLiteral("kind")] = QStringLiteral("text");
-            att[QStringLiteral("text")] = QString::fromUtf8(textBytes) + suffix;
-        }
-        existingPaths.insert(abs);
-        m_attachments.append(att);
-    }
+    // The file I/O + JSON assembly lives in AttachmentBuilder; the panel keeps
+    // the chip UI and the rejection banner.
+    const QStringList skipped =
+        agentkate::buildPathAttachments(paths, m_workspace, m_attachments);
     if (!skipped.isEmpty()) {
         showAttachNotice(skipped.size() == 1
                              ? i18n("Couldn't attach %1", skipped.first())
@@ -2104,73 +1884,14 @@ void AgentPanel::attachPaths(const QStringList &paths)
 
 void AgentPanel::attachItems(const QJsonArray &items)
 {
-    // Names of existing ranged (text-excerpt) attachments, for dedup.
-    QSet<QString> existingNames;
-    for (const QJsonValue &av : std::as_const(m_attachments)) {
-        existingNames.insert(av.toObject().value(QStringLiteral("name")).toString());
-    }
-
-    QStringList wholeFile; // non-ranged items degrade to attachPaths
-    for (const QJsonValue &iv : items) {
-        const QJsonObject it = iv.toObject();
-        const QString path = it.value(QStringLiteral("path")).toString();
-        if (path.isEmpty()) {
-            continue;
-        }
-        if (!it.contains(QStringLiteral("line"))) {
-            wholeFile << path;
-            continue;
-        }
-        const QFileInfo info(path);
-        if (!info.exists() || info.isDir()) {
-            continue;
-        }
-        QFile file(path);
-        if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-            showAttachNotice(i18n("Couldn't attach %1 — could not be read",
-                                  info.fileName()));
-            continue;
-        }
-        const QByteArray bytes = file.readAll();
-        if (bytes.left(8 * 1024).contains('\0')) {
-            showAttachNotice(
-                i18n("Couldn't attach %1 — binary file, can't be added as "
-                     "text context",
-                     info.fileName()));
-            continue;
-        }
-        const QStringList lines =
-            QString::fromUtf8(bytes).split(QLatin1Char('\n'));
-
-        // line/endLine are 0-based; widen by ~8 lines of context each side.
-        constexpr int kContext = 8;
-        const int line = it.value(QStringLiteral("line")).toInt();
-        const int endLine = it.value(QStringLiteral("endLine")).toInt(line);
-        const int from = qMax(0, line - kContext);
-        const int to = qMin(lines.size() - 1, endLine + kContext);
-        if (from > to) {
-            continue;
-        }
-        QString excerpt;
-        for (int i = from; i <= to; ++i) {
-            excerpt += lines.at(i);
-            excerpt += QLatin1Char('\n');
-        }
-        // The range rides purely in the display name; the core sees plain text.
-        const QString name = QStringLiteral("%1:%2-%3")
-                                 .arg(info.fileName())
-                                 .arg(line + 1)
-                                 .arg(endLine + 1);
-        if (existingNames.contains(name)) {
-            continue;
-        }
-        existingNames.insert(name);
-        m_attachments.append(QJsonObject{
-            {QStringLiteral("kind"), QStringLiteral("text")},
-            {QStringLiteral("name"), name},
-            {QStringLiteral("path"), info.absoluteFilePath()},
-            {QStringLiteral("text"), excerpt},
-        });
+    // The ranged-excerpt extraction lives in AttachmentBuilder; non-ranged items
+    // come back in `wholeFile` to degrade to attachPaths, and any per-item
+    // failures come back as `skipped` reasons for the banner.
+    QStringList wholeFile;
+    const QStringList skipped =
+        agentkate::buildItemAttachments(items, m_attachments, wholeFile);
+    for (const QString &reason : skipped) {
+        showAttachNotice(i18n("Couldn't attach %1", reason));
     }
     rebuildAttachChips();
     if (!wholeFile.isEmpty()) {
@@ -2461,7 +2182,7 @@ void AgentPanel::showNextPermission()
         return;
     }
     const QString tool = req.value(QStringLiteral("toolName")).toString();
-    QString summary = permSummary(tool, req.value(QStringLiteral("input")).toObject());
+    QString summary = agentkate::permSummary(tool, req.value(QStringLiteral("input")).toObject());
     if (summary.length() > 240) {
         summary = summary.left(240) + QChar(0x2026);
     }
@@ -2643,7 +2364,7 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
                     addMessageCard(QStringLiteral("Agent Kate"),
                                    isDark(this) ? QStringLiteral("#5fd3bf")
                                                 : QStringLiteral("#1a7f6b"),
-                                   markdownToHtml(t), t, m_replaying);
+                                   agentkate::markdownToHtml(t), t, m_replaying);
                     m_working->setActivity(QString()); // text → generic reasoning
                 }
             } else if (bt == QLatin1String("tool_use")) {
@@ -2655,7 +2376,7 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
                     continue;
                 }
                 const QJsonObject input = b.value(QStringLiteral("input")).toObject();
-                QString summary = permSummary(name, input).simplified();
+                QString summary = agentkate::permSummary(name, input).simplified();
                 if (summary.length() > 96) {
                     summary = summary.left(95) + QChar(0x2026);
                 }
@@ -2673,7 +2394,7 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
                     m_jumpUnread = true;
                     updateJumpButton();
                 }
-                m_working->setActivity(activityFor(name));
+                m_working->setActivity(agentkate::activityFor(name));
             }
         }
 
@@ -2689,7 +2410,7 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
                     // Clip very long results to keep the row cheap to lay out;
                     // the "Show full output" affordance expands them on demand.
                     QString full =
-                        toolResultText(b.value(QStringLiteral("content"))).trimmed();
+                        agentkate::toolResultText(b.value(QStringLiteral("content"))).trimmed();
                     const bool truncated = full.size() > kToolResultDisplayClip;
                     QString shown = truncated ? full.left(kToolResultDisplayClip) : full;
                     // Cap the retained copy so a giant result can't bloat the
