@@ -86,6 +86,12 @@ MainWindow::MainWindow(const QString &openPath, QWidget *parent)
     m_tabsByAgent =
         KSharedConfig::openConfig()->group(QStringLiteral("Editor"))
             .readEntry("tabsByAgent", false);
+    // Capture first-run BEFORE setupUi() bumps the View schema: a brand-new
+    // profile (no schema yet) gets the friendly Simple default; everyone else
+    // keeps the Advanced surface they already know.
+    m_firstRunProfile =
+        KSharedConfig::openConfig()->group(QStringLiteral("View"))
+            .readEntry("schema", 0) == 0;
 
     setupUi();
     setupActions();
@@ -94,6 +100,7 @@ MainWindow::MainWindow(const QString &openPath, QWidget *parent)
     setupShellShortcuts();
     setupPerspectives();
     setupCore();
+    setupExperience();
 
     // Resolve the launch argument: a file opens its parent directory as the
     // first project, then the file itself once that project is active.
@@ -639,6 +646,25 @@ void MainWindow::setupActions()
         dlg.exec();
     });
 
+    // Experience level: Simple shows only the essentials; Advanced reveals the
+    // full developer surface. The radio mirrors the status-bar toggle.
+    QMenu *expMenu = optionsMenu->addMenu(QIcon::fromTheme(QStringLiteral("games-difficult")),
+                                          i18n("E&xperience Level"));
+    auto *expGroup = new QActionGroup(this);
+    m_simpleAct = expMenu->addAction(i18n("&Simple — just the essentials"));
+    m_advancedAct = expMenu->addAction(i18n("&Advanced — every developer tool"));
+    for (QAction *a : {m_simpleAct, m_advancedAct}) {
+        a->setCheckable(true);
+        expGroup->addAction(a);
+    }
+    m_simpleAct->setToolTip(i18n("Hide the code editor's developer tools and panels "
+                                 "— ideal for working alongside an agent."));
+    m_advancedAct->setToolTip(i18n("Show everything: language tools, git, terminal and all panels."));
+    connect(m_simpleAct, &QAction::triggered, this,
+            [this] { applyExperienceLevel(QStringLiteral("simple")); });
+    connect(m_advancedAct, &QAction::triggered, this,
+            [this] { applyExperienceLevel(QStringLiteral("advanced")); });
+
     QMenu *viewMenu = menuBar()->addMenu(i18n("&View"));
 
     auto *paletteAct = viewMenu->addAction(
@@ -796,7 +822,13 @@ void MainWindow::setupActions()
         }
     });
 
-    QMenu *codeMenu = menuBar()->addMenu(i18n("&Code"));
+    // The developer-only View actions are hidden in Simple mode. Collect them
+    // now that all of them exist (terminals, worktree terminal, git blame).
+    m_advancedActions = {m_blameToggle, newTermAct, focusTermAct, nextTermAct,
+                         prevTermAct, m_openWorktreeTerminalAct};
+
+    m_codeMenu = menuBar()->addMenu(i18n("&Code"));
+    QMenu *codeMenu = m_codeMenu;
     QAction *defAct = codeMenu->addAction(i18n("Go to &Definition"));
     defAct->setShortcut(Qt::Key_F12);
     connect(defAct, &QAction::triggered, this, [this] {
@@ -940,7 +972,9 @@ void MainWindow::showCommandPalette()
                 continue;
             }
             if (a->menu()) {
-                walk(a->menu());
+                if (a->isVisible()) { // skip menus hidden by Simple mode
+                    walk(a->menu());
+                }
                 continue;
             }
             if (!seen.contains(a)) {
@@ -951,7 +985,9 @@ void MainWindow::showCommandPalette()
     };
     for (QAction *top : menuBar()->actions()) {
         if (top->menu()) {
-            walk(top->menu());
+            if (top->isVisible()) {
+                walk(top->menu());
+            }
         } else if (!top->isSeparator() && !seen.contains(top)) {
             seen.insert(top);
             actions << top;
@@ -959,6 +995,96 @@ void MainWindow::showCommandPalette()
     }
     m_commandPalette->setActions(actions);
     m_commandPalette->showPalette();
+}
+
+// setupExperience installs the status-bar Simple/Advanced toggle and applies the
+// saved (or first-run default) level. A brand-new profile starts in Simple so a
+// non-developer isn't met with a wall of code tooling on first launch.
+void MainWindow::setupExperience()
+{
+    m_experienceButton = new QToolButton(this);
+    m_experienceButton->setAutoRaise(true);
+    m_experienceButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    m_experienceButton->setIcon(QIcon::fromTheme(QStringLiteral("games-difficult")));
+    m_experienceButton->setToolTip(i18n("Switch between Simple (just the essentials) "
+                                        "and Advanced (every developer tool)."));
+    connect(m_experienceButton, &QToolButton::clicked, this,
+            &MainWindow::toggleExperienceLevel);
+    statusBar()->insertPermanentWidget(0, m_experienceButton);
+
+    KConfigGroup grp = KSharedConfig::openConfig()->group(QStringLiteral("Experience"));
+    QString level = grp.readEntry("level", QString());
+    const bool wasUnset = level.isEmpty();
+    if (wasUnset) {
+        level = m_firstRunProfile ? QStringLiteral("simple") : QStringLiteral("advanced");
+    }
+    // Persist a computed first-run default so it can't flip once the View schema
+    // bumps and m_firstRunProfile would read false next launch.
+    applyExperienceLevel(level, /*persist=*/wasUnset);
+}
+
+void MainWindow::applyExperienceLevel(const QString &level, bool persist)
+{
+    const bool simple = (level == QLatin1String("simple"));
+    m_experienceLevel = simple ? QStringLiteral("simple") : QStringLiteral("advanced");
+
+    // Hide the Code menu and the developer-only View actions in Simple mode.
+    if (m_codeMenu) {
+        m_codeMenu->menuAction()->setVisible(!simple);
+    }
+    for (QAction *a : m_advancedActions) {
+        if (a) {
+            a->setVisible(!simple);
+        }
+    }
+    // Hide the developer-only panels. The essentials — Projects & Agents, Files,
+    // Search and Cowork — always stay on the rail.
+    const QStringList advancedPanels = {
+        m_keyOutline, m_keyWorktrees, m_keyGitLog, m_keyCoop, m_keyInspector,
+        m_keyTerminal, m_keyReferences, m_keyProblems, m_keyOutput, m_keyTasks};
+    for (const QString &key : advancedPanels) {
+        setPanelTabVisible(key, !simple);
+    }
+
+    if (m_simpleAct) m_simpleAct->setChecked(simple);
+    if (m_advancedAct) m_advancedAct->setChecked(!simple);
+    if (m_experienceButton) {
+        m_experienceButton->setText(simple ? i18n("Simple") : i18n("Advanced"));
+    }
+
+    if (persist) {
+        KSharedConfig::openConfig()
+            ->group(QStringLiteral("Experience"))
+            .writeEntry("level", m_experienceLevel);
+    }
+    statusBar()->showMessage(
+        simple ? i18n("Simple mode — just the essentials. Switch to Advanced for the developer tools.")
+               : i18n("Advanced mode — every tool and panel is available."),
+        5000);
+}
+
+void MainWindow::toggleExperienceLevel()
+{
+    applyExperienceLevel(m_experienceLevel == QLatin1String("simple")
+                             ? QStringLiteral("advanced")
+                             : QStringLiteral("simple"));
+}
+
+void MainWindow::setPanelTabVisible(const QString &key, bool visible)
+{
+    SideBar *bar = panelBar(key);
+    const int id = panelId(key);
+    if (!bar || id < 0) {
+        return;
+    }
+    if (auto *tab = bar->tabBar()->tab(id)) {
+        tab->setVisible(visible);
+        // If we just hid the raised panel, collapse the strip so we don't leave
+        // an orphaned panel area open with no tab to toggle it.
+        if (!visible && bar->raisedId() == id) {
+            bar->setRaisedId(-1);
+        }
+    }
 }
 
 // setupShellShortcuts wires the JetBrains-style raise-by-ordinal accelerators
@@ -1026,26 +1152,41 @@ void MainWindow::setupPerspectives()
     if (!viewMenu) {
         return; // no View menu — nothing to attach to
     }
-    m_perspectivesMenu = new QMenu(i18n("&Perspective"), viewMenu);
-    auto add = [this](const QString &label, const QString &key,
+    m_perspectivesMenu = new QMenu(i18n("&Layout"), viewMenu);
+    m_perspectivesMenu->setIcon(QIcon::fromTheme(QStringLiteral("view-multiple-objects")));
+    auto add = [this](const QString &label, const QString &key, const QString &tip,
                       const QKeySequence &shortcut = QKeySequence()) {
         QAction *act = m_perspectivesMenu->addAction(label);
+        act->setToolTip(tip);
         if (!shortcut.isEmpty()) {
             act->setShortcut(shortcut);
         }
         connect(act, &QAction::triggered, this, [this, key] { applyPerspective(key); });
     };
-    add(i18n("&Code Focus"), QStringLiteral("code"),
+    add(i18n("&Converse"), QStringLiteral("converse"),
+        i18n("Focus the conversation with your agent."),
         Qt::CTRL | Qt::SHIFT | Qt::Key_1);
-    add(i18n("C&hat Focus"), QStringLiteral("chat"),
+    add(i18n("&Build"), QStringLiteral("build"),
+        i18n("Focus the code editor and files."),
         Qt::CTRL | Qt::SHIFT | Qt::Key_2);
     add(i18n("&Review"), QStringLiteral("review"),
+        i18n("Editor and agent side by side, with changes and history."),
         Qt::CTRL | Qt::SHIFT | Qt::Key_3);
-    m_perspectivesMenu->addSeparator();
-    add(i18n("&Reset Layout"), QStringLiteral("reset"));
+    add(i18n("&Side by Side"), QStringLiteral("split"),
+        i18n("A balanced split of the editor and the agent."),
+        Qt::CTRL | Qt::SHIFT | Qt::Key_4);
 
     viewMenu->addSeparator();
     viewMenu->addMenu(m_perspectivesMenu);
+}
+
+QString MainWindow::layoutDisplayName(const QString &key)
+{
+    if (key == QLatin1String("converse")) return i18n("Converse");
+    if (key == QLatin1String("build")) return i18n("Build");
+    if (key == QLatin1String("review")) return i18n("Review");
+    if (key == QLatin1String("split")) return i18n("Side by Side");
+    return key;
 }
 
 void MainWindow::applyPerspective(const QString &name)
@@ -1053,42 +1194,52 @@ void MainWindow::applyPerspective(const QString &name)
     if (!m_shell) {
         return;
     }
-    auto *agent = m_agent ? m_agent->panelStack() : nullptr;
-    auto *editor = m_editor;
-    if (name == QLatin1String("code")) {
-        if (editor) editor->setVisible(true);
-        if (agent) agent->setVisible(false);
-        if (m_bottomBar) m_bottomBar->setRaisedId(-1);
-        raisePanelByKey(m_keyFiles);
-        if (m_rightBar) m_rightBar->setRaisedId(-1);
-        if (auto *v = m_editor ? m_editor->currentView() : nullptr) v->setFocus();
-    } else if (name == QLatin1String("chat")) {
-        if (editor) editor->setVisible(false);
-        if (agent) agent->setVisible(true);
-        raisePanelByKey(m_keyRoster);
+    // Only raise a panel whose tab is actually visible — Simple mode hides the
+    // developer panels, and a layout must not drag a hidden one back on screen.
+    auto raiseIfShown = [this](const QString &key) {
+        SideBar *bar = panelBar(key);
+        const int id = panelId(key);
+        if (!bar || id < 0) {
+            return;
+        }
+        if (auto *tab = bar->tabBar()->tab(id); tab && tab->isVisible()) {
+            raisePanelByKey(key);
+        }
+    };
+
+    // Route the centre split through applyCentreMode so the Editor/Split/Chat
+    // toggles and the persisted centre mode stay in sync with the layout.
+    if (name == QLatin1String("converse")) {
+        applyCentreMode(QStringLiteral("chat"));
+        raiseIfShown(m_keyRoster);
         if (m_rightBar) m_rightBar->setRaisedId(-1);
         if (m_bottomBar) m_bottomBar->setRaisedId(-1);
         if (m_agent) {
             if (auto *p = m_agent->activePanel()) p->setFocus();
         }
-    } else if (name == QLatin1String("review")) {
-        if (editor) editor->setVisible(true);
-        if (agent) agent->setVisible(true);
-        if (m_leftBar) m_leftBar->setRaisedId(-1);
-        raisePanelByKey(m_keyGitLog);
-        raisePanelByKey(m_keyProblems);
-    } else if (name == QLatin1String("reset")) {
-        if (editor) editor->setVisible(true);
-        if (agent) agent->setVisible(true);
-        raisePanelByKey(m_keyRoster);
-        raisePanelByKey(m_keyWorktrees);
+    } else if (name == QLatin1String("build")) {
+        applyCentreMode(QStringLiteral("editor"));
+        raiseIfShown(m_keyFiles);
+        if (m_rightBar) m_rightBar->setRaisedId(-1);
         if (m_bottomBar) m_bottomBar->setRaisedId(-1);
-        // Restore a 60/40 editor/agent split.
-        if (auto *h = m_shell->centreHSplitter()) {
-            h->setSizes({700, 500});
-        }
+        if (auto *v = m_editor ? m_editor->currentView() : nullptr) v->setFocus();
+    } else if (name == QLatin1String("review")) {
+        applyCentreMode(QStringLiteral("split"));
+        if (m_leftBar) m_leftBar->setRaisedId(-1);
+        raiseIfShown(m_keyGitLog);
+        raiseIfShown(m_keyProblems);
+        if (auto *h = m_shell->centreHSplitter()) h->setSizes({650, 550});
+    } else { // "split" — a balanced side-by-side, and the default reset
+        applyCentreMode(QStringLiteral("split"));
+        raiseIfShown(m_keyRoster);
+        raiseIfShown(m_keyWorktrees);
+        if (m_bottomBar) m_bottomBar->setRaisedId(-1);
+        if (auto *h = m_shell->centreHSplitter()) h->setSizes({700, 500});
     }
-    statusBar()->showMessage(i18n("Perspective: %1", name), 3000);
+    if (m_layoutButton) {
+        m_layoutButton->setText(layoutDisplayName(name));
+    }
+    statusBar()->showMessage(i18n("Layout: %1", layoutDisplayName(name)), 3000);
 }
 
 SideBar *MainWindow::barByName(const QString &name) const
@@ -1715,6 +1866,28 @@ void MainWindow::setupTopToolbar()
     auto *stretch = new QWidget(toolbar);
     stretch->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     toolbar->addWidget(stretch);
+
+    // Layout preset switcher — the friendly, high-level way to reshape the whole
+    // workspace for the task at hand (Converse / Build / Review / Side by Side).
+    m_layoutButton = new QToolButton(toolbar);
+    m_layoutButton->setText(i18n("Layout"));
+    m_layoutButton->setIcon(QIcon::fromTheme(QStringLiteral("view-multiple-objects")));
+    m_layoutButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    m_layoutButton->setPopupMode(QToolButton::InstantPopup);
+    m_layoutButton->setAutoRaise(true);
+    m_layoutButton->setToolTip(i18n("Reshape the whole workspace for the task at hand."));
+    auto *layoutMenu = new QMenu(m_layoutButton);
+    auto addLayoutItem = [this, layoutMenu](const QString &key) {
+        QAction *a = layoutMenu->addAction(layoutDisplayName(key));
+        connect(a, &QAction::triggered, this, [this, key] { applyPerspective(key); });
+    };
+    addLayoutItem(QStringLiteral("converse"));
+    addLayoutItem(QStringLiteral("build"));
+    addLayoutItem(QStringLiteral("split"));
+    addLayoutItem(QStringLiteral("review"));
+    m_layoutButton->setMenu(layoutMenu);
+    toolbar->addWidget(m_layoutButton);
+    toolbar->addSeparator();
 
     // Centre-slab mode toggle: Editor / Split / Chat. The three actions form
     // an exclusive group so exactly one stays raised; applyCentreMode hides

@@ -58,6 +58,18 @@ private:
     // Collect every leaf action in the window and show the searchable command
     // palette — the keyboard-first way to reach any feature.
     void showCommandPalette();
+
+    // Experience level — "simple" hides power tooling (the Code menu and the
+    // developer-only panels) so a newcomer sees only the essentials; "advanced"
+    // restores the full surface. Persisted; new profiles start Simple.
+    void setupExperience();
+    void applyExperienceLevel(const QString &level, bool persist = true);
+    void toggleExperienceLevel();
+    // Show/hide one activity-rail tab without destroying its panel; collapses
+    // the strip if the hidden tab was the raised one.
+    void setPanelTabVisible(const QString &key, bool visible);
+    // Friendly display name for a layout key (converse/build/split/review).
+    static QString layoutDisplayName(const QString &key);
     void applyPerspective(const QString &name);
     void applyCentreMode(const QString &mode); // "editor" | "split" | "chat"
 
@@ -161,7 +173,17 @@ private:
     QAction *m_centreEditorAct = nullptr;
     QAction *m_centreSplitAct = nullptr;
     QAction *m_centreChatAct = nullptr;
+    QToolButton *m_layoutButton = nullptr; // top-toolbar "Layout ▾" preset switcher
     QString m_centreMode;
+
+    // Experience level ("simple" / "advanced") and the chrome it gates.
+    QString m_experienceLevel;
+    bool m_firstRunProfile = false;        // captured before the shell migration
+    QMenu *m_codeMenu = nullptr;           // hidden in Simple mode
+    QList<QAction *> m_advancedActions;     // dev-only menu actions hidden in Simple
+    QAction *m_simpleAct = nullptr;        // radio sync for the Experience menu
+    QAction *m_advancedAct = nullptr;
+    QToolButton *m_experienceButton = nullptr; // status-bar Simple/Advanced toggle
     QList<int> m_centreSplitSizes; // remembered horizontal split for restore
 
     // Top toolbar + status-bar widgets
