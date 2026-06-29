@@ -356,10 +356,13 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
         "QFrame#promoteBar { border: 1px solid palette(mid); border-radius: 6px; }"));
     m_promoteBar->setVisible(false);
     auto *promoteLabel = new QLabel(
-        QStringLiteral("Running directly in the workspace — this agent is not isolated."),
+        QStringLiteral("Working directly in your files — changes apply straight away."),
         m_promoteBar);
     promoteLabel->setWordWrap(true);
-    m_promoteBtn = new QPushButton(QStringLiteral("Promote to worktree"), m_promoteBar);
+    m_promoteBtn = new QPushButton(QStringLiteral("Move to a private copy"), m_promoteBar);
+    m_promoteBtn->setToolTip(QStringLiteral(
+        "Move this agent's work into a private copy (a git worktree) so its "
+        "changes stay separate until you choose to keep them."));
     m_promoteBtn->setCursor(Qt::PointingHandCursor);
     auto *promoteLayout = new QHBoxLayout(m_promoteBar);
     promoteLayout->setContentsMargins(10, 6, 10, 6);
@@ -431,11 +434,12 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     });
 
     m_modeCombo = new QComboBox(this);
-    m_modeCombo->addItem(QStringLiteral("Accept edits"), QStringLiteral("acceptEdits"));
-    m_modeCombo->addItem(QStringLiteral("Approve each tool"), QStringLiteral("default"));
-    m_modeCombo->addItem(QStringLiteral("Auto"), QStringLiteral("auto"));
-    m_modeCombo->addItem(QStringLiteral("Unsafe (bypass)"), QStringLiteral("bypassPermissions"));
-    m_modeCombo->setToolTip(QStringLiteral("Permission mode for this agent (fixed once it starts)"));
+    m_modeCombo->addItem(QStringLiteral("Apply edits automatically"), QStringLiteral("acceptEdits"));
+    m_modeCombo->addItem(QStringLiteral("Ask before each step"), QStringLiteral("default"));
+    m_modeCombo->addItem(QStringLiteral("Work freely"), QStringLiteral("auto"));
+    m_modeCombo->addItem(QStringLiteral("Expert — never ask"), QStringLiteral("bypassPermissions"));
+    m_modeCombo->setToolTip(QStringLiteral(
+        "How much the agent checks with you before it acts. Fixed once it starts."));
     // Sticky: the last choice becomes the default for the next agent — except
     // for "Unsafe (bypass)", which resets to "Auto" so it's never re-armed
     // accidentally on the next conversation.
@@ -463,17 +467,17 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     });
 
     m_isolationCombo = new QComboBox(this);
-    m_isolationCombo->addItem(QStringLiteral("Auto isolation"), QStringLiteral("auto"));
-    m_isolationCombo->addItem(QStringLiteral("Isolated worktree"),
+    m_isolationCombo->addItem(QStringLiteral("Automatic"), QStringLiteral("auto"));
+    m_isolationCombo->addItem(QStringLiteral("In a private copy (sandbox)"),
                               QStringLiteral("isolated"));
-    m_isolationCombo->addItem(QStringLiteral("In the workspace"),
+    m_isolationCombo->addItem(QStringLiteral("Directly in my files"),
                               QStringLiteral("workspace"));
     m_isolationCombo->setToolTip(QStringLiteral(
-        "Where this agent runs, fixed once it starts:\n"
-        "• Auto isolation — its own git worktree when the repo has commits,\n"
-        "  otherwise directly in the workspace\n"
-        "• Isolated worktree — always its own worktree on branch agentkate/<id>\n"
-        "• In the workspace — directly in the project, no isolation"));
+        "Whether the agent works on a private copy of your project or directly\n"
+        "in your files. Fixed once it starts:\n"
+        "• Automatic — a private copy when the project is a git repo, else your files\n"
+        "• In a private copy — always its own sandbox; merge it back when you're happy\n"
+        "• Directly in my files — no sandbox; changes land in your project immediately"));
     // Sticky: the last choice becomes the default for the next agent.
     {
         const QString saved = KSharedConfig::openConfig()
@@ -492,16 +496,16 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
 
     m_effortCombo = new QComboBox(this);
     // An empty value passes no --effort flag, leaving Claude Code's own default.
-    m_effortCombo->addItem(QStringLiteral("Default effort"), QString());
-    m_effortCombo->addItem(QStringLiteral("Low effort"), QStringLiteral("low"));
-    m_effortCombo->addItem(QStringLiteral("Medium effort"), QStringLiteral("medium"));
-    m_effortCombo->addItem(QStringLiteral("High effort"), QStringLiteral("high"));
-    m_effortCombo->addItem(QStringLiteral("Extra-high effort"), QStringLiteral("xhigh"));
-    m_effortCombo->addItem(QStringLiteral("Max effort"), QStringLiteral("max"));
+    m_effortCombo->addItem(QStringLiteral("Default"), QString());
+    m_effortCombo->addItem(QStringLiteral("Low"), QStringLiteral("low"));
+    m_effortCombo->addItem(QStringLiteral("Medium"), QStringLiteral("medium"));
+    m_effortCombo->addItem(QStringLiteral("High"), QStringLiteral("high"));
+    m_effortCombo->addItem(QStringLiteral("Extra-high"), QStringLiteral("xhigh"));
+    m_effortCombo->addItem(QStringLiteral("Maximum"), QStringLiteral("max"));
     m_effortCombo->setToolTip(QStringLiteral(
-        "Reasoning effort for this agent, fixed once it starts.\n"
-        "Higher levels let Claude Code think longer before it acts.\n"
-        "Default effort leaves Claude Code's own configured level untouched."));
+        "How long the agent thinks before it acts. Higher is more thorough but\n"
+        "slower. Default leaves the model's own configured level untouched.\n"
+        "Fixed once it starts."));
     // Sticky: the last choice becomes the default for the next agent.
     {
         const QString saved = KSharedConfig::openConfig()
@@ -590,21 +594,21 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     // whole transcript. The five options encode (when, model) combos; the
     // strip flag asks LLM-based compactors to pre-trim noisy events.
     m_compactCombo = new QComboBox(this);
-    m_compactCombo->addItem(QStringLiteral("Compact on Stop/Exit (Hot Opus)"),
+    m_compactCombo->addItem(QStringLiteral("When it stops — best quality"),
                             QStringLiteral("exit_opus_hot"));
-    m_compactCombo->addItem(QStringLiteral("Compact on Stop/Exit (Cold Sonnet)"),
+    m_compactCombo->addItem(QStringLiteral("When it stops — cheaper"),
                             QStringLiteral("exit_sonnet_cold"));
-    m_compactCombo->addItem(QStringLiteral("Compact on Resume (Cold Sonnet)"),
+    m_compactCombo->addItem(QStringLiteral("On resume — balanced"),
                             QStringLiteral("resume_sonnet_cold"));
-    m_compactCombo->addItem(QStringLiteral("Compact on Resume (Cold Haiku)"),
+    m_compactCombo->addItem(QStringLiteral("On resume — cheapest"),
                             QStringLiteral("resume_haiku_cold"));
-    m_compactCombo->addItem(QStringLiteral("Compact on Resume (Local)"),
+    m_compactCombo->addItem(QStringLiteral("On resume — on this computer"),
                             QStringLiteral("resume_local"));
     m_compactCombo->setToolTip(QStringLiteral(
-        "When and how this thread's transcript is condensed for resumption.\n"
-        "Hot Opus is most accurate and cheapest in dollars but spends Opus quota.\n"
-        "Sonnet on a Max plan uses a separate quota bucket. Local is free but\n"
-        "behaviourally-lossless only — preserves decisions, drops tool outputs."));
+        "When the agent's long conversation gets summarized so it stays cheap to\n"
+        "continue later. \"Best quality\" summarizes the moment it stops; the\n"
+        "\"on resume\" options defer the work until you reopen it. \"On this\n"
+        "computer\" is free and runs locally (keeps decisions, drops tool output)."));
     {
         const QString saved = KSharedConfig::openConfig()
                                   ->group(QStringLiteral("Agent"))
@@ -615,10 +619,11 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
             m_compactCombo->setCurrentIndex(savedIdx);
         }
     }
-    m_compactStrip = new QCheckBox(QStringLiteral("Strip"), this);
+    m_compactStrip = new QCheckBox(QStringLiteral("Trim noisy logs first"), this);
     m_compactStrip->setToolTip(QStringLiteral(
-        "Pre-trim noisy events (stale reads, lifecycle, etc.) before handing\n"
-        "the transcript to an LLM compactor. No effect on the Local strategy."));
+        "Drop low-value events (stale file reads, lifecycle noise) before the\n"
+        "summary is made, for a tighter result. No effect on the on-this-computer\n"
+        "option."));
     m_compactStrip->setChecked(KSharedConfig::openConfig()
                                    ->group(QStringLiteral("Agent"))
                                    .readEntry("compactStrip", false));
@@ -717,12 +722,12 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
         auto *panel = new QWidget(menu);
         auto *form = new QFormLayout(panel);
         form->setContentsMargins(10, 8, 10, 8);
-        form->addRow(QStringLiteral("Permission"), m_modeCombo);
-        form->addRow(QStringLiteral("Isolation"), m_isolationCombo);
-        form->addRow(QStringLiteral("Effort"), m_effortCombo);
-        form->addRow(QStringLiteral("Provider"), m_providerCombo);
+        form->addRow(QStringLiteral("When to ask"), m_modeCombo);
+        form->addRow(QStringLiteral("Where it works"), m_isolationCombo);
+        form->addRow(QStringLiteral("Thinking effort"), m_effortCombo);
+        form->addRow(QStringLiteral("AI provider"), m_providerCombo);
         form->addRow(QStringLiteral("Model"), m_modelCombo);
-        form->addRow(QStringLiteral("Desktop"), m_coworkCheck);
+        form->addRow(QStringLiteral("Desktop access"), m_coworkCheck);
         auto *action = new QWidgetAction(menu);
         action->setDefaultWidget(panel);
         menu->addAction(action);
@@ -735,8 +740,8 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     setupBtn->setPopupMode(QToolButton::InstantPopup);
     setupBtn->setCursor(Qt::PointingHandCursor);
     setupBtn->setToolTip(QStringLiteral(
-        "Permission, isolation, reasoning effort, and model for this agent.\n"
-        "These are fixed once the agent starts."));
+        "How this agent works — what it's allowed to do, where it works, how hard\n"
+        "it thinks, and which model. These are fixed once the agent starts."));
     setupBtn->setMenu(buildSetupMenu());
 
     // "Compaction ▾" — strategy + strip live + a "Compact now" submenu for
@@ -746,36 +751,36 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
         auto *panel = new QWidget(menu);
         auto *form = new QFormLayout(panel);
         form->setContentsMargins(10, 8, 10, 8);
-        form->addRow(QStringLiteral("Strategy"), m_compactCombo);
+        form->addRow(QStringLiteral("When to summarize"), m_compactCombo);
         form->addRow(QString(), m_compactStrip);
         auto *panelAction = new QWidgetAction(menu);
         panelAction->setDefaultWidget(panel);
         menu->addAction(panelAction);
         menu->addSeparator();
-        auto *nowMenu = menu->addMenu(QStringLiteral("Compact now"));
+        auto *nowMenu = menu->addMenu(QStringLiteral("Summarize now"));
         m_compactNowMenu = nowMenu; // kept so updateActionStates can disable it
         auto add = [this, nowMenu](const QString &label, const QString &token) {
             QAction *a = nowMenu->addAction(label);
             connect(a, &QAction::triggered, this, [this, token] { runCompactNow(token); });
             return a;
         };
-        add(QStringLiteral("Hot Opus (live thread)"), QStringLiteral("hot"));
+        add(QStringLiteral("Best quality, on the live agent"), QStringLiteral("hot"));
         nowMenu->addSeparator();
-        add(QStringLiteral("Cold Opus"), QStringLiteral("opus"));
-        add(QStringLiteral("Cold Sonnet"), QStringLiteral("sonnet"));
-        add(QStringLiteral("Cold Haiku"), QStringLiteral("haiku"));
-        add(QStringLiteral("Local (programmatic)"), QStringLiteral("local"));
+        add(QStringLiteral("High quality (Opus)"), QStringLiteral("opus"));
+        add(QStringLiteral("Balanced (Sonnet)"), QStringLiteral("sonnet"));
+        add(QStringLiteral("Cheapest (Haiku)"), QStringLiteral("haiku"));
+        add(QStringLiteral("On this computer"), QStringLiteral("local"));
         return menu;
     };
     auto *compactionBtn = new QToolButton(this);
-    compactionBtn->setText(QStringLiteral("Compaction"));
+    compactionBtn->setText(QStringLiteral("Memory"));
     compactionBtn->setIcon(QIcon::fromTheme(QStringLiteral("edit-clear-history")));
     compactionBtn->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
     compactionBtn->setPopupMode(QToolButton::InstantPopup);
     compactionBtn->setCursor(Qt::PointingHandCursor);
     compactionBtn->setToolTip(QStringLiteral(
-        "When and how this thread's transcript is condensed for resumption,\n"
-        "plus a one-shot \"Compact now\" with any backend."));
+        "How this agent's long conversation is summarized so it stays affordable\n"
+        "to continue later — plus a one-shot \"Summarize now\"."));
     compactionBtn->setMenu(buildCompactionMenu());
 
     // The standalone Compact-now button is now folded into the Compaction
@@ -1121,7 +1126,7 @@ void AgentPanel::runCompactNow(const QString &model)
                 QStringLiteral("err"));
         return;
     }
-    addNote(QStringLiteral("compacting with <b>%1</b>…").arg(model.toHtmlEscaped()),
+    addNote(QStringLiteral("summarizing with <b>%1</b>…").arg(model.toHtmlEscaped()),
             QStringLiteral("sys"));
     const QString tid = m_threadId;
     m_core->call(QStringLiteral("agent.compactNow"),
@@ -1230,7 +1235,7 @@ void AgentPanel::resume()
                          doResume();
                          return;
                      }
-                     addNote(QStringLiteral("compacting with <b>%1</b>…").arg(model.toHtmlEscaped()),
+                     addNote(QStringLiteral("summarizing with <b>%1</b>…").arg(model.toHtmlEscaped()),
                              QStringLiteral("sys"));
                      m_core->call(QStringLiteral("agent.compactNow"),
                                   QJsonObject{
@@ -2103,8 +2108,8 @@ void AgentPanel::onPromoteClicked()
         return;
     }
     m_promoting = true;
-    addNote(QStringLiteral("promoting to an isolated worktree — the agent will "
-                           "restart in its own branch…"),
+    addNote(QStringLiteral("moving to a private copy — the agent will restart in "
+                           "its own sandbox…"),
             QStringLiteral("sys"));
     m_core->call(QStringLiteral("agent.promote"),
                  QJsonObject{{QStringLiteral("threadId"), m_threadId}},
