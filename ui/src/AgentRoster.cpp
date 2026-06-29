@@ -1,5 +1,6 @@
 #include "AgentRoster.h"
 #include "AgentCardDelegate.h"
+#include "theme/ThemeManager.h"
 
 #include <QAction>
 #include <QApplication>
@@ -371,7 +372,7 @@ void AgentRoster::addAgent(const QString &projectPath, int agentId, const QStrin
     item->setData(0, Qt::UserRole, agentId);
     item->setData(0, Title, title);
     item->setData(0, Number, 0);
-    item->setData(0, AgentRoles::Dot, QStringLiteral("#8b91a0"));
+    item->setData(0, AgentRoles::Dot, ThemeManager::palette().agentIdle.name());
     item->setText(0, composeLabel(0, title));
     project->setExpanded(true);
 }

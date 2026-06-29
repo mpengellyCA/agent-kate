@@ -1,6 +1,8 @@
 #include "MainWindow.h"
 #include "AgentDock.h"
 #include "AgentPanel.h"
+#include "AppearanceDialog.h"
+#include "CommandPalette.h"
 #include "EditorArea.h"
 #include "ExtensionsDialog.h"
 #include "OutlinePanel.h"
@@ -49,6 +51,7 @@
 
 #include <QAction>
 #include <QActionGroup>
+#include <functional>
 #include <QCloseEvent>
 #include <QCoreApplication>
 #include <QCursor>
@@ -225,7 +228,7 @@ void MainWindow::setupUi()
                   i18n("Cowork"), m_coworkPanel, QStringLiteral("right"));
     m_inspectorPanel = new AiInspectorPanel(m_core, this);
     registerPanel(m_keyInspector, QIcon::fromTheme(QStringLiteral("view-statistics")),
-                  i18n("AI Inspector"), m_inspectorPanel, QStringLiteral("right"));
+                  i18n("Agent Activity"), m_inspectorPanel, QStringLiteral("right"));
 
     registerPanel(m_keyTerminal, QIcon::fromTheme(QStringLiteral("utilities-terminal")),
                   i18n("Terminal"), m_terminal, QStringLiteral("bottom"));
@@ -245,6 +248,42 @@ void MainWindow::setupUi()
                                 i18n("Background tasks, hook runs, and queued work appear here."),
                                 this),
                   QStringLiteral("bottom"));
+
+    // Plain-language descriptions for every activity-rail tab. The rail is
+    // icon-only by default, which reads as cryptic to anyone who isn't a
+    // power user — a hover that says what each panel is *for* makes the whole
+    // shell approachable without adding chrome.
+    const QHash<QString, QString> panelHelp = {
+        {m_keyRoster, i18n("Your projects and the agents working in them. "
+                           "Right-click an agent for actions.")},
+        {m_keyFiles, i18n("Browse the files in the active project.")},
+        {m_keyOutline, i18n("Jump to the functions, classes and symbols in the open file.")},
+        {m_keySearch, i18n("Search across the whole project — plain text or regular expressions.")},
+        {m_keyWorktrees, i18n("Each agent works in its own isolated copy of the project "
+                              "(a git worktree). Review and manage them here.")},
+        {m_keyGitLog, i18n("The commit history for the active project.")},
+        {m_keyCoop, i18n("See who — human or agent — is editing what, in real time.")},
+        {m_keyCowork, i18n("Let an agent see and control your desktop, only with your permission.")},
+        {m_keyInspector, i18n("A live view of the agent's model, token use, cost and tool calls.")},
+        {m_keyTerminal, i18n("A built-in command-line terminal.")},
+        {m_keyReferences, i18n("Everywhere the selected symbol is used.")},
+        {m_keyProblems, i18n("Errors and warnings from the language tools.")},
+        {m_keyOutput, i18n("Background log output from Agent Kate's core.")},
+        {m_keyTasks, i18n("Background tasks, hook runs and queued work.")},
+    };
+    for (auto it = panelHelp.constBegin(); it != panelHelp.constEnd(); ++it) {
+        SideBar *bar = panelBar(it.key());
+        const int id = panelId(it.key());
+        if (!bar || id < 0) {
+            continue;
+        }
+        if (auto *tab = bar->tabBar()->tab(id)) {
+            QString title = bar->panelLabel(id);
+            title.replace(QLatin1String("&&"), QLatin1String("&"));
+            tab->setToolTip(QStringLiteral("<b>%1</b><p>%2</p>")
+                                .arg(title.toHtmlEscaped(), it.value().toHtmlEscaped()));
+        }
+    }
     // Wire the Output panel to drain m_core's coreLog. m_core does not exist
     // yet (setupCore runs after setupUi); defer the connect via a queued
     // single-shot, by which time m_core is constructed.
@@ -588,7 +627,31 @@ void MainWindow::setupActions()
         }
     });
 
+    optionsMenu->addSeparator();
+    auto *appearanceAct = optionsMenu->addAction(
+        QIcon::fromTheme(QStringLiteral("preferences-desktop-color")),
+        i18n("&Appearance…"));
+    appearanceAct->setToolTip(i18n(
+        "Give Agent Kate its own look — a signature theme or any KDE colour "
+        "scheme — independent of the rest of your desktop."));
+    connect(appearanceAct, &QAction::triggered, this, [this] {
+        AppearanceDialog dlg(this);
+        dlg.exec();
+    });
+
     QMenu *viewMenu = menuBar()->addMenu(i18n("&View"));
+
+    auto *paletteAct = viewMenu->addAction(
+        QIcon::fromTheme(QStringLiteral("show-menu")), i18n("&Command Palette…"));
+    // Ctrl+Shift+P is the convention; Ctrl+P is a friendly second binding since
+    // Agent Kate has no print action to clash with.
+    paletteAct->setShortcuts({QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_P),
+                              QKeySequence(Qt::CTRL | Qt::Key_P)});
+    paletteAct->setToolTip(
+        i18n("Search and run any command by name — the fastest way to reach "
+             "every feature."));
+    connect(paletteAct, &QAction::triggered, this, &MainWindow::showCommandPalette);
+    viewMenu->addSeparator();
     m_blameToggle = viewMenu->addAction(i18n("Show Git &Blame"));
     m_blameToggle->setCheckable(true);
     m_blameToggle->setShortcut(Qt::CTRL | Qt::SHIFT | Qt::Key_B);
@@ -858,6 +921,44 @@ void MainWindow::setupActions()
 
     auto *helpMenu = new KHelpMenu(this, KAboutData::applicationData());
     menuBar()->addMenu(helpMenu->menu());
+}
+
+void MainWindow::showCommandPalette()
+{
+    if (!m_commandPalette) {
+        m_commandPalette = new CommandPalette(this);
+    }
+    // Gather every leaf action reachable from the menu bar. Because the menu
+    // bar is the single source of truth (the hamburger mirrors it), this one
+    // walk surfaces File/Options/View/Code/Help plus perspectives and the
+    // centre-mode toggles — the whole feature surface, searchable by name.
+    QList<QAction *> actions;
+    QSet<QAction *> seen;
+    std::function<void(QMenu *)> walk = [&](QMenu *menu) {
+        for (QAction *a : menu->actions()) {
+            if (a->isSeparator()) {
+                continue;
+            }
+            if (a->menu()) {
+                walk(a->menu());
+                continue;
+            }
+            if (!seen.contains(a)) {
+                seen.insert(a);
+                actions << a;
+            }
+        }
+    };
+    for (QAction *top : menuBar()->actions()) {
+        if (top->menu()) {
+            walk(top->menu());
+        } else if (!top->isSeparator() && !seen.contains(top)) {
+            seen.insert(top);
+            actions << top;
+        }
+    }
+    m_commandPalette->setActions(actions);
+    m_commandPalette->showPalette();
 }
 
 // setupShellShortcuts wires the JetBrains-style raise-by-ordinal accelerators

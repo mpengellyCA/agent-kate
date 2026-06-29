@@ -3,6 +3,7 @@
 
 #include "GutterController.h"
 #include "ipc/CoreClient.h"
+#include "theme/ThemeManager.h"
 
 #include <KLocalizedString>
 #include <KTextEditor/Document>
@@ -65,20 +66,20 @@ QPixmap trianglePixmap(const QColor &color)
 
 QColor addedColor(const QPalette &pal)
 {
-    return pal.color(QPalette::Base).lightness() < 128
-        ? QColor(0x5f, 0xd3, 0x8a) : QColor(0x1a, 0x7f, 0x37);
+    Q_UNUSED(pal);
+    return ThemeManager::palette().positive;
 }
 
 QColor modifiedColor(const QPalette &pal)
 {
-    return pal.color(QPalette::Base).lightness() < 128
-        ? QColor(0x7c, 0xb7, 0xff) : QColor(0x1a, 0x5f, 0xb4);
+    Q_UNUSED(pal);
+    return ThemeManager::palette().info;
 }
 
 QColor deletedColor(const QPalette &pal)
 {
-    return pal.color(QPalette::Base).lightness() < 128
-        ? QColor(0xff, 0x8a, 0x80) : QColor(0xc0, 0x1c, 0x28);
+    Q_UNUSED(pal);
+    return ThemeManager::palette().negative;
 }
 } // namespace
 
@@ -96,6 +97,11 @@ GutterController::GutterController(KTextEditor::Document *doc, const QString &ab
     m_debounceTimer->setInterval(kInvalidatedDebounceMs);
 
     registerMarkPixmaps();
+
+    // The mark icons are baked into pixmaps from the active theme's semantic
+    // colours, so re-bake them when the theme switches.
+    connect(ThemeManager::instance(), &ThemeManager::changed, this,
+            &GutterController::registerMarkPixmaps);
 
     connect(m_pollTimer, &QTimer::timeout, this, &GutterController::pollNow);
     connect(m_debounceTimer, &QTimer::timeout, this, &GutterController::pollNow);

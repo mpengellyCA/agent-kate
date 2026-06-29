@@ -3,6 +3,7 @@
 
 #include "RefChipDelegate.h"
 #include "LogModel.h"
+#include "theme/ThemeManager.h"
 
 #include <QApplication>
 #include <QColor>
@@ -39,7 +40,7 @@ QColor chipBackground(const QPalette &pal, RefKind kind)
     switch (kind) {
     case RefKind::Branch: return base;
     case RefKind::Remote: return base.darker(130);
-    case RefKind::Tag:    return QColor(0xc9, 0x8a, 0x1f); // muted gold
+    case RefKind::Tag:    return ThemeManager::palette().neutral; // theme warning/gold
     }
     return base;
 }

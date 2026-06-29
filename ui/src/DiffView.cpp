@@ -1,5 +1,7 @@
 #include "DiffView.h"
 
+#include "theme/ThemeManager.h"
+
 #include <KConfigGroup>
 #include <KLocalizedString>
 #include <KSharedConfig>
@@ -386,9 +388,9 @@ DiffView::DiffView(const QString &unifiedDiff, QWidget *parent)
     const QList<DiffFile> files = parseDiff(m_unifiedDiff);
 
     // --- top bar ----------------------------------------------------------
-    const bool dark = palette().color(QPalette::Base).lightness() < 128;
-    const QString addFg = dark ? QStringLiteral("#5fd38a") : QStringLiteral("#1a7f37");
-    const QString delFg = dark ? QStringLiteral("#ff8a80") : QStringLiteral("#c01c28");
+    const AkColors &ak = ThemeManager::palette();
+    const QString addFg = ak.positive.name();
+    const QString delFg = ak.negative.name();
 
     int totalAdded = 0;
     int totalRemoved = 0;
@@ -486,22 +488,35 @@ void DiffView::setEmptyMessage(const QString &message)
 void DiffView::rebuild()
 {
     const bool dark = palette().color(QPalette::Base).lightness() < 128;
+    const AkColors &ak = ThemeManager::palette();
     DiffPalette c;
-    c.addBg    = dark ? QStringLiteral("#16331d") : QStringLiteral("#e6ffec");
-    c.delBg    = dark ? QStringLiteral("#3a1e1f") : QStringLiteral("#ffebe9");
-    c.hunkBg   = dark ? QStringLiteral("#1f2733") : QStringLiteral("#ddf4ff");
+    c.addBg    = ak.addedBg.name();
+    c.delBg    = ak.removedBg.name();
+    c.hunkBg   = ak.hunkBg.name();
     c.hunkFg   = dark ? QStringLiteral("#7c9cc0") : QStringLiteral("#3b5b7a");
     c.gutterFg = dark ? QStringLiteral("#6b7280") : QStringLiteral("#9aa0a8");
     c.headBg   = dark ? QStringLiteral("#23272f") : QStringLiteral("#eef0f3");
-    c.addFg    = dark ? QStringLiteral("#5fd38a") : QStringLiteral("#1a7f37");
-    c.delFg    = dark ? QStringLiteral("#ff8a80") : QStringLiteral("#c01c28");
+    c.addFg    = ak.positive.name();
+    c.delFg    = ak.negative.name();
 
     const QList<DiffFile> files = parseDiff(m_unifiedDiff);
 
     KSyntaxHighlighting::Repository &repo = sharedRepository();
-    const KSyntaxHighlighting::Theme theme = repo.defaultTheme(
-        dark ? KSyntaxHighlighting::Repository::DarkTheme
-             : KSyntaxHighlighting::Repository::LightTheme);
+    // Honour the app's chosen syntax theme when it names one; otherwise fall
+    // back to a sensible default by light/dark.
+    KSyntaxHighlighting::Theme theme;
+    const QString wanted = ThemeManager::instance()->syntaxTheme();
+    if (!wanted.isEmpty()) {
+        const KSyntaxHighlighting::Theme picked = repo.theme(wanted);
+        if (picked.isValid()) {
+            theme = picked;
+        }
+    }
+    if (!theme.isValid()) {
+        theme = repo.defaultTheme(
+            dark ? KSyntaxHighlighting::Repository::DarkTheme
+                 : KSyntaxHighlighting::Repository::LightTheme);
+    }
     c.codeBg = QColor(theme.editorColor(KSyntaxHighlighting::Theme::BackgroundColor));
 
     const QString sheet =

@@ -3,6 +3,7 @@
 
 #include "TranscriptDelegate.h"
 #include "TranscriptModel.h"
+#include "theme/ThemeManager.h"
 
 #include <QAbstractItemView>
 #include <QAbstractTextDocumentLayout>
@@ -38,16 +39,18 @@ constexpr int kDetailPadX = 10;
 // whole cache and the currently-visible rows re-measure lazily (cheap).
 constexpr int kHeightCacheCap = 16384;
 
-// noteColor mirrors AgentPanel.cpp's palette-aware dim/ok/err colours.
+// noteColor maps a note's kind to the active theme's semantic colours.
 QColor noteColor(const QString &kind, bool dark)
 {
+    Q_UNUSED(dark);
+    const AkColors &c = ThemeManager::palette();
     if (kind == QLatin1String("ok")) {
-        return dark ? QColor(0x5f, 0xd3, 0x8a) : QColor(0x1a, 0x7f, 0x37);
+        return c.positive;
     }
     if (kind == QLatin1String("err")) {
-        return dark ? QColor(0xff, 0x8a, 0x80) : QColor(0xc0, 0x1c, 0x28);
+        return c.negative;
     }
-    return dark ? QColor(0x9a, 0x9a, 0xa3) : QColor(0x6b, 0x6b, 0x72);
+    return c.agentIdle;
 }
 
 // Wrap matches of `needle` in `plain` with a highlight span, escaping first.

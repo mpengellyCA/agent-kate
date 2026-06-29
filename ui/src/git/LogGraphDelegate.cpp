@@ -3,6 +3,7 @@
 
 #include "LogGraphDelegate.h"
 #include "LogModel.h"
+#include "theme/ThemeManager.h"
 
 #include <QApplication>
 #include <QColor>
@@ -11,21 +12,13 @@
 #include <QStyle>
 
 namespace {
-// Six perceptually distinct hues, chosen to read on both light and dark
-// Breeze palettes. We don't pull from QPalette here because the lane palette
-// needs to stay stable as the user scrolls — palette roles cycle hue with
-// theme and would scramble lane identity.
+// Lane hues come from the active theme's stable lane palette (>= 6 distinct
+// hues that read on both light and dark schemes). They stay stable as the user
+// scrolls — the theme's AkColors::lane() wraps the palette by lane index, so
+// lane identity is preserved.
 QColor laneColor(int lane)
 {
-    static const QColor kPalette[6] = {
-        QColor(0x35, 0x8c, 0xe6), // azure
-        QColor(0xe6, 0x7e, 0x22), // amber
-        QColor(0x2e, 0xc4, 0x71), // emerald
-        QColor(0xe7, 0x4c, 0x3c), // vermilion
-        QColor(0x9b, 0x59, 0xb6), // amethyst
-        QColor(0x1a, 0xbc, 0x9c), // teal
-    };
-    return kPalette[((lane % 6) + 6) % 6];
+    return ThemeManager::palette().lane(lane);
 }
 } // namespace
 

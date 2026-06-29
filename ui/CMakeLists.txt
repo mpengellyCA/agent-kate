@@ -43,6 +43,9 @@ find_package(KF6 6.0 QUIET COMPONENTS Wallet)
 add_executable(agentkate
     src/main.cpp
     src/state/Reactive.cpp
+    src/theme/ThemeManager.cpp
+    src/AppearanceDialog.cpp
+    src/CommandPalette.cpp
     src/MainWindow.cpp
     src/EditorArea.cpp
     src/DiffView.cpp
@@ -210,9 +213,11 @@ if(Qt6Test_FOUND)
 
     # Plan 10 phase 2: the virtualized chat transcript model + delegate.
     add_executable(TranscriptModelTest tests/TranscriptModelTest.cpp
-        src/TranscriptModel.cpp src/TranscriptDelegate.cpp)
+        src/TranscriptModel.cpp src/TranscriptDelegate.cpp
+        src/theme/ThemeManager.cpp)
     target_include_directories(TranscriptModelTest PRIVATE src)
-    target_link_libraries(TranscriptModelTest PRIVATE Qt6::Widgets Qt6::Test)
+    target_link_libraries(TranscriptModelTest PRIVATE Qt6::Widgets Qt6::Test
+        KF6::ColorScheme KF6::ConfigCore)
     add_test(NAME TranscriptModelTest COMMAND TranscriptModelTest)
     set_tests_properties(TranscriptModelTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
@@ -226,3 +231,17 @@ if(Qt6Test_FOUND)
     set_tests_properties(MarkdownUtilTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 endif()
+
+# Dev-only visual harness for the new Appearance dialog + Command Palette. Not a
+# ctest and not installed — it shows the widgets under a chosen Agent Kate theme
+# so they can be eyeballed/screenshotted in isolation. Build tree only.
+add_executable(akwidgets-preview EXCLUDE_FROM_ALL
+    tests/WidgetsPreview.cpp
+    src/theme/ThemeManager.cpp
+    src/AppearanceDialog.cpp
+    src/CommandPalette.cpp)
+target_include_directories(akwidgets-preview PRIVATE src)
+target_link_libraries(akwidgets-preview PRIVATE
+    Qt6::Widgets KF6::I18n KF6::ColorScheme KF6::ConfigCore)
+set_target_properties(akwidgets-preview PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})

@@ -27,6 +27,7 @@ class AiInspectorPanel;
 class CoworkPortal;
 class SideBar;
 class ShellLayout;
+class CommandPalette;
 class QAction;
 class QLabel;
 class QLineEdit;
@@ -54,6 +55,9 @@ private:
     void setupShellShortcuts();
     void setupPerspectives();
     void setupCore();
+    // Collect every leaf action in the window and show the searchable command
+    // palette — the keyboard-first way to reach any feature.
+    void showCommandPalette();
     void applyPerspective(const QString &name);
     void applyCentreMode(const QString &mode); // "editor" | "split" | "chat"
 
@@ -110,6 +114,7 @@ private:
     QLabel *m_gitStatusLabel = nullptr; // status-bar git widget for the active editor
 
     ShellLayout *m_shell = nullptr;
+    CommandPalette *m_commandPalette = nullptr; // lazily created on first use
     SideBar *m_leftBar = nullptr;
     SideBar *m_rightBar = nullptr;
     SideBar *m_bottomBar = nullptr;

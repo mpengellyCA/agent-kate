@@ -1,6 +1,7 @@
 // agentkate — native multi-agent coding arena (C++/Qt6/KF6 KDE application).
 #include "MainWindow.h"
 #include "WelcomeDialog.h"
+#include "theme/ThemeManager.h"
 
 #include <QApplication>
 #include <QCommandLineParser>
@@ -35,6 +36,12 @@ int main(int argc, char *argv[])
 
     QApplication app(argc, argv);
     KLocalizedString::setApplicationDomain("agentkate");
+
+    // Apply Agent Kate's own appearance before any window is shown. This lets
+    // the app wear its signature identity (or a deliberately different KDE
+    // scheme) independent of the rest of the desktop. Must run while qApp's
+    // palette is still the genuine system one so "Follow System" can restore it.
+    ThemeManager::instance()->applySavedOrDefault();
 
     // The hicolor PNGs are installed system-wide by CMake, but also live in
     // the binary as Qt resources so the icon shows up when running straight

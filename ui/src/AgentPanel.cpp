@@ -5,6 +5,7 @@
 #include "TranscriptDelegate.h"
 #include "TranscriptModel.h"
 #include "ipc/CoreClient.h"
+#include "theme/ThemeManager.h"
 
 #include <KConfigGroup>
 #include <KLocalizedString>
@@ -174,9 +175,9 @@ protected:
     {
         QPainter p(this);
         p.setRenderHint(QPainter::Antialiasing);
-        const bool dark = palette().color(QPalette::Base).lightness() < 128;
-        const QColor accent =
-            dark ? QColor(0x5f, 0xd3, 0xbf) : QColor(0x1a, 0x7f, 0x6b);
+        // This spinner is shown only while a turn is actively computing, so it
+        // wears the active-agent colour from the theme.
+        const QColor accent = ThemeManager::palette().agentRunning;
 
         // Rotating arc spinner.
         const qreal d = 15;
