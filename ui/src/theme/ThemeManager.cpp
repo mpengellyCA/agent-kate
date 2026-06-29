@@ -123,7 +123,9 @@ AkThemeDef midnightTheme()
     d.description = QStringLiteral("Signature dark theme — navy, purple & neon pink");
     d.kind = AkThemeDef::BuiltinPalette;
     d.dark = true;
-    d.syntaxTheme = QStringLiteral("Breeze Dark");
+    // Our bundled navy syntax theme (ui/themes/agent-kate-midnight.theme), so the
+    // editor / diff canvas matches the navy chrome instead of Breeze-Dark grey.
+    d.syntaxTheme = QStringLiteral("Agent Kate Midnight");
     d.palette = buildPalette(s);
 
     AkColors c;
@@ -180,7 +182,7 @@ AkThemeDef daylightTheme()
     d.description = QStringLiteral("Signature light theme — soft lilac, navy ink & pink");
     d.kind = AkThemeDef::BuiltinPalette;
     d.dark = false;
-    d.syntaxTheme = QStringLiteral("Breeze Light");
+    d.syntaxTheme = QStringLiteral("Agent Kate Daylight");
     d.palette = buildPalette(s);
 
     AkColors c;

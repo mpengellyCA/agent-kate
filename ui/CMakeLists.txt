@@ -115,6 +115,7 @@ add_executable(agentkate
     src/lsp/LspSignatureHelp.cpp
     src/lsp/WorkspaceSymbolDialog.cpp
     icons/agentkate.qrc
+    themes/aktheme.qrc
 )
 
 target_include_directories(agentkate PRIVATE src)
@@ -252,7 +253,8 @@ add_executable(akwidgets-preview EXCLUDE_FROM_ALL
     src/AppearanceDialog.cpp
     src/CommandPalette.cpp
     src/DiffView.cpp
-    src/shell/FlowLayout.cpp)
+    src/shell/FlowLayout.cpp
+    themes/aktheme.qrc)
 target_include_directories(akwidgets-preview PRIVATE src)
 target_link_libraries(akwidgets-preview PRIVATE
     Qt6::Widgets KF6::I18n KF6::ColorScheme KF6::ConfigCore KF6::SyntaxHighlighting)

@@ -1,0 +1,8 @@
+<!-- Bundle Agent Kate's signature syntax-highlighting themes where
+     KSyntaxHighlighting::Repository auto-discovers app-provided themes. -->
+<RCC>
+  <qresource prefix="/org.kde.syntax-highlighting/themes-addons">
+    <file alias="agent-kate-midnight.theme">agent-kate-midnight.theme</file>
+    <file alias="agent-kate-daylight.theme">agent-kate-daylight.theme</file>
+  </qresource>
+</RCC>

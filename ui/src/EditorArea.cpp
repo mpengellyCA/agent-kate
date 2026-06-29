@@ -4,6 +4,7 @@
 #include "ImageView.h"
 #include "KPartView.h"
 #include "RichTextView.h"
+#include "theme/ThemeManager.h"
 
 #include <KLocalizedString>
 #include <KMessageBox>
@@ -35,6 +36,26 @@ namespace {
 constexpr const char *kWrappedViewTab = "editorarea_wrapped_view";
 } // namespace
 
+namespace {
+// Apply Agent Kate's bundled signature syntax theme to a KTextEditor view, so
+// the code canvas matches the navy chrome. KF6 KTextEditor exposes a per-view
+// "theme" config key; guard on it so this is a safe no-op where unsupported or
+// when no app theme is selected (the editor keeps its palette-derived default).
+void applyEditorTheme(KTextEditor::View *view)
+{
+    if (!view) {
+        return;
+    }
+    const QString name = ThemeManager::instance()->syntaxTheme();
+    if (name.isEmpty()) {
+        return;
+    }
+    if (view->configKeys().contains(QLatin1String("theme"))) {
+        view->setConfigValue(QStringLiteral("theme"), name);
+    }
+}
+} // namespace
+
 EditorArea::EditorArea(QWidget *parent)
     : QWidget(parent)
     , m_stack(new QStackedWidget(this))
@@ -50,6 +71,15 @@ EditorArea::EditorArea(QWidget *parent)
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->addWidget(m_stack);
+
+    // Re-theme every open editor view when the app theme changes (the palette
+    // change alone won't update a view we overrode via setConfigValue).
+    connect(ThemeManager::instance(), &ThemeManager::changed, this, [this] {
+        const auto views = findChildren<KTextEditor::View *>();
+        for (KTextEditor::View *view : views) {
+            applyEditorTheme(view);
+        }
+    });
 }
 
 EditorArea::~EditorArea()
@@ -460,6 +490,7 @@ void EditorArea::openFile(const QString &groupKey, const QString &path, int line
     vbox->setSpacing(0);
 
     KTextEditor::View *view = doc->createView(container);
+    applyEditorTheme(view);
     vbox->addWidget(view);
 
     wireDocument(doc, tabs, container);
