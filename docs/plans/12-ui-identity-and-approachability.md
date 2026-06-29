@@ -1,8 +1,11 @@
 # 12 — UI Identity & Approachability (broaden the audience beyond CS)
 
-> **Status: phases 1–3 implemented and merged to local `main`** (branch
-> `agentkate/t-7bb53c7e24`, commits `2d0ed9d`, `c5ee29f`, `c045e3f`). Phases 4–8
-> below are the remaining roadmap — grounded, sequenced, not yet built.
+> **Status: phases 1–8 implemented** (branch `agentkate/t-7bb53c7e24`). Phases 1–3:
+> `2d0ed9d`, `c5ee29f`, `c045e3f` (merged to local `main`). Phases 4–8: `21532d0`
+> (Agent menu), `5a6c54d` (plain language), `360532b` (navy editor theme), `2d7d1cc`
+> (guided New Agent), `b9b7f4d` (Welcome + first-run Converse). Each was built green,
+> ctest 4/4, and verified live. The only deferred item is the lower-priority
+> `KColorScheme`-call-site cleanup (see end).
 
 ## Goal
 
@@ -61,9 +64,16 @@ Two product principles drive every item here:
 
 ---
 
-## Remaining roadmap
+## Roadmap (phases 4–8 — all implemented)
 
-### Phase 4 — First-class Agent actions (Agent menu) — size **M**
+> The plans below are kept as the design record; each is now built and committed
+> (hashes in the Status line). Notable as-built deltas: phase 4 reuses the roster's
+> git lambdas via new `AgentRoster::request*` emitters rather than extracting them;
+> phase 6 set the per-view editor theme through KF6's `View::setConfigValue("theme")`
+> (no public `setTheme` exists); phase 7's dialog pre-fills the task but does not
+> auto-start (no surprise token spend).
+
+### Phase 4 — First-class Agent actions (Agent menu) — size **M** — ✅ done (`21532d0`)
 **Why:** the agent lifecycle actions (new, rename, stop/resume, attach, show changes, commit,
 PR, merge, discard worktree, tags) live **only** in the roster right-click menus
 (`AgentRoster.cpp`) and the composer toolbar (`AgentPanel.cpp`). A newcomer never discovers
@@ -84,7 +94,7 @@ them. They should also be a top-level **Agent** menu (→ menu bar, hamburger, c
 3. Mark the developer-only subset (e.g. *Discard worktree*, *Merge into local main*) so Simple
    mode hides them (add to `m_advancedActions`).
 
-### Phase 5 — Plain-language agent panel — size **M**
+### Phase 5 — Plain-language agent panel — size **M** — ✅ done (`5a6c54d`)
 **Why:** the composer's **Setup** and **Compaction** dropdowns are dense, jargon-heavy forms
 ("Permission / Isolation / Effort / Compact on Stop (Hot Opus)…") — `ui/src/AgentPanel.cpp`
 (~`710` Setup, ~`740` Compaction). This is the single biggest "too much nuance" surface.
@@ -100,7 +110,7 @@ them. They should also be a top-level **Agent** menu (→ menu bar, hamburger, c
 - Add a small **"?" affordance** per row (a `QLabel` with a what's-this tooltip) instead of
   burying meaning in the option text.
 
-### Phase 6 — Custom navy editor theme (close the canvas seam) — size **S–M**
+### Phase 6 — Custom navy editor theme (close the canvas seam) — size **S–M** — ✅ done (`360532b`)
 **Why:** the app chrome is navy but the code editor / DiffView canvas is **Breeze Dark grey**
 (`ThemeManager` currently sets `syntaxTheme = "Breeze Dark"` for Midnight). The seam is visible
 in screenshots.
@@ -114,13 +124,13 @@ in screenshots.
 3. Ship a matching Daylight editor theme. Finish migrating the few remaining `KColorScheme`-reading
    call sites (e.g. `CleanupDialog`, `ControlConsentDialog`) to the theme for full coherence.
 
-### Phase 7 — Guided "New Agent" — size **M**
+### Phase 7 — Guided "New Agent" — size **M** — ✅ done (`2d7d1cc`)
 **Why:** the front-door action (start an agent to do X) is a blank starter + the dense Setup
 dropdown. Replace with a friendly **New Agent** dialog: a big task field, plain-language choices
 (model as "Smartest / Balanced / Fastest", sandbox on/off), and an **"Advanced"** disclosure for
 the full Setup form. Reuses `AgentPanel`'s existing option model; new dialog only.
 
-### Phase 8 — Welcome / first-run redesign — size **S–M**
+### Phase 8 — Welcome / first-run redesign — size **S–M** — ✅ done (`b9b7f4d`)
 **Why:** `ui/src/WelcomeDialog.cpp` is functional but plain. Make first-run set the tone: recent
 projects, "open a folder", "start something new", a one-line theme/Experience intro, and land the
 newcomer in **Simple + Converse**. Pairs with the Phase 3 first-run heuristic already in
