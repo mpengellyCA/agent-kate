@@ -40,6 +40,7 @@ Q_SIGNALS:
 protected:
     void mousePressEvent(QMouseEvent *event) override;
     void keyPressEvent(QKeyEvent *event) override;
+    void paintEvent(QPaintEvent *event) override; // rounded card, palette-driven
     bool event(QEvent *event) override; // palette changes → restyle
 
 private:

@@ -12,7 +12,18 @@
 #include <QKeyEvent>
 #include <QLabel>
 #include <QMouseEvent>
+#include <QPainter>
+#include <QPaintEvent>
 #include <QVBoxLayout>
+
+namespace {
+// Warning accent for control-tier tiles: derived from the palette so it
+// tracks light/dark schemes rather than a fixed amber.
+QColor warnColor(const QPalette &pal)
+{
+    return QColor::fromHsv(35, 200, pal.color(QPalette::Base).value() > 128 ? 200 : 235);
+}
+} // namespace
 
 namespace {
 constexpr int kTileWidth = 148; // ~140px target incl. margins
@@ -100,45 +111,55 @@ bool CapabilityTile::event(QEvent *event)
 
 // Palette-only styling: the on-state fills with Highlight and switches the text
 // to HighlightedText; the off-state is a subtle Base card. Control-tier tiles
-// keep a warning-coloured border in both states. We use a per-widget stylesheet
-// (scoped to this object) so the FlowLayout parent and the rest of the app are
-// untouched — this is the panel's established pattern (dynamic per-widget style,
-// never an app-wide sheet or Fusion).
+// keep a warning-coloured border in both states. The card itself is painted in
+// paintEvent(); only the label foregrounds are set here, via the children's
+// palettes. A per-widget stylesheet must not be used: setStyleSheet() delivers
+// PaletteChange back to this widget, and restyle() runs on PaletteChange —
+// infinite recursion (stack-overflow SIGSEGV on startup).
 void CapabilityTile::restyle()
 {
     const QPalette pal = palette();
-    const QColor base = pal.color(QPalette::Base);
     const QColor text = pal.color(QPalette::Text);
-    const QColor hi = pal.color(QPalette::Highlight);
     const QColor hiText = pal.color(QPalette::HighlightedText);
     const QColor mid = pal.color(QPalette::Mid);
 
-    // Warning accent for control-tier tiles: derived from the palette so it
-    // tracks light/dark schemes rather than a fixed amber.
-    const QColor warn = QColor::fromHsv(35, 200, base.value() > 128 ? 200 : 235);
+    const QColor fg = m_checked ? hiText : text;
+    QPalette tp = m_title->palette();
+    tp.setColor(QPalette::WindowText, fg);
+    m_title->setPalette(tp);
+
+    // Description is muted relative to the title; on Highlight we keep the
+    // HighlightedText colour (a mid grey would vanish on the accent fill).
+    QPalette dp = m_desc->palette();
+    dp.setColor(QPalette::WindowText, m_checked ? hiText : mid);
+    m_desc->setPalette(dp);
+
+    update();
+}
+
+void CapabilityTile::paintEvent(QPaintEvent *event)
+{
+    Q_UNUSED(event);
+    const QPalette pal = palette();
+    const QColor base = pal.color(QPalette::Base);
+    const QColor hi = pal.color(QPalette::Highlight);
+    const QColor mid = pal.color(QPalette::Mid);
 
     const QColor bg = m_checked ? hi : base;
-    const QColor fg = m_checked ? hiText : text;
     QColor border;
-    int borderW = 1;
+    qreal borderW = 1.0;
     if (m_dangerous) {
-        border = warn;
-        borderW = 2;
+        border = warnColor(pal);
+        borderW = 2.0;
     } else {
         border = m_checked ? hi : mid;
     }
 
-    setStyleSheet(QStringLiteral(
-                      "CapabilityTile { background: %1; border: %2px solid %3; border-radius: 8px; }")
-                      .arg(bg.name(), QString::number(borderW), border.name()));
-
-    const QString fgName = fg.name();
-    m_title->setStyleSheet(QStringLiteral("color: %1;").arg(fgName));
-    // Description is muted relative to the title; on Highlight we keep the
-    // HighlightedText colour (a mid grey would vanish on the accent fill).
-    if (m_checked) {
-        m_desc->setStyleSheet(QStringLiteral("color: %1;").arg(fgName));
-    } else {
-        m_desc->setStyleSheet(QStringLiteral("color: %1;").arg(mid.name()));
-    }
+    QPainter p(this);
+    p.setRenderHint(QPainter::Antialiasing);
+    const qreal inset = borderW / 2.0;
+    const QRectF r = QRectF(rect()).adjusted(inset, inset, -inset, -inset);
+    p.setPen(QPen(border, borderW));
+    p.setBrush(bg);
+    p.drawRoundedRect(r, 8, 8);
 }
