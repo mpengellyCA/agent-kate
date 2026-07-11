@@ -827,13 +827,21 @@ void AgentDock::refreshAgentNumbers()
                              m_worktreePathByThread.insert(id, p);
                          }
                      }
+                     QHash<QString, QString> titlesByThread;
                      for (const Entry &e : m_agents) {
                          const QString tid = e.panel->threadId();
                          if (tid.isEmpty()) {
                              continue;
                          }
                          m_roster->setAgentNumber(e.id, byThread.value(tid, 0));
+                         const QString title = m_roster->agentTitle(e.id);
+                         if (!title.isEmpty()) {
+                             titlesByThread.insert(tid, title);
+                         }
                      }
+                     // Feed the WorktreeDashboard so its cards can name the
+                     // agent, not just its branch.
+                     emit agentTitlesChanged(titlesByThread);
                  },
                  this);
 }

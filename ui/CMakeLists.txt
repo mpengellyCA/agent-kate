@@ -98,6 +98,7 @@ add_executable(agentkate
     src/TranscriptDelegate.cpp
     src/ToolInspectorDialog.cpp
     src/WorktreeDashboard.cpp
+    src/WorktreeCardDelegate.cpp
     src/CleanupDialog.cpp
     src/ShutdownDialog.cpp
     src/git/AuthorChipDelegate.cpp
@@ -112,6 +113,7 @@ add_executable(agentkate
     src/git/LogViewer.cpp
     src/git/PRDialog.cpp
     src/git/RefChipDelegate.cpp
+    src/git/WorktreeDiffDialog.cpp
     src/ipc/CoreClient.cpp
     src/lsp/LspActions.cpp
     src/lsp/LspClient.cpp

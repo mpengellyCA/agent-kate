@@ -3,29 +3,31 @@
 
 #include "WorktreeDashboard.h"
 #include "CleanupDialog.h"
+#include "WorktreeCardDelegate.h"
 #include "git/CommitDialog.h"
 #include "git/ConflictDialog.h"
 #include "git/PRDialog.h"
+#include "git/WorktreeDiffDialog.h"
 #include "ipc/CoreClient.h"
 #include "shell/FlowLayout.h"
 
 #include <KLocalizedString>
 
+#include <QDateTime>
 #include <QEvent>
 #include <QHBoxLayout>
-#include <QHeaderView>
 #include <QItemSelectionModel>
 #include <QIcon>
 #include <QJsonArray>
 #include <QJsonValue>
 #include <QLabel>
+#include <QListView>
 #include <QMenu>
 #include <QMessageBox>
 #include <QPalette>
 #include <QPushButton>
 #include <QResizeEvent>
 #include <QSignalBlocker>
-#include <QTableView>
 #include <QVBoxLayout>
 
 namespace {
@@ -33,10 +35,13 @@ namespace {
 // on the core's git.invalidated notification (diff-suppressed in applySnapshot),
 // so this timer only backstops anything the watcher misses — no need for 1 Hz.
 constexpr int kPollIntervalMs = 20000;
+// Cadence at which the visible cards are repainted so "updated Xs ago" stays
+// roughly current without a full snapshot round-trip.
+constexpr int kRelTimeMs = 30000;
 } // namespace
 
 WorktreeModel::WorktreeModel(QObject *parent)
-    : QAbstractTableModel(parent)
+    : QAbstractListModel(parent)
 {
 }
 
@@ -45,106 +50,30 @@ int WorktreeModel::rowCount(const QModelIndex &parent) const
     return parent.isValid() ? 0 : m_rows.size();
 }
 
-int WorktreeModel::columnCount(const QModelIndex &parent) const
-{
-    return parent.isValid() ? 0 : ColCount;
-}
-
 QVariant WorktreeModel::data(const QModelIndex &index, int role) const
 {
     if (!index.isValid() || index.row() < 0 || index.row() >= m_rows.size()) {
         return {};
     }
     const WorktreeRow &r = m_rows.at(index.row());
-    if (role == Qt::DisplayRole) {
-        switch (index.column()) {
-        case ColAgent:
-            return r.number > 0 ? QStringLiteral("#%1").arg(r.number) : QString();
-        case ColBranch:
-            return r.branch.isEmpty()
-                       ? i18nc("git branch state", "(detached)")
-                       : r.branch;
-        case ColIsolation:
-            return r.isolated
-                       ? i18nc("agent runs in its own git worktree", "worktree")
-                       : i18nc("agent runs directly in the workspace", "workspace");
-        case ColAhead:
-            return r.ahead;
-        case ColBehind:
-            return r.behindBase;
-        case ColRemote:
-            // No upstream tracking branch (never pushed) → "local". Otherwise
-            // compact ↑ahead ↓behind against origin/<branch>.
-            if (!r.hasUpstream) {
-                return i18nc("branch has no upstream / has never been pushed",
-                             "local");
-            }
-            return QStringLiteral("↑%1 ↓%2").arg(r.remoteAhead).arg(r.remoteBehind);
-        case ColDirty:
-            if (r.conflicts) {
-                return i18nc("dirty file count followed by a conflict marker",
-                             "%1 · conflicts", r.dirty);
-            }
-            return r.dirty;
-        case ColPath:
-            return r.path;
-        }
+    if (role == WorktreeRoles::Row) {
+        // Hand the delegate a pointer to the row it paints. Safe for the
+        // duration of the paint call; the model outlives every paint.
+        return QVariant::fromValue(
+            static_cast<void *>(const_cast<WorktreeRow *>(&r)));
     }
     if (role == Qt::ToolTipRole) {
         if (!r.error.isEmpty()) {
             return r.error;
         }
-        if (index.column() == ColRemote) {
-            if (!r.hasUpstream) {
-                return i18n("No upstream branch — this branch has not been "
-                            "pushed to origin.");
-            }
-            return i18nc("remote tracking tooltip: ahead/behind counts vs origin",
-                         "%1 ahead, %2 behind origin/%3.",
-                         r.remoteAhead, r.remoteBehind, r.branch);
+        QString tip = i18n("thread %1\n%2", r.threadId, r.path);
+        if (r.hasUpstream) {
+            tip += QLatin1Char('\n')
+                   + i18nc("remote tracking tooltip: ahead/behind counts vs origin",
+                           "%1 ahead, %2 behind origin/%3.",
+                           r.remoteAhead, r.remoteBehind, r.branch);
         }
-        return i18n("thread %1\n%2", r.threadId, r.path);
-    }
-    if (role == Qt::ForegroundRole && r.conflicts && index.column() == ColDirty) {
-        QPalette pal;
-        return pal.color(QPalette::BrightText);
-    }
-    if (role == Qt::TextAlignmentRole) {
-        switch (index.column()) {
-        case ColAgent:
-        case ColAhead:
-        case ColBehind:
-        case ColRemote:
-        case ColDirty:
-            return int(Qt::AlignRight | Qt::AlignVCenter);
-        }
-    }
-    return {};
-}
-
-QVariant WorktreeModel::headerData(int section, Qt::Orientation orientation, int role) const
-{
-    if (role != Qt::DisplayRole || orientation != Qt::Horizontal) {
-        return {};
-    }
-    switch (section) {
-    case ColAgent:
-        return i18nc("worktree dashboard column", "Agent");
-    case ColBranch:
-        return i18nc("worktree dashboard column", "Branch");
-    case ColIsolation:
-        return i18nc("worktree dashboard column", "Mode");
-    case ColAhead:
-        return QStringLiteral("↑");
-    case ColBehind:
-        return QStringLiteral("↓");
-    case ColRemote:
-        return i18nc("worktree dashboard column: state vs origin remote",
-                     "Remote");
-    case ColDirty:
-        return i18nc("worktree dashboard column", "Dirty");
-    case ColPath:
-        return i18nc("worktree dashboard column", "Path");
+        return tip;
     }
     return {};
 }
@@ -154,8 +83,8 @@ void WorktreeModel::setRows(QList<WorktreeRow> rows)
     // The core sorts snapshots by threadId (cd8ec6a) and threadIds are
     // immutable, so old and new lists are both sorted on the same stable key.
     // A merge walk emits insertions / removals / dataChanged in place — no
-    // beginResetModel, which would otherwise clear the QTableView's selection
-    // on every 1 Hz poll.
+    // beginResetModel, which would otherwise clear the QListView's selection
+    // on every poll.
     int i = 0;
     int j = 0;
     while (i < m_rows.size() || j < rows.size()) {
@@ -178,10 +107,13 @@ void WorktreeModel::setRows(QList<WorktreeRow> rows)
         if (oldId == newId) {
             // Same thread: only touch the row (and repaint it) when a
             // load-bearing field actually changed. An identical row is left
-            // untouched so the QTableView never repaints it.
-            if (m_rows[i] != rows[j]) {
+            // untouched so the QListView never repaints it.
+            // Compare git-sourced fields (operator==) *and* the merged-in
+            // title, which lives outside the snapshot and so is excluded from
+            // operator== — a title-only change must still repaint.
+            if (m_rows[i] != rows[j] || m_rows[i].title != rows[j].title) {
                 m_rows[i] = std::move(rows[j]);
-                emit dataChanged(index(i, 0), index(i, ColCount - 1));
+                emit dataChanged(index(i), index(i));
             }
             ++i;
             ++j;
@@ -210,37 +142,25 @@ const WorktreeRow *WorktreeModel::rowAt(int row) const
 WorktreeDashboard::WorktreeDashboard(CoreClient *core, QWidget *parent)
     : QWidget(parent)
     , m_core(core)
-    , m_view(new QTableView(this))
+    , m_view(new QListView(this))
     , m_model(new WorktreeModel(this))
     , m_pollTimer(new QTimer(this))
+    , m_relTimeTimer(new QTimer(this))
 {
     m_view->setModel(m_model);
-    m_view->setSelectionBehavior(QAbstractItemView::SelectRows);
+    m_view->setItemDelegate(new WorktreeCardDelegate(m_view));
     m_view->setSelectionMode(QAbstractItemView::SingleSelection);
-    m_view->setShowGrid(false);
-    m_view->setAlternatingRowColors(true);
-    m_view->verticalHeader()->setVisible(false);
-    m_view->horizontalHeader()->setStretchLastSection(true);
-    m_view->horizontalHeader()->setSectionResizeMode(
-        WorktreeModel::ColAgent, QHeaderView::ResizeToContents);
-    m_view->horizontalHeader()->setSectionResizeMode(
-        WorktreeModel::ColBranch, QHeaderView::ResizeToContents);
-    m_view->horizontalHeader()->setSectionResizeMode(
-        WorktreeModel::ColIsolation, QHeaderView::ResizeToContents);
-    m_view->horizontalHeader()->setSectionResizeMode(
-        WorktreeModel::ColAhead, QHeaderView::ResizeToContents);
-    m_view->horizontalHeader()->setSectionResizeMode(
-        WorktreeModel::ColBehind, QHeaderView::ResizeToContents);
-    m_view->horizontalHeader()->setSectionResizeMode(
-        WorktreeModel::ColRemote, QHeaderView::ResizeToContents);
-    m_view->horizontalHeader()->setSectionResizeMode(
-        WorktreeModel::ColDirty, QHeaderView::ResizeToContents);
+    m_view->setUniformItemSizes(true); // every card is the same height
+    m_view->setMouseTracking(true);    // so hover repaints the card
+    m_view->setResizeMode(QListView::Adjust);
+    m_view->setFrameShape(QFrame::NoFrame);
+    m_view->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
 
-    // Empty-state overlay: a centred hint shown over the (empty) table when
-    // the active project has no running agents. Parented to the viewport so it
-    // floats above the table area; repositioned on resize via an event filter.
+    // Empty-state overlay: a centred hint shown over the (empty) list when the
+    // active project has no agent worktrees. Parented to the viewport so it
+    // floats above the list area; repositioned on resize via an event filter.
     m_placeholder = new QLabel(
-        i18n("No agents running in this project yet."), m_view->viewport());
+        i18n("No agent worktrees in this project yet."), m_view->viewport());
     m_placeholder->setAlignment(Qt::AlignCenter);
     m_placeholder->setWordWrap(true);
     {
@@ -286,24 +206,21 @@ WorktreeDashboard::WorktreeDashboard(CoreClient *core, QWidget *parent)
 
     m_pollTimer->setInterval(kPollIntervalMs);
     connect(m_pollTimer, &QTimer::timeout, this, &WorktreeDashboard::refresh);
+    m_relTimeTimer->setInterval(kRelTimeMs);
+    connect(m_relTimeTimer, &QTimer::timeout, this, [this] {
+        // Nudge the visible cards to repaint so "updated Xs ago" advances.
+        if (m_model->rowCount() > 0) {
+            m_view->viewport()->update();
+        }
+    });
     connect(m_core, &CoreClient::notification, this, &WorktreeDashboard::onNotification);
     connect(m_core, &CoreClient::connected, this, &WorktreeDashboard::refresh);
     connect(m_view->selectionModel(), &QItemSelectionModel::selectionChanged, this,
-            [this] {
-                const WorktreeRow *r = selectedRow();
-                m_commitBtn->setEnabled(r != nullptr);
-                // Land and Open PR only make sense for an isolated worktree
-                // on its own branch with commits actually to merge / push.
-                const bool merging = r != nullptr && r->isolated && r->ahead > 0;
-                m_landBtn->setEnabled(merging);
-                m_prBtn->setEnabled(merging);
-                // Discard is only meaningful when there are uncommitted changes.
-                m_discardBtn->setEnabled(r != nullptr && r->dirty > 0);
-            });
-    connect(m_view, &QTableView::doubleClicked, this,
-            [this](const QModelIndex &) { openCommitDialog(); });
+            [this] { updateActionEnablement(); });
+    connect(m_view, &QListView::doubleClicked, this,
+            [this](const QModelIndex &) { openDiffDialog(); });
     m_view->setContextMenuPolicy(Qt::CustomContextMenu);
-    connect(m_view, &QTableView::customContextMenuRequested, this,
+    connect(m_view, &QListView::customContextMenuRequested, this,
             &WorktreeDashboard::showRowContextMenu);
     connect(m_commitBtn, &QPushButton::clicked, this,
             &WorktreeDashboard::openCommitDialog);
@@ -343,6 +260,50 @@ void WorktreeDashboard::setActiveProject(const QString &projectPath)
     }
     m_activeProject = projectPath;
     refresh();
+}
+
+void WorktreeDashboard::setAgentTitles(const QHash<QString, QString> &titlesByThread)
+{
+    if (titlesByThread == m_titlesByThread) {
+        return;
+    }
+    m_titlesByThread = titlesByThread;
+    // Re-merge the titles into the current rows without a fresh snapshot: run
+    // the existing rows back through applySnapshot (setRows repaints only the
+    // cards whose title actually changed).
+    applySnapshot(m_snapshot.get());
+}
+
+void WorktreeDashboard::updateActionEnablement()
+{
+    const WorktreeRow *r = selectedRow();
+    m_commitBtn->setEnabled(r != nullptr);
+    // Land and Open PR only make sense for an isolated worktree on its own
+    // branch with commits actually to merge / push.
+    const bool merging = r != nullptr && r->isolated && r->ahead > 0;
+    m_landBtn->setEnabled(merging);
+    m_prBtn->setEnabled(merging);
+    // Discard is only meaningful when there are uncommitted changes.
+    m_discardBtn->setEnabled(r != nullptr && r->dirty > 0);
+}
+
+void WorktreeDashboard::openDiffDialog()
+{
+    const WorktreeRow *r = selectedRow();
+    if (!r || r->threadId.isEmpty()) {
+        return;
+    }
+    const bool canMerge = r->isolated && r->ahead > 0;
+    auto *dlg = new WorktreeDiffDialog(m_core, r->threadId, r->branch, r->number,
+                                       canMerge, this);
+    // The dashboard owns the action dialogs, so the diff modal hands off to us.
+    connect(dlg, &WorktreeDiffDialog::commitRequested, this,
+            [this](const QString &) { openCommitDialog(); });
+    connect(dlg, &WorktreeDiffDialog::landRequested, this,
+            [this](const QString &) { landSelected(); });
+    connect(dlg, &WorktreeDiffDialog::prRequested, this,
+            [this](const QString &) { openPRDialog(); });
+    dlg->show();
 }
 
 const WorktreeRow *WorktreeDashboard::selectedRow() const
@@ -538,13 +499,17 @@ void WorktreeDashboard::showRowContextMenu(const QPoint &pos)
     if (!idx.isValid()) {
         return;
     }
-    m_view->selectRow(idx.row());
+    m_view->setCurrentIndex(idx);
     const WorktreeRow *r = selectedRow();
     if (!r) {
         return;
     }
 
     QMenu menu(this);
+    QAction *diffAct = menu.addAction(
+        QIcon::fromTheme(QStringLiteral("vcs-diff")),
+        i18nc("@action:inmenu", "View changes…"));
+    diffAct->setEnabled(!r->threadId.isEmpty());
     QAction *termAct = menu.addAction(
         QIcon::fromTheme(QStringLiteral("utilities-terminal")),
         i18nc("@action:inmenu", "Open Terminal Here"));
@@ -570,7 +535,9 @@ void WorktreeDashboard::showRowContextMenu(const QPoint &pos)
         i18nc("@action:inmenu", "Analyze && Clean up…"));
 
     QAction *chosen = menu.exec(m_view->viewport()->mapToGlobal(pos));
-    if (chosen == termAct) {
+    if (chosen == diffAct) {
+        openDiffDialog();
+    } else if (chosen == termAct) {
         emit openTerminalRequested(r->path);
     } else if (chosen == commitAct) {
         openCommitDialog();
@@ -589,6 +556,9 @@ void WorktreeDashboard::showEvent(QShowEvent *e)
     if (!m_pollTimer->isActive()) {
         m_pollTimer->start();
     }
+    if (!m_relTimeTimer->isActive()) {
+        m_relTimeTimer->start();
+    }
     refresh();
 }
 
@@ -596,6 +566,7 @@ void WorktreeDashboard::hideEvent(QHideEvent *e)
 {
     QWidget::hideEvent(e);
     m_pollTimer->stop();
+    m_relTimeTimer->stop();
 }
 
 bool WorktreeDashboard::eventFilter(QObject *watched, QEvent *event)
@@ -667,6 +638,12 @@ void WorktreeDashboard::refresh()
                              o.value(QStringLiteral("remoteAhead")).toInt();
                          r.remoteBehind =
                              o.value(QStringLiteral("remoteBehind")).toInt();
+                         // updatedAt is an RFC3339 timestamp (Go time.Time);
+                         // flatten to secs-since-epoch for the card's second line.
+                         const QDateTime up = QDateTime::fromString(
+                             o.value(QStringLiteral("updatedAt")).toString(),
+                             Qt::ISODate);
+                         r.updatedAt = up.isValid() ? up.toSecsSinceEpoch() : 0;
                          r.error = o.value(QStringLiteral("error")).toString();
                          rows.append(r);
                      }
@@ -690,7 +667,15 @@ void WorktreeDashboard::applySnapshot(const QList<WorktreeRow> &rows)
     const WorktreeRow *prev = selectedRow();
     const QString selectedThread = prev ? prev->threadId : QString();
 
-    m_model->setRows(rows);
+    // Merge the roster titles in here (not in refresh) so setAgentTitles can
+    // re-apply against the last snapshot without a fresh RPC. Titles live
+    // outside the git snapshot's value-equality, so this never fights the
+    // Reactive guard.
+    QList<WorktreeRow> merged = rows;
+    for (WorktreeRow &r : merged) {
+        r.title = m_titlesByThread.value(r.threadId);
+    }
+    m_model->setRows(std::move(merged));
 
     // Re-select the same thread by id. Block the selection model so the swap
     // does not transiently fire selectionChanged (which would flicker the
@@ -701,7 +686,7 @@ void WorktreeDashboard::applySnapshot(const QList<WorktreeRow> &rows)
             for (int row = 0; row < m_model->rowCount(); ++row) {
                 const WorktreeRow *r = m_model->rowAt(row);
                 if (r && r->threadId == selectedThread) {
-                    m_view->selectRow(row);
+                    m_view->setCurrentIndex(m_model->index(row));
                     break;
                 }
             }
@@ -712,12 +697,7 @@ void WorktreeDashboard::applySnapshot(const QList<WorktreeRow> &rows)
     // Row data (esp. dirty count) may have changed under the current
     // selection without the selection model firing — refresh the action
     // enablement to match.
-    const WorktreeRow *sel = selectedRow();
-    m_commitBtn->setEnabled(sel != nullptr);
-    const bool merging = sel != nullptr && sel->isolated && sel->ahead > 0;
-    m_landBtn->setEnabled(merging);
-    m_prBtn->setEnabled(merging);
-    m_discardBtn->setEnabled(sel != nullptr && sel->dirty > 0);
+    updateActionEnablement();
 }
 
 void WorktreeDashboard::onNotification(const QString &method, const QJsonObject &)

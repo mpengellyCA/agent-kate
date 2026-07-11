@@ -104,6 +104,9 @@ Q_SIGNALS:
     // Carries an agent's WORKTREE path (distinct from a project path) so the
     // shell can open a terminal rooted there.
     void openWorktreeTerminalRequested(const QString &worktreePath);
+    // Human agent titles keyed by thread id, refreshed alongside the #N badges
+    // (refreshAgentNumbers). The WorktreeDashboard uses these to name each card.
+    void agentTitlesChanged(const QHash<QString, QString> &titlesByThread);
 
 private:
     struct Entry {

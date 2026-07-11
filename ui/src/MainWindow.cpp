@@ -452,6 +452,8 @@ void MainWindow::setupUi()
                     m_terminal->openTerminalAt(dir);
                 }
             });
+    connect(m_agent, &AgentDock::agentTitlesChanged, m_worktreeDashboard,
+            &WorktreeDashboard::setAgentTitles);
     connect(m_agent, &AgentDock::openDiff, this,
             [this](const QString &title, const QString &diff) {
                 m_editor->openDiff(groupKey(), title, diff);
