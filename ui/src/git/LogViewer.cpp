@@ -3,6 +3,8 @@
 
 #include "LogViewer.h"
 
+#include "AuthorChipDelegate.h"
+#include "CommitDetailDialog.h"
 #include "CommitDetailPanel.h"
 #include "LogGraphDelegate.h"
 #include "LogModel.h"
@@ -14,6 +16,7 @@
 
 #include <QApplication>
 #include <QClipboard>
+#include <QComboBox>
 #include <QDateTime>
 #include <QHBoxLayout>
 #include <QHeaderView>
@@ -23,6 +26,7 @@
 #include <QJsonValue>
 #include <QKeySequence>
 #include <QLabel>
+#include <QLineEdit>
 #include <QMenu>
 #include <QPalette>
 #include <QPushButton>
@@ -82,11 +86,35 @@ LogViewer::LogViewer(CoreClient *core, QWidget *parent)
     m_sourceLabel->setElideMode(Qt::ElideRight);
     m_sourceLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
 
+    // Branch selector — scopes the log to any local/remote branch (read-only).
+    m_branchCombo = new QComboBox(this);
+    m_branchCombo->setToolTip(i18n("Show the history of a different branch"));
+    m_branchCombo->setSizeAdjustPolicy(QComboBox::AdjustToContents);
+    m_branchCombo->setMinimumContentsLength(10);
+
+    // Path filter — narrows history to a file or directory (plumbed `path`).
+    m_pathEdit = new QLineEdit(this);
+    m_pathEdit->setPlaceholderText(i18n("Path filter…"));
+    m_pathEdit->setClearButtonEnabled(true);
+    m_pathEdit->setToolTip(
+        i18n("Only show commits that touched this file or folder"));
+
+    // Search — client-side filter over already-loaded subjects/authors.
+    m_searchEdit = new QLineEdit(this);
+    m_searchEdit->setPlaceholderText(i18n("Search subjects…"));
+    m_searchEdit->setClearButtonEnabled(true);
+    m_searchEdit->setToolTip(
+        i18n("Filter the loaded commits by subject or author"));
+
     m_refreshBtn = new QPushButton(i18nc("@action:button", "Refresh"), this);
 
     auto *toolbar = new QHBoxLayout;
     toolbar->setContentsMargins(6, 4, 6, 4);
+    toolbar->setSpacing(4);
     toolbar->addWidget(m_sourceLabel, 1);
+    toolbar->addWidget(m_branchCombo);
+    toolbar->addWidget(m_pathEdit);
+    toolbar->addWidget(m_searchEdit);
     toolbar->addWidget(m_refreshBtn);
 
     m_model = new LogModel(this);
@@ -96,8 +124,13 @@ LogViewer::LogViewer(CoreClient *core, QWidget *parent)
     m_view->setSelectionMode(QAbstractItemView::SingleSelection);
     m_view->setShowGrid(false);
     m_view->setAlternatingRowColors(true);
+    // Hover highlight on the row under the cursor (GitKraken-ish feedback).
+    m_view->setMouseTracking(true);
+    m_view->setAttribute(Qt::WA_Hover, true);
     m_view->verticalHeader()->setVisible(false);
-    m_view->verticalHeader()->setDefaultSectionSize(20);
+    // Slightly taller rows so the graph nodes and chips breathe.
+    m_view->verticalHeader()->setDefaultSectionSize(
+        m_view->fontMetrics().height() + 10);
     m_view->horizontalHeader()->setStretchLastSection(false);
     m_view->horizontalHeader()->setSectionResizeMode(
         LogModel::ColGraph, QHeaderView::ResizeToContents);
@@ -113,6 +146,7 @@ LogViewer::LogViewer(CoreClient *core, QWidget *parent)
     m_graphDelegate = new LogGraphDelegate(this);
     m_view->setItemDelegateForColumn(LogModel::ColGraph, m_graphDelegate);
     m_view->setItemDelegateForColumn(LogModel::ColSubject, new RefChipDelegate(this));
+    m_view->setItemDelegateForColumn(LogModel::ColAuthor, new AuthorChipDelegate(this));
 
     // Right-click commit actions (copy hash / subject / patch).
     m_view->setContextMenuPolicy(Qt::CustomContextMenu);
@@ -155,8 +189,20 @@ LogViewer::LogViewer(CoreClient *core, QWidget *parent)
 
     connect(m_refreshBtn, &QPushButton::clicked, this, [this] {
         resolveThreadForProject();
+        reloadBranches();
         reloadFromFirstPage();
     });
+    connect(m_branchCombo, QOverload<int>::of(&QComboBox::activated), this,
+            &LogViewer::onBranchChanged);
+    connect(m_pathEdit, &QLineEdit::editingFinished, this,
+            &LogViewer::onPathFilterChanged);
+    connect(m_pathEdit, &QLineEdit::returnPressed, this,
+            &LogViewer::onPathFilterChanged);
+    connect(m_searchEdit, &QLineEdit::textChanged, this,
+            [this](const QString &) { applySearchFilter(); });
+    // Double-click a commit → tabbed modal reader.
+    connect(m_view, &QTableView::doubleClicked, this,
+            &LogViewer::openCommitDialog);
     connect(m_view->selectionModel(), &QItemSelectionModel::currentRowChanged, this,
             [this](const QModelIndex &, const QModelIndex &) { onSelectionChanged(); });
     connect(m_view->verticalScrollBar(), &QScrollBar::valueChanged, this,
@@ -175,12 +221,20 @@ void LogViewer::setActiveSource(const QString &projectPath, const QString &threa
     }
     m_activeProject = projectPath;
     if (!threadId.isEmpty()) {
-        m_source = Source{threadId, QString(), QString()};
+        m_source = Source{threadId, QString(), QString(), QString()};
     } else {
         // Agent hasn't started — show the workspace branch for the project.
-        m_source = Source{QString(), projectPath, QString()};
+        m_source = Source{QString(), projectPath, QString(), QString()};
+    }
+    // A new source resets the user's filters — its branches/paths differ.
+    {
+        QSignalBlocker bp(m_pathEdit);
+        QSignalBlocker bs(m_searchEdit);
+        m_pathEdit->clear();
+        m_searchEdit->clear();
     }
     updateLabel();
+    reloadBranches();
     reloadFromFirstPage();
     if (threadId.isEmpty()) {
         // Will upgrade us to the agent's thread once it exists.
@@ -190,16 +244,19 @@ void LogViewer::setActiveSource(const QString &projectPath, const QString &threa
 
 void LogViewer::updateLabel()
 {
+    QString text;
     if (!m_source.threadId.isEmpty()) {
-        m_sourceLabel->setText(
-            i18n("Agent worktree · %1", m_source.threadId.left(8)));
+        text = m_source.branch.isEmpty()
+                   ? i18n("Agent worktree · %1", m_source.threadId.left(8))
+                   : i18n("Agent worktree · %1", m_source.branch);
     } else if (!m_source.repoRoot.isEmpty()) {
-        m_sourceLabel->setText(m_source.branch.isEmpty()
-                                   ? i18n("Workspace · (detached)")
-                                   : i18n("Workspace · %1", m_source.branch));
+        text = m_source.branch.isEmpty()
+                   ? i18n("Workspace · (current branch)")
+                   : i18n("Workspace · %1", m_source.branch);
     } else {
-        m_sourceLabel->setText(i18n("No project selected"));
+        text = i18n("No project selected");
     }
+    m_sourceLabel->setText(text);
 }
 
 // resolveThreadForProject asks the core for snapshots and, if the active
@@ -255,8 +312,10 @@ void LogViewer::resolveThreadForProject()
                          }
                          return;
                      }
-                     m_source = Source{matchedThread, QString(), QString()};
+                     m_source = Source{matchedThread, QString(), QString(),
+                                       QString()};
                      updateLabel();
+                     reloadBranches();
                      reloadFromFirstPage();
                  },
                  this); // lifetime guard against late reply after viewer destruction
@@ -284,6 +343,23 @@ void LogViewer::reloadFromFirstPage()
     loadNextPage();
 }
 
+void LogViewer::addSourceParams(QJsonObject &params, bool includeFilters) const
+{
+    if (!m_source.threadId.isEmpty()) {
+        params.insert(QStringLiteral("threadId"), m_source.threadId);
+    } else if (!m_source.repoRoot.isEmpty()) {
+        params.insert(QStringLiteral("repoRoot"), m_source.repoRoot);
+    }
+    if (includeFilters) {
+        if (!m_source.branch.isEmpty()) {
+            params.insert(QStringLiteral("branch"), m_source.branch);
+        }
+        if (!m_source.path.isEmpty()) {
+            params.insert(QStringLiteral("path"), m_source.path);
+        }
+    }
+}
+
 void LogViewer::loadNextPage()
 {
     if (m_pageInFlight || m_endReached
@@ -296,14 +372,7 @@ void LogViewer::loadNextPage()
     const int skip = m_model->loadedCount();
     QJsonObject params{{QStringLiteral("skip"), skip},
                        {QStringLiteral("limit"), kPageSize}};
-    if (!m_source.threadId.isEmpty()) {
-        params.insert(QStringLiteral("threadId"), m_source.threadId);
-    } else {
-        params.insert(QStringLiteral("repoRoot"), m_source.repoRoot);
-        if (!m_source.branch.isEmpty()) {
-            params.insert(QStringLiteral("branch"), m_source.branch);
-        }
-    }
+    addSourceParams(params, /*includeFilters=*/true);
     m_core->call(QStringLiteral("git.log"), params,
                  [this, token, skip](const QJsonObject &result, const QJsonObject &error) {
                      if (token != m_loadToken) {
@@ -337,6 +406,9 @@ void LogViewer::loadNextPage()
                          m_stack->setCurrentIndex(0);
                          m_view->selectRow(0);
                      }
+                     // Re-apply any active search over the freshly-paged rows so
+                     // scroll-to-load doesn't reveal rows the filter should hide.
+                     applySearchFilter();
                  },
                  this);
 }
@@ -362,14 +434,7 @@ void LogViewer::refreshHead()
     m_pageInFlight = false;
     QJsonObject params{{QStringLiteral("skip"), 0},
                        {QStringLiteral("limit"), kPageSize}};
-    if (!m_source.threadId.isEmpty()) {
-        params.insert(QStringLiteral("threadId"), m_source.threadId);
-    } else {
-        params.insert(QStringLiteral("repoRoot"), m_source.repoRoot);
-        if (!m_source.branch.isEmpty()) {
-            params.insert(QStringLiteral("branch"), m_source.branch);
-        }
-    }
+    addSourceParams(params, /*includeFilters=*/true);
     m_core->call(
         QStringLiteral("git.log"), params,
         [this, token](const QJsonObject &result, const QJsonObject &error) {
@@ -450,6 +515,8 @@ void LogViewer::refreshHead()
             } else if (bar) {
                 bar->setValue(savedScroll);
             }
+            // Prepended commits may need hiding under an active search.
+            applySearchFilter();
         },
         this);
 }
@@ -536,6 +603,10 @@ void LogViewer::showContextMenu(const QPoint &pos)
 
     QMenu menu(this);
     const QIcon copyIcon = QIcon::fromTheme(QStringLiteral("edit-copy"));
+    QAction *openCommit = menu.addAction(
+        QIcon::fromTheme(QStringLiteral("document-open")),
+        i18nc("@action:inmenu", "Open Commit…"));
+    menu.addSeparator();
     QAction *copyHash =
         menu.addAction(copyIcon, i18nc("@action:inmenu", "Copy Commit Hash"));
     QAction *copyShort =
@@ -547,7 +618,9 @@ void LogViewer::showContextMenu(const QPoint &pos)
         menu.addAction(copyIcon, i18nc("@action:inmenu", "Copy as Patch"));
 
     QAction *chosen = menu.exec(m_view->viewport()->mapToGlobal(pos));
-    if (chosen == copyHash) {
+    if (chosen == openCommit) {
+        openCommitDialog(m_view->selectionModel()->currentIndex());
+    } else if (chosen == copyHash) {
         copySelectedSha(false);
     } else if (chosen == copyShort) {
         copySelectedSha(true);
@@ -594,13 +667,9 @@ void LogViewer::copySelectedAsPatch()
         return;
     }
     // Reuse git.commit.diff for the full patch of this commit, scoped to the
-    // active source exactly like CommitDetailPanel::sourceParams().
+    // active source (branch/path filters don't apply to a single commit's diff).
     QJsonObject params{{QStringLiteral("sha"), sha}};
-    if (!m_source.threadId.isEmpty()) {
-        params.insert(QStringLiteral("threadId"), m_source.threadId);
-    } else if (!m_source.repoRoot.isEmpty()) {
-        params.insert(QStringLiteral("repoRoot"), m_source.repoRoot);
-    }
+    addSourceParams(params, /*includeFilters=*/false);
     m_core->call(QStringLiteral("git.commit.diff"), params,
                  [](const QJsonObject &result, const QJsonObject &error) {
                      if (!error.isEmpty()) {
@@ -612,4 +681,120 @@ void LogViewer::copySelectedAsPatch()
                          QApplication::clipboard()->setText(patch);
                      }
                  });
+}
+
+// reloadBranches asks the core for the source's branch list and repopulates the
+// selector, preserving the picked branch when it still exists. The first entry
+// is always "(current branch)" — an empty value that scopes the log to HEAD.
+void LogViewer::reloadBranches()
+{
+    if ((m_source.threadId.isEmpty() && m_source.repoRoot.isEmpty())
+        || !m_core->isConnected()) {
+        QSignalBlocker block(m_branchCombo);
+        m_branchCombo->clear();
+        m_branchCombo->addItem(i18n("(current branch)"), QString());
+        return;
+    }
+    const QString wanted = m_source.branch;
+    QJsonObject params;
+    addSourceParams(params, /*includeFilters=*/false);
+    m_core->call(
+        QStringLiteral("git.branches"), params,
+        [this, wanted](const QJsonObject &result, const QJsonObject &error) {
+            QSignalBlocker block(m_branchCombo);
+            m_branchCombo->clear();
+            m_branchCombo->addItem(i18n("(current branch)"), QString());
+            if (error.isEmpty()) {
+                const QJsonArray branches =
+                    result.value(QStringLiteral("branches")).toArray();
+                for (const QJsonValue &v : branches) {
+                    const QJsonObject o = v.toObject();
+                    const QString name =
+                        o.value(QStringLiteral("name")).toString();
+                    if (name.isEmpty()) {
+                        continue;
+                    }
+                    QString label = name;
+                    if (o.value(QStringLiteral("current")).toBool()) {
+                        label = i18nc("current branch in the selector",
+                                      "%1 (current)", name);
+                    }
+                    m_branchCombo->addItem(label, name);
+                }
+            }
+            // Re-select the user's branch if it's still present; else HEAD.
+            int idx = wanted.isEmpty() ? 0 : m_branchCombo->findData(wanted);
+            if (idx < 0) {
+                idx = 0;
+            }
+            m_branchCombo->setCurrentIndex(idx);
+        },
+        this); // lifetime guard against late reply after viewer destruction
+}
+
+void LogViewer::onBranchChanged(int index)
+{
+    const QString branch = m_branchCombo->itemData(index).toString();
+    if (branch == m_source.branch) {
+        return;
+    }
+    m_source.branch = branch;
+    updateLabel();
+    reloadFromFirstPage();
+}
+
+void LogViewer::onPathFilterChanged()
+{
+    const QString path = m_pathEdit->text().trimmed();
+    if (path == m_source.path) {
+        return;
+    }
+    m_source.path = path;
+    reloadFromFirstPage();
+}
+
+// applySearchFilter hides loaded rows whose subject/author don't contain the
+// search text (case-insensitive). Client-side over the paged-in rows only — a
+// deep search would need a git.log --grep param, which the plan defers unless
+// this proves insufficient.
+void LogViewer::applySearchFilter()
+{
+    const QString needle = m_searchEdit->text().trimmed();
+    const int rows = m_model->rowCount();
+    if (needle.isEmpty()) {
+        for (int r = 0; r < rows; ++r) {
+            if (m_view->isRowHidden(r)) {
+                m_view->setRowHidden(r, false);
+            }
+        }
+        return;
+    }
+    for (int r = 0; r < rows; ++r) {
+        const QModelIndex subjectIdx = m_model->index(r, LogModel::ColSubject);
+        const QModelIndex authorIdx = m_model->index(r, LogModel::ColAuthor);
+        const bool match =
+            m_model->data(subjectIdx, Qt::DisplayRole)
+                    .toString()
+                    .contains(needle, Qt::CaseInsensitive)
+            || m_model->data(authorIdx, Qt::DisplayRole)
+                   .toString()
+                   .contains(needle, Qt::CaseInsensitive);
+        m_view->setRowHidden(r, !match);
+    }
+}
+
+void LogViewer::openCommitDialog(const QModelIndex &idx)
+{
+    if (!idx.isValid()) {
+        return;
+    }
+    const QString sha = m_model->shaAt(idx.row());
+    if (sha.isEmpty()) {
+        return;
+    }
+    auto *dlg = new CommitDetailDialog(m_core, m_source.threadId,
+                                       m_source.repoRoot, sha, this);
+    dlg->show();
+    dlg->raise();
+    dlg->activateWindow();
 }

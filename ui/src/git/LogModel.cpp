@@ -3,6 +3,7 @@
 
 #include "LogModel.h"
 
+#include <KFormat>
 #include <KLocalizedString>
 
 #include <QLocale>
@@ -273,11 +274,11 @@ QVariant LogModel::data(const QModelIndex &idx, int role) const
         case ColAuthor:
             return e.author;
         case ColDate:
-            // Locale-aware short date+time so the column stays narrow but
-            // still useful at a glance. Tooltip carries the ISO form.
+            // Relative "3 days ago" so the column reads at a glance and stays
+            // narrow; the absolute ISO form lives in the tooltip below.
             return e.authorTime.isValid()
-                       ? QLocale().toString(e.authorTime.toLocalTime(),
-                                            QLocale::ShortFormat)
+                       ? KFormat().formatRelativeDateTime(
+                             e.authorTime.toLocalTime(), QLocale::NarrowFormat)
                        : QString();
         case ColShortSha:
             return e.shortSha;

@@ -100,7 +100,9 @@ add_executable(agentkate
     src/WorktreeDashboard.cpp
     src/CleanupDialog.cpp
     src/ShutdownDialog.cpp
+    src/git/AuthorChipDelegate.cpp
     src/git/BlameController.cpp
+    src/git/CommitDetailDialog.cpp
     src/git/CommitDetailPanel.cpp
     src/git/CommitDialog.cpp
     src/git/ConflictDialog.cpp

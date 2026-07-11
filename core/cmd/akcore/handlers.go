@@ -1863,6 +1863,32 @@ func registerHandlers(d handlerDeps) {
 		return map[string]any{"entries": entries}, nil
 	})
 
+	// git.branches lists the repo's local + remote-tracking branches so the log
+	// viewer's branch selector can scope the history to any of them. Read-only:
+	// it never checks anything out. Resolves the source (thread worktree or
+	// workspace repo root) exactly like git.log.
+	d.srv.Handle("git.branches", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID string `json:"threadId"`
+			RepoRoot string `json:"repoRoot"` // workspace fallback when no thread
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		wt, err := resolveLogSource(d, p.ThreadID, p.RepoRoot)
+		if err != nil {
+			return nil, err
+		}
+		branches, err := gitstatus.Branches(wt)
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		if branches == nil {
+			branches = []gitstatus.BranchRef{}
+		}
+		return map[string]any{"branches": branches}, nil
+	})
+
 	// git.commit.detail returns one commit's metadata + per-file change list
 	// for the right-hand pane of the log viewer.
 	d.srv.Handle("git.commit.detail", func(_ context.Context, raw json.RawMessage) (any, error) {

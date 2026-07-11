@@ -17,7 +17,10 @@ class CommitDetailPanel;
 class CoreClient;
 class ElidingLabel;
 class LogGraphDelegate;
+class QComboBox;
 class QLabel;
+class QLineEdit;
+class QModelIndex;
 class QPushButton;
 class QStackedWidget;
 class QTableView;
@@ -49,6 +52,18 @@ public:
 
 private:
     void reloadFromFirstPage();
+    // Fetch the branch list for the active source and repopulate the branch
+    // selector, preserving the user's picked branch when it still exists.
+    void reloadBranches();
+    // Apply the client-side text search over already-loaded subject/author,
+    // hiding non-matching rows in place (no re-query).
+    void applySearchFilter();
+    // Open the tabbed CommitDetailDialog for a row (double-click / menu).
+    void openCommitDialog(const QModelIndex &idx);
+    // Branch selector picked a new branch: re-scope the log to it.
+    void onBranchChanged(int index);
+    // Path filter box committed: re-scope the log to that path (empty clears).
+    void onPathFilterChanged();
     // refreshHead re-fetches the first page on a real history change and merges
     // it into the loaded model in place (see LogModel::applyHead), preserving
     // the user's selection and scroll position. Used instead of the wholesale
@@ -67,15 +82,25 @@ private:
     void updateEmptyState();
 
     // A log "source" is either an agent worktree (threadId set) or a
-    // workspace branch (repoRoot + branch set).
+    // workspace branch (repoRoot set). `branch` scopes the walk to a non-HEAD
+    // branch in either mode; `path` narrows history to a file/dir. Both are
+    // user-driven filters from the toolbar and travel straight into git.log.
     struct Source {
         QString threadId;
         QString repoRoot;
         QString branch;
+        QString path;
     };
+
+    // Add branch/path filter params to a git.log/git.branches request for the
+    // active source. Shared by every loader so they stay in lock-step.
+    void addSourceParams(QJsonObject &params, bool includeFilters) const;
 
     CoreClient *m_core = nullptr;
     ElidingLabel *m_sourceLabel = nullptr;
+    QComboBox *m_branchCombo = nullptr;
+    QLineEdit *m_pathEdit = nullptr;
+    QLineEdit *m_searchEdit = nullptr;
     QPushButton *m_refreshBtn = nullptr;
     QTableView *m_view = nullptr;
     QStackedWidget *m_stack = nullptr;
