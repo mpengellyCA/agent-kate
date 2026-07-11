@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QHash>
+#include <QPointer>
 #include <QString>
 #include <QStringList>
 #include <QWidget>
@@ -12,6 +13,7 @@ class View;
 }
 class QStackedWidget;
 class QTabWidget;
+class QTimer;
 
 // EditorArea hosts editor tabs grouped by a caller-chosen key (a project path
 // or an agent id). Each group has its own QTabWidget of KTextEditor views and
@@ -46,12 +48,25 @@ public:
     bool confirmCloseAll();
     KTextEditor::View *currentView() const;
 
+    // Autosave: debounced write of a modified document ~1s after the last edit,
+    // plus save on focus-out / app deactivation. Off by default until the caller
+    // reflects the persisted preference. Autosave never runs the LSP formatter,
+    // so the cursor never jumps — manual Ctrl+S still formats.
+    void setAutosaveEnabled(bool on);
+    bool isAutosaveEnabled() const { return m_autosaveEnabled; }
+    // Flush every modified local document now, without formatting. Called on app
+    // deactivation so edits reach disk even before the per-doc debounce fires.
+    void autosaveAll();
+
 Q_SIGNALS:
     void openFilesChanged();
     void statusMessage(const QString &text);
     void currentFileChanged(const QString &path);
     void documentOpened(KTextEditor::Document *doc, const QString &path);
     void documentClosed(KTextEditor::Document *doc);
+    // A document was written to disk by autosave (no LSP formatting was run).
+    // MainWindow relays this to the LSP so diagnostics refresh on the saved file.
+    void documentAutosaved(KTextEditor::Document *doc);
     // Request the project tree to reveal/select this path (tab context menu).
     void revealInTreeRequested(const QString &path);
 
@@ -78,9 +93,24 @@ private:
     void updateVisible();
     void updateTabIcon(KTextEditor::Document *doc);
 
+    // Autosave helpers. A document qualifies for autosave when it has a local
+    // URL, is modified, isn't read-only, and isn't showing the modified-on-disk
+    // reload banner (never clobber the on-disk version the human is deciding on).
+    void wireAutosave(KTextEditor::Document *doc, QWidget *bannerHost);
+    bool autosaveCandidate(KTextEditor::Document *doc) const;
+    void autosaveDocument(KTextEditor::Document *doc);
+    // The container widget hosting a document's view (for reload-banner lookup).
+    QWidget *bannerHostForDocument(KTextEditor::Document *doc) const;
+
     QStackedWidget *m_stack = nullptr;
     QWidget *m_placeholder = nullptr;
     KTextEditor::Editor *m_editor = nullptr;
     QHash<QString, QTabWidget *> m_groups;
     QString m_activeGroup;
+
+    bool m_autosaveEnabled = false;
+    // One shared single-shot timer coalesces the debounce; whichever document
+    // last edited is remembered and written when it fires.
+    QTimer *m_autosaveTimer = nullptr;
+    QPointer<KTextEditor::Document> m_autosavePending;
 };

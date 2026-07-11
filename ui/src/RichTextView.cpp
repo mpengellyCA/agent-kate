@@ -217,6 +217,9 @@ void RichTextView::showReloadBanner(int reason)
 {
     if (!m_reloadBanner) {
         m_reloadBanner = new KMessageWidget(this);
+        // Same object name the plain-text editor's reload banner uses, so
+        // EditorArea's autosave can uniformly detect "banner showing → skip".
+        m_reloadBanner->setObjectName(QStringLiteral("editorReloadBanner"));
         m_reloadBanner->setMessageType(KMessageWidget::Warning);
         m_reloadBanner->setCloseButtonVisible(true);
         m_reloadBanner->setWordWrap(true);

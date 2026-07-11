@@ -78,6 +78,10 @@ private:
     static QString layoutDisplayName(const QString &key);
     void applyPerspective(const QString &name);
     void applyCentreMode(const QString &mode); // "editor" | "split" | "chat"
+    // If the centre is chat-only, switch to split so a just-opened file is
+    // actually visible (keeps the conversation on screen; Ctrl+E → full editor).
+    // Call only from user-initiated opens — never session restore/startup.
+    void ensureEditorVisible();
 
     // Panel placement: register every tool window through registerPanel so
     // the persisted location overrides (or the default strip) decide which
@@ -99,6 +103,10 @@ private:
     void updateAgentBadge();
     void updateLspStatus();    // refresh the status-bar language-server widget
     void onSave();
+    // Perform the actual document write + LSP save notification, with status
+    // feedback on failure. Split out of onSave so the format-on-save fallback
+    // timer can call it exactly once (guarded by a shared "done" flag).
+    void finishSave(const QString &path);
     void onSaveAll();
     void reloadExtensionServers();
     void onAgentActivated(int agentId, const QString &projectPath);

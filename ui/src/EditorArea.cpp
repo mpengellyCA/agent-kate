@@ -6,6 +6,7 @@
 #include "RichTextView.h"
 #include "theme/ThemeManager.h"
 
+#include <KActionCollection>
 #include <KLocalizedString>
 #include <KMessageBox>
 #include <KMessageWidget>
@@ -22,11 +23,13 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QIcon>
+#include <QKeySequence>
 #include <QLabel>
 #include <QMenu>
 #include <QStackedWidget>
 #include <QTabBar>
 #include <QTabWidget>
+#include <QTimer>
 #include <QUrl>
 #include <QVBoxLayout>
 
@@ -54,6 +57,33 @@ void applyEditorTheme(KTextEditor::View *view)
         view->setConfigValue(QStringLiteral("theme"), name);
     }
 }
+
+// KTextEditor::View ships its own action collection whose "file_save" action
+// also binds Ctrl+S. With focus inside the view both that action and the
+// window-level KStandardAction::save match the key, so Qt reports an "Ambiguous
+// shortcut overload" and disables the binding — Ctrl+S silently does nothing.
+// Clear the view-internal bindings that collide with window actions so the
+// MainWindow save action (set to Qt::ApplicationShortcut) owns Ctrl+S. We drop
+// the shortcut but keep the action, so File ▸ Save via the menu still works.
+void clearConflictingViewShortcuts(KTextEditor::View *view)
+{
+    if (!view) {
+        return;
+    }
+    KActionCollection *ac = view->actionCollection();
+    if (!ac) {
+        return;
+    }
+    // Names of the view-internal actions whose default shortcut clashes with a
+    // window-level action of ours. "file_save" is the Ctrl+S offender that
+    // breaks saving; "file_save_as" (Ctrl+Shift+S) collides with our Save All.
+    for (const char *name : {"file_save", "file_save_as"}) {
+        if (QAction *act = ac->action(QLatin1String(name))) {
+            act->setShortcut(QKeySequence());
+            ac->setDefaultShortcut(act, QKeySequence());
+        }
+    }
+}
 } // namespace
 
 EditorArea::EditorArea(QWidget *parent)
@@ -71,6 +101,19 @@ EditorArea::EditorArea(QWidget *parent)
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->addWidget(m_stack);
+
+    // Autosave debounce: one shared single-shot timer written ~1s after the
+    // last edit. m_autosavePending tracks which document to flush; the QPointer
+    // guards against the document being closed before the timer fires.
+    m_autosaveTimer = new QTimer(this);
+    m_autosaveTimer->setSingleShot(true);
+    m_autosaveTimer->setInterval(1000);
+    connect(m_autosaveTimer, &QTimer::timeout, this, [this] {
+        if (m_autosavePending) {
+            autosaveDocument(m_autosavePending);
+        }
+        m_autosavePending = nullptr;
+    });
 
     // Re-theme every open editor view when the app theme changes (the palette
     // change alone won't update a view we overrode via setConfigValue).
@@ -428,6 +471,10 @@ void EditorArea::openFile(const QString &groupKey, const QString &path, int line
         // here we wire the dirty-tab indicator on the document it exposes.
         connect(md->document(), &KTextEditor::Document::modifiedChanged, this,
                 [this, doc = md->document()] { updateTabIcon(doc); });
+        clearConflictingViewShortcuts(md->view());
+        // Autosave the markdown/HTML document too; its reload banner is a child
+        // of the RichTextView (same object name), so bannerHost is the view.
+        wireAutosave(md->document(), md);
         if (line >= 0) {
             md->view()->setCursorPosition(KTextEditor::Cursor(line, column));
         }
@@ -491,9 +538,14 @@ void EditorArea::openFile(const QString &groupKey, const QString &path, int line
 
     KTextEditor::View *view = doc->createView(container);
     applyEditorTheme(view);
+    // Reconcile the view's internal Ctrl+S / Ctrl+Shift+S so the window-level
+    // save actions own those keys (otherwise Qt disables them as ambiguous when
+    // the editor has focus — the "Ctrl+S does nothing" bug).
+    clearConflictingViewShortcuts(view);
     vbox->addWidget(view);
 
     wireDocument(doc, tabs, container);
+    wireAutosave(doc, container);
 
     const bool opened = doc->openUrl(QUrl::fromLocalFile(abs));
 
@@ -557,6 +609,127 @@ bool EditorArea::saveCurrent()
     emit statusMessage(ok ? QStringLiteral("Saved %1").arg(view->document()->documentName())
                           : QStringLiteral("Save failed"));
     return ok;
+}
+
+void EditorArea::setAutosaveEnabled(bool on)
+{
+    m_autosaveEnabled = on;
+    if (!on && m_autosaveTimer) {
+        m_autosaveTimer->stop();
+        m_autosavePending = nullptr;
+    }
+}
+
+QWidget *EditorArea::bannerHostForDocument(KTextEditor::Document *doc) const
+{
+    if (!doc) {
+        return nullptr;
+    }
+    for (QTabWidget *tabs : std::as_const(m_groups)) {
+        for (int i = 0; i < tabs->count(); ++i) {
+            QWidget *w = tabs->widget(i);
+            KTextEditor::View *view = viewForTab(w);
+            if (view && view->document() == doc) {
+                // Plain-text tabs wrap the view in a container that also hosts
+                // the reload banner; RichTextView hosts its own banner. Either
+                // way the tab widget is where a visible banner would live.
+                return w;
+            }
+        }
+    }
+    return nullptr;
+}
+
+bool EditorArea::autosaveCandidate(KTextEditor::Document *doc) const
+{
+    if (!m_autosaveEnabled || !doc) {
+        return false;
+    }
+    if (!doc->isModified() || doc->url().isEmpty() || !doc->url().isLocalFile()) {
+        return false;
+    }
+    if (!doc->isReadWrite()) {
+        return false;
+    }
+    // Never overwrite the on-disk version while the human is being asked to
+    // resolve a modified-on-disk conflict via the reload banner.
+    if (QWidget *host = bannerHostForDocument(doc)) {
+        if (auto *banner = host->findChild<KMessageWidget *>(
+                QStringLiteral("editorReloadBanner"))) {
+            if (banner->isVisible()) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+void EditorArea::autosaveDocument(KTextEditor::Document *doc)
+{
+    if (!autosaveCandidate(doc)) {
+        return;
+    }
+    // Autosave deliberately skips the LSP format step (that's manual Ctrl+S
+    // only) so the cursor never jumps while the user is still typing.
+    if (doc->documentSave()) {
+        emit statusMessage(i18n("Autosaved %1", doc->documentName()));
+        emit documentAutosaved(doc);
+    }
+}
+
+void EditorArea::autosaveAll()
+{
+    if (!m_autosaveEnabled) {
+        return;
+    }
+    for (QTabWidget *tabs : std::as_const(m_groups)) {
+        for (int i = 0; i < tabs->count(); ++i) {
+            KTextEditor::View *view = viewForTab(tabs->widget(i));
+            if (view) {
+                autosaveDocument(view->document());
+            }
+        }
+    }
+}
+
+void EditorArea::wireAutosave(KTextEditor::Document *doc, QWidget *bannerHost)
+{
+    Q_UNUSED(bannerHost);
+    // Debounce: (re)start the shared ~1s timer on every edit, remembering this
+    // document as the one to flush. A burst of keystrokes coalesces into one
+    // write once typing pauses.
+    connect(doc, &KTextEditor::Document::textChanged, this,
+            [this, doc] {
+                if (!m_autosaveEnabled) {
+                    return;
+                }
+                m_autosavePending = doc;
+                m_autosaveTimer->start();
+            });
+    // Save on focus-out too, so switching away commits the edit immediately
+    // rather than waiting out the debounce.
+    connect(doc, &KTextEditor::Document::viewCreated, this,
+            [this](KTextEditor::Document *, KTextEditor::View *view) {
+                if (!view) {
+                    return;
+                }
+                connect(view, &KTextEditor::View::focusOut, this,
+                        [this](KTextEditor::View *v) {
+                            if (v) {
+                                autosaveDocument(v->document());
+                            }
+                        });
+            });
+    // The initial view is created before wireAutosave runs, so wire it directly.
+    const auto views = doc->views();
+    for (KTextEditor::View *view : views) {
+        connect(view, &KTextEditor::View::focusOut, this,
+                [this](KTextEditor::View *v) {
+                    if (v) {
+                        autosaveDocument(v->document());
+                    }
+                });
+    }
 }
 
 bool EditorArea::saveAll()

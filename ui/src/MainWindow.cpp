@@ -51,6 +51,7 @@
 
 #include <QAction>
 #include <QActionGroup>
+#include <QApplication>
 #include <functional>
 #include <QCloseEvent>
 #include <QCoreApplication>
@@ -66,6 +67,8 @@
 #include <QKeySequence>
 #include <QMenu>
 #include <QMenuBar>
+#include <QPointer>
+#include <QSharedPointer>
 #include <QLabel>
 #include <QLineEdit>
 #include <QToolButton>
@@ -166,6 +169,7 @@ void MainWindow::setupUi()
 
     connect(problems, &ProblemsPanel::activated, this,
             [this](const QString &path, int line) {
+                ensureEditorVisible();
                 m_editor->openFile(groupKey(), path, line);
             });
 
@@ -174,6 +178,7 @@ void MainWindow::setupUi()
     m_search = new SearchPanel(m_core, this);
     connect(m_search, &SearchPanel::resultActivated, this,
             [this](const QString &path, int line, int column) {
+                ensureEditorVisible();
                 m_editor->openFile(groupKey(), path, line, column);
             });
     // Esc inside the search field returns focus to the active editor view.
@@ -356,6 +361,7 @@ void MainWindow::setupUi()
 
     connect(m_lsp, &LspManager::definitionResolved, this,
             [this](const QString &path, int line) {
+                ensureEditorVisible();
                 m_editor->openFile(groupKey(), path, line);
             });
     connect(m_lsp, &LspManager::referencesResolved, references, &ReferencesPanel::setLocations);
@@ -363,11 +369,13 @@ void MainWindow::setupUi()
             [this](const QList<Location> &) { raisePanelByKey(m_keyReferences); });
     connect(references, &ReferencesPanel::activated, this,
             [this](const QString &path, int line) {
+                ensureEditorVisible();
                 m_editor->openFile(groupKey(), path, line);
             });
     connect(m_lsp, &LspManager::symbolsResolved, outline, &OutlinePanel::setSymbols);
     connect(outline, &OutlinePanel::activated, this,
             [this](const QString &path, int line) {
+                ensureEditorVisible();
                 m_editor->openFile(groupKey(), path, line);
             });
     connect(m_editor, &EditorArea::currentFileChanged, this, [this](const QString &path) {
@@ -385,6 +393,7 @@ void MainWindow::setupUi()
     // A workspace edit (rename / code action) touched a file that isn't open.
     connect(m_lsp, &LspManager::openFileRequested, this,
             [this](const QString &path, int line) {
+                ensureEditorVisible();
                 m_editor->openFile(groupKey(), path, line);
             });
     // Code actions arrived — pop the quick-fix menu at the cursor.
@@ -455,7 +464,10 @@ void MainWindow::setupUi()
             });
 
     connect(m_tree, &ProjectTree::fileActivated, this,
-            [this](const QString &path) { m_editor->openFile(groupKey(), path); });
+            [this](const QString &path) {
+                ensureEditorVisible();
+                m_editor->openFile(groupKey(), path);
+            });
     connect(m_tree, &ProjectTree::terminalRequested, this,
             [this](const QString &dir) {
                 if (m_terminal) {
@@ -536,6 +548,26 @@ void MainWindow::setupUi()
                     bc->deleteLater();
                 }
             });
+    // Surface the editor's own save/autosave feedback ("Saved x.cpp",
+    // "Autosaved x.cpp") in the status bar.
+    connect(m_editor, &EditorArea::statusMessage, this,
+            [this](const QString &text) { statusBar()->showMessage(text, 4000); });
+    // Autosave writes bypass the LSP formatter, but the language server still
+    // needs telling the file changed on disk so diagnostics refresh.
+    connect(m_editor, &EditorArea::documentAutosaved, this,
+            [this](KTextEditor::Document *doc) {
+                if (doc && !doc->url().isEmpty()) {
+                    m_lsp->documentSaved(doc->url().toLocalFile());
+                }
+            });
+    // Flush unsaved edits when the app loses focus (Alt-Tab away, etc.), so
+    // autosave doesn't wait out its debounce while attention is elsewhere.
+    connect(qApp, &QApplication::applicationStateChanged, this,
+            [this](Qt::ApplicationState state) {
+                if (state != Qt::ApplicationActive && m_editor) {
+                    m_editor->autosaveAll();
+                }
+            });
 }
 
 void MainWindow::setupActions()
@@ -571,6 +603,11 @@ void MainWindow::setupActions()
     fileMenu->addAction(resumeAct);
 
     QAction *saveAct = KStandardAction::save(this, &MainWindow::onSave, this);
+    // Own Ctrl+S at the application level so it fires no matter which widget has
+    // focus. Paired with EditorArea clearing the KTextEditor view's internal
+    // file_save binding, this resolves the "Ambiguous shortcut overload" that
+    // disabled Ctrl+S whenever the editor had focus.
+    saveAct->setShortcutContext(Qt::ApplicationShortcut);
     fileMenu->addAction(saveAct);
 
     // KStandardAction has no saveAll in this KF6 release; build the equivalent
@@ -626,6 +663,28 @@ void MainWindow::setupActions()
             .writeEntry("showTools", on);
         m_agent->applyChatSettings();
     });
+
+    // Autosave: write file edits to disk automatically ~1s after you stop
+    // typing (and on focus loss). On by default; persisted in [Editor] autosave.
+    const KConfigGroup editorCfg =
+        KSharedConfig::openConfig()->group(QStringLiteral("Editor"));
+    const bool autosaveOn = editorCfg.readEntry("autosave", true);
+    auto *autosaveAct = optionsMenu->addAction(i18n("&Autosave files"));
+    autosaveAct->setCheckable(true);
+    autosaveAct->setChecked(autosaveOn);
+    autosaveAct->setToolTip(i18n("Automatically save your edits shortly after you "
+                                 "stop typing. Manual Ctrl+S still formats the file."));
+    connect(autosaveAct, &QAction::toggled, this, [this](bool on) {
+        KSharedConfig::openConfig()
+            ->group(QStringLiteral("Editor"))
+            .writeEntry("autosave", on);
+        if (m_editor) {
+            m_editor->setAutosaveEnabled(on);
+        }
+    });
+    if (m_editor) {
+        m_editor->setAutosaveEnabled(autosaveOn);
+    }
 
     optionsMenu->addSeparator();
     auto *providersAct = optionsMenu->addAction(i18n("Configure API &Providers…"));
@@ -860,6 +919,7 @@ void MainWindow::setupActions()
         dlg->setAttribute(Qt::WA_DeleteOnClose);
         connect(dlg, &WorkspaceSymbolDialog::symbolChosen, this,
                 [this](const QString &path, int line) {
+                    ensureEditorVisible();
                     m_editor->openFile(groupKey(), path, line);
                 });
         dlg->show();
@@ -1569,6 +1629,15 @@ void MainWindow::showPanelContextMenu(SideBar *bar, int id, const QPoint &global
     else if (chosen == detach)   detachPanel(key);
 }
 
+void MainWindow::ensureEditorVisible()
+{
+    // In chat-only layout a freshly-opened file lands in a hidden editor. Show
+    // it beside the conversation; leave editor/split modes untouched.
+    if (m_centreMode == QLatin1String("chat")) {
+        applyCentreMode(QStringLiteral("split"));
+    }
+}
+
 void MainWindow::applyCentreMode(const QString &mode)
 {
     if (!m_shell) {
@@ -1777,17 +1846,40 @@ void MainWindow::onSave()
     // markdown/csv/agent-save and server-less files are untouched.
     if (view && formatOnSave && m_lsp->canFormat(view)) {
         const QString path = m_activeFilePath;
-        m_lsp->formatDocument(view, [this, path](bool) {
-            if (m_editor->saveCurrent()) {
-                m_lsp->documentSaved(path);
+        // A hung or dead language server can drop the format callback, which
+        // used to mean the file silently never saved. Guard with a single-shot
+        // fallback that saves directly if the callback hasn't fired in ~1.5s.
+        auto done = QSharedPointer<bool>::create(false);
+        QPointer<MainWindow> self(this);
+        m_lsp->formatDocument(view, [self, path, done](bool) {
+            if (!self || *done) {
+                return;
             }
+            *done = true;
+            self->finishSave(path);
+        });
+        QTimer::singleShot(1500, this, [self, path, done] {
+            if (!self || *done) {
+                return;
+            }
+            *done = true;
+            self->finishSave(path);
         });
         return;
     }
 
-    const QString path = m_activeFilePath;
-    if (m_editor->saveCurrent() && view) {
-        m_lsp->documentSaved(path);
+    finishSave(m_activeFilePath);
+}
+
+void MainWindow::finishSave(const QString &path)
+{
+    if (m_editor->saveCurrent()) {
+        if (!path.isEmpty()) {
+            m_lsp->documentSaved(path);
+        }
+    } else {
+        statusBar()->showMessage(
+            i18n("Save failed: %1", path.isEmpty() ? i18n("no file") : path), 6000);
     }
 }
 
