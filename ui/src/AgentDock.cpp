@@ -656,10 +656,12 @@ void AgentDock::wireAgentPanel(int agentId, AgentPanel *panel)
     connect(panel, &AgentPanel::openFileRequested, this, &AgentDock::openFileRequested);
     connect(panel, &AgentPanel::titleChanged, this,
             [this, agentId](const QString &title) { m_roster->setAgentTitle(agentId, title); });
-    connect(panel, &AgentPanel::stateChanged, this,
-            [this, agentId](const QString &dot) { m_roster->setAgentStatus(agentId, dot); });
+    connect(panel, &AgentPanel::statusChanged, this,
+            [this, agentId](int status) { m_roster->setAgentStatus(agentId, status); });
     connect(panel, &AgentPanel::subtitleChanged, this,
             [this, agentId](const QString &text) { m_roster->setAgentSubtitle(agentId, text); });
+    connect(panel, &AgentPanel::previewChanged, this,
+            [this, agentId](const QString &text) { m_roster->setAgentPreview(agentId, text); });
     connect(panel, &AgentPanel::dormantChanged, this,
             [this, agentId](bool dormant) { m_roster->setAgentDormant(agentId, dormant); });
     connect(panel, &AgentPanel::attentionChanged, this,

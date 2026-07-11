@@ -9,6 +9,7 @@
 class QAction;
 class QLabel;
 class QLineEdit;
+class QTimer;
 class QToolButton;
 class QTreeWidget;
 class QTreeWidgetItem;
@@ -34,10 +35,15 @@ public:
     void restoreAgentTitleUnpinned(int agentId, const QString &title);
     bool isAgentTitlePinned(int agentId) const;
     QString agentTitle(int agentId) const;
-    void setAgentStatus(int agentId, const QString &dotColorHex);
-    // A muted second line for the agent card (isolation / worktree / idle).
-    // Derived locally in the UI for now — there is no backend description field.
+    // Status is the card's source-of-truth state (Working/Idle/NeedsInput/
+    // Dormant/Error); the delegate maps it to a symbol + semantic colour.
+    void setAgentStatus(int agentId, int status);
+    // The full status detail (branch / cost / tokens) — shown as the card
+    // tooltip now that the card body carries a chat preview instead.
     void setAgentSubtitle(int agentId, const QString &subtitle);
+    // The two-line chat preview (last exchange line; "You: …" for the user's
+    // own messages). Also stamps the card's "last activity" time.
+    void setAgentPreview(int agentId, const QString &preview);
     // Worktree number (the same #N the WorktreeDashboard shows), so the
     // roster row can be cross-referenced with that table. 0 hides it.
     void setAgentNumber(int agentId, int number);
@@ -109,6 +115,10 @@ private:
     void rebuildTagFilterMenu();
     void applyAttentionDisplay(QTreeWidgetItem *item);
     void recomputeProjectBadge(QTreeWidgetItem *project);
+    // Start/stop the ~10fps working-animation timer based on whether any agent
+    // is currently Working, and repaint only the working rows on each tick.
+    void updateWorkingAnimation();
+    void repaintWorkingRows();
     void updateEmptyState();
     void openFileManager(const QString &path) const;
     QTreeWidgetItem *projectItem(const QString &path) const;
@@ -130,4 +140,7 @@ private:
     QAction *m_tagFilterSeparator = nullptr;
     QAction *m_tagFilterClearAct = nullptr;
     QList<QPair<QString, QString>> m_models;
+    // Drives the Working status-badge arc sweep; runs only while at least one
+    // agent is Working, and repaints just those rows (~10fps).
+    QTimer *m_workingTimer = nullptr;
 };

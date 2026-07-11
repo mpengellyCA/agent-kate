@@ -126,10 +126,16 @@ Q_SIGNALS:
     // agent gets its id asynchronously when its session starts, after activation, so
     // consumers keyed on the thread (Cowork panel, Git Log) must refresh on this.
     void threadIdChanged(const QString &threadId);
-    void stateChanged(const QString &dotColorHex);
-    // Human-readable one-line status (isolation / worktree branch / idle), used
-    // as the roster card's subtitle. Tracks the same state as stateChanged.
+    // The card's status enum (AgentRoles::AgentStatus as int): the single source
+    // of truth for the roster badge (symbol + semantic colour). Replaces the old
+    // raw-hex dot colour.
+    void statusChanged(int status);
+    // Human-readable one-line status detail (isolation / worktree branch / cost
+    // / tokens). Now the roster card's tooltip; the card body shows a preview.
     void subtitleChanged(const QString &text);
+    // The latest chat line for the roster card preview ("You: …" for the user's
+    // own messages). Emitted on every message append.
+    void previewChanged(const QString &preview);
     void dormantChanged(bool dormant);
     // Roster card affordance: attention = a turn is waiting on the user's input
     // (a permission prompt). The roster paints this as a card marker.
@@ -274,6 +280,7 @@ private:
     bool m_dormant = false;   // has a thread id, but no live process — resumable
     bool m_promoting = false; // a promote-to-worktree is in flight
     bool m_replaying = false; // inside loadTranscript() — don't double-count cost
+    bool m_errored = false;   // the last start/turn failed — card shows Error
     // Attachment sidecar turns (name/kind/path/mediaType/outside per sent
     // message that had attachments), returned by agent.transcript and consumed in
     // order as the matching user messages are replayed so the You cards regain

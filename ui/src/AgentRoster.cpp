@@ -1,11 +1,11 @@
 #include "AgentRoster.h"
 #include "AgentCardDelegate.h"
 #include "shell/FlowLayout.h"
-#include "theme/ThemeManager.h"
 
 #include <QAction>
 #include <QApplication>
 #include <QClipboard>
+#include <QDateTime>
 #include <QDesktopServices>
 #include <QDir>
 #include <QEvent>
@@ -24,6 +24,7 @@
 #include <QShortcut>
 #include <QSignalBlocker>
 #include <QShowEvent>
+#include <QTimer>
 #include <QToolButton>
 #include <QTreeWidget>
 #include <QTreeWidgetItem>
@@ -91,6 +92,14 @@ AgentRoster::AgentRoster(QWidget *parent)
     m_tree->setUniformRowHeights(false);
     m_tree->setItemDelegate(new AgentCardDelegate(m_tree));
     m_tree->installEventFilter(this);
+
+    // Working-badge animation: a single ~10fps timer that repaints only the
+    // rows whose agent is Working. Started/stopped by updateWorkingAnimation()
+    // so it costs nothing while every agent is idle.
+    m_workingTimer = new QTimer(this);
+    m_workingTimer->setInterval(100);
+    connect(m_workingTimer, &QTimer::timeout, this,
+            &AgentRoster::repaintWorkingRows);
 
     connect(m_tree, &QTreeWidget::currentItemChanged, this,
             [this](QTreeWidgetItem *item, QTreeWidgetItem *previous) {
@@ -380,7 +389,8 @@ void AgentRoster::addAgent(const QString &projectPath, int agentId, const QStrin
     item->setData(0, Qt::UserRole, agentId);
     item->setData(0, Title, title);
     item->setData(0, Number, 0);
-    item->setData(0, AgentRoles::Dot, ThemeManager::palette().agentIdle.name());
+    item->setData(0, AgentRoles::StatusRole,
+                  int(AgentRoles::AgentStatus::Idle));
     item->setText(0, composeLabel(0, title));
     project->setExpanded(true);
 }
@@ -479,17 +489,82 @@ QStringList AgentRoster::agentTags(int agentId) const
     return {};
 }
 
-void AgentRoster::setAgentStatus(int agentId, const QString &dotColorHex)
+void AgentRoster::setAgentStatus(int agentId, int status)
 {
     if (QTreeWidgetItem *item = agentItem(agentId)) {
-        item->setData(0, AgentRoles::Dot, dotColorHex);
+        if (item->data(0, AgentRoles::StatusRole).toInt() == status) {
+            return;
+        }
+        item->setData(0, AgentRoles::StatusRole, status);
+        updateWorkingAnimation();
+    }
+}
+
+// updateWorkingAnimation runs the ~10fps repaint timer only while at least one
+// agent is Working, so idle rosters stay perfectly still.
+void AgentRoster::updateWorkingAnimation()
+{
+    bool anyWorking = false;
+    for (int i = 0; i < m_tree->topLevelItemCount() && !anyWorking; ++i) {
+        QTreeWidgetItem *project = m_tree->topLevelItem(i);
+        for (int j = 0; j < project->childCount(); ++j) {
+            if (AgentRoles::AgentStatus(project->child(j)->data(0, AgentRoles::StatusRole).toInt())
+                == AgentRoles::AgentStatus::Working) {
+                anyWorking = true;
+                break;
+            }
+        }
+    }
+    if (anyWorking && !m_workingTimer->isActive()) {
+        m_workingTimer->start();
+    } else if (!anyWorking && m_workingTimer->isActive()) {
+        m_workingTimer->stop();
+    }
+}
+
+// repaintWorkingRows invalidates just the Working rows each tick so the badge
+// arc sweeps without repainting the whole (potentially long) roster.
+void AgentRoster::repaintWorkingRows()
+{
+    for (int i = 0; i < m_tree->topLevelItemCount(); ++i) {
+        QTreeWidgetItem *project = m_tree->topLevelItem(i);
+        for (int j = 0; j < project->childCount(); ++j) {
+            QTreeWidgetItem *agent = project->child(j);
+            if (agent->isHidden()) {
+                continue;
+            }
+            if (AgentRoles::AgentStatus(agent->data(0, AgentRoles::StatusRole).toInt())
+                == AgentRoles::AgentStatus::Working) {
+                const QRect rect = m_tree->visualItemRect(agent);
+                if (!rect.isNull()) {
+                    m_tree->viewport()->update(rect);
+                }
+            }
+        }
     }
 }
 
 void AgentRoster::setAgentSubtitle(int agentId, const QString &subtitle)
 {
     if (QTreeWidgetItem *item = agentItem(agentId)) {
+        // The composed status detail (branch/cost/tokens) is now the card's
+        // tooltip — the card body shows a chat preview instead.
         item->setData(0, AgentRoles::Subtitle, subtitle);
+        item->setToolTip(0, subtitle);
+    }
+}
+
+void AgentRoster::setAgentPreview(int agentId, const QString &preview)
+{
+    if (QTreeWidgetItem *item = agentItem(agentId)) {
+        if (item->data(0, AgentRoles::Preview).toString() == preview) {
+            return;
+        }
+        item->setData(0, AgentRoles::Preview, preview);
+        // Every fresh preview line is a "last activity" moment; stamp it so the
+        // card's relative time ("2m ago") tracks the latest exchange.
+        item->setData(0, AgentRoles::LastActivity,
+                      QDateTime::currentSecsSinceEpoch());
     }
 }
 
@@ -537,6 +612,7 @@ void AgentRoster::removeAgent(int agentId)
         QTreeWidgetItem *project = item->parent();
         delete item;
         recomputeProjectBadge(project);
+        updateWorkingAnimation(); // a removed Working agent may stop the timer
     }
 }
 

@@ -1,4 +1,5 @@
 #include "AgentPanel.h"
+#include "AgentCardDelegate.h"
 #include "AgentChatHelpers.h"
 #include "AttachmentBuilder.h"
 #include "ImageView.h"
@@ -1502,18 +1503,30 @@ void AgentPanel::refresh()
 
     QString dot;
     QString text;
-    if (m_workspace.isEmpty()) {
+    // Map the same state the header text describes onto the roster card's status
+    // enum (the single source of truth for the badge symbol + semantic colour).
+    AgentRoles::AgentStatus st = AgentRoles::AgentStatus::Idle;
+    if (m_errored) {
+        // A failed start/turn: surface Error until the next send/resume clears it.
+        dot = QStringLiteral("#d05050");
+        text = QStringLiteral("Failed — check the conversation, then try again");
+        st = AgentRoles::AgentStatus::Error;
+    } else if (m_workspace.isEmpty()) {
         dot = QStringLiteral("#5d6471");
         text = QStringLiteral("Open a workspace folder to begin");
+        st = AgentRoles::AgentStatus::Idle;
     } else if (m_dormant) {
         dot = QStringLiteral("#5d6471");
         text = QStringLiteral("Dormant — Resume to continue this session");
+        st = AgentRoles::AgentStatus::Dormant;
     } else if (!running) {
         dot = QStringLiteral("#8b91a0");
         text = QStringLiteral("Ready — describe a task below");
+        st = AgentRoles::AgentStatus::Idle;
     } else if (!m_permQueue.isEmpty()) {
         dot = QStringLiteral("#f0c000");
         text = QStringLiteral("Needs your input");
+        st = AgentRoles::AgentStatus::NeedsInput;
     } else {
         const QString where = (m_isolated && !m_branch.isEmpty())
                                    ? QStringLiteral("branch %1").arg(m_branch)
@@ -1521,9 +1534,11 @@ void AgentPanel::refresh()
         if (m_idle) {
             dot = QStringLiteral("#e0905f");
             text = QStringLiteral("Idle · %1 · send a follow-up").arg(where);
+            st = AgentRoles::AgentStatus::Idle;
         } else {
             dot = QStringLiteral("#6cc08a");
             text = QStringLiteral("Working · %1").arg(where);
+            st = AgentRoles::AgentStatus::Working;
         }
     }
     // Append the running session cost as a quiet suffix once any has accrued.
@@ -1539,7 +1554,7 @@ void AgentPanel::refresh()
     }
     m_header->setText(QStringLiteral("<span style='color:%1'>&#9679;</span>&nbsp;&nbsp;%2")
                           .arg(dot, text.toHtmlEscaped()));
-    emit stateChanged(dot);
+    emit statusChanged(int(st));
     emit subtitleChanged(text);
     // Roster card affordance, derived from the same state computed above.
     emit attentionChanged(running && !m_permQueue.isEmpty());
@@ -1569,6 +1584,18 @@ void AgentPanel::addMessageCard(const QString &role, const QString &accentHex,
         : QLocale().toString(QTime::currentTime(), QLocale::ShortFormat);
     m_model->appendMessage(role, accentHex, bodyHtml, plainText, replayed, ts,
                            attachments);
+
+    // Feed the roster card its two-line preview: the latest message line, with a
+    // "You: " prefix on the user's own messages. plainText is the raw Markdown
+    // source (safe for QTextLayout); fall back to nothing rather than raw HTML.
+    if (!plainText.isEmpty()) {
+        const bool fromUser = role == QLatin1String("You");
+        const QString flat = plainText.simplified();
+        emit previewChanged(fromUser
+                                ? i18nc("@item roster preview, user message",
+                                        "You: %1", flat)
+                                : flat);
+    }
 
     // A fresh row while the user is scrolled up flags unread content on the
     // jump-to-latest button.
@@ -2123,6 +2150,7 @@ void AgentPanel::deliverMessage(const QString &text, const QJsonArray &attachmen
 {
     addYouCard(text, attachments);
     m_idle = false;
+    m_errored = false; // a fresh turn clears any prior failure state
     m_working->setActivity(QString()); // a new turn starts in generic mode
     m_core->call(QStringLiteral("agent.send"),
                  QJsonObject{{QStringLiteral("threadId"), m_threadId},
@@ -2911,6 +2939,7 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
         if (phase == QLatin1String("started")) {
             m_isolated = ev.value(QStringLiteral("isolated")).toBool();
             m_branch = ev.value(QStringLiteral("branch")).toString();
+            m_errored = false; // a clean start clears any prior failure state
             addNote(detail, QStringLiteral("sys"));
             refresh();
         } else if (phase == QLatin1String("resumed")) {
@@ -2918,6 +2947,7 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             m_branch = ev.value(QStringLiteral("branch")).toString();
             m_dormant = false;
             m_idle = true;
+            m_errored = false; // resuming clears any prior failure state
             // A resumed process bills a fresh session — restart the meter so the
             // header doesn't show a stale/zero cost as new turns accrue.
             m_sessionCostUsd = 0.0;
@@ -2956,6 +2986,7 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             addNote(QStringLiteral("agent failed: %1").arg(detail), QStringLiteral("err"));
             m_idle = false;
             m_promoting = false;
+            m_errored = true; // roster card shows Error until the next send/resume
             if (!m_dormant) {
                 m_threadId.clear(); // a fresh start failed — back to a blank panel
             }
