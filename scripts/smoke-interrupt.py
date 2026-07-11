@@ -19,6 +19,12 @@ SCENARIO B — escalation backstop for a hung tool:
       arrives) and the thread goes dormant, and
     * the next agent.send auto-resumes and answers with prior context.
 
+SCENARIO C — stop & close on a dormant agent archives (does not error):
+  Starts an agent, lets its turn finish, agent.stop's it to dormant (the CLI
+  exits and the supervisor forgets the thread), then calls agent.stopClose and
+  proves it archives the thread out of the live roster instead of erroring with
+  "unknown thread" — the regression guard for the dormant stop-close fix.
+
 Exercises the real RPC path: agent.interrupt -> Supervisor.Interrupt ->
 in-band frame (stdin kept open) -> pumpStdout sees the aborted result ->
 `turn_aborted`; and the signal-escalation fallback -> reap() "interrupted".
@@ -346,6 +352,58 @@ def scenario_blocking_tool(c, workspace, checks):
     checks["B: follow-up continues with context"] = SECRET in haystack
 
 
+def scenario_dormant_stopclose(c, workspace, checks):
+    """Stop & close on a DORMANT agent must archive, not error. A dormant thread
+    has already been reaped, so the supervisor no longer tracks it and Stop()
+    reports "unknown thread" — the normal dormant state. Regression guard for the
+    core lifecycle fix: agent.stopClose must ignore that and archive anyway."""
+    log("\n=== SCENARIO C: stop & close on a dormant agent archives ===")
+    start = c.call("agent.start", {
+        "workspacePath": workspace,
+        "prompt": "Reply with only the word: ready.",
+        "model": HAIKU,
+    })
+    if start.get("error"):
+        sys.exit(f"agent.start (C) failed: {start['error']}")
+    thread_id = start["result"]["threadId"]
+    log(f"thread {thread_id}")
+
+    # Let the opening turn complete so there's a real session on disk.
+    c.wait_for_result(thread_id)
+
+    # agent.stop closes stdin; the CLI exits and reap() marks the thread dormant
+    # and drops it from the supervisor's tracking map.
+    stop = c.call("agent.stop", {"threadId": thread_id})
+    checks["C: agent.stop accepted"] = not stop.get("error")
+    phase, _ = c.wait_for_lifecycle(thread_id, {"exited", "interrupted"}, timeout=20)
+    log(f"lifecycle after stop: {phase}")
+
+    # Poll until the record actually reads dormant (reap → UpdateQuiet is async).
+    dormant = False
+    for _ in range(30):
+        rec = next((t for t in c.call("session.listThreads", {})["result"]["threads"]
+                    if t["threadId"] == thread_id), None)
+        if rec and rec.get("status") == "dormant":
+            dormant = True
+            break
+        time.sleep(0.2)
+    checks["C: thread is dormant before stop & close"] = dormant
+
+    # The fix under test: stopClose on the dormant thread must NOT error even
+    # though the supervisor no longer tracks it.
+    close = c.call("agent.stopClose", {"threadId": thread_id}, timeout=90)
+    checks["C: agent.stopClose on dormant accepted (no error)"] = not close.get("error")
+    if close.get("error"):
+        log(f"  stopClose error: {close['error']}")
+
+    still = next((t for t in c.call("session.listThreads", {})["result"]["threads"]
+                  if t["threadId"] == thread_id), None)
+    checks["C: dormant stop & close clears the roster entry"] = still is None
+    arch = c.call("cleanup.listArchived", {})["result"].get("archived", [])
+    checks["C: dormant stop & close archives (restorable)"] = any(
+        a.get("threadId") == thread_id for a in arch)
+
+
 def main():
     if not os.path.exists(AKCORE):
         sys.exit("build akcore first: scripts/build.sh")
@@ -365,6 +423,7 @@ def main():
             sys.exit("handshake failed")
         scenario_inband(c, workspace, checks)
         scenario_blocking_tool(c, workspace, checks)
+        scenario_dormant_stopclose(c, workspace, checks)
     finally:
         if c:
             c.stop()

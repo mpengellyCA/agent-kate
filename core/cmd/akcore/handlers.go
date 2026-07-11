@@ -437,11 +437,17 @@ func registerHandlers(d handlerDeps) {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
 		// Hot-compaction must run against the live session, before termination.
+		// It is a no-op for a dormant thread (guards on d.sup.Running internally).
 		runHotCompactIfConfigured(d, p.ThreadID)
 		// Stop the process and wait for it to exit so its cooperation locks and
 		// git watch are torn down by the reap/lifecycle path before we archive.
-		if err := d.sup.Stop(p.ThreadID); err != nil {
-			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		// A dormant thread has already been reaped, so the supervisor no longer
+		// tracks it and Stop reports "unknown thread" — that is the normal
+		// dormant state, not an error, so ignore it and proceed to archive.
+		if d.sup.Running(p.ThreadID) {
+			if err := d.sup.Stop(p.ThreadID); err != nil {
+				return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+			}
 		}
 		for i := 0; i < 60 && d.sup.Running(p.ThreadID); i++ {
 			time.Sleep(100 * time.Millisecond)
@@ -2031,8 +2037,13 @@ func registerHandlers(d handlerDeps) {
 		}
 
 		// 8. Drop the rest of the thread's state and notify, mirroring
-		//    agent.discard's teardown.
+		//    agent.discard's teardown. This is a permanent removal (the worktree
+		//    is gone), so the attachment sidecar goes too — unlike the reversible
+		//    agent.stopClose archive, where chips must survive un-archive.
 		_ = d.summaries.Remove(p.ThreadID)
+		if d.attachSide != nil {
+			_ = d.attachSide.Remove(p.ThreadID)
+		}
 		d.gitCache.Forget(p.ThreadID)
 		d.threads.remove(p.ThreadID)
 		d.srv.Notify("agent.discarded", map[string]any{"threadId": p.ThreadID})

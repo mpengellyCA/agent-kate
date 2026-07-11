@@ -269,6 +269,12 @@ func forkAgentThread(d handlerDeps, src session.Record, newThreadID, model, effo
 		Created:        time.Now(),
 		Status:         session.StatusRunning,
 		CoworkEnabled:  src.CoworkEnabled,
+		// Carry the source's user-set policy so the fork behaves like its parent:
+		// compaction strategy/strip and roster tags. SessionID, worktree, status,
+		// created/updated and summary/turn timestamps are intentionally per-fork.
+		CompactStrategy: src.CompactStrategy,
+		CompactStrip:    src.CompactStrip,
+		Tags:            append([]string(nil), src.Tags...),
 	}
 	applyProviderToRecord(&rec, providerFromRecord(src))
 	if err := d.sessions.Put(rec); err != nil {

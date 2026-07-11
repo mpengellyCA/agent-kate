@@ -46,6 +46,7 @@ ForkAgentDialog::ForkAgentDialog(const QString &sourceTitle, const QString &sour
     m_model->addItem(i18n("Smartest (Opus)"), QStringLiteral("opus"));
     m_model->addItem(i18n("Balanced (Sonnet)"), QStringLiteral("sonnet"));
     m_model->addItem(i18n("Fastest (Haiku)"), QStringLiteral("haiku"));
+    m_model->addItem(i18n("Fable"), QStringLiteral("fable"));
     m_model->setToolTip(i18n("Which model the forked conversation continues on."));
     // Prefill from the source agent so a fork that changes only the effort keeps
     // the model, and vice versa.
