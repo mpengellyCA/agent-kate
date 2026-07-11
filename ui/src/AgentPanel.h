@@ -5,6 +5,8 @@
 #include <QJsonObject>
 #include <QList>
 #include <QPair>
+#include <QPersistentModelIndex>
+#include <QPointer>
 #include <QString>
 #include <QWidget>
 
@@ -196,6 +198,14 @@ private:
     void scrollFeedToBottom();
     // Show the whole-message + code-block copy menu for a feed row.
     void showFeedContextMenu(const QModelIndex &idx, const QPoint &globalPos);
+
+    // In-place selectable text overlay (plan 13 phase 1): a click on a message
+    // body opens a persistent, frameless QTextBrowser over that row's text so an
+    // arbitrary substring can be selected and Ctrl+C'd. Only one is open at a
+    // time; it closes on Esc, on a click outside it, on that row's data changing,
+    // and on model reset/eviction.
+    void openSelectionOverlay(const QModelIndex &idx);
+    void closeSelectionOverlay();
     // After an interactive resize settles, re-measure exactly the rows currently
     // visible in the view (the rest keep their cheap estimate until shown). This
     // is what keeps resize cost O(visible rows) — see TranscriptDelegate.
@@ -249,6 +259,12 @@ private:
     QToolButton *m_jumpBtn = nullptr;
     bool m_jumpUnread = false; // a card arrived while detached from the bottom
     QHash<QString, int> m_toolRows; // tool_use id -> stable transcript key
+    // The Message row whose selection overlay is currently open (invalid = none).
+    // Persistent so it tracks the row across insertions/scroll.
+    QPersistentModelIndex m_selectionRow;
+    // Handle to the open overlay editor (the delegate hands it over via
+    // editorCreated), so the panel can focus it and filter Esc / outside clicks.
+    QPointer<QWidget> m_selectionEditor;
     // Coalesces interactive resize into a single exact re-measure of the visible
     // rows once the drag settles (~80ms), mirroring the ImageView/RichTextView
     // debounce from phase 1.

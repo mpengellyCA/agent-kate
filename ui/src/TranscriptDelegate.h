@@ -4,6 +4,7 @@
 #pragma once
 
 #include <QHash>
+#include <QModelIndex>
 #include <QRect>
 #include <QStyledItemDelegate>
 
@@ -43,9 +44,32 @@ public:
     int measureExact(const QModelIndex &idx, int width,
                      const QStyleOptionViewItem &opt) const;
 
+    // --- in-place selectable overlay (plan 13 phase 1) -------------------
+    // A Message row's body can be covered by a frameless read-only QTextBrowser
+    // so the user can select and copy an arbitrary substring. The browser reuses
+    // the exact document setup paint() uses, so glyph positions match the painted
+    // row and opening the overlay causes no visual jump.
+    QWidget *createEditor(QWidget *parent, const QStyleOptionViewItem &opt,
+                          const QModelIndex &idx) const override;
+    void setEditorData(QWidget *editor, const QModelIndex &idx) const override;
+    void updateEditorGeometry(QWidget *editor, const QStyleOptionViewItem &opt,
+                              const QModelIndex &idx) const override;
+
+Q_SIGNALS:
+    // A left click landed inside a Message row's body (and not on a link) — the
+    // panel opens a persistent selection overlay for this row.
+    void messageBodyClicked(const QModelIndex &idx) const;
+    // A selection-overlay editor was just created; the panel takes a handle so it
+    // can focus it and dismiss it on Esc / click-outside (the view offers no
+    // getter for a persistent delegate editor).
+    void editorCreated(QWidget *editor) const;
+    // A link inside a Message body's selection overlay was activated.
+    void anchorActivated(const QString &href) const;
+
 protected:
     // Hit-testing for tool expand/collapse, the copy button, the "show full
-    // output" link, message links and double-click-to-copy.
+    // output" link and message links; a body click asks the panel to open the
+    // selection overlay.
     bool editorEvent(QEvent *event, QAbstractItemModel *model,
                      const QStyleOptionViewItem &opt,
                      const QModelIndex &idx) override;
@@ -66,7 +90,8 @@ private:
 
     // Build (and configure widths on) the text document for a row's body.
     // Returns a freshly-built document the caller owns. `contentWidth` is the
-    // text width to wrap at.
+    // text width to wrap at. Shares the document setup with the selection overlay
+    // (createEditor) via configureBodyDoc() so glyph metrics match exactly.
     QTextDocument *buildBodyDoc(const QModelIndex &idx, int contentWidth,
                                 const QStyleOptionViewItem &opt) const;
 
@@ -74,4 +99,10 @@ private:
     // and index, compute the sub-rects of the tool header / copy button.
     QRect toolHeaderRect(const QRect &row) const;
     QRect toolCopyRect(const QRect &row) const;
+
+    // The body-text sub-rect of a Message row (excludes the card padding and the
+    // role/timestamp line) — the exact area the selection overlay covers. `row`
+    // is the full row rect; `opt` supplies the font. Matches the translate the
+    // body draw uses in layoutRow().
+    QRect messageBodyRect(const QRect &row, const QStyleOptionViewItem &opt) const;
 };

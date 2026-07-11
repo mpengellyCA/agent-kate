@@ -14,6 +14,7 @@
 #include <QFontMetrics>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QTextBrowser>
 #include <QTextDocument>
 #include <QUrl>
 
@@ -80,6 +81,40 @@ QString highlightedHtml(const QString &plain, const QString &needle, bool curren
     }
     return out.replace(QLatin1Char('\n'), QStringLiteral("<br>"));
 }
+
+// Resolve the body HTML for a Message/Note row: the pre-rendered HtmlRole, with
+// the in-conversation find highlight substituted in for a matching Message. Kept
+// as one routine so the painted row and the selection overlay show identical
+// content (same substring highlighting, same glyph flow).
+QString resolveBodyHtml(const QModelIndex &idx)
+{
+    const auto kind = TranscriptModel::Kind(idx.data(TranscriptModel::KindRole).toInt());
+    QString html = idx.data(TranscriptModel::HtmlRole).toString();
+    if (kind == TranscriptModel::Message) {
+        const auto *m = qobject_cast<const TranscriptModel *>(idx.model());
+        if (m && !m->findNeedle().isEmpty()) {
+            const QString plain = idx.data(TranscriptModel::PlainRole).toString();
+            if (plain.contains(m->findNeedle(), Qt::CaseInsensitive)) {
+                html = highlightedHtml(plain, m->findNeedle(),
+                                       idx.row() == m->findCurrentRow());
+            }
+        }
+    }
+    return html;
+}
+
+// The single source of a body document's metrics — font, zero margin, HTML and
+// wrap width. paint()/measure use it through buildBodyDoc(); the selection
+// overlay (a QTextBrowser) applies the same setup to its own document so the
+// overlay's glyph positions line up with the painted row exactly.
+void configureBodyDoc(QTextDocument *doc, const QFont &font, int contentWidth,
+                      const QString &html)
+{
+    doc->setDefaultFont(font);
+    doc->setDocumentMargin(0);
+    doc->setHtml(html);
+    doc->setTextWidth(contentWidth);
+}
 } // namespace
 
 TranscriptDelegate::TranscriptDelegate(QObject *parent)
@@ -93,25 +128,8 @@ QTextDocument *TranscriptDelegate::buildBodyDoc(const QModelIndex &idx,
                                                 int contentWidth,
                                                 const QStyleOptionViewItem &opt) const
 {
-    const auto kind = TranscriptModel::Kind(idx.data(TranscriptModel::KindRole).toInt());
     auto *doc = new QTextDocument;
-    doc->setDefaultFont(opt.font);
-    doc->setDocumentMargin(0);
-
-    QString html = idx.data(TranscriptModel::HtmlRole).toString();
-    // Apply the find highlight to the matching message body only.
-    if (kind == TranscriptModel::Message) {
-        const auto *m = qobject_cast<const TranscriptModel *>(idx.model());
-        if (m && !m->findNeedle().isEmpty()) {
-            const QString plain = idx.data(TranscriptModel::PlainRole).toString();
-            if (plain.contains(m->findNeedle(), Qt::CaseInsensitive)) {
-                html = highlightedHtml(plain, m->findNeedle(),
-                                       idx.row() == m->findCurrentRow());
-            }
-        }
-    }
-    doc->setHtml(html);
-    doc->setTextWidth(contentWidth);
+    configureBodyDoc(doc, opt.font, contentWidth, resolveBodyHtml(idx));
     return doc;
 }
 
@@ -391,6 +409,85 @@ QRect TranscriptDelegate::toolCopyRect(const QRect &row) const
     return QRect(right - kToolCopyW, row.top(), kToolCopyW, kToolHeaderH);
 }
 
+QRect TranscriptDelegate::messageBodyRect(const QRect &row,
+                                          const QStyleOptionViewItem &opt) const
+{
+    const int lineH = QFontMetrics(opt.font).height();
+    const int left = row.left() + kOuterMarginX + kCardPadX;
+    const int top = row.top() + kCardPadTop + lineH + kRoleRowGap;
+    const int innerW = row.width() - 2 * kOuterMarginX - 2 * kCardPadX;
+    const int bodyH = row.height() - kCardPadTop - lineH - kRoleRowGap - kCardPadBottom;
+    return QRect(left, top, qMax(1, innerW), qMax(0, bodyH));
+}
+
+// --- in-place selectable overlay (plan 13 phase 1) -----------------------
+
+QWidget *TranscriptDelegate::createEditor(QWidget *parent,
+                                          const QStyleOptionViewItem &opt,
+                                          const QModelIndex &idx) const
+{
+    Q_UNUSED(opt);
+    Q_UNUSED(idx);
+    // A frameless, read-only text browser laid over the row's body. It shares the
+    // exact document setup of the painted body (font, margin, wrap width, HTML) so
+    // opening it causes no visual jump — it just makes the same glyphs selectable.
+    auto *browser = new QTextBrowser(parent);
+    browser->setFrameShape(QFrame::NoFrame);
+    browser->setReadOnly(true);
+    browser->setContextMenuPolicy(Qt::DefaultContextMenu); // native copy menu
+    browser->setTextInteractionFlags(Qt::TextSelectableByMouse
+                                     | Qt::TextSelectableByKeyboard
+                                     | Qt::LinksAccessibleByMouse);
+    browser->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    browser->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    browser->document()->setDocumentMargin(0);
+    // Let the painted card show through: transparent frame + viewport, no opaque
+    // fill. The painted body underneath stays visible so opening the overlay is
+    // seamless; only the selection highlight is drawn by the browser.
+    QPalette pal = browser->palette();
+    pal.setColor(QPalette::Base, Qt::transparent);
+    browser->setPalette(pal);
+    browser->viewport()->setAutoFillBackground(false);
+    browser->setAutoFillBackground(false);
+    // Links open through the panel's handler, never QTextBrowser navigation.
+    browser->setOpenLinks(false);
+    browser->setOpenExternalLinks(false);
+    connect(browser, &QTextBrowser::anchorClicked, this,
+            [this](const QUrl &url) { emit anchorActivated(url.toString()); });
+    emit editorCreated(browser);
+    return browser;
+}
+
+void TranscriptDelegate::setEditorData(QWidget *editor, const QModelIndex &idx) const
+{
+    auto *browser = qobject_cast<QTextBrowser *>(editor);
+    if (!browser) {
+        return;
+    }
+    // Match paint()'s document setup exactly (see configureBodyDoc). The browser
+    // is a child of the view's viewport, so it inherits the same font paint()
+    // draws with (opt.font). The wrap width is re-applied by updateEditorGeometry
+    // once the geometry is known.
+    configureBodyDoc(browser->document(), browser->font(),
+                     browser->viewport()->width(), resolveBodyHtml(idx));
+}
+
+void TranscriptDelegate::updateEditorGeometry(QWidget *editor,
+                                              const QStyleOptionViewItem &opt,
+                                              const QModelIndex &idx) const
+{
+    if (TranscriptModel::Kind(idx.data(TranscriptModel::KindRole).toInt())
+        != TranscriptModel::Message) {
+        return;
+    }
+    const QRect body = messageBodyRect(opt.rect, opt);
+    editor->setGeometry(body);
+    if (auto *browser = qobject_cast<QTextBrowser *>(editor)) {
+        // Re-wrap the document to the body width now the geometry is known.
+        browser->document()->setTextWidth(body.width());
+    }
+}
+
 bool TranscriptDelegate::editorEvent(QEvent *event, QAbstractItemModel *model,
                                      const QStyleOptionViewItem &opt,
                                      const QModelIndex &idx)
@@ -443,7 +540,9 @@ bool TranscriptDelegate::editorEvent(QEvent *event, QAbstractItemModel *model,
         }
 
         if (kind == TranscriptModel::Message) {
-            // Open an anchor if the click landed on a link.
+            // A click on a link opens it directly (the overlay isn't up on the
+            // first click). Otherwise a click on the body asks the panel to open
+            // the persistent selection overlay so the text becomes selectable.
             const int innerW = opt.rect.width() - 2 * kOuterMarginX - 2 * kCardPadX;
             QTextDocument *doc = buildBodyDoc(idx, qMax(1, innerW), opt);
             const QFontMetrics fm(opt.font);
@@ -456,18 +555,12 @@ bool TranscriptDelegate::editorEvent(QEvent *event, QAbstractItemModel *model,
                 QDesktopServices::openUrl(QUrl(anchor));
                 return true;
             }
+            if (messageBodyRect(opt.rect, opt).contains(pos)) {
+                emit messageBodyClicked(idx);
+                return true;
+            }
         }
         return false;
-    }
-
-    if (event->type() == QEvent::MouseButtonDblClick && kind == TranscriptModel::Message) {
-        // Double-click copies the whole message (selection across rows isn't
-        // available in the virtualized feed; this covers the common copy path).
-        const QString plain = idx.data(TranscriptModel::PlainRole).toString();
-        if (!plain.isEmpty()) {
-            QGuiApplication::clipboard()->setText(plain);
-            return true;
-        }
     }
 
     return QStyledItemDelegate::editorEvent(event, model, opt, idx);

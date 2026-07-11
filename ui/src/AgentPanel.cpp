@@ -16,6 +16,7 @@
 #include <QAbstractButton>
 #include <QClipboard>
 #include <QCryptographicHash>
+#include <QDesktopServices>
 #include <QGuiApplication>
 #include <QLineEdit>
 #include <QLocale>
@@ -49,6 +50,7 @@
 #include <QLabel>
 #include <QLayout>
 #include <QListView>
+#include <QMouseEvent>
 #include <QPaintEvent>
 #include <QPainter>
 #include <QPalette>
@@ -279,6 +281,39 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
                     showFeedContextMenu(idx, m_view->viewport()->mapToGlobal(pos));
                 }
             });
+
+    // --- in-place selectable text overlay (plan 13 phase 1) ----------------
+    // A click on a message body opens a persistent, frameless QTextBrowser over
+    // that row's text so an arbitrary substring can be selected and copied. The
+    // delegate paints the row and the overlay from the same document setup, so
+    // opening it causes no visual jump. Only one overlay is open at a time.
+    connect(m_delegate, &TranscriptDelegate::messageBodyClicked, this,
+            &AgentPanel::openSelectionOverlay);
+    connect(m_delegate, &TranscriptDelegate::editorCreated, this,
+            [this](QWidget *editor) {
+                m_selectionEditor = editor;
+                editor->installEventFilter(this); // Esc to dismiss
+                editor->setFocus(Qt::MouseFocusReason);
+            });
+    connect(m_delegate, &TranscriptDelegate::anchorActivated, this,
+            [](const QString &href) {
+                if (!href.isEmpty()) {
+                    QDesktopServices::openUrl(QUrl(href));
+                }
+            });
+    // Close the overlay when its row's data changes (streaming/mutation) or the
+    // model resets, so a stale editor never lingers over a re-laid-out row.
+    connect(m_model, &QAbstractItemModel::dataChanged, this,
+            [this](const QModelIndex &tl, const QModelIndex &br) {
+                if (m_selectionRow.isValid() && m_selectionRow.row() >= tl.row()
+                    && m_selectionRow.row() <= br.row()) {
+                    closeSelectionOverlay();
+                }
+            });
+    connect(m_model, &QAbstractItemModel::modelReset, this,
+            &AgentPanel::closeSelectionOverlay);
+    connect(m_model, &QAbstractItemModel::rowsAboutToBeRemoved, this,
+            &AgentPanel::closeSelectionOverlay);
 
     // Sticky-bottom: the feed auto-scrolls to keep the latest entry in view.
     // Scrolling upward releases the stick; scrolling back to the bottom reclaims
@@ -1005,6 +1040,27 @@ bool AgentPanel::eventFilter(QObject *obj, QEvent *event)
         }
         return QWidget::eventFilter(obj, event);
     }
+    // A press on the feed viewport that lands outside the open selection overlay
+    // dismisses it (the overlay is a child of the viewport, so its own presses
+    // never reach here). Don't consume the event — the click also (re)targets the
+    // row it landed on.
+    if (m_view && obj == m_view->viewport() && m_selectionEditor
+        && event->type() == QEvent::MouseButtonPress) {
+        const QPoint pos = static_cast<QMouseEvent *>(event)->pos();
+        if (!m_selectionEditor->geometry().contains(pos)) {
+            closeSelectionOverlay();
+        }
+    }
+    // The open overlay closes on Esc; consumed so it doesn't bubble further. (We
+    // don't close on focus-out: right-clicking the overlay for its native copy
+    // menu takes focus away, and that must not dismiss the selection.)
+    if (m_selectionEditor && obj == m_selectionEditor) {
+        if (event->type() == QEvent::KeyPress
+            && static_cast<QKeyEvent *>(event)->key() == Qt::Key_Escape) {
+            closeSelectionOverlay();
+            return true;
+        }
+    }
     // File/attachment drops onto the chat input must attach as context, not
     // insert the path as text. The drop is delivered to the input's viewport;
     // forward acceptable drops to the panel's handlers and consume them, while
@@ -1475,6 +1531,41 @@ void AgentPanel::showFeedContextMenu(const QModelIndex &idx, const QPoint &globa
         });
     }
     menu.exec(globalPos);
+}
+
+void AgentPanel::openSelectionOverlay(const QModelIndex &idx)
+{
+    if (!idx.isValid()) {
+        return;
+    }
+    // Don't cover the in-flight last row while a turn is running: it may still be
+    // mutating, and the overlay would be torn down immediately by dataChanged.
+    if (isRunning() && !m_idle && idx.row() == m_model->count() - 1) {
+        return;
+    }
+    // Re-opening the same row is a no-op (keeps the current selection).
+    if (m_selectionRow == idx && m_selectionEditor) {
+        return;
+    }
+    closeSelectionOverlay();
+    m_selectionRow = idx;
+    // openPersistentEditor drives createEditor → editorCreated, which stores the
+    // handle and gives it focus so Ctrl+C works right away.
+    m_view->openPersistentEditor(idx);
+}
+
+void AgentPanel::closeSelectionOverlay()
+{
+    if (!m_selectionRow.isValid()) {
+        m_selectionEditor.clear();
+        return;
+    }
+    const QModelIndex idx = m_selectionRow;
+    m_selectionRow = QPersistentModelIndex();
+    m_selectionEditor.clear();
+    if (idx.isValid()) {
+        m_view->closePersistentEditor(idx);
+    }
 }
 
 void AgentPanel::remeasureVisibleRows()
