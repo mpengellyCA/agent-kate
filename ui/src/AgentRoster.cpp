@@ -554,17 +554,25 @@ void AgentRoster::setAgentSubtitle(int agentId, const QString &subtitle)
     }
 }
 
-void AgentRoster::setAgentPreview(int agentId, const QString &preview)
+void AgentRoster::setAgentPreview(int agentId, const QString &preview,
+                                  qint64 activityEpoch)
 {
     if (QTreeWidgetItem *item = agentItem(agentId)) {
         if (item->data(0, AgentRoles::Preview).toString() == preview) {
             return;
         }
         item->setData(0, AgentRoles::Preview, preview);
-        // Every fresh preview line is a "last activity" moment; stamp it so the
-        // card's relative time ("2m ago") tracks the latest exchange.
-        item->setData(0, AgentRoles::LastActivity,
-                      QDateTime::currentSecsSinceEpoch());
+        // Stamp the card's "last activity" time so its relative label ("2m ago")
+        // tracks the latest exchange. activityEpoch == 0 means "now" (a live
+        // message); > 0 is an explicit event time (used at replay end so restored
+        // history keeps its real time); < 0 means leave it unstamped (replayed
+        // history with no usable timestamp — the delegate then shows no time
+        // rather than a wrong "just now").
+        if (activityEpoch >= 0) {
+            item->setData(0, AgentRoles::LastActivity,
+                          activityEpoch > 0 ? activityEpoch
+                                            : QDateTime::currentSecsSinceEpoch());
+        }
     }
 }
 
@@ -622,6 +630,10 @@ void AgentRoster::removeProject(const QString &path)
         delete item; // also deletes its agent children
     }
     updateEmptyState();
+    // Deleting a project drops any Working agents under it — the 10fps repaint
+    // timer must re-check whether it still has anything to animate, or it spins
+    // forever after the last Working agent is gone.
+    updateWorkingAnimation();
 }
 
 void AgentRoster::setCurrentAgent(int agentId)

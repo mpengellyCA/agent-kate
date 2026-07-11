@@ -693,7 +693,9 @@ void AgentDock::wireAgentPanel(int agentId, AgentPanel *panel)
     connect(panel, &AgentPanel::subtitleChanged, this,
             [this, agentId](const QString &text) { m_roster->setAgentSubtitle(agentId, text); });
     connect(panel, &AgentPanel::previewChanged, this,
-            [this, agentId](const QString &text) { m_roster->setAgentPreview(agentId, text); });
+            [this, agentId](const QString &text, qint64 activityEpoch) {
+                m_roster->setAgentPreview(agentId, text, activityEpoch);
+            });
     connect(panel, &AgentPanel::dormantChanged, this,
             [this, agentId](bool dormant) { m_roster->setAgentDormant(agentId, dormant); });
     connect(panel, &AgentPanel::attentionChanged, this,

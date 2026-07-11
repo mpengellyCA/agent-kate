@@ -42,8 +42,12 @@ public:
     // tooltip now that the card body carries a chat preview instead.
     void setAgentSubtitle(int agentId, const QString &subtitle);
     // The two-line chat preview (last exchange line; "You: …" for the user's
-    // own messages). Also stamps the card's "last activity" time.
-    void setAgentPreview(int agentId, const QString &preview);
+    // own messages). Stamps the card's "last activity" time: `activityEpoch` is
+    // seconds-since-epoch, or 0 to stamp the current time. Pass a real event
+    // timestamp (or leave at 0 only for genuinely-live messages) — replayed
+    // history should not claim "just now".
+    void setAgentPreview(int agentId, const QString &preview,
+                         qint64 activityEpoch = 0);
     // Worktree number (the same #N the WorktreeDashboard shows), so the
     // roster row can be cross-referenced with that table. 0 hides it.
     void setAgentNumber(int agentId, int number);

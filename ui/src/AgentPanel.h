@@ -144,8 +144,11 @@ Q_SIGNALS:
     // / tokens). Now the roster card's tooltip; the card body shows a preview.
     void subtitleChanged(const QString &text);
     // The latest chat line for the roster card preview ("You: …" for the user's
-    // own messages). Emitted on every message append.
-    void previewChanged(const QString &preview);
+    // own messages). Emitted once per live append; during transcript replay it
+    // fires once at the end with the final line. `activityEpoch` is the seconds-
+    // since-epoch to stamp as the card's last-activity time; 0 means "stamp now"
+    // (live messages) and a replay with no usable timestamp leaves it unstamped.
+    void previewChanged(const QString &preview, qint64 activityEpoch = 0);
     void dormantChanged(bool dormant);
     // Roster card affordance: attention = a turn is waiting on the user's input
     // (a permission prompt). The roster paints this as a card marker.
@@ -189,6 +192,9 @@ private:
     // Fire the next queued follow-up, if any, once the thread is idle. Called
     // on every `result` event; sends one message per turn boundary.
     void drainSendQueue();
+    // Move still-queued follow-ups back into the composer when a turn stops or
+    // fails, so the human's text is never silently discarded.
+    void restoreQueuedToComposer();
     // Rebuild the "queued messages" chip bar from m_sendQueue.
     void rebuildQueueChips();
     void onStopClicked();
@@ -295,6 +301,12 @@ private:
     bool m_promoting = false; // a promote-to-worktree is in flight
     bool m_replaying = false; // inside loadTranscript() — don't double-count cost
     bool m_errored = false;   // the last start/turn failed — card shows Error
+    // During replay we accumulate the final preview line + its event timestamp
+    // and emit a single previewChanged at the end, so a dormant agent's card
+    // isn't repainted N times nor re-stamped "just now" for historical lines.
+    QString m_replayLastPreview;
+    qint64 m_replayEventEpoch = 0; // timestamp of the event currently rendering
+    qint64 m_replayLastEpoch = 0;  // epoch paired with m_replayLastPreview
     // Attachment sidecar turns (name/kind/path/mediaType/outside per sent
     // message that had attachments), returned by agent.transcript and consumed in
     // order as the matching user messages are replayed so the You cards regain

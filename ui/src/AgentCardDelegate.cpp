@@ -258,7 +258,7 @@ void AgentCardDelegate::paint(QPainter *painter, const QStyleOptionViewItem &opt
     // Title line.
     painter->setFont(titleFont);
     painter->setPen(titleColor);
-    const QRect titleRect(textX, titleLine.top(), titleRight - textX,
+    const QRect titleRect(textX, titleLine.top(), qMax(0, titleRight - textX),
                           titleLine.height());
     painter->drawText(titleRect, Qt::AlignVCenter | Qt::AlignLeft,
                       fmTitle.elidedText(title, Qt::ElideRight, titleRect.width()));
@@ -275,7 +275,7 @@ void AgentCardDelegate::paint(QPainter *painter, const QStyleOptionViewItem &opt
         flat.replace(QLatin1Char('\n'), QLatin1Char(' '));
         QTextLayout layout(flat, previewFont);
         layout.setTextOption(topt);
-        const int lineWidth = r.width();
+        const int lineWidth = qMax(0, r.width());
         layout.beginLayout();
         int line = 0;
         while (line < kPreviewLines) {

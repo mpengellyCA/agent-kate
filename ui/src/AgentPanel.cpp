@@ -26,6 +26,7 @@
 #include <QPixmap>
 #include <QRegularExpression>
 #include <QShortcut>
+#include <QDateTime>
 #include <QTime>
 #include <QCheckBox>
 #include <QComboBox>
@@ -1266,11 +1267,23 @@ void AgentPanel::loadTranscriptFrom(const QString &fromThreadId)
                      // events must not be counted, and replayed cards carry no
                      // synthetic send time.
                      m_replaying = true;
+                     m_replayLastPreview.clear();
+                     m_replayLastEpoch = 0;
+                     m_replayEventEpoch = 0;
                      for (const QJsonValue &v : events) {
                          renderEvent(v.toObject());
                      }
                      m_replaying = false;
                      m_replayAttachTurns = QJsonArray();
+                     // One preview update for the whole replay: the final line,
+                     // stamped with its real event time (0 = leave unstamped, so
+                     // the card shows no time rather than a wrong "just now").
+                     if (!m_replayLastPreview.isEmpty()) {
+                         // >0: real event time. -1: no usable timestamp — leave
+                         // the card unstamped rather than lying "just now".
+                         emit previewChanged(m_replayLastPreview,
+                                             m_replayLastEpoch > 0 ? m_replayLastEpoch : -1);
+                     }
                      addNote(QStringLiteral("— prior conversation restored —"),
                              QStringLiteral("dim"));
                      scrollFeedToBottom();
@@ -1588,13 +1601,21 @@ void AgentPanel::addMessageCard(const QString &role, const QString &accentHex,
     // Feed the roster card its two-line preview: the latest message line, with a
     // "You: " prefix on the user's own messages. plainText is the raw Markdown
     // source (safe for QTextLayout); fall back to nothing rather than raw HTML.
+    // During replay we DON'T emit per-message — that would repaint the card N
+    // times and stamp its "last activity" as now for every historical line.
+    // Instead we retain the final line and emit once at replay end.
     if (!plainText.isEmpty()) {
         const bool fromUser = role == QLatin1String("You");
         const QString flat = plainText.simplified();
-        emit previewChanged(fromUser
-                                ? i18nc("@item roster preview, user message",
-                                        "You: %1", flat)
-                                : flat);
+        const QString preview =
+            fromUser ? i18nc("@item roster preview, user message", "You: %1", flat)
+                     : flat;
+        if (replayed) {
+            m_replayLastPreview = preview;
+            m_replayLastEpoch = m_replayEventEpoch;
+        } else {
+            emit previewChanged(preview);
+        }
     }
 
     // A fresh row while the user is scrolled up flags unread content on the
@@ -2173,6 +2194,52 @@ void AgentPanel::drainSendQueue()
     deliverMessage(q.text, q.attachments);
 }
 
+// restoreQueuedToComposer moves any still-queued follow-ups back into the
+// composer so a stopped/failed turn never silently eats the human's text. The
+// messages join with blank lines; if the composer already holds a draft the
+// queued text is prepended so nothing typed is clobbered. Attachments from the
+// queued messages are restored to the pending bar (deduped by path).
+void AgentPanel::restoreQueuedToComposer()
+{
+    if (m_sendQueue.isEmpty()) {
+        return;
+    }
+    QStringList parts;
+    QJsonArray restoredAttachments;
+    QSet<QString> seenPaths;
+    for (const QueuedMsg &q : m_sendQueue) {
+        if (!q.text.isEmpty()) {
+            parts << q.text;
+        }
+        for (const QJsonValue &a : q.attachments) {
+            const QString path = a.toObject().value(QStringLiteral("path")).toString();
+            if (path.isEmpty() || !seenPaths.contains(path)) {
+                seenPaths.insert(path);
+                restoredAttachments.append(a);
+            }
+        }
+    }
+    m_sendQueue.clear();
+    rebuildQueueChips();
+
+    const QString queued = parts.join(QStringLiteral("\n\n"));
+    if (!queued.isEmpty()) {
+        const QString existing = m_input->toPlainText();
+        m_input->setPlainText(existing.trimmed().isEmpty()
+                                  ? queued
+                                  : queued + QStringLiteral("\n\n") + existing);
+    }
+    // Fold the queued attachments back in front of any already-pending ones.
+    for (const QJsonValue &a : m_attachments) {
+        const QString path = a.toObject().value(QStringLiteral("path")).toString();
+        if (path.isEmpty() || !seenPaths.contains(path)) {
+            restoredAttachments.append(a);
+        }
+    }
+    m_attachments = restoredAttachments;
+    rebuildAttachChips();
+}
+
 // rebuildQueueChips redraws the queued-message chip bar from m_sendQueue.
 // Each chip shows the message (truncated) and removes it on click.
 void AgentPanel::rebuildQueueChips()
@@ -2737,6 +2804,17 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
 {
     const QString type = ev.value(QStringLiteral("type")).toString();
 
+    // The transcript event carries an ISO-8601 "timestamp"; during replay we
+    // remember it so the end-of-replay preview can stamp the card's last-activity
+    // with the real time rather than lying "just now". 0 if absent/unparseable.
+    if (m_replaying) {
+        const QString iso = ev.value(QStringLiteral("timestamp")).toString();
+        const QDateTime when =
+            iso.isEmpty() ? QDateTime()
+                          : QDateTime::fromString(iso, Qt::ISODateWithMs);
+        m_replayEventEpoch = when.isValid() ? when.toSecsSinceEpoch() : 0;
+    }
+
     if (type == QLatin1String("system")) {
         // Only the init system event is worth showing in the feed.
         if (ev.value(QStringLiteral("subtype")).toString() != QLatin1String("init")) {
@@ -2843,10 +2921,17 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
                 // step even if some replayed user messages had no attachments.
                 if (hasInlineAttachment && !m_replayAttachTurns.isEmpty()) {
                     const QJsonObject turn = m_replayAttachTurns.first().toObject();
-                    if (turn.value(QStringLiteral("text")).toString() == userText) {
-                        attachments = turn.value(QStringLiteral("attachments")).toArray();
-                        m_replayAttachTurns.removeFirst();
+                    attachments = turn.value(QStringLiteral("attachments")).toArray();
+                    // Positional (FIFO) pairing: an inline-attachment message must
+                    // correspond to the next sidecar turn. Consume the front turn
+                    // even on a text mismatch — leaving it stuck would mis-pair
+                    // every later attachment message and cascade the desync.
+                    if (turn.value(QStringLiteral("text")).toString() != userText) {
+                        qWarning("AgentPanel: replay attachment turn text mismatch "
+                                 "(front sidecar didn't match user message); "
+                                 "pairing positionally to keep the FIFO in sync");
                     }
+                    m_replayAttachTurns.removeFirst();
                 }
                 addYouCard(userText, attachments);
             }
@@ -2996,6 +3081,11 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             if (!m_dormant) {
                 m_threadId.clear(); // a fresh start failed — back to a blank panel
             }
+            // A follow-up queued during the failed turn can never drain now —
+            // hand the text back to the composer instead of stranding it.
+            if (!m_sendQueue.isEmpty()) {
+                restoreQueuedToComposer();
+            }
             refresh();
         } else if (phase == QLatin1String("exited")
                    || phase == QLatin1String("interrupted")) {
@@ -3009,11 +3099,13 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             m_permQueue.clear();
             m_permBar->setVisible(false);
             m_questionBox->setVisible(false);
-            // Don't fire queued follow-ups into a stopped session.
+            // The session stopped before the queued follow-ups could fire.
+            // Don't discard the human's text — put it back in the composer so
+            // it can be re-sent (into a resumed session) with one keystroke.
             if (!m_sendQueue.isEmpty()) {
-                m_sendQueue.clear();
-                rebuildQueueChips();
-                addNote(QStringLiteral("queued messages cleared — agent stopped"),
+                restoreQueuedToComposer();
+                addNote(QStringLiteral("agent stopped — your queued message is "
+                                       "back in the composer"),
                         QStringLiteral("dim"));
             }
             // The process is gone but the Claude Code session persists — keep
