@@ -60,4 +60,9 @@ private:
     QVBoxLayout *m_changesDiffSlot = nullptr;
     DiffView *m_patch = nullptr;       // whole-commit diff (Patch tab)
     QVBoxLayout *m_patchSlot = nullptr;
+    // Monotonic token for per-file diff requests: a quick file-selection change
+    // fires several git.commit.diff calls, and their replies can arrive out of
+    // order. Each reply checks its captured token against this and discards
+    // itself if a newer request has superseded it, so the wrong diff never shows.
+    quint64 m_fileDiffReq = 0;
 };

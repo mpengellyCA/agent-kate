@@ -135,6 +135,11 @@ private:
     QString m_projectRoot;
     QString m_worktreeRoot;
     Scope m_scope = ProjectScope;
+    // Whether the Worktree tab was enabled on the last applyScope(). Lets
+    // applyScope early-return when neither the displayed root nor the tab-enabled
+    // state changed, so the constant git.invalidated churn no longer re-roots the
+    // tree (collapsing the user's expansion/scroll). -1 = never applied yet.
+    int m_appliedWorktreeEnabled = -1;
 
     // Canonical path → status map. refreshGitStatus()'s reply set()s it; an
     // identical snapshot is dropped silently (no signal, no repaint), so the

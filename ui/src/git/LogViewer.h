@@ -24,6 +24,7 @@ class QModelIndex;
 class QPushButton;
 class QStackedWidget;
 class QTableView;
+class QTimer;
 
 // LogViewer is the visual git history pane for the active agent. It glues
 // together the building blocks shipped in Phase 5b:
@@ -56,7 +57,10 @@ private:
     // selector, preserving the user's picked branch when it still exists.
     void reloadBranches();
     // Apply the client-side text search over already-loaded subject/author,
-    // hiding non-matching rows in place (no re-query).
+    // hiding non-matching rows in place (no re-query). When a non-empty filter
+    // hides every loaded row and more history is available, kicks the next page
+    // so the user can search deeper than the loaded window (progressive paging up
+    // to the model's cap, guarded against an infinite loop by m_endReached).
     void applySearchFilter();
     // Open the tabbed CommitDetailDialog for a row (double-click / menu).
     void openCommitDialog(const QModelIndex &idx);
@@ -114,6 +118,13 @@ private:
     int m_loadToken = 0;
     bool m_pageInFlight = false;
     bool m_endReached = false;
+    // Debounces the per-keystroke search so a full row scan (up to the 5000 cap)
+    // doesn't run on every character.
+    QTimer *m_searchTimer = nullptr;
+    // True while a non-empty search filter is applied. The graph delegate reads
+    // this (via a widget property) to skip painting lane rails, which would
+    // otherwise connect through hidden rows and look corrupt.
+    bool m_searchFilterActive = false;
 
     // Last first page we applied via refreshHead(). Gating on it means an
     // identical first page — a working-tree-only change that left history

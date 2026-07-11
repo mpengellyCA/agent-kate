@@ -2,6 +2,7 @@
 
 #include <QHash>
 #include <QPointer>
+#include <QSet>
 #include <QString>
 #include <QStringList>
 #include <QWidget>
@@ -31,6 +32,11 @@ public:
                   int column = 0);
     void openDiff(const QString &groupKey, const QString &title, const QString &text);
     bool saveCurrent();
+    // Save a specific document (the format-on-save path captures the document at
+    // save-request time, so a tab switch during the async format round-trip can't
+    // redirect the write to the wrong file). Returns false if the document is no
+    // longer open or the write failed. Callers own the status feedback.
+    bool saveDocument(KTextEditor::Document *doc);
     // Save every modified document across all groups. Returns true if all
     // succeeded (or there was nothing to save).
     bool saveAll();
@@ -113,4 +119,11 @@ private:
     // last edited is remembered and written when it fires.
     QTimer *m_autosaveTimer = nullptr;
     QPointer<KTextEditor::Document> m_autosavePending;
+    // Documents whose autosave is suspended after a failed write (deleted /
+    // read-only file). Without this an autosave that fails would re-fire on every
+    // keystroke, and KTextEditor would pop a modal error dialog each time — a
+    // once-per-second dialog storm while typing. Cleared by a successful manual
+    // save. Keyed by document URL so it survives the QPointer being cleared on
+    // close and re-open of the same path.
+    QSet<QString> m_autosaveSuspended;
 };

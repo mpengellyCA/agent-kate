@@ -30,6 +30,7 @@
 #include <QJsonValue>
 #include <QLabel>
 #include <QMenu>
+#include <QPalette>
 #include <QPlainTextEdit>
 #include <QPointer>
 #include <QPushButton>
@@ -42,6 +43,18 @@
 #include <QVBoxLayout>
 
 namespace {
+
+// Tint a hint label with the muted Mid role via its palette instead of a
+// per-widget "color: palette(mid)" stylesheet (which fights the app's
+// palette-only theming convention). Mirrors CapabilityTile::restyle. Set once at
+// construction; these labels aren't in a palette handler, so a live scheme switch
+// won't recolor them — acceptable for static hint copy.
+void tintHint(QLabel *label)
+{
+    QPalette p = label->palette();
+    p.setColor(QPalette::WindowText, p.color(QPalette::Mid));
+    label->setPalette(p);
+}
 
 QString targetSummary(const QJsonObject &t)
 {
@@ -117,12 +130,17 @@ QString capDesc(const QString &key)
 QString capIcon(const QString &key)
 {
     if (key == QLatin1String("window_list")) return QStringLiteral("window");
-    if (key == QLatin1String("screenshot")) return QStringLiteral("camera-photo");
+    // camera-photo / camera-web / input-tablet carry malformed <path> data in the
+    // shipped Breeze SVGs and emit QtSvg "Invalid path data; path truncated"
+    // warnings when the icon engine rasterizes them at the 28px tile size. Swap to
+    // clean equivalents that render without warnings (verified in-app): screenshot
+    // → camera, screencast → camera-video, a11y_action → hand.
+    if (key == QLatin1String("screenshot")) return QStringLiteral("camera");
     if (key == QLatin1String("a11y_read")) return QStringLiteral("format-text-underline");
-    if (key == QLatin1String("screencast")) return QStringLiteral("camera-web");
+    if (key == QLatin1String("screencast")) return QStringLiteral("camera-video");
     if (key == QLatin1String("launch_browser")) return QStringLiteral("internet-web-browser");
     if (key == QLatin1String("vd_sandbox")) return QStringLiteral("virtual-desktops");
-    if (key == QLatin1String("a11y_action")) return QStringLiteral("input-tablet");
+    if (key == QLatin1String("a11y_action")) return QStringLiteral("hand");
     if (key == QLatin1String("input_inject")) return QStringLiteral("input-keyboard");
     if (key == QLatin1String("pointer_control")) return QStringLiteral("input-mouse");
     return QStringLiteral("preferences-desktop");
@@ -186,12 +204,12 @@ CoworkPanel::CoworkPanel(CoreClient *core, QWidget *parent)
     auto *capsHint = new QLabel(i18n("Turn on what agents can do without asking each time."),
                                 capsBox);
     capsHint->setWordWrap(true);
-    capsHint->setStyleSheet(QStringLiteral("color: palette(mid);"));
+    tintHint(capsHint);
     m_capsLayout->addWidget(capsHint);
     m_tilesFlow = new FlowLayout(0, 6, 6);
     m_capsLayout->addLayout(m_tilesFlow);
     m_capsEmpty = new QLabel(i18n("Loading…"), capsBox);
-    m_capsEmpty->setStyleSheet(QStringLiteral("color: palette(mid);"));
+    tintHint(m_capsEmpty);
     m_capsLayout->addWidget(m_capsEmpty);
     layout->addWidget(capsBox);
 
@@ -207,7 +225,7 @@ CoworkPanel::CoworkPanel(CoreClient *core, QWidget *parent)
     m_grantsLayout->setSpacing(4);
     m_grantsEmpty = new QLabel(i18n("No agent has any desktop access right now."), grantsHost);
     m_grantsEmpty->setWordWrap(true);
-    m_grantsEmpty->setStyleSheet(QStringLiteral("color: palette(mid);"));
+    tintHint(m_grantsEmpty);
     m_grantsLayout->addWidget(m_grantsEmpty);
     m_grantsLayout->addStretch(1);
     grantsScroll->setWidget(grantsHost);

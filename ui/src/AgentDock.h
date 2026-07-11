@@ -131,6 +131,13 @@ private:
     QString worktreeRootForAgent(int agentId) const;
     // Re-resolve and push the shown agent's worktree scope to the file browser.
     void emitActiveWorktree();
+    // Emit activeWorktreeChanged only when the path actually differs from the
+    // last one pushed. git.invalidated (and thus refreshAgentNumbers →
+    // emitActiveWorktree) fires on every file an agent touches; without this
+    // guard the file browser would re-root — collapsing the user's expansion and
+    // scroll — constantly. A sentinel distinguishes "nothing emitted yet" from an
+    // emitted empty path so the first empty scope still propagates.
+    void pushActiveWorktree(const QString &worktreePath);
 
     void ensureProject(const QString &path);
     AgentPanel *addAgent(const QString &projectPath, const QString &model = QString());
@@ -189,5 +196,9 @@ private:
     // in the restored session). Populated in addProject, drained in restore.
     QSet<QString> m_pendingFocusProjects;
     QHash<QString, int> m_initialAgentByProject;
+    // Last worktree path pushed to the file browser via activeWorktreeChanged.
+    // Sentinel (never a valid path) means "nothing emitted yet"; see
+    // pushActiveWorktree.
+    QString m_lastEmittedWorktree = QStringLiteral("\x01<uninitialised>");
     int m_counter = 0;
 };

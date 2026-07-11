@@ -78,7 +78,13 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
             // Remember where we are so the next launch lands here. No-op for a
             // blank starter agent (empty thread) — see setLastActiveThread.
             setLastActiveThread(e->project, e->panel->threadId());
-            emit agentActivated(e->id, e->project, worktreeRootForAgent(e->id));
+            // agentActivated re-roots the file browser directly (via
+            // onAgentActivated), bypassing activeWorktreeChanged. Keep the
+            // pushActiveWorktree cache in step so a later git.invalidated for the
+            // same worktree doesn't needlessly re-emit (or, if the switch changed
+            // the worktree, so the next emit for the previous path isn't skipped).
+            m_lastEmittedWorktree = worktreeRootForAgent(e->id);
+            emit agentActivated(e->id, e->project, m_lastEmittedWorktree);
         }
     });
     connect(m_roster, &AgentRoster::closeRequested, this, &AgentDock::closeAgent);
@@ -634,9 +640,18 @@ void AgentDock::emitActiveWorktree()
 {
     if (auto *w = qobject_cast<AgentPanel *>(m_stack->currentWidget())) {
         if (Entry *e = entryByPanel(w)) {
-            emit activeWorktreeChanged(worktreeRootForAgent(e->id));
+            pushActiveWorktree(worktreeRootForAgent(e->id));
         }
     }
+}
+
+void AgentDock::pushActiveWorktree(const QString &worktreePath)
+{
+    if (worktreePath == m_lastEmittedWorktree) {
+        return;
+    }
+    m_lastEmittedWorktree = worktreePath;
+    emit activeWorktreeChanged(worktreePath);
 }
 
 AgentPanel *AgentDock::addAgent(const QString &projectPath, const QString &model)
@@ -710,7 +725,7 @@ void AgentDock::wireAgentPanel(int agentId, AgentPanel *panel)
     connect(panel, &AgentPanel::worktreePathChanged, this,
             [this, panel](const QString &worktreePath) {
                 if (m_stack->currentWidget() == panel) {
-                    Q_EMIT activeWorktreeChanged(worktreePath);
+                    pushActiveWorktree(worktreePath);
                 }
             });
     // "Stop & close" already archived the thread on the core; here we just drop

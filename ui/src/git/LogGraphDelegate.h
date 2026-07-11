@@ -26,6 +26,12 @@ public:
     void setMaxLane(int maxLane);
     int maxLane() const { return m_maxLane; }
 
+    // While a search filter hides rows, the surviving rows are non-contiguous,
+    // so the lane rails would connect through hidden commits and look corrupt.
+    // The viewer sets this true while filtering; the delegate then paints only
+    // the row background (no rails, no node). The caller triggers a repaint.
+    void setSuppressLanes(bool suppress) { m_suppressLanes = suppress; }
+
     QSize sizeHint(const QStyleOptionViewItem &opt,
                    const QModelIndex &idx) const override;
     void paint(QPainter *painter, const QStyleOptionViewItem &opt,
@@ -37,4 +43,5 @@ private:
     static constexpr int kNodeRadius = 4;
 
     int m_maxLane = 0;
+    bool m_suppressLanes = false;
 };

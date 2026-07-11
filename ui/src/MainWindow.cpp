@@ -1864,37 +1864,49 @@ void MainWindow::onSave()
     // markdown/csv/agent-save and server-less files are untouched.
     if (view && formatOnSave && m_lsp->canFormat(view)) {
         const QString path = m_activeFilePath;
+        // Capture the DOCUMENT being saved, not the current view: the user may
+        // switch tabs during the async format round-trip, and finishSave must
+        // still write (and format) the document the save was requested for, not
+        // whatever tab happens to be active when the reply lands. QPointer so a
+        // closed document is simply skipped.
+        QPointer<KTextEditor::Document> doc(view->document());
         // A hung or dead language server can drop the format callback, which
         // used to mean the file silently never saved. Guard with a single-shot
         // fallback that saves directly if the callback hasn't fired in ~1.5s.
         auto done = QSharedPointer<bool>::create(false);
         QPointer<MainWindow> self(this);
-        m_lsp->formatDocument(view, [self, path, done](bool) {
+        m_lsp->formatDocument(view, [self, path, doc, done](bool) {
             if (!self || *done) {
                 return;
             }
             *done = true;
-            self->finishSave(path);
+            self->finishSave(doc, path);
         });
-        QTimer::singleShot(1500, this, [self, path, done] {
+        QTimer::singleShot(1500, this, [self, path, doc, done] {
             if (!self || *done) {
                 return;
             }
             *done = true;
-            self->finishSave(path);
+            self->finishSave(doc, path);
         });
         return;
     }
 
-    finishSave(m_activeFilePath);
+    finishSave(m_editor->currentView() ? m_editor->currentView()->document() : nullptr,
+               m_activeFilePath);
 }
 
-void MainWindow::finishSave(const QString &path)
+void MainWindow::finishSave(KTextEditor::Document *doc, const QString &path)
 {
-    if (m_editor->saveCurrent()) {
+    // finishSave owns the single save-status message for the manual save paths;
+    // EditorArea::saveDocument stays silent so a failure isn't reported twice.
+    if (m_editor->saveDocument(doc)) {
         if (!path.isEmpty()) {
             m_lsp->documentSaved(path);
         }
+        statusBar()->showMessage(
+            i18n("Saved %1", path.isEmpty() ? i18n("file") : QFileInfo(path).fileName()),
+            4000);
     } else {
         statusBar()->showMessage(
             i18n("Save failed: %1", path.isEmpty() ? i18n("no file") : path), 6000);

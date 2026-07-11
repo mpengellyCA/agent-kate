@@ -386,6 +386,17 @@ void ProjectTree::applyScope()
 
     const QString path = useWorktree ? m_worktreeRoot : m_projectRoot;
 
+    // Re-rooting the QFileSystemModel collapses the tree's expansion and scroll
+    // and re-runs the git-status RPC. git.invalidated fires on every file an
+    // agent touches, so without this guard the browser would churn constantly.
+    // Skip the re-root when neither the effective root nor the Worktree-tab
+    // enabled state changed since the last apply. The tab sync above stays
+    // outside the guard so it always reflects the current enabled state.
+    if (path == m_root && m_appliedWorktreeEnabled == (hasWorktree ? 1 : 0)) {
+        return;
+    }
+    m_appliedWorktreeEnabled = hasWorktree ? 1 : 0;
+
     m_root = path;
     if (path.isEmpty()) {
         m_pathLabel->clear();
@@ -449,10 +460,13 @@ void ProjectTree::revealPath(const QString &path)
     if (path.isEmpty() || m_root.isEmpty()) {
         return;
     }
-    // Guard against paths outside the current root.
-    const QString cleanRoot = QDir(m_root).absolutePath();
-    const QString cleanPath = QFileInfo(path).absoluteFilePath();
-    if (!cleanPath.startsWith(cleanRoot)) {
+    // Guard against paths outside the current root. Compare against cleanRoot
+    // plus a separator (or equality) so a sibling like /home/u/proj-other is not
+    // treated as living under /home/u/proj by a bare prefix match.
+    const QString cleanRoot = QDir::cleanPath(QDir(m_root).absolutePath());
+    const QString cleanPath = QDir::cleanPath(QFileInfo(path).absoluteFilePath());
+    if (cleanPath != cleanRoot
+        && !cleanPath.startsWith(cleanRoot + QLatin1Char('/'))) {
         return;
     }
     const QModelIndex src = m_model->index(path);

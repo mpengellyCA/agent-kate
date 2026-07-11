@@ -272,13 +272,16 @@ void CommitDetailDialog::loadFileDiff(const QString &path)
         return;
     }
     QPointer<CommitDetailDialog> guard(this);
+    const quint64 req = ++m_fileDiffReq;
     QJsonObject params = sourceParams();
     if (!path.isEmpty()) {
         params.insert(QStringLiteral("path"), path);
     }
     m_core->call(QStringLiteral("git.commit.diff"), params,
-                 [this, guard](const QJsonObject &result, const QJsonObject &error) {
-                     if (!guard) {
+                 [this, guard, req](const QJsonObject &result, const QJsonObject &error) {
+                     // Discard a reply a newer file selection has superseded, so
+                     // out-of-order replies can't leave a stale diff on screen.
+                     if (!guard || req != m_fileDiffReq) {
                          return;
                      }
                      QString patch;

@@ -37,6 +37,7 @@
 #include <QStackedWidget>
 #include <QStringList>
 #include <QTableView>
+#include <QTimer>
 #include <QVBoxLayout>
 
 namespace
@@ -198,8 +199,14 @@ LogViewer::LogViewer(CoreClient *core, QWidget *parent)
             &LogViewer::onPathFilterChanged);
     connect(m_pathEdit, &QLineEdit::returnPressed, this,
             &LogViewer::onPathFilterChanged);
+    // Debounce the search: a full row scan (up to the 5000-row cap) on every
+    // keystroke is wasteful, and progressive paging shouldn't fire mid-word.
+    m_searchTimer = new QTimer(this);
+    m_searchTimer->setSingleShot(true);
+    m_searchTimer->setInterval(250);
+    connect(m_searchTimer, &QTimer::timeout, this, &LogViewer::applySearchFilter);
     connect(m_searchEdit, &QLineEdit::textChanged, this,
-            [this](const QString &) { applySearchFilter(); });
+            [this](const QString &) { m_searchTimer->start(); });
     // Double-click a commit → tabbed modal reader.
     connect(m_view, &QTableView::doubleClicked, this,
             &LogViewer::openCommitDialog);
@@ -226,12 +233,22 @@ void LogViewer::setActiveSource(const QString &projectPath, const QString &threa
         // Agent hasn't started — show the workspace branch for the project.
         m_source = Source{QString(), projectPath, QString(), QString()};
     }
-    // A new source resets the user's filters — its branches/paths differ.
+    // A new source resets the user's filters — its branches/paths differ. The
+    // clears run under a signal blocker so they don't fire applySearchFilter for
+    // the old model, so reset the derived filter state (graph-lane suppression)
+    // here rather than relying on that slot.
     {
         QSignalBlocker bp(m_pathEdit);
         QSignalBlocker bs(m_searchEdit);
         m_pathEdit->clear();
         m_searchEdit->clear();
+    }
+    if (m_searchTimer) {
+        m_searchTimer->stop();
+    }
+    if (m_searchFilterActive) {
+        m_searchFilterActive = false;
+        m_graphDelegate->setSuppressLanes(false);
     }
     updateLabel();
     reloadBranches();
@@ -388,7 +405,13 @@ void LogViewer::loadNextPage()
                          m_endReached = true;
                      }
                      if (entries.isEmpty()) {
-                         updateEmptyState();
+                         // History exhausted mid-search: let the filter path show
+                         // the "no match" hint rather than a bare empty state.
+                         if (m_searchFilterActive) {
+                             applySearchFilter();
+                         } else {
+                             updateEmptyState();
+                         }
                          return;
                      }
                      const QVector<UiLogEntry> page = parseLogEntries(entries);
@@ -696,11 +719,20 @@ void LogViewer::reloadBranches()
         return;
     }
     const QString wanted = m_source.branch;
+    // Capture the source this request was issued for. Switching agents mid-flight
+    // changes m_source; a slow reply that predates the switch must not populate
+    // the combo with the previous repo's branches.
+    const QString reqThread = m_source.threadId;
+    const QString reqRepo = m_source.repoRoot;
     QJsonObject params;
     addSourceParams(params, /*includeFilters=*/false);
     m_core->call(
         QStringLiteral("git.branches"), params,
-        [this, wanted](const QJsonObject &result, const QJsonObject &error) {
+        [this, wanted, reqThread, reqRepo](const QJsonObject &result,
+                                           const QJsonObject &error) {
+            if (reqThread != m_source.threadId || reqRepo != m_source.repoRoot) {
+                return; // superseded by a source switch — discard.
+            }
             QSignalBlocker block(m_branchCombo);
             m_branchCombo->clear();
             m_branchCombo->addItem(i18n("(current branch)"), QString());
@@ -761,14 +793,27 @@ void LogViewer::applySearchFilter()
 {
     const QString needle = m_searchEdit->text().trimmed();
     const int rows = m_model->rowCount();
+
+    // Toggle the graph-lane suppression so filtered (non-contiguous) rows don't
+    // paint misleading rails. Repaint the graph column when the state flips.
+    const bool nowFiltering = !needle.isEmpty();
+    if (nowFiltering != m_searchFilterActive) {
+        m_searchFilterActive = nowFiltering;
+        m_graphDelegate->setSuppressLanes(nowFiltering);
+        m_view->viewport()->update();
+    }
+
     if (needle.isEmpty()) {
         for (int r = 0; r < rows; ++r) {
             if (m_view->isRowHidden(r)) {
                 m_view->setRowHidden(r, false);
             }
         }
+        updateEmptyState();
         return;
     }
+
+    int visible = 0;
     for (int r = 0; r < rows; ++r) {
         const QModelIndex subjectIdx = m_model->index(r, LogModel::ColSubject);
         const QModelIndex authorIdx = m_model->index(r, LogModel::ColAuthor);
@@ -780,6 +825,27 @@ void LogViewer::applySearchFilter()
                    .toString()
                    .contains(needle, Qt::CaseInsensitive);
         m_view->setRowHidden(r, !match);
+        if (match) {
+            ++visible;
+        }
+    }
+
+    // Search dead-end guard: if nothing in the loaded window matches but more
+    // history is available, page deeper. loadNextPage's reply re-applies this
+    // filter, so paging continues until a match surfaces or history is exhausted
+    // (m_endReached / the model's row cap) — m_endReached prevents an infinite
+    // loop when there are no more pages.
+    if (visible == 0) {
+        if (!m_endReached && !m_pageInFlight) {
+            m_emptyLabel->setText(i18n("Searching deeper for “%1”…", needle));
+            m_stack->setCurrentIndex(1);
+            loadNextPage();
+        } else {
+            m_emptyLabel->setText(i18n("No commits match “%1”.", needle));
+            m_stack->setCurrentIndex(1);
+        }
+    } else {
+        m_stack->setCurrentIndex(0);
     }
 }
 

@@ -103,10 +103,12 @@ private:
     void updateAgentBadge();
     void updateLspStatus();    // refresh the status-bar language-server widget
     void onSave();
-    // Perform the actual document write + LSP save notification, with status
-    // feedback on failure. Split out of onSave so the format-on-save fallback
-    // timer can call it exactly once (guarded by a shared "done" flag).
-    void finishSave(const QString &path);
+    // Perform the actual write of the captured document + LSP save notification,
+    // emitting the single save-status message. Split out of onSave so the
+    // format-on-save fallback timer can call it exactly once (guarded by a shared
+    // "done" flag). Takes the document (not the current view) so a tab switch
+    // during the async format round-trip can't redirect the write.
+    void finishSave(KTextEditor::Document *doc, const QString &path);
     void onSaveAll();
     void reloadExtensionServers();
     void onAgentActivated(int agentId, const QString &projectPath,

@@ -597,17 +597,26 @@ void EditorArea::openDiff(const QString &groupKey, const QString &title, const Q
 
 bool EditorArea::saveCurrent()
 {
-    QTabWidget *tabs = activeTabs();
-    if (!tabs) {
-        return false;
-    }
     KTextEditor::View *view = currentView();
     if (!view) {
         return false;
     }
-    const bool ok = view->document()->documentSave();
-    emit statusMessage(ok ? QStringLiteral("Saved %1").arg(view->document()->documentName())
-                          : QStringLiteral("Save failed"));
+    return saveDocument(view->document());
+}
+
+bool EditorArea::saveDocument(KTextEditor::Document *doc)
+{
+    if (!doc) {
+        return false;
+    }
+    const bool ok = doc->documentSave();
+    if (ok) {
+        // A successful manual save re-arms autosave for a document that had been
+        // suspended after a failed write (the file is writable again).
+        m_autosaveSuspended.remove(doc->url().toString());
+    }
+    // Feedback is owned by the caller (MainWindow::finishSave / saveAll), so a
+    // failure isn't announced twice. saveDocument stays silent.
     return ok;
 }
 
@@ -651,6 +660,22 @@ bool EditorArea::autosaveCandidate(KTextEditor::Document *doc) const
     if (!doc->isReadWrite()) {
         return false;
     }
+    // A previous autosave failed (file deleted / made read-only): stay out until
+    // a successful manual save clears the flag, so we neither retry every second
+    // nor let KTextEditor pop its modal error dialog on each keystroke.
+    if (m_autosaveSuspended.contains(doc->url().toString())) {
+        return false;
+    }
+    // Pre-flight writability so the write never reaches KTextEditor's modal error
+    // dialog from the autosave path: the target file must exist and be writable,
+    // or (if it was deleted) its parent directory must be writable to recreate it.
+    const QString localPath = doc->url().toLocalFile();
+    const QFileInfo fi(localPath);
+    const bool writable =
+        fi.exists() ? fi.isWritable() : QFileInfo(fi.absolutePath()).isWritable();
+    if (!writable) {
+        return false;
+    }
     // Never overwrite the on-disk version while the human is being asked to
     // resolve a modified-on-disk conflict via the reload banner.
     if (QWidget *host = bannerHostForDocument(doc)) {
@@ -674,6 +699,17 @@ void EditorArea::autosaveDocument(KTextEditor::Document *doc)
     if (doc->documentSave()) {
         emit statusMessage(i18n("Autosaved %1", doc->documentName()));
         emit documentAutosaved(doc);
+    } else {
+        // The writability pre-flight passed but the write still failed (e.g. the
+        // file changed out from under us). Suspend autosave for this document and
+        // announce it once — a manual save re-arms it. Without this the 1s
+        // debounce would re-fire on every keystroke and KTextEditor would pop its
+        // modal error dialog each time.
+        m_autosaveSuspended.insert(doc->url().toString());
+        emit statusMessage(
+            i18n("Autosave paused for %1 — could not write file. It will resume "
+                 "after a successful manual save.",
+                 doc->documentName()));
     }
 }
 
@@ -744,7 +780,9 @@ bool EditorArea::saveAll()
             }
             KTextEditor::Document *doc = view->document();
             if (doc->isModified() && !doc->url().isEmpty()) {
-                if (doc->documentSave()) {
+                // saveDocument clears any autosave suspension on success — a
+                // Save-All counts as a manual save for re-arming purposes.
+                if (saveDocument(doc)) {
                     ++saved;
                 } else {
                     allOk = false;

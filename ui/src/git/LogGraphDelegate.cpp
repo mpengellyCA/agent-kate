@@ -56,6 +56,12 @@ void LogGraphDelegate::paint(QPainter *painter, const QStyleOptionViewItem &opt,
     QStyle *style = styled.widget ? styled.widget->style() : QApplication::style();
     style->drawControl(QStyle::CE_ItemViewItem, &styled, painter, styled.widget);
 
+    // Filtered view: hidden rows make the lane topology non-contiguous, so drawn
+    // rails would mislead. Paint the background only.
+    if (m_suppressLanes) {
+        return;
+    }
+
     const int lane = idx.data(LogModel::LaneRole).toInt();
     const QList<int> lanesIn = idx.data(LogModel::LanesInRole).value<QList<int>>();
     const QList<int> lanesOut = idx.data(LogModel::LanesOutRole).value<QList<int>>();
