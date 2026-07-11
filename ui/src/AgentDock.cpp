@@ -78,7 +78,7 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
             // Remember where we are so the next launch lands here. No-op for a
             // blank starter agent (empty thread) — see setLastActiveThread.
             setLastActiveThread(e->project, e->panel->threadId());
-            emit agentActivated(e->id, e->project);
+            emit agentActivated(e->id, e->project, worktreeRootForAgent(e->id));
         }
     });
     connect(m_roster, &AgentRoster::closeRequested, this, &AgentDock::closeAgent);
@@ -607,6 +607,38 @@ QString AgentDock::worktreePathForAgent(int agentId) const
     return {};
 }
 
+QString AgentDock::worktreeRootForAgent(int agentId) const
+{
+    for (const Entry &e : m_agents) {
+        if (e.id != agentId) {
+            continue;
+        }
+        // Non-isolated agents run directly in the workspace — no distinct
+        // worktree to scope, so the browser's Worktree tab stays disabled.
+        if (!e.panel->isIsolated()) {
+            return {};
+        }
+        // Prefer the panel's live workdir (authoritative for a running agent);
+        // fall back to the last git.snapshot path for a dormant thread whose
+        // process has not emitted a lifecycle event this run.
+        const QString live = e.panel->worktreePath();
+        if (!live.isEmpty()) {
+            return live;
+        }
+        return worktreePathForAgent(agentId);
+    }
+    return {};
+}
+
+void AgentDock::emitActiveWorktree()
+{
+    if (auto *w = qobject_cast<AgentPanel *>(m_stack->currentWidget())) {
+        if (Entry *e = entryByPanel(w)) {
+            emit activeWorktreeChanged(worktreeRootForAgent(e->id));
+        }
+    }
+}
+
 AgentPanel *AgentDock::addAgent(const QString &projectPath, const QString &model)
 {
     const int id = ++m_counter;
@@ -671,6 +703,14 @@ void AgentDock::wireAgentPanel(int agentId, AgentPanel *panel)
             Q_EMIT activeThreadChanged(threadId);
         }
     });
+    // A live start/resume/promote reveals (or moves) this agent's worktree — if
+    // it is the shown agent, re-root the file browser's Worktree tab.
+    connect(panel, &AgentPanel::worktreePathChanged, this,
+            [this, panel](const QString &worktreePath) {
+                if (m_stack->currentWidget() == panel) {
+                    Q_EMIT activeWorktreeChanged(worktreePath);
+                }
+            });
     // "Stop & close" already archived the thread on the core; here we just drop
     // the panel and its roster entry. Deferred so we never delete the panel from
     // inside its own reply callback.
@@ -842,6 +882,10 @@ void AgentDock::refreshAgentNumbers()
                      // Feed the WorktreeDashboard so its cards can name the
                      // agent, not just its branch.
                      emit agentTitlesChanged(titlesByThread);
+                     // A dormant agent's worktree path may only have become known
+                     // in this snapshot — refresh the shown agent's file-browser
+                     // scope so its Worktree tab enables without re-selecting it.
+                     emitActiveWorktree();
                  },
                  this);
 }

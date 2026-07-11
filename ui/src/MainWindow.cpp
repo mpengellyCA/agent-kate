@@ -439,6 +439,13 @@ void MainWindow::setupUi()
     });
     connect(m_agent, &AgentDock::projectFocused, this,
             [this](const QString &path) { m_tree->setRoot(path); });
+    // A live promote (or a dormant agent's worktree path arriving in a later
+    // git.snapshot) re-roots only the file browser's Worktree tab, without a
+    // full agent re-activation.
+    connect(m_agent, &AgentDock::activeWorktreeChanged, this,
+            [this](const QString &worktreePath) {
+                m_tree->setRoots(m_activeProject, worktreePath);
+            });
     connect(m_agent, &AgentDock::openTerminalRequested, this,
             [this](const QString &dir) {
                 if (m_terminal && !dir.isEmpty()) {
@@ -1767,7 +1774,7 @@ void MainWindow::setupCore()
         updateCursorStatus();
     });
     connect(m_agent, &AgentDock::agentActivated, this,
-            [this](int, const QString &) { updateAgentBadge(); });
+            [this](int, const QString &, const QString &) { updateAgentBadge(); });
     updateAgentBadge();
     updateCursorStatus();
 
@@ -1798,11 +1805,14 @@ void MainWindow::setupCore()
     m_core->setParent(this);
 }
 
-void MainWindow::onAgentActivated(int agentId, const QString &projectPath)
+void MainWindow::onAgentActivated(int agentId, const QString &projectPath,
+                                  const QString &worktreePath)
 {
     m_activeAgentId = agentId;
     m_activeProject = projectPath;
-    m_tree->setRoot(projectPath);
+    // The file browser scopes to the project root or the agent's worktree via
+    // its own tab; Terminal/Search/Git Log stay project-scoped by design.
+    m_tree->setRoots(projectPath, worktreePath);
     m_terminal->setWorkingDirectory(projectPath);
     if (m_search) {
         m_search->setProjectRoot(projectPath);

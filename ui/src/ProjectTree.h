@@ -19,6 +19,7 @@ class QLineEdit;
 class QModelIndex;
 class QPoint;
 class QStackedWidget;
+class QTabBar;
 class QTimer;
 class QToolButton;
 class QTreeView;
@@ -38,6 +39,15 @@ public:
 
     void setRoot(const QString &path);
     QString root() const { return m_root; }
+
+    // Set both scope roots for the selected agent: the project (workspace)
+    // path and its isolated worktree path (empty when the agent runs directly
+    // in the workspace or has no worktree — the Worktree tab is then disabled).
+    // The active tab (a global, persisted preference) picks which root the tree
+    // shows; when the preference is "worktree" but no worktree is available the
+    // project root is displayed with the tab disabled, leaving the preference
+    // untouched so a later worktree-bearing agent snaps back to it.
+    void setRoots(const QString &projectPath, const QString &worktreePath);
 
     // Select and scroll the tree to `path` (from a tab's "Reveal in Tree" or a
     // breadcrumb click), expanding any collapsed ancestors. No-op if the path
@@ -64,6 +74,14 @@ private:
     void setShowHidden(bool show);
     void applyFilterEffects();
     void setSyncWithEditor(bool on);
+
+    // Scope tabs. Which enum value the current tab maps to; the selected scope
+    // is a single global preference persisted to KConfig [Files] scope. Applies
+    // the effective root for the current (project, worktree) pair honouring the
+    // preference and worktree availability.
+    enum Scope { ProjectScope = 0, WorktreeScope = 1 };
+    void onScopeTabChanged(int index);
+    void applyScope();
 
     // Git status decoration.
     void refreshGitStatus();
@@ -96,6 +114,7 @@ private:
     QModelIndex viewIndex(const QModelIndex &srcIndex) const;
 
     CoreClient *m_core = nullptr;
+    QTabBar *m_scopeTabs = nullptr;
     QTreeView *m_tree = nullptr;
     QFileSystemModel *m_model = nullptr;
     FileFilterProxyModel *m_proxy = nullptr;
@@ -107,8 +126,15 @@ private:
     QToolButton *m_syncToggle = nullptr;
     QTimer *m_filterTimer = nullptr;
     QTimer *m_gitTimer = nullptr;
-    QString m_root;
+    QString m_root; // the root currently displayed by the tree
     bool m_syncWithEditor = false;
+
+    // Scope roots for the active agent and the sticky global scope preference.
+    // m_projectRoot is always the workspace; m_worktreeRoot is empty when the
+    // agent has no isolated worktree. m_scope is the persisted user choice.
+    QString m_projectRoot;
+    QString m_worktreeRoot;
+    Scope m_scope = ProjectScope;
 
     // Canonical path → status map. refreshGitStatus()'s reply set()s it; an
     // identical snapshot is dropped silently (no signal, no repaint), so the

@@ -2939,12 +2939,16 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
         if (phase == QLatin1String("started")) {
             m_isolated = ev.value(QStringLiteral("isolated")).toBool();
             m_branch = ev.value(QStringLiteral("branch")).toString();
+            m_workdir = ev.value(QStringLiteral("workdir")).toString();
+            emit worktreePathChanged(worktreePath());
             m_errored = false; // a clean start clears any prior failure state
             addNote(detail, QStringLiteral("sys"));
             refresh();
         } else if (phase == QLatin1String("resumed")) {
             m_isolated = ev.value(QStringLiteral("isolated")).toBool();
             m_branch = ev.value(QStringLiteral("branch")).toString();
+            m_workdir = ev.value(QStringLiteral("workdir")).toString();
+            emit worktreePathChanged(worktreePath());
             m_dormant = false;
             m_idle = true;
             m_errored = false; // resuming clears any prior failure state
@@ -2964,6 +2968,8 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
         } else if (phase == QLatin1String("promoted")) {
             m_isolated = true;
             m_branch = ev.value(QStringLiteral("branch")).toString();
+            m_workdir = ev.value(QStringLiteral("workdir")).toString();
+            emit worktreePathChanged(worktreePath());
             m_promoting = false;
             addNote(detail, QStringLiteral("sys"));
             refresh();

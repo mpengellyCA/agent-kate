@@ -55,6 +55,11 @@ public:
     void setWorkspace(const QString &path);
     QString threadId() const { return m_threadId; }
     bool isIsolated() const { return m_isolated; }
+    // The agent's isolated worktree directory (the working dir a lifecycle
+    // event / dormant record reports). Empty when the agent runs directly in
+    // the workspace (non-isolated) — callers use this to scope the file
+    // browser's Worktree tab.
+    QString worktreePath() const { return m_isolated ? m_workdir : QString(); }
     // A live agent has a thread and a running process (not dormant/resumable).
     bool isRunning() const { return !m_threadId.isEmpty() && !m_dormant; }
 
@@ -126,6 +131,11 @@ Q_SIGNALS:
     // agent gets its id asynchronously when its session starts, after activation, so
     // consumers keyed on the thread (Cowork panel, Git Log) must refresh on this.
     void threadIdChanged(const QString &threadId);
+    // Emitted when this agent's isolated worktree path becomes known or changes
+    // (started/resumed/promoted lifecycle, or a dormant restore). Carries the
+    // effective worktree path — empty when the agent is non-isolated — so the
+    // file browser can re-root its Worktree tab live (e.g. after a promote).
+    void worktreePathChanged(const QString &worktreePath);
     // The card's status enum (AgentRoles::AgentStatus as int): the single source
     // of truth for the roster badge (symbol + semantic colour). Replaces the old
     // raw-hex dot colour.
@@ -275,6 +285,10 @@ private:
     QString m_workspace;
     QString m_threadId;
     QString m_branch;
+    // The working directory the agent's process runs in, as reported by
+    // lifecycle events / the dormant record. When m_isolated this is the
+    // isolated worktree; otherwise it mirrors the workspace.
+    QString m_workdir;
     bool m_isolated = false;
     bool m_idle = false;      // turn finished, awaiting a follow-up
     bool m_dormant = false;   // has a thread id, but no live process — resumable

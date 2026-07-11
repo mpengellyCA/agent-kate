@@ -90,11 +90,20 @@ Q_SIGNALS:
     // Routed to MainWindow to open a file (a clicked attachment chip) in the
     // editor, making the editor visible if the layout was chat-only.
     void openFileRequested(const QString &path);
-    void agentActivated(int agentId, const QString &projectPath);
+    // worktreePath is the selected agent's isolated worktree (empty when it
+    // runs non-isolated in the workspace or has no worktree yet), so the file
+    // browser can offer a Worktree scope tab alongside the Project one.
+    void agentActivated(int agentId, const QString &projectPath,
+                        const QString &worktreePath);
     // Emitted when the CURRENTLY-shown agent's thread id is assigned/changes (e.g. a
     // freshly-created agent's session starting). agentActivated fires on selection,
     // before a fresh agent has a thread; this closes that gap for thread-keyed panels.
     void activeThreadChanged(const QString &threadId);
+    // Emitted when the CURRENTLY-shown agent's isolated worktree path becomes
+    // known or changes (a live promote, or a dormant agent's path arriving in a
+    // git.snapshot after activation). Lets the file browser re-root its Worktree
+    // tab without a full agent re-activation.
+    void activeWorktreeChanged(const QString &worktreePath);
     void projectFocused(const QString &projectPath);
     // Emitted when a project is explicitly CLOSED (not merely switched away
     // from). Consumers tied to a project — e.g. its terminal tabs — tear down.
@@ -114,6 +123,14 @@ private:
         QString project;
         AgentPanel *panel;
     };
+
+    // Effective worktree root to scope the file browser's Worktree tab for an
+    // agent: the panel's live workdir when known (isolated only), else the
+    // snapshot-derived path gated on the panel's isolated flag. Empty for
+    // non-isolated agents so the tab disables.
+    QString worktreeRootForAgent(int agentId) const;
+    // Re-resolve and push the shown agent's worktree scope to the file browser.
+    void emitActiveWorktree();
 
     void ensureProject(const QString &path);
     AgentPanel *addAgent(const QString &projectPath, const QString &model = QString());

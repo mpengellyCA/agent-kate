@@ -109,7 +109,8 @@ private:
     void finishSave(const QString &path);
     void onSaveAll();
     void reloadExtensionServers();
-    void onAgentActivated(int agentId, const QString &projectPath);
+    void onAgentActivated(int agentId, const QString &projectPath,
+                          const QString &worktreePath);
     void setTabsByAgent(bool byAgent);
     QString groupKey() const;
     void pushOpenFilesToCore();

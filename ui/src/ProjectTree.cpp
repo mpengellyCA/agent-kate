@@ -40,8 +40,10 @@
 #include <QPointer>
 #include <QProcess>
 #include <QShortcut>
+#include <QSignalBlocker>
 #include <QStackedWidget>
 #include <QStandardPaths>
+#include <QTabBar>
 #include <QStringList>
 #include <QTextStream>
 #include <QTimer>
@@ -129,6 +131,20 @@ ProjectTree::ProjectTree(CoreClient *core, QWidget *parent)
         m_tree->hideColumn(col);
     }
 
+    // Scope tabs: Project (workspace root) vs Worktree (the agent's isolated
+    // copy). A compact, document-mode bar so it sits flush above the header and
+    // never expands to fill the pane. The Worktree tab is disabled until an
+    // isolated worktree is available for the selected agent.
+    m_scopeTabs = new QTabBar(this);
+    m_scopeTabs->setDocumentMode(true);
+    m_scopeTabs->setExpanding(false);
+    m_scopeTabs->setDrawBase(false);
+    m_scopeTabs->addTab(i18n("Project"));   // index ProjectScope
+    m_scopeTabs->addTab(i18n("Worktree"));  // index WorktreeScope
+    m_scopeTabs->setTabToolTip(ProjectScope, i18n("Browse the workspace root"));
+    m_scopeTabs->setTabToolTip(WorktreeScope,
+                               i18n("Browse the selected agent's isolated worktree"));
+
     // Header: project heading + small toolbar (filter, sync, hidden toggle,
     // new file, new folder, open terminal, open in Dolphin).
     auto *header = new QWidget(this);
@@ -209,6 +225,7 @@ ProjectTree::ProjectTree(CoreClient *core, QWidget *parent)
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(0);
+    layout->addWidget(m_scopeTabs);
     layout->addWidget(header);
     layout->addWidget(m_filterEdit);
     layout->addWidget(m_stack, 1);
@@ -238,12 +255,21 @@ ProjectTree::ProjectTree(CoreClient *core, QWidget *parent)
         applyGitStatuses(statuses);
     });
 
-    // Restore the persisted "sync with editor" preference.
+    // Restore the persisted "sync with editor" preference and the global scope
+    // tab. The scope is one preference shared across agents, restored here so it
+    // survives a full app restart.
     const KConfigGroup grp = KSharedConfig::openConfig()->group(QLatin1String("Files"));
     m_syncToggle->setChecked(grp.readEntry("syncWithEditor", false));
     m_syncWithEditor = m_syncToggle->isChecked();
+    m_scope = grp.readEntry("scope", QString()) == QLatin1String("worktree")
+                  ? WorktreeScope
+                  : ProjectScope;
+    QSignalBlocker blockTabs(m_scopeTabs);
+    m_scopeTabs->setCurrentIndex(m_scope);
+    blockTabs.unblock();
 
     connect(m_syncToggle, &QToolButton::toggled, this, &ProjectTree::setSyncWithEditor);
+    connect(m_scopeTabs, &QTabBar::currentChanged, this, &ProjectTree::onScopeTabChanged);
     connect(newFileBtn, &QToolButton::clicked, this,
             [this] { actNewFile(currentTargetDir()); });
     connect(newFolderBtn, &QToolButton::clicked, this,
@@ -308,8 +334,58 @@ ProjectTree::ProjectTree(CoreClient *core, QWidget *parent)
             [this] { actPaste(currentTargetDir()); });
 }
 
+void ProjectTree::setRoots(const QString &projectPath, const QString &worktreePath)
+{
+    m_projectRoot = projectPath;
+    // A worktree path equal to the project root is not a distinct scope (a
+    // non-isolated agent runs directly in the workspace) — treat it as absent so
+    // the Worktree tab stays disabled.
+    m_worktreeRoot =
+        (worktreePath.isEmpty()
+         || QDir(worktreePath).absolutePath() == QDir(projectPath).absolutePath())
+            ? QString()
+            : worktreePath;
+    applyScope();
+}
+
 void ProjectTree::setRoot(const QString &path)
 {
+    // Single-root callers (project-only focus, editor-session restore) have no
+    // worktree to offer, so the Worktree tab disables.
+    setRoots(path, QString());
+}
+
+void ProjectTree::onScopeTabChanged(int index)
+{
+    const Scope scope = index == WorktreeScope ? WorktreeScope : ProjectScope;
+    // Only a user-driven tab change updates the sticky preference; programmatic
+    // snapping (applyScope) blocks this signal so it never overwrites the choice.
+    m_scope = scope;
+    KConfigGroup grp = KSharedConfig::openConfig()->group(QLatin1String("Files"));
+    grp.writeEntry("scope",
+                   scope == WorktreeScope ? QStringLiteral("worktree")
+                                          : QStringLiteral("project"));
+    grp.sync();
+    applyScope();
+}
+
+void ProjectTree::applyScope()
+{
+    const bool hasWorktree = !m_worktreeRoot.isEmpty();
+
+    // Enable the Worktree tab only when a worktree exists. Reflect the sticky
+    // preference in the tab selection WITHOUT firing currentChanged (which would
+    // rewrite the preference): when scope is worktree but none is available we
+    // fall back to displaying the Project root below, leaving the stored
+    // preference intact so a later worktree-bearing agent snaps back to it.
+    QSignalBlocker block(m_scopeTabs);
+    m_scopeTabs->setTabEnabled(WorktreeScope, hasWorktree);
+    const bool useWorktree = m_scope == WorktreeScope && hasWorktree;
+    m_scopeTabs->setCurrentIndex(useWorktree ? WorktreeScope : ProjectScope);
+    block.unblock();
+
+    const QString path = useWorktree ? m_worktreeRoot : m_projectRoot;
+
     m_root = path;
     if (path.isEmpty()) {
         m_pathLabel->clear();
