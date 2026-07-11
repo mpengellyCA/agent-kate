@@ -19,6 +19,7 @@ daily dogfooding. Each item has its own grounded plan file with the relevant
 | 10 | Panel responsiveness & resize performance | UI (C++) | [10-panel-responsiveness.md](10-panel-responsiveness.md) | M (Phase 2: chat virtualization) |
 | 11 | Third-party API providers (Fireworks, OpenRouter) via the Anthropic endpoint | Core (Go) + UI (C++) | [11-third-party-providers.md](11-third-party-providers.md) | M (phased core/persist/UI) |
 | 12 | UI identity & approachability (signature theme, theme override, command palette, Simple/Advanced modes, layouts, panel responsiveness) | UI (C++) | [12-ui-identity-and-approachability.md](12-ui-identity-and-approachability.md) | L (phases 1–3 done; 4–8 planned) |
+| 13 | Agent experience overhaul (chat selection/copy, interrupt vs stop, save+autosave, attachments, tool inspector, fork agent, roster cards v2, Git Log v2, Worktrees v2, Cowork control centre) | Core (Go) + UI (C++) | [13-agent-experience-overhaul.md](13-agent-experience-overhaul.md) | XL (10 phases, one major release) |
 
 Size key: **S** ≈ <½ day, **M** ≈ 1–2 days, **L** ≈ 3–5 days.
 
