@@ -101,6 +101,7 @@ type StartOptions struct {
 	Attachments    []Attachment // files attached to the opening message
 	SessionID      string       // Claude Code session id (a UUID)
 	Resume         bool         // true: --resume the session; false: --session-id a new one
+	ForkSession    bool         // with Resume: --fork-session — branch a NEW session off the resumed context
 	CoworkEnabled  bool         // opt this thread into the KDE Cowork desktop MCP server
 	Provider       *Provider    // optional third-party API routing; nil/empty BaseURL = Claude direct
 }
@@ -317,6 +318,12 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 	if opts.SessionID != "" {
 		if opts.Resume {
 			args = append(args, "--resume", opts.SessionID)
+			// A fork replays the resumed session's context but mints a fresh
+			// session id for the new turns, leaving the source session untouched.
+			// The init event reports that new id, which the run loop persists.
+			if opts.ForkSession {
+				args = append(args, "--fork-session")
+			}
 		} else {
 			args = append(args, "--session-id", opts.SessionID)
 		}

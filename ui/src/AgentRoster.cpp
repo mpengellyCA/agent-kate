@@ -132,6 +132,10 @@ AgentRoster::AgentRoster(QWidget *parent)
             }
             QAction *renameAct = menu.addAction(
                 QIcon::fromTheme(QStringLiteral("document-edit")), i18n("Rename…"));
+            QAction *forkAct = menu.addAction(
+                QIcon::fromTheme(QStringLiteral("edit-copy")), i18n("Fork…"));
+            forkAct->setToolTip(
+                i18n("Continue this conversation as a new agent on a different model."));
             menu.addSeparator();
             const int number = item->data(0, AgentRoles::Number).toInt();
             QAction *termAct = menu.addAction(
@@ -198,6 +202,8 @@ AgentRoster::AgentRoster(QWidget *parent)
                 emit openWorktreeTerminalRequested(id);
             } else if (chosen == renameAct) {
                 emit renameRequested(id);
+            } else if (chosen == forkAct) {
+                emit forkRequested(id);
             } else if (chosen == commitAct) {
                 emit commitRequested(id);
             } else if (chosen == prAct) {

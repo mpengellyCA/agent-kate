@@ -47,6 +47,7 @@ add_executable(agentkate
     src/AppearanceDialog.cpp
     src/CommandPalette.cpp
     src/NewAgentDialog.cpp
+    src/ForkAgentDialog.cpp
     src/MainWindow.cpp
     src/EditorArea.cpp
     src/DiffView.cpp

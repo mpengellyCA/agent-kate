@@ -3,6 +3,7 @@
 #include "AgentPanel.h"
 #include "AgentRoster.h"
 #include "NewAgentDialog.h"
+#include "ForkAgentDialog.h"
 #include "shell/PanelStack.h"
 #include "AutoOrganizeDialog.h"
 #include "TagEditorDialog.h"
@@ -60,6 +61,7 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
     connect(m_roster, &AgentRoster::openTerminalRequested, this,
             &AgentDock::openTerminalRequested); // routed to MainWindow
     connect(m_roster, &AgentRoster::renameRequested, this, &AgentDock::renameAgent);
+    connect(m_roster, &AgentRoster::forkRequested, this, &AgentDock::forkAgent);
     connect(m_roster, &AgentRoster::projectFocused, this, &AgentDock::projectFocused);
 
     // Seed the "+ New Agent" model dropdown. Ids must match AgentPanel's combo.
@@ -673,6 +675,8 @@ void AgentDock::wireAgentPanel(int agentId, AgentPanel *panel)
     connect(panel, &AgentPanel::closeRequested, this, [this, agentId] {
         QTimer::singleShot(0, this, [this, agentId] { closeAgent(agentId); });
     });
+    connect(panel, &AgentPanel::forkRequested, this,
+            [this, agentId] { forkAgent(agentId); });
 }
 
 bool AgentDock::hasThread(const QString &threadId) const
@@ -950,6 +954,76 @@ void AgentDock::renameAgent(int agentId)
                      }
                  },
                  this);
+}
+
+void AgentDock::forkAgent(int agentId)
+{
+    Entry *e = entryById(agentId);
+    if (!e) {
+        return;
+    }
+    const QString sourceThreadId = e->panel->threadId();
+    if (sourceThreadId.isEmpty()) {
+        emit statusMessage(i18n("Start the agent before forking it"));
+        return;
+    }
+    const QString sourceTitle = m_roster->agentTitle(agentId);
+    ForkAgentDialog dlg(sourceTitle, e->panel->currentModel(),
+                        e->panel->currentEffort(), m_dialogParent);
+    if (dlg.exec() != QDialog::Accepted) {
+        return;
+    }
+    const ForkChoices c = dlg.choices();
+    const QString project = e->project;
+
+    QJsonObject params{{QStringLiteral("threadId"), sourceThreadId}};
+    if (!c.modelId.isEmpty()) {
+        params.insert(QStringLiteral("model"), c.modelId);
+    }
+    if (!c.effort.isEmpty()) {
+        params.insert(QStringLiteral("effort"), c.effort);
+    }
+    if (!c.name.isEmpty()) {
+        params.insert(QStringLiteral("title"), c.name);
+    }
+    // Guard the async reply: the dock (or its window) may be gone by the time
+    // the core answers — a known SIGSEGV class in this codebase.
+    QPointer<AgentDock> self(this);
+    m_core->call(
+        QStringLiteral("agent.fork"), params,
+        [self, project, sourceThreadId, c](const QJsonObject &result, const QJsonObject &error) {
+            if (!self) {
+                return;
+            }
+            if (!error.isEmpty()) {
+                emit self->statusMessage(i18n("Fork failed: %1",
+                    error.value(QStringLiteral("message")).toString()));
+                return;
+            }
+            const QString newThreadId = result.value(QStringLiteral("threadId")).toString();
+            if (newThreadId.isEmpty()) {
+                emit self->statusMessage(i18n("Fork failed: no thread was created"));
+                return;
+            }
+            // The fork is already running on the core; adopt it into a new panel
+            // that replays the source conversation and focus it.
+            const int id = ++self->m_counter;
+            auto *panel = new AgentPanel(self->m_core, self->m_stack);
+            panel->setWorkspace(project);
+            self->m_stack->addWidget(panel);
+            self->m_agents.append(Entry{id, project, panel});
+            const QString label =
+                c.name.isEmpty() ? i18n("Fork of %1", id) : c.name;
+            self->m_roster->addAgent(project, id, label);
+            self->m_roster->setAgentTitlePinned(id, label);
+            self->wireAgentPanel(id, panel);
+            // Forks always run in their own isolated worktree (core branches one
+            // from the source HEAD).
+            panel->adoptRunningThread(newThreadId, sourceThreadId, label, /*isolated=*/true);
+            self->m_roster->setCurrentAgent(id); // bring the fork to the front
+            emit self->statusMessage(i18n("Forked into “%1”", label));
+        },
+        this);
 }
 
 AgentDock::Entry *AgentDock::entryById(int agentId)

@@ -77,6 +77,7 @@ Q_SIGNALS:
     void projectFocused(const QString &projectPath);
     void resumeRequested(int agentId);
     void renameRequested(int agentId);
+    void forkRequested(int agentId);
     void commitRequested(int agentId);
     void prRequested(int agentId);
     void landRequested(int agentId);

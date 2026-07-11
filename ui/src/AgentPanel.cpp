@@ -742,6 +742,14 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     m_diffBtn = new QPushButton(
         QIcon::fromTheme(QStringLiteral("vcs-diff")), QStringLiteral("Changes"), this);
     m_diffBtn->setCursor(Qt::PointingHandCursor);
+    // "Fork…" — continue this conversation on a different model or effort in a
+    // brand-new agent, keeping the full context. Enabled once a session exists.
+    m_forkBtn = new QPushButton(
+        QIcon::fromTheme(QStringLiteral("edit-copy")), QStringLiteral("Fork…"), this);
+    m_forkBtn->setCursor(Qt::PointingHandCursor);
+    m_forkBtn->setToolTip(QStringLiteral(
+        "Continue this conversation as a new agent on a different model or "
+        "thinking effort, keeping the full context. The original is untouched."));
     // "Stop & close" is the terminal action: it summarises the conversation and
     // closes the agent (archived — reversible from the Sessions browser). To just
     // cancel the current response and keep going, use Interrupt instead.
@@ -846,6 +854,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     buttons->addWidget(compactionBtn);
     buttons->addWidget(m_attachBtn);
     buttons->addWidget(m_diffBtn);
+    buttons->addWidget(m_forkBtn);
     // "Stop & close" sits with the setup/config group — it's the deliberate,
     // less-frequent end-this-agent action. Interrupt is the prominent in-flight
     // control, grouped next to Send.
@@ -878,6 +887,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     connect(m_stopBtn, &QPushButton::clicked, this, &AgentPanel::onStopClicked);
     connect(m_interruptBtn, &QPushButton::clicked, this, &AgentPanel::onInterruptClicked);
     connect(m_diffBtn, &QPushButton::clicked, this, &AgentPanel::onChangesClicked);
+    connect(m_forkBtn, &QPushButton::clicked, this, [this] { Q_EMIT forkRequested(); });
     connect(m_promoteBtn, &QPushButton::clicked, this, &AgentPanel::onPromoteClicked);
     connect(m_attachBtn, &QPushButton::clicked, this, &AgentPanel::onAttachClicked);
     connect(m_permAllow, &QPushButton::clicked, this, [this] { answerPermission(true); });
@@ -908,6 +918,16 @@ void AgentPanel::setWorkspace(const QString &path)
     m_workspace = path;
     restoreDraft(); // recover an unsent composer draft for this workspace/thread
     refresh();
+}
+
+QString AgentPanel::currentModel() const
+{
+    return m_modelCombo ? m_modelCombo->currentData().toString() : QString();
+}
+
+QString AgentPanel::currentEffort() const
+{
+    return m_effortCombo ? m_effortCombo->currentData().toString() : QString();
 }
 
 void AgentPanel::preselectModel(const QString &modelId)
@@ -1183,14 +1203,43 @@ void AgentPanel::setDormant(const QString &threadId, const QString &title, bool 
     refresh();
 }
 
+void AgentPanel::adoptRunningThread(const QString &threadId, const QString &sourceThreadId,
+                                    const QString &title, bool isolated)
+{
+    m_threadId = threadId;
+    Q_EMIT threadIdChanged(m_threadId);
+    m_dormant = false;
+    m_idle = true; // the fork is live and waiting for its first turn/follow-up
+    m_isolated = isolated;
+    // A fork bills its own fresh session — start the cost meter from zero.
+    m_sessionCostUsd = 0.0;
+    m_sessionInTokens = 0;
+    m_sessionOutTokens = 0;
+    // Replay the inherited conversation from the source agent (the fork's own
+    // session id is minted asynchronously, so its transcript file isn't ready yet).
+    loadTranscriptFrom(sourceThreadId);
+    addNote(QStringLiteral("forked from %1 — the conversation continues here.")
+                .arg(title.toHtmlEscaped()),
+            QStringLiteral("sys"));
+    emit dormantChanged(false);
+    refresh();
+}
+
 void AgentPanel::loadTranscript()
 {
-    if (m_threadId.isEmpty() || !m_core->isConnected()) {
+    loadTranscriptFrom(m_threadId);
+}
+
+void AgentPanel::loadTranscriptFrom(const QString &fromThreadId)
+{
+    if (fromThreadId.isEmpty() || m_threadId.isEmpty() || !m_core->isConnected()) {
         return;
     }
+    // The reply guard keys on THIS panel's thread (which may differ from the
+    // source we're pulling the transcript from — a fork replays its parent's).
     const QString tid = m_threadId;
     m_core->call(QStringLiteral("agent.transcript"),
-                 QJsonObject{{QStringLiteral("threadId"), tid}},
+                 QJsonObject{{QStringLiteral("threadId"), fromThreadId}},
                  [this, tid](const QJsonObject &result, const QJsonObject &error) {
                      if (tid != m_threadId) {
                          return; // panel moved to another thread before this returned
@@ -1413,6 +1462,11 @@ void AgentPanel::refresh()
         m_interruptBtn->setVisible(running && !m_idle);
     }
     m_diffBtn->setEnabled(running);
+    // Fork needs a conversation to branch from — any thread with a session on
+    // disk (running or dormant) qualifies; the core rejects an empty session.
+    if (m_forkBtn) {
+        m_forkBtn->setEnabled(!m_threadId.isEmpty());
+    }
     // Compact-now needs a thread on disk (running or dormant). The Hot Opus
     // menu item is the only one that further needs the thread to be live.
     if (m_compactNowBtn) {

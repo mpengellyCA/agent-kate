@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -184,6 +185,101 @@ func resumeAgentThread(d handlerDeps, rec session.Record, provOverride *agent.Pr
 	d.log.Info("agent thread resumed",
 		"thread", rec.ThreadID, "session", sessionIDForRecord, "seeded", current)
 	emitLifecycle(d.srv, rec.ThreadID, "resumed", detail, &rec.Worktree)
+}
+
+// forkAgentThread branches a source thread's conversation into a brand-new
+// thread that can run on a different model or effort while keeping the full
+// context. It creates a fresh isolated worktree from the source worktree's HEAD
+// (committed state only — uncommitted changes are NOT copied), then starts the
+// new thread with `--resume <sourceSessionID> --fork-session`, which replays the
+// source context but mints a new Claude Code session for the fork's own turns.
+// The source thread is never touched. The new session id is captured from the
+// CLI init event by the run loop (see run.go's lastSessionID wiring), so the
+// fork's Record starts with an empty SessionID and is filled in on first event.
+func forkAgentThread(d handlerDeps, src session.Record, newThreadID, model, effort, title string) {
+	// Branch the fork's worktree from the source worktree's HEAD so it starts
+	// from exactly the committed state the conversation was continuing from.
+	base, ok := worktree.Head(src.Worktree.Path)
+	if !ok {
+		emitLifecycle(d.srv, newThreadID, "error",
+			"fork: cannot read the source worktree's HEAD (no commits to branch from)", nil)
+		return
+	}
+	wt, err := worktree.CreateFrom(src.Project, newThreadID, base)
+	if err != nil {
+		d.log.Error("fork worktree create failed", "thread", newThreadID, "err", err)
+		emitLifecycle(d.srv, newThreadID, "error", "fork worktree: "+err.Error(), nil)
+		return
+	}
+	wt.Number = d.sessions.NextNumber(src.Project)
+	d.threads.put(newThreadID, wt)
+	d.gitCache.Register(wt)
+	d.gitCache.Activate(newThreadID)
+
+	mcpConfig, err := writeMCPConfig(d.exePath, d.socketPath, newThreadID, wt.Path, src.CoworkEnabled)
+	if err != nil {
+		emitLifecycle(d.srv, newThreadID, "error", "mcp config: "+err.Error(), &wt)
+		return
+	}
+
+	// Model/effort default to the source's when the fork didn't override them —
+	// a fork that changes only the effort keeps the source model, and vice versa.
+	resolvedModel := src.Model
+	if strings.TrimSpace(model) != "" {
+		resolvedModel = resolveModel(model)
+	}
+	resolvedEffort := src.Effort
+	if strings.TrimSpace(effort) != "" {
+		resolvedEffort = effort
+	}
+
+	if _, err := d.sup.Start(agent.StartOptions{
+		ID:             newThreadID,
+		WorkDir:        wt.Path,
+		MCPConfig:      mcpConfig,
+		PermissionMode: src.PermissionMode,
+		Effort:         resolvedEffort,
+		Model:          resolvedModel,
+		SessionID:      src.SessionID,
+		Resume:         true,
+		ForkSession:    true,
+		CoworkEnabled:  src.CoworkEnabled,
+		Provider:       providerFromRecord(src),
+	}); err != nil {
+		os.Remove(mcpConfig)
+		emitLifecycle(d.srv, newThreadID, "error", err.Error(), &wt)
+		return
+	}
+
+	forkTitle := strings.TrimSpace(title)
+	if forkTitle == "" {
+		forkTitle = summarizePrompt("Fork of " + src.Title)
+	}
+	rec := session.Record{
+		ThreadID: newThreadID,
+		// SessionID is intentionally empty: --fork-session mints a new one that
+		// the run loop captures from the init event into this record.
+		SessionID:      "",
+		Project:        src.Project,
+		Worktree:       wt,
+		PermissionMode: src.PermissionMode,
+		Effort:         resolvedEffort,
+		Model:          resolvedModel,
+		Title:          forkTitle,
+		Created:        time.Now(),
+		Status:         session.StatusRunning,
+		CoworkEnabled:  src.CoworkEnabled,
+	}
+	applyProviderToRecord(&rec, providerFromRecord(src))
+	if err := d.sessions.Put(rec); err != nil {
+		d.log.Warn("could not persist fork record", "thread", newThreadID, "err", err)
+	}
+
+	d.log.Info("agent thread forked",
+		"from", src.ThreadID, "thread", newThreadID, "branch", wt.Branch,
+		"model", resolvedModel, "effort", resolvedEffort)
+	emitLifecycle(d.srv, newThreadID, "started",
+		"forked from #"+strconv.Itoa(src.Worktree.Number)+" on "+wt.Branch, &wt)
 }
 
 // promoteAgentThread upgrades a non-isolated thread to an isolated worktree: it

@@ -117,6 +117,9 @@ private:
     AgentPanel *addDormantAgent(const QString &project, const QString &threadId,
                                 const QString &title, bool isolated);
     void renameAgent(int agentId);
+    // Fork an agent: show the Fork dialog prefilled from the source, call
+    // agent.fork, then adopt the newly-started thread into its own roster panel.
+    void forkAgent(int agentId);
     void closeOtherProjects(const QString &keepPath);
     void wireAgentPanel(int agentId, AgentPanel *panel);
     void restoreThreads(const QString &project);

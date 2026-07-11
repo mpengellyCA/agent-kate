@@ -58,6 +58,20 @@ public:
     // A live agent has a thread and a running process (not dormant/resumable).
     bool isRunning() const { return !m_threadId.isEmpty() && !m_dormant; }
 
+    // The model tier / effort this agent runs on, read from its (frozen-once-
+    // started) pickers. Used to prefill the Fork dialog from the source agent.
+    QString currentModel() const;
+    QString currentEffort() const;
+
+    // Bind this fresh panel to a thread the core has ALREADY started (a fork):
+    // adopt the running thread id and go live. The fork's own session id is
+    // minted asynchronously (--fork-session), so the inherited conversation is
+    // replayed from sourceThreadId — the agent it was forked from — which already
+    // has the transcript on disk. Unlike setDormant, the process is running, so
+    // there is no Resume step.
+    void adoptRunningThread(const QString &threadId, const QString &sourceThreadId,
+                            const QString &title, bool isolated);
+
     // Pre-pick the start model by its id ("opus", "sonnet", …) before the first
     // start. No-op once a thread exists (the combo is frozen then) or if the id
     // isn't an offered choice.
@@ -127,6 +141,9 @@ Q_SIGNALS:
     // Emitted after a "Stop & close" archives this agent on the core — asks the
     // dock to remove this panel and its roster entry (the terminal close path).
     void closeRequested();
+    // The user picked "Fork…" from this panel's header — asks the dock to run
+    // the fork flow for this agent (dialog → agent.fork → adopt the new thread).
+    void forkRequested();
 
 protected:
     bool eventFilter(QObject *obj, QEvent *event) override;
@@ -173,6 +190,10 @@ private:
     // Pull the persisted Claude Code transcript and replay it into the feed so
     // a reopened dormant thread shows its prior conversation.
     void loadTranscript();
+    // Replay a thread's persisted transcript into this feed. loadTranscript()
+    // uses this panel's own thread; a fork passes its source thread so the
+    // inherited conversation appears before the fork's own session id exists.
+    void loadTranscriptFrom(const QString &fromThreadId);
     // Send the current compact-combo + strip values to the core for this
     // thread. No-op when no thread exists yet — the choice is then sticky
     // local-only until a thread is created.
@@ -326,6 +347,7 @@ private:
     QPushButton *m_stopBtn = nullptr;
     QPushButton *m_interruptBtn = nullptr;
     QPushButton *m_diffBtn = nullptr;
+    QPushButton *m_forkBtn = nullptr;
     QPushButton *m_attachBtn = nullptr;
 
     // Pending attachments for the next message (each {kind,name,mediaType,…}).

@@ -216,6 +216,36 @@ func registerHandlers(d handlerDeps) {
 		return map[string]any{"events": events, "attachments": attachTurns}, nil
 	})
 
+	// agent.fork branches a thread's conversation into a new thread so it can
+	// continue on a different model or effort while keeping the full context.
+	// The source thread is left running and untouched: the fork gets its own
+	// isolated worktree (branched from the source worktree's HEAD; uncommitted
+	// changes are not copied) and its own Claude Code session via --fork-session.
+	d.srv.Handle("agent.fork", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID string `json:"threadId"`
+			Model    string `json:"model"`  // tier token ("opus"…); "" keeps the source's model
+			Effort   string `json:"effort"` // "" keeps the source's effort
+			Title    string `json:"title"`  // "" defaults to "Fork of <source title>"
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		src, ok := d.sessions.Get(p.ThreadID)
+		if !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		}
+		if src.SessionID == "" {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams,
+				"this agent has no conversation yet to fork")
+		}
+		newThreadID := agent.NewThreadID()
+		safe.Go("agent.forkThread", func() {
+			forkAgentThread(d, src, newThreadID, p.Model, p.Effort, p.Title)
+		})
+		return map[string]any{"threadId": newThreadID}, nil
+	})
+
 	// agent.promote upgrades a non-isolated thread into a dedicated git
 	// worktree, carrying its working-tree changes and Claude Code session over.
 	d.srv.Handle("agent.promote", func(_ context.Context, raw json.RawMessage) (any, error) {

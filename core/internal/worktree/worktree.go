@@ -48,6 +48,13 @@ func headCommit(dir string) (string, bool) {
 	return strings.TrimSpace(out), true
 }
 
+// Head returns the HEAD commit of the repo or worktree at dir, and whether it
+// resolved. Exported so the fork path can read a source worktree's HEAD to
+// branch a new isolated worktree from exactly the state the conversation was on.
+func Head(dir string) (string, bool) {
+	return headCommit(dir)
+}
+
 // Isolation modes for Create.
 const (
 	ModeAuto      = "auto"      // isolate when the repo has commits, else run direct
@@ -89,6 +96,38 @@ func Create(repoRoot, threadID, mode string) (Worktree, error) {
 	dir := filepath.Join(repoRoot, ".agentkate", "worktrees", threadID)
 	branch := "agentkate/" + threadID
 
+	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
+		return Worktree{}, err
+	}
+	if _, err := git(repoRoot, "worktree", "add", "-b", branch, dir, base); err != nil {
+		return Worktree{}, err
+	}
+	return Worktree{
+		ThreadID: threadID,
+		RepoRoot: repoRoot,
+		Path:     dir,
+		Branch:   branch,
+		Base:     base,
+		Isolated: true,
+	}, nil
+}
+
+// CreateFrom sets up a fresh isolated worktree for threadID branched from an
+// explicit base commit rather than repoRoot's current HEAD. Forking an agent
+// uses it so the new thread starts from the *source worktree's* HEAD — the
+// committed state the conversation was continuing from. Only committed history
+// is carried: uncommitted changes in the source worktree are NOT copied.
+//
+// base must be a commit reachable in repoRoot (a fork's source worktree shares
+// repoRoot's object store, so its HEAD qualifies). An empty base is an error —
+// this is the isolation-required path, with no workspace fallback.
+func CreateFrom(repoRoot, threadID, base string) (Worktree, error) {
+	base = strings.TrimSpace(base)
+	if base == "" {
+		return Worktree{}, fmt.Errorf("fork needs a base commit to branch from")
+	}
+	dir := filepath.Join(repoRoot, ".agentkate", "worktrees", threadID)
+	branch := "agentkate/" + threadID
 	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
 		return Worktree{}, err
 	}
