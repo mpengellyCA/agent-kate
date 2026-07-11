@@ -3,6 +3,7 @@
 #include "AttachmentBuilder.h"
 #include "ImageView.h"
 #include "ProviderConfig.h"
+#include "ToolInspectorDialog.h"
 #include "TranscriptDelegate.h"
 #include "TranscriptModel.h"
 #include "ipc/CoreClient.h"
@@ -308,6 +309,9 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     // A click on an attachment chip under a You message opens that file.
     connect(m_delegate, &TranscriptDelegate::attachmentActivated, this,
             &AgentPanel::openAttachment);
+    // The tool card's "open in inspector" glyph opens the full-size modal.
+    connect(m_delegate, &TranscriptDelegate::inspectToolRequested, this,
+            &AgentPanel::openToolInspector);
     // Close the overlay when its row's data changes (streaming/mutation) or the
     // model resets, so a stale editor never lingers over a re-laid-out row.
     connect(m_model, &QAbstractItemModel::dataChanged, this,
@@ -1531,8 +1535,25 @@ void AgentPanel::addNote(const QString &html, const QString &kind)
 
 void AgentPanel::showFeedContextMenu(const QModelIndex &idx, const QPoint &globalPos)
 {
-    if (TranscriptModel::Kind(idx.data(TranscriptModel::KindRole).toInt())
-        != TranscriptModel::Message) {
+    const auto kind =
+        TranscriptModel::Kind(idx.data(TranscriptModel::KindRole).toInt());
+    // Tool rows: a single "Open in inspector…" entry (mirrors the header glyph).
+    if (kind == TranscriptModel::Tool
+        && idx.data(TranscriptModel::ToolVisibleRole).toBool()) {
+        QMenu toolMenu(this);
+        QAction *inspect = toolMenu.addAction(
+            QIcon::fromTheme(QStringLiteral("document-preview")),
+            i18n("Open in inspector…"));
+        const QPersistentModelIndex pidx(idx);
+        connect(inspect, &QAction::triggered, this, [this, pidx] {
+            if (pidx.isValid()) {
+                openToolInspector(pidx);
+            }
+        });
+        toolMenu.exec(globalPos);
+        return;
+    }
+    if (kind != TranscriptModel::Message) {
         return;
     }
     const QString src = idx.data(TranscriptModel::PlainRole).toString();
@@ -2019,6 +2040,26 @@ void AgentPanel::openAttachment(const QJsonObject &att)
 
     // Text / file: open it in the editor (MainWindow makes the editor visible).
     emit openFileRequested(path);
+}
+
+void AgentPanel::openToolInspector(const QModelIndex &idx)
+{
+    if (!idx.isValid()
+        || TranscriptModel::Kind(idx.data(TranscriptModel::KindRole).toInt())
+               != TranscriptModel::Tool) {
+        return;
+    }
+    const QString name = idx.data(TranscriptModel::ToolNameRole).toString();
+    const QString input = idx.data(TranscriptModel::ToolDetailRole).toString();
+    const QString full = idx.data(TranscriptModel::ToolFullResultRole).toString();
+    // The retained result is capped at kToolResultStoreCap; a stored size at the
+    // cap means the true output was longer (the on-disk transcript has it all).
+    const bool capped = full.size() >= kToolResultStoreCap;
+
+    auto *dlg = new ToolInspectorDialog(name, input, full, capped, this);
+    connect(dlg, &ToolInspectorDialog::openFile, this,
+            &AgentPanel::openFileRequested);
+    dlg->show();
 }
 
 // deliverMessage sends a message to the live thread right now: it shows the

@@ -43,6 +43,7 @@ constexpr int kChipMaxW = 220;  // max chip width before the name elides
 constexpr int kToolPad = 6;       // tool card inner padding
 constexpr int kToolHeaderH = 28;  // clickable header height
 constexpr int kToolCopyW = 26;    // copy hit zone on the right of the header
+constexpr int kToolInspectW = 26; // "open in inspector" glyph, left of the copy glyph
 constexpr int kDetailPadX = 10;
 
 // The height cache is keyed by the model's per-row stableId, which the model
@@ -414,15 +415,18 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
         const QString header = QStringLiteral("%1  %2  \U0001f527 %3   %4")
                                    .arg(arrow, mark, name, summary);
         const QRect hdr(card.left() + 8, card.top(),
-                        card.width() - 8 - kToolCopyW, kToolHeaderH);
+                        card.width() - 8 - kToolCopyW - kToolInspectW, kToolHeaderH);
         painter->save();
         painter->setPen(opt.palette.color(QPalette::WindowText));
         painter->drawText(hdr, Qt::AlignLeft | Qt::AlignVCenter,
                           fm.elidedText(header, Qt::ElideRight, hdr.width()));
-        // Copy glyph.
+        painter->setPen(opt.palette.color(QPalette::Mid));
+        // "Open in inspector" glyph, then the copy glyph on the far right.
+        const QRect inspectR(card.right() - kToolCopyW - kToolInspectW, card.top(),
+                             kToolInspectW, kToolHeaderH);
+        painter->drawText(inspectR, Qt::AlignCenter, QStringLiteral("⤢"));
         const QRect copyR(card.right() - kToolCopyW, card.top(), kToolCopyW,
                           kToolHeaderH);
-        painter->setPen(opt.palette.color(QPalette::Mid));
         painter->drawText(copyR, Qt::AlignCenter, QStringLiteral("⧉"));
         painter->restore();
 
@@ -522,13 +526,21 @@ void TranscriptDelegate::paint(QPainter *painter, const QStyleOptionViewItem &op
 QRect TranscriptDelegate::toolHeaderRect(const QRect &row) const
 {
     return QRect(row.left() + kOuterMarginX, row.top(),
-                 row.width() - 2 * kOuterMarginX - kToolCopyW, kToolHeaderH);
+                 row.width() - 2 * kOuterMarginX - kToolCopyW - kToolInspectW,
+                 kToolHeaderH);
 }
 
 QRect TranscriptDelegate::toolCopyRect(const QRect &row) const
 {
     const int right = row.right() - kOuterMarginX;
     return QRect(right - kToolCopyW, row.top(), kToolCopyW, kToolHeaderH);
+}
+
+QRect TranscriptDelegate::toolInspectRect(const QRect &row) const
+{
+    const int right = row.right() - kOuterMarginX;
+    return QRect(right - kToolCopyW - kToolInspectW, row.top(), kToolInspectW,
+                 kToolHeaderH);
 }
 
 int TranscriptDelegate::attachmentsBlockHeight(const QModelIndex &idx,
@@ -674,6 +686,11 @@ bool TranscriptDelegate::editorEvent(QEvent *event, QAbstractItemModel *model,
 
         if (kind == TranscriptModel::Tool
             && idx.data(TranscriptModel::ToolVisibleRole).toBool()) {
+            // "Open in inspector" glyph — opens the full tool-call modal.
+            if (toolInspectRect(opt.rect).contains(pos)) {
+                emit inspectToolRequested(idx);
+                return true;
+            }
             // Copy button.
             if (toolCopyRect(opt.rect).contains(pos)) {
                 QString out = idx.data(TranscriptModel::ToolNameRole).toString();

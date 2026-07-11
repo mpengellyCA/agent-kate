@@ -207,6 +207,9 @@ private:
     // Open a clicked attachment chip: image → in-place preview dialog reusing
     // ImageView; text/file → openFileRequested so MainWindow shows it in the editor.
     void openAttachment(const QJsonObject &att);
+    // Open the full-size tool-call inspector modal for a Tool row (plan 13
+    // phase 5): tool-aware Overview, full input JSON, searchable result.
+    void openToolInspector(const QModelIndex &idx);
     void addNote(const QString &html, const QString &kind);
     void scrollFeedToBottom();
     // Show the whole-message + code-block copy menu for a feed row.

@@ -69,6 +69,9 @@ Q_SIGNALS:
     // An attachment chip under a You message was clicked; the payload is the
     // compact attachment object (name/kind/path/mediaType/outside).
     void attachmentActivated(const QJsonObject &att) const;
+    // The tool card's "open in inspector" glyph was clicked — the panel opens the
+    // ToolInspectorDialog for this row (plan 13 phase 5).
+    void inspectToolRequested(const QModelIndex &idx) const;
 
 protected:
     // Hit-testing for tool expand/collapse, the copy button, the "show full
@@ -103,6 +106,8 @@ private:
     // and index, compute the sub-rects of the tool header / copy button.
     QRect toolHeaderRect(const QRect &row) const;
     QRect toolCopyRect(const QRect &row) const;
+    // The "open in inspector" glyph sits immediately left of the copy glyph.
+    QRect toolInspectRect(const QRect &row) const;
 
     // The body-text sub-rect of a Message row (excludes the card padding, the
     // role/timestamp line, and any attachment chip block) — the exact area the

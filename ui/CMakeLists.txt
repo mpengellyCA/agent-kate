@@ -94,6 +94,7 @@ add_executable(agentkate
     src/AttachmentBuilder.cpp
     src/TranscriptModel.cpp
     src/TranscriptDelegate.cpp
+    src/ToolInspectorDialog.cpp
     src/WorktreeDashboard.cpp
     src/CleanupDialog.cpp
     src/ShutdownDialog.cpp
