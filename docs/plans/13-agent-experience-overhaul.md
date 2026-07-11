@@ -1,9 +1,10 @@
 # 13 — Agent Experience Overhaul (chat flow, lifecycle, panels)
 
-> **Status: planned — not started.** Ten phases for one targeted major release, ordered
-> so regressions and workflow-blockers land first. Phases are largely independent; land
-> them sequentially (1→10), one commit per phase, each built green (`scripts/build.sh`),
-> `ctest --test-dir build` passing, and verified live before moving on.
+> **Status: planned — not started.** Eleven phases for one targeted major release,
+> ordered so regressions and workflow-blockers land first. Phases are largely
+> independent; land them sequentially (1→11), one commit per phase, each built green
+> (`scripts/build.sh`), `ctest --test-dir build` passing, and verified live before
+> moving on.
 
 ## Goal
 
@@ -419,6 +420,53 @@ all previous functions reachable through the three dialogs.
 
 ---
 
+## Phase 11 — File Browser: Project / Worktree tabs — **S–M**
+
+**Why.** The Files panel always shows the project root; there's no way to browse the
+selected agent's isolated worktree, where the agent's actual edits live.
+
+**Now.** `ProjectTree` is a single-root browser: `setRoot()`
+(`ui/src/ProjectTree.cpp:311`) points a QFileSystemModel at one path, called with the
+*project* path from `MainWindow::onAgentActivated` (`ui/src/MainWindow.cpp:1728`) and
+the `projectFocused` connect (MainWindow.cpp:432). The worktree path is already on the
+wire — every `_lifecycle` event carries `workdir`, `isolated`, `branch`
+(`core/cmd/akcore/handlers.go:2083-2100`) — but the UI only reads `isolated`/`branch`
+(`ui/src/AgentPanel.cpp:~2545`) and drops `workdir`. Git-status tinting comes from
+`git.snapshot`, whose per-thread entries are keyed by worktree paths already.
+
+**Design (UI-only).**
+- **Scope tabs:** a compact `QTabBar` (document mode, no expanding) above the existing
+  ProjectTree header with two tabs — **Project** and **Worktree**. ProjectTree gains
+  `setRoots(projectPath, worktreePath)`; an empty `worktreePath` disables the Worktree
+  tab (agent running non-isolated in the workspace, dormant without a worktree, or a
+  project row selected in the roster).
+- **Sticky + persistent, global:** the selected tab is one global preference persisted
+  to KConfig `[Files] scope` (project|worktree), restored on startup. When scope is
+  `worktree` but the current agent has none, *display* the project root with the tab
+  disabled without overwriting the preference — selecting an agent that has a worktree
+  snaps back to its worktree.
+- **Plumbing the worktree path:** `AgentPanel` stores `workdir` from lifecycle events
+  (`started`/`resumed`/`promoted`) and exposes it (accessor + change signal);
+  `AgentDock` forwards it alongside `agentActivated` so
+  `MainWindow::onAgentActivated` calls `m_tree->setRoots(projectPath, workdir)`. For
+  dormant agents restored at startup, verify `session.listThreads` serializes the
+  record's embedded worktree (path + isolated) and pass it through the same way; a
+  mid-session promote updates the tree live via the `promoted` event's `workdir`.
+- **Out of scope:** Terminal, Search, and Git Log scoping are unchanged (they have
+  their own scoping rules); the tab only drives the file browser root.
+
+**Steps.** `setRoots` + QTabBar in ProjectTree (preserve per-root expansion state when
+flipping tabs if cheap — otherwise just re-root) → workdir plumbing
+(AgentPanel/AgentDock/MainWindow, dormant-restore path included) → KConfig persistence
+→ verify git-status emblems render for worktree files and `revealPath`/sync-with-editor
+behaves in both scopes.
+
+**Accept.** With an isolated agent selected, the Worktree tab shows its worktree files
+(with git emblems); a workspace-mode agent leaves the tab disabled showing the project;
+the chosen tab survives switching agents and a full app restart.
+
+---
+
 ## Suggested landing order & sizing recap
 
 | Phase | What | Size | Touches |
@@ -433,7 +481,9 @@ all previous functions reachable through the three dialogs.
 | 8 | Git Log v2 | L | UI + 1 small RPC |
 | 9 | Worktrees v2 | M | UI |
 | 10 | Cowork control centre | M | UI only |
+| 11 | File Browser project/worktree tabs | S–M | UI only |
 
 Phases 1, 4, 5 all touch `TranscriptDelegate`/`TranscriptModel` — land them in order to
 avoid conflicts. Phases 7 and 9 share the chip-painting helper (extract it in whichever
-lands first). Everything else is independent.
+lands first). Everything else is independent (Phase 11 can land any time — it only
+touches ProjectTree and the agent-activation wiring).
