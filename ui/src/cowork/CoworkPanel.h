@@ -1,19 +1,19 @@
 #pragma once
 
 #include <QHash>
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QString>
 #include <QWidget>
 
 class CoreClient;
+class CapabilityTile;
 class KMessageWidget;
-class QTreeWidget;
 class QPlainTextEdit;
 class QPushButton;
 class QToolButton;
 class QMenu;
 class QLabel;
-class QCheckBox;
 class QComboBox;
 class QSlider;
 class QSpinBox;
@@ -24,6 +24,11 @@ class QVBoxLayout;
 // user revoke any grant, and provides a global kill-switch and an audit log. It is
 // the security cockpit — the consent authority lives in the core; this panel renders
 // it and relays the user's decisions (plan 06).
+//
+// Plan 13 phase 10 reshapes it into a device-control-centre: the panel body carries
+// only the plain-language essentials (status, active agent, capability tiles, active
+// grants as sentences, kill-switch). The debug/tuning surfaces (activity log, pointer
+// motion, browser tools) move behind an "Advanced" toolbar into their own dialogs.
 class CoworkPanel : public QWidget
 {
     Q_OBJECT
@@ -44,7 +49,7 @@ private:
     void refreshAudit();
     void refreshPolicy();
     void handleGrantRequested(const QJsonObject &params);
-    void revokeSelected();
+    void revokeGrant(const QString &id);
     void toggleKill();
     void enableForActiveThread();
     void rebuildBrowserMenu();
@@ -52,6 +57,12 @@ private:
     void launchBrowserAndReport(const QString &name, const QString &command, const QString &family);
     void refreshBrowserPrefCombo();
     void savePointerBounds(); // persist + push the user's pointer-motion defaults to core
+
+    // Advanced dialogs (built lazily; the tuning/debug widgets are hosted in the
+    // dialog and rebuilt from persisted config each open).
+    void showActivityLog();
+    void showPointerSettings();
+    void showBrowserTools();
 
     CoreClient *m_core = nullptr;
     QString m_activeThread;
@@ -62,17 +73,32 @@ private:
     KMessageWidget *m_status = nullptr;
     QLabel *m_activeLabel = nullptr;
     QPushButton *m_enableBtn = nullptr;
+
+    // Capability tiles (control-centre grid). Keyed by capability key.
+    QVBoxLayout *m_capsLayout = nullptr;         // the tile grid's FlowLayout lives inside
+    class FlowLayout *m_tilesFlow = nullptr;     // holds the CapabilityTiles
+    QHash<QString, CapabilityTile *> m_tiles;    // capability key -> tile
+    QLabel *m_capsEmpty = nullptr;               // shown until the first policy arrives
+
+    // Active grants rendered as sentences (widget list).
+    QVBoxLayout *m_grantsLayout = nullptr;
+    QLabel *m_grantsEmpty = nullptr;
+
+    QPushButton *m_killBtn = nullptr;
+
+    // --- Advanced surfaces, hosted inside their dialogs on demand ---
+    // Pointer motion controls (rebuilt per dialog open, saved to KConfig + core).
+    QComboBox *m_pointerSpeed = nullptr;
+    QSlider *m_pointerAccuracy = nullptr;
+    QLabel *m_pointerAccuracyLabel = nullptr;
+    QSpinBox *m_pointerSettle = nullptr;
+    // Browser tools.
     QToolButton *m_browserBtn = nullptr;
     QMenu *m_browserMenu = nullptr;
     QComboBox *m_agentBrowserCombo = nullptr;
-    QVBoxLayout *m_capsLayout = nullptr;                 // holds the capability toggles
-    QHash<QString, QCheckBox *> m_policyChecks;          // capability key -> switch
-    QComboBox *m_pointerSpeed = nullptr;                 // default agent pointer px/s
-    QSlider *m_pointerAccuracy = nullptr;                // 0..100% path exactness
-    QLabel *m_pointerAccuracyLabel = nullptr;           // "Accuracy: N%"
-    QSpinBox *m_pointerSettle = nullptr;                 // ms to settle before a click
-    QTreeWidget *m_grants = nullptr;
-    QPushButton *m_revokeBtn = nullptr;
-    QPushButton *m_killBtn = nullptr;
+    // Activity log view + its cached data.
     QPlainTextEdit *m_audit = nullptr;
+    QComboBox *m_auditFilter = nullptr;
+    QJsonArray m_auditEntries; // last fetched entries, so the filter can re-render offline
+    void renderAudit();        // apply m_auditFilter over m_auditEntries into m_audit
 };

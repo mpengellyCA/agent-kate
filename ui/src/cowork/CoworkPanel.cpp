@@ -1,9 +1,11 @@
 #include "CoworkPanel.h"
 
 #include "BrowserLaunch.h"
+#include "CapabilityTile.h"
 #include "ConsentDialog.h"
 #include "ControlConsentDialog.h"
 #include "ipc/CoreClient.h"
+#include "shell/ElidingLabel.h"
 #include "shell/FlowLayout.h"
 
 #include <KConfigGroup>
@@ -13,27 +15,30 @@
 #include <KSharedConfig>
 
 #include <QAction>
-#include <QCheckBox>
 #include <QComboBox>
 #include <QDateTime>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFrame>
 #include <QGroupBox>
 #include <QHBoxLayout>
-#include <QHeaderView>
+#include <QIcon>
 #include <QInputDialog>
 #include <QJsonArray>
 #include <QJsonValue>
 #include <QLabel>
 #include <QMenu>
 #include <QPlainTextEdit>
+#include <QPointer>
 #include <QPushButton>
+#include <QScrollArea>
 #include <QSignalBlocker>
 #include <QSizePolicy>
 #include <QSlider>
 #include <QSpinBox>
 #include <QToolButton>
-#include <QTreeWidget>
 #include <QVBoxLayout>
 
 namespace {
@@ -49,24 +54,78 @@ QString targetSummary(const QJsonObject &t)
         const QString rc = t.value(QStringLiteral("resourceClass")).toString();
         return rc.isEmpty() ? i18n("a window") : rc;
     }
-    if (kind == QLatin1String("any")) {
-        return i18n("whole desktop");
+    if (kind == QLatin1String("screen")) {
+        return i18n("the whole screen");
     }
-    return kind;
+    if (kind == QLatin1String("vdesktop") || kind == QLatin1String("sandbox")) {
+        return i18n("the sandbox desktop");
+    }
+    if (kind == QLatin1String("any")) {
+        return i18n("the whole desktop");
+    }
+    return kind.isEmpty() ? i18n("your desktop") : kind;
 }
 
-QString capLabel(const QString &key)
+// Human, one-word-verb phrasing for a capability, used inside the grant sentence
+// ("Agent X can <verb> on …"). Kept lower-case so it flows in the sentence.
+QString capVerb(const QString &key)
+{
+    if (key == QLatin1String("window_list")) return i18n("see open windows");
+    if (key == QLatin1String("screenshot")) return i18n("take screenshots");
+    if (key == QLatin1String("a11y_read")) return i18n("read app contents");
+    if (key == QLatin1String("screencast")) return i18n("watch the screen");
+    if (key == QLatin1String("launch_browser")) return i18n("open a browser");
+    if (key == QLatin1String("vd_sandbox")) return i18n("use a sandbox desktop");
+    if (key == QLatin1String("a11y_action")) return i18n("click buttons and controls as you");
+    if (key == QLatin1String("input_inject")) return i18n("type and press keys as you");
+    if (key == QLatin1String("pointer_control")) return i18n("move and click the mouse as you");
+    return key;
+}
+
+// Tile title (Title-ish case) for the control-centre grid.
+QString capTitle(const QString &key)
 {
     if (key == QLatin1String("window_list")) return i18n("See open windows");
     if (key == QLatin1String("screenshot")) return i18n("Take screenshots");
-    if (key == QLatin1String("a11y_read")) return i18n("Read on-screen text");
-    if (key == QLatin1String("screencast")) return i18n("Watch the screen live");
-    if (key == QLatin1String("launch_browser")) return i18n("Open a web browser");
-    if (key == QLatin1String("vd_sandbox")) return i18n("Use a sandbox desktop");
-    if (key == QLatin1String("a11y_action")) return i18n("Click buttons & controls");
-    if (key == QLatin1String("input_inject")) return i18n("Type & click as me");
-    if (key == QLatin1String("pointer_control")) return i18n("Move & click the pointer");
+    if (key == QLatin1String("a11y_read")) return i18n("Read app contents");
+    if (key == QLatin1String("screencast")) return i18n("Watch the screen");
+    if (key == QLatin1String("launch_browser")) return i18n("Open a browser");
+    if (key == QLatin1String("vd_sandbox")) return i18n("Sandbox desktop");
+    if (key == QLatin1String("a11y_action")) return i18n("Click controls");
+    if (key == QLatin1String("input_inject")) return i18n("Type as you");
+    if (key == QLatin1String("pointer_control")) return i18n("Move the mouse");
     return key;
+}
+
+// One-line, plain-language description shown under the tile title.
+QString capDesc(const QString &key)
+{
+    if (key == QLatin1String("window_list")) return i18n("List the windows you have open");
+    if (key == QLatin1String("screenshot")) return i18n("Capture what's on your screen");
+    if (key == QLatin1String("a11y_read")) return i18n("Read the text and controls in apps");
+    if (key == QLatin1String("screencast")) return i18n("Watch your screen live as it changes");
+    if (key == QLatin1String("launch_browser")) return i18n("Open a browser it can read and use");
+    if (key == QLatin1String("vd_sandbox")) return i18n("Work on a separate virtual desktop");
+    if (key == QLatin1String("a11y_action")) return i18n("Click buttons and controls as you");
+    if (key == QLatin1String("input_inject")) return i18n("Type text and press keys as you");
+    if (key == QLatin1String("pointer_control")) return i18n("Move the pointer and click as you");
+    return QString();
+}
+
+// A recognisable theme icon per capability. Falls back gracefully if a name is
+// missing from the active icon set.
+QString capIcon(const QString &key)
+{
+    if (key == QLatin1String("window_list")) return QStringLiteral("window");
+    if (key == QLatin1String("screenshot")) return QStringLiteral("camera-photo");
+    if (key == QLatin1String("a11y_read")) return QStringLiteral("format-text-underline");
+    if (key == QLatin1String("screencast")) return QStringLiteral("camera-web");
+    if (key == QLatin1String("launch_browser")) return QStringLiteral("internet-web-browser");
+    if (key == QLatin1String("vd_sandbox")) return QStringLiteral("virtual-desktops");
+    if (key == QLatin1String("a11y_action")) return QStringLiteral("input-tablet");
+    if (key == QLatin1String("input_inject")) return QStringLiteral("input-keyboard");
+    if (key == QLatin1String("pointer_control")) return QStringLiteral("input-mouse");
+    return QStringLiteral("preferences-desktop");
 }
 
 QString expiryText(const QJsonObject &g)
@@ -118,158 +177,64 @@ CoworkPanel::CoworkPanel(CoreClient *core, QWidget *parent)
     enableRow->addWidget(m_enableBtn);
     layout->addLayout(enableRow);
 
-    // Capability switchboard: flip a capability ON to pre-authorize it for any
-    // cowork-enabled agent — no per-action prompt while on (the kill-switch + audit
-    // log remain the safety net). Populated from cowork.getPolicy.
-    // The group title is the widest non-eliding element on this panel; a
-    // QGroupBox title never wraps, so it pins the right pane's minimum width.
-    // Keep it short and move the qualifier into a wrapping hint inside the box.
+    // Capability tiles: flip a tile ON to pre-authorize it for any cowork-enabled
+    // agent — no per-action prompt while on (the kill-switch + activity log remain
+    // the safety net). Populated from cowork.getPolicy as large control-centre
+    // toggles instead of a checkbox column.
     auto *capsBox = new QGroupBox(i18n("What agents may do"), this);
     m_capsLayout = new QVBoxLayout(capsBox);
-    auto *capsHint = new QLabel(i18n("On = allowed without asking."), capsBox);
+    auto *capsHint = new QLabel(i18n("Turn on what agents can do without asking each time."),
+                                capsBox);
     capsHint->setWordWrap(true);
-    capsHint->setStyleSheet(QStringLiteral("color: palette(mid); font-size: small;"));
+    capsHint->setStyleSheet(QStringLiteral("color: palette(mid);"));
     m_capsLayout->addWidget(capsHint);
+    m_tilesFlow = new FlowLayout(0, 6, 6);
+    m_capsLayout->addLayout(m_tilesFlow);
+    m_capsEmpty = new QLabel(i18n("Loading…"), capsBox);
+    m_capsEmpty->setStyleSheet(QStringLiteral("color: palette(mid);"));
+    m_capsLayout->addWidget(m_capsEmpty);
     layout->addWidget(capsBox);
 
-    // Pointer motion defaults: sane USER-set bounds the core clamps every agent
-    // pointer move to. The agent may still ask for slower/less-exact motion within
-    // these limits, but never faster or jerkier. Saved in KConfig (group "Cowork")
-    // and pushed to the core via cowork.setPointerBounds.
-    auto *pointerBox = new QGroupBox(i18n("Pointer motion"), this);
-    auto *pointerLayout = new QVBoxLayout(pointerBox);
-
-    const KConfigGroup cfg = KSharedConfig::openConfig()->group(QStringLiteral("Cowork"));
-    const int savedSpeed = cfg.readEntry("PointerSpeed", 1600);
-    const int savedAccuracy = cfg.readEntry("PointerAccuracy", 100);
-    const int savedSettle = cfg.readEntry("PointerSettleMs", 30);
-
-    auto *speedRow = new QHBoxLayout;
-    auto *speedLabel = new QLabel(i18n("Speed:"), this);
-    speedLabel->setSizePolicy(QSizePolicy::Ignored, speedLabel->sizePolicy().verticalPolicy());
-    m_pointerSpeed = new QComboBox(this);
-    m_pointerSpeed->setToolTip(i18n("How fast the agent's pointer travels. 'Instant' "
-                                    "teleports straight to the target with no visible motion."));
-    m_pointerSpeed->addItem(i18n("Instant"), 0);     // teleport, no animation
-    m_pointerSpeed->addItem(i18n("Fast"), 3000);
-    m_pointerSpeed->addItem(i18n("Normal"), 1600);   // default
-    m_pointerSpeed->addItem(i18n("Slow"), 800);
-    {
-        const int idx = m_pointerSpeed->findData(savedSpeed);
-        m_pointerSpeed->setCurrentIndex(idx >= 0 ? idx : m_pointerSpeed->findData(1600));
-    }
-    speedRow->addWidget(speedLabel);
-    speedRow->addWidget(m_pointerSpeed, 1);
-    pointerLayout->addLayout(speedRow);
-
-    m_pointerAccuracyLabel = new QLabel(i18n("Accuracy: %1%", savedAccuracy), this);
-    m_pointerAccuracy = new QSlider(Qt::Horizontal, this);
-    m_pointerAccuracy->setRange(0, 100);
-    m_pointerAccuracy->setValue(savedAccuracy);
-    m_pointerAccuracy->setToolTip(i18n("100% = straight, exact, robotic motion. Lower adds a "
-                                       "more human-like path (easing, overshoot, jitter) — but "
-                                       "the click always lands exactly on the target."));
-    pointerLayout->addWidget(m_pointerAccuracyLabel);
-    pointerLayout->addWidget(m_pointerAccuracy);
-
-    auto *settleRow = new QHBoxLayout;
-    auto *settleLabel = new QLabel(i18n("Settle before click (ms)"), this);
-    settleLabel->setWordWrap(true);
-    settleLabel->setSizePolicy(QSizePolicy::Ignored, settleLabel->sizePolicy().verticalPolicy());
-    m_pointerSettle = new QSpinBox(this);
-    m_pointerSettle->setRange(0, 500);
-    m_pointerSettle->setValue(savedSettle);
-    m_pointerSettle->setToolTip(i18n("Pause after the pointer arrives, before clicking, so the "
-                                     "target has time to react to hover."));
-    settleRow->addWidget(settleLabel, 1);
-    settleRow->addWidget(m_pointerSettle);
-    pointerLayout->addLayout(settleRow);
-
-    connect(m_pointerSpeed, &QComboBox::currentIndexChanged, this, &CoworkPanel::savePointerBounds);
-    connect(m_pointerAccuracy, &QSlider::valueChanged, this, [this](int v) {
-        m_pointerAccuracyLabel->setText(i18n("Accuracy: %1%", v));
-        savePointerBounds();
-    });
-    connect(m_pointerSettle, &QSpinBox::valueChanged, this, &CoworkPanel::savePointerBounds);
-
-    layout->addWidget(pointerBox);
-
-    // Browser launcher. Browsers hide their web content from the accessibility tree
-    // unless started with the right flag/env, so agents can't read or click page
-    // elements. This opens one with accessibility forced on (the menu lists browsers
-    // found on PATH plus an "Other browser…" picker).
-    auto *browserRow = new QHBoxLayout;
-    auto *browserLabel = new QLabel(i18n("Open a browser agents can read:"), this);
-    browserLabel->setWordWrap(true);
-    browserLabel->setSizePolicy(QSizePolicy::Ignored, browserLabel->sizePolicy().verticalPolicy());
-    m_browserBtn = new QToolButton(this);
-    m_browserBtn->setText(i18n("Launch browser"));
-    m_browserBtn->setIcon(QIcon::fromTheme(QStringLiteral("internet-web-browser")));
-    m_browserBtn->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
-    m_browserBtn->setPopupMode(QToolButton::InstantPopup);
-    m_browserBtn->setToolTip(i18n(
-        "Launch a web browser with its accessibility tree enabled so agents can read\n"
-        "and click page elements. The browser must be started fresh from here — if it\n"
-        "is already running, quit it first."));
-    m_browserMenu = new QMenu(m_browserBtn);
-    m_browserBtn->setMenu(m_browserMenu);
-    connect(m_browserMenu, &QMenu::aboutToShow, this, &CoworkPanel::rebuildBrowserMenu);
-    browserRow->addWidget(browserLabel, 1);
-    browserRow->addWidget(m_browserBtn);
-    layout->addLayout(browserRow);
-
-    // Which browser an agent opens when it calls desktop_open_browser itself.
-    auto *prefRow = new QHBoxLayout;
-    auto *prefLabel = new QLabel(i18n("Agent's default browser:"), this);
-    prefLabel->setWordWrap(true);
-    prefLabel->setSizePolicy(QSizePolicy::Ignored, prefLabel->sizePolicy().verticalPolicy());
-    m_agentBrowserCombo = new QComboBox(this);
-    m_agentBrowserCombo->setToolTip(i18n(
-        "When an agent opens a browser on its own, it uses this one. The agent can "
-        "only open browsers listed here — never an arbitrary program."));
-    connect(m_agentBrowserCombo, &QComboBox::currentIndexChanged, this, [this] {
-        const QString cmd = m_agentBrowserCombo->currentData().toString();
-        if (!cmd.isEmpty()) {
-            BrowserLaunch::setPreferred(cmd);
-        }
-    });
-    prefRow->addWidget(prefLabel);
-    prefRow->addWidget(m_agentBrowserCombo, 1);
-    layout->addLayout(prefRow);
-    refreshBrowserPrefCombo();
-
-    // Active grants.
+    // Active grants, rendered as plain-language sentences with a per-row Revoke.
     auto *grantsBox = new QGroupBox(i18n("Active access"), this);
-    auto *grantsLayout = new QVBoxLayout(grantsBox);
-    m_grants = new QTreeWidget(grantsBox);
-    m_grants->setRootIsDecorated(false);
-    m_grants->setHeaderLabels({i18n("Agent"), i18n("Can"), i18n("Target"), i18n("Until")});
-    m_grants->header()->setSectionResizeMode(QHeaderView::ResizeToContents);
-    // Let the widest column ("Target", index 2) absorb the slack so the table
-    // fits the pane width instead of growing past it.
-    m_grants->header()->setSectionResizeMode(2, QHeaderView::Stretch);
-    grantsLayout->addWidget(m_grants);
-    m_revokeBtn = new QPushButton(i18n("Revoke selected"), grantsBox);
-    m_revokeBtn->setIcon(QIcon::fromTheme(QStringLiteral("edit-delete")));
-    connect(m_revokeBtn, &QPushButton::clicked, this, &CoworkPanel::revokeSelected);
-    grantsLayout->addWidget(m_revokeBtn, 0, Qt::AlignRight);
+    auto *grantsOuter = new QVBoxLayout(grantsBox);
+    auto *grantsScroll = new QScrollArea(grantsBox);
+    grantsScroll->setWidgetResizable(true);
+    grantsScroll->setFrameShape(QFrame::NoFrame);
+    auto *grantsHost = new QWidget(grantsScroll);
+    m_grantsLayout = new QVBoxLayout(grantsHost);
+    m_grantsLayout->setContentsMargins(0, 0, 0, 0);
+    m_grantsLayout->setSpacing(4);
+    m_grantsEmpty = new QLabel(i18n("No agent has any desktop access right now."), grantsHost);
+    m_grantsEmpty->setWordWrap(true);
+    m_grantsEmpty->setStyleSheet(QStringLiteral("color: palette(mid);"));
+    m_grantsLayout->addWidget(m_grantsEmpty);
+    m_grantsLayout->addStretch(1);
+    grantsScroll->setWidget(grantsHost);
+    grantsOuter->addWidget(grantsScroll);
     layout->addWidget(grantsBox, 1);
 
-    // Kill-switch.
+    // Kill-switch — stays prominent, full-width, below the tiles/grants.
     m_killBtn = new QPushButton(i18n("Stop ALL desktop access"), this);
     m_killBtn->setIcon(QIcon::fromTheme(QStringLiteral("process-stop")));
     connect(m_killBtn, &QPushButton::clicked, this, &CoworkPanel::toggleKill);
     layout->addWidget(m_killBtn);
 
-    // Audit log.
-    auto *auditBox = new QGroupBox(i18n("Recent activity"), this);
-    auto *auditLayout = new QVBoxLayout(auditBox);
-    m_audit = new QPlainTextEdit(auditBox);
-    m_audit->setReadOnly(true);
-    m_audit->setMaximumBlockCount(2000);
-    m_audit->setFrameShape(QFrame::NoFrame);
-    auditLayout->addWidget(m_audit);
-    layout->addWidget(auditBox, 1);
+    // Advanced surfaces behind buttons — the panel body stays plain-language.
+    auto *advancedRow = new FlowLayout(0, 6, 6);
+    auto *logBtn = new QPushButton(i18n("Activity log…"), this);
+    logBtn->setIcon(QIcon::fromTheme(QStringLiteral("view-list-text")));
+    connect(logBtn, &QPushButton::clicked, this, &CoworkPanel::showActivityLog);
+    auto *pointerBtn = new QPushButton(i18n("Pointer settings…"), this);
+    pointerBtn->setIcon(QIcon::fromTheme(QStringLiteral("input-mouse")));
+    connect(pointerBtn, &QPushButton::clicked, this, &CoworkPanel::showPointerSettings);
+    auto *browserBtn = new QPushButton(i18n("Browser tools…"), this);
+    browserBtn->setIcon(QIcon::fromTheme(QStringLiteral("internet-web-browser")));
+    connect(browserBtn, &QPushButton::clicked, this, &CoworkPanel::showBrowserTools);
+    advancedRow->addWidget(logBtn);
+    advancedRow->addWidget(pointerBtn);
+    advancedRow->addWidget(browserBtn);
+    layout->addLayout(advancedRow);
 
     connect(m_core, &CoreClient::notification, this, &CoworkPanel::onNotification);
     connect(m_core, &CoreClient::connected, this, &CoworkPanel::refresh);
@@ -324,49 +289,65 @@ void CoworkPanel::refresh()
 
 void CoworkPanel::refreshPolicy()
 {
-    m_core->call(QStringLiteral("cowork.getPolicy"), {}, [this](const QJsonObject &res, const QJsonObject &err) {
-        if (!err.isEmpty()) {
+    QPointer<CoworkPanel> self(this);
+    m_core->call(QStringLiteral("cowork.getPolicy"), {}, [this, self](const QJsonObject &res, const QJsonObject &err) {
+        if (!self || !err.isEmpty()) {
             return;
         }
         const QJsonArray caps = res.value(QStringLiteral("capabilities")).toArray();
+        if (m_capsEmpty && !caps.isEmpty()) {
+            m_capsEmpty->hide();
+        }
         for (const QJsonValue &cv : caps) {
             const QJsonObject c = cv.toObject();
             const QString key = c.value(QStringLiteral("key")).toString();
             const bool enabled = c.value(QStringLiteral("enabled")).toBool();
             const bool dangerous = c.value(QStringLiteral("tier")).toString() == QLatin1String("R2");
-            QCheckBox *box = m_policyChecks.value(key, nullptr);
-            if (!box) {
-                box = new QCheckBox(dangerous ? i18n("⚠ %1", capLabel(key)) : capLabel(key), this);
+            CapabilityTile *tile = m_tiles.value(key, nullptr);
+            if (!tile) {
+                tile = new CapabilityTile(key, capTitle(key), capDesc(key), capIcon(key), dangerous, this);
                 if (dangerous) {
-                    box->setToolTip(i18n("High-risk: lets the agent act as you (type, click). "
-                                         "The kill-switch and audit log are your safety net."));
+                    tile->setToolTip(i18n("High-risk: lets the agent act as you (type, click). "
+                                          "The kill-switch and activity log are your safety net."));
+                } else {
+                    tile->setToolTip(capDesc(key));
                 }
-                // clicked() fires on user interaction only — not on setChecked() below.
-                connect(box, &QCheckBox::clicked, this, [this, key](bool on) {
+                connect(tile, &CapabilityTile::toggled, this, [this, self](const QString &k, bool on) {
+                    if (!self) {
+                        return;
+                    }
                     m_core->call(QStringLiteral("cowork.setPolicy"),
-                                 {{QStringLiteral("capability"), key}, {QStringLiteral("enabled"), on}},
+                                 {{QStringLiteral("capability"), k}, {QStringLiteral("enabled"), on}},
                                  nullptr, this);
                 });
-                m_capsLayout->addWidget(box);
-                m_policyChecks.insert(key, box);
+                m_tilesFlow->addWidget(tile);
+                m_tiles.insert(key, tile);
             }
-            box->setChecked(enabled);
+            tile->setChecked(enabled); // silent — no toggled() echo
         }
     }, this);
 }
 
 void CoworkPanel::savePointerBounds()
 {
-    const int spd = m_pointerSpeed->currentData().toInt();
-    const int acc = m_pointerAccuracy->value();
-    const int settle = m_pointerSettle->value();
-
-    // Persist locally so the choice survives restarts (same group as the browser prefs).
+    // The pointer controls only exist while the settings dialog is open; when it is
+    // closed we push the persisted config values instead. This keeps the core in
+    // sync on connect and after every dialog edit.
     KConfigGroup cfg = KSharedConfig::openConfig()->group(QStringLiteral("Cowork"));
-    cfg.writeEntry("PointerSpeed", spd);
-    cfg.writeEntry("PointerAccuracy", acc);
-    cfg.writeEntry("PointerSettleMs", settle);
-    cfg.sync();
+    int spd, acc, settle;
+    if (m_pointerSpeed && m_pointerAccuracy && m_pointerSettle) {
+        spd = m_pointerSpeed->currentData().toInt();
+        acc = m_pointerAccuracy->value();
+        settle = m_pointerSettle->value();
+        cfg.writeEntry("PointerSpeed", spd);
+        cfg.writeEntry("PointerAccuracy", acc);
+        cfg.writeEntry("PointerSettleMs", settle);
+        cfg.sync();
+    } else {
+        spd = cfg.readEntry("PointerSpeed", 1600);
+        acc = cfg.readEntry("PointerAccuracy", 100);
+        settle = cfg.readEntry("PointerSettleMs", 30);
+    }
 
     // Inform the core so it clamps each agent's per-call pointer values to these bounds.
     // The core's accuracy is a float in 0..1 (1 = straight line, lands exact); the slider
@@ -381,8 +362,9 @@ void CoworkPanel::savePointerBounds()
 
 void CoworkPanel::refreshStatus()
 {
-    m_core->call(QStringLiteral("cowork.status"), {}, [this](const QJsonObject &res, const QJsonObject &err) {
-        if (!err.isEmpty()) {
+    QPointer<CoworkPanel> self(this);
+    m_core->call(QStringLiteral("cowork.status"), {}, [this, self](const QJsonObject &res, const QJsonObject &err) {
+        if (!self || !err.isEmpty()) {
             return;
         }
         m_available = res.value(QStringLiteral("available")).toBool();
@@ -408,11 +390,27 @@ void CoworkPanel::refreshStatus()
 
 void CoworkPanel::refreshGrants()
 {
-    m_core->call(QStringLiteral("cowork.listGrants"), {}, [this](const QJsonObject &res, const QJsonObject &err) {
-        if (!err.isEmpty()) {
+    QPointer<CoworkPanel> self(this);
+    m_core->call(QStringLiteral("cowork.listGrants"), {}, [this, self](const QJsonObject &res, const QJsonObject &err) {
+        if (!self || !err.isEmpty()) {
             return;
         }
-        m_grants->clear();
+        // Clear existing grant rows (everything before the trailing stretch), but
+        // keep the empty-state label and the stretch.
+        while (m_grantsLayout->count() > 0) {
+            QLayoutItem *item = m_grantsLayout->itemAt(0);
+            if (!item) {
+                break;
+            }
+            if (item->widget() == m_grantsEmpty || item->spacerItem()) {
+                break; // the empty label + stretch sit last; stop when we reach them
+            }
+            m_grantsLayout->takeAt(0);
+            delete item->widget();
+            delete item;
+        }
+
+        int shown = 0;
         const QJsonArray grants = res.value(QStringLiteral("grants")).toArray();
         for (const QJsonValue &gv : grants) {
             const QJsonObject g = gv.toObject();
@@ -420,41 +418,86 @@ void CoworkPanel::refreshGrants()
             if (!g.value(QStringLiteral("revokedAt")).toString().isEmpty()) {
                 continue;
             }
-            auto *item = new QTreeWidgetItem(m_grants);
-            item->setText(0, g.value(QStringLiteral("threadId")).toString());
-            item->setText(1, g.value(QStringLiteral("capability")).toString());
-            item->setText(2, targetSummary(g.value(QStringLiteral("target")).toObject()));
-            item->setText(3, expiryText(g));
-            item->setData(0, Qt::UserRole, g.value(QStringLiteral("id")).toString());
-            if (g.value(QStringLiteral("tier")).toString() == QLatin1String("R2")) {
-                item->setIcon(1, QIcon::fromTheme(QStringLiteral("dialog-warning")));
+            const QString id = g.value(QStringLiteral("id")).toString();
+            const QString threadId = g.value(QStringLiteral("threadId")).toString();
+            const QString cap = g.value(QStringLiteral("capability")).toString();
+            const QString target = targetSummary(g.value(QStringLiteral("target")).toObject());
+            const QString until = expiryText(g);
+            const bool r2 = g.value(QStringLiteral("tier")).toString() == QLatin1String("R2");
+
+            auto *row = new QWidget;
+            auto *rowLay = new QHBoxLayout(row);
+            rowLay->setContentsMargins(0, 0, 0, 0);
+            rowLay->setSpacing(6);
+
+            if (r2) {
+                auto *warn = new QLabel(row);
+                warn->setPixmap(QIcon::fromTheme(QStringLiteral("dialog-warning")).pixmap(16, 16));
+                warn->setToolTip(i18n("High-risk: this agent can act as you."));
+                rowLay->addWidget(warn, 0, Qt::AlignTop);
             }
+
+            // The sentence, bold-highlighting the agent, action, target and expiry.
+            auto *sentence = new QLabel(row);
+            sentence->setWordWrap(true);
+            sentence->setTextFormat(Qt::RichText);
+            sentence->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+            sentence->setText(i18n("<b>%1</b> can <i>%2</i> on <i>%3</i> until <b>%4</b>.",
+                                   threadId.toHtmlEscaped(), capVerb(cap).toHtmlEscaped(),
+                                   target.toHtmlEscaped(), until.toHtmlEscaped()));
+            rowLay->addWidget(sentence, 1);
+
+            auto *revoke = new QToolButton(row);
+            revoke->setText(i18n("Revoke"));
+            revoke->setIcon(QIcon::fromTheme(QStringLiteral("edit-delete")));
+            revoke->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+            revoke->setToolTip(i18n("Immediately remove this access"));
+            connect(revoke, &QToolButton::clicked, this, [this, id] { revokeGrant(id); });
+            rowLay->addWidget(revoke, 0, Qt::AlignTop);
+
+            // Insert above the empty-label + stretch (they always sit last).
+            m_grantsLayout->insertWidget(shown, row);
+            ++shown;
         }
-        m_revokeBtn->setEnabled(m_grants->topLevelItemCount() > 0);
+        m_grantsEmpty->setVisible(shown == 0);
     }, this);
+}
+
+void CoworkPanel::renderAudit()
+{
+    if (!m_audit) {
+        return;
+    }
+    const QString filter = m_auditFilter ? m_auditFilter->currentData().toString() : QString();
+    QStringList lines;
+    for (const QJsonValue &ev : std::as_const(m_auditEntries)) {
+        const QJsonObject e = ev.toObject();
+        if (!filter.isEmpty()
+            && !filter.split(QLatin1Char(',')).contains(e.value(QStringLiteral("kind")).toString())) {
+            continue;
+        }
+        const QDateTime at = QDateTime::fromString(e.value(QStringLiteral("at")).toString(), Qt::ISODateWithMs);
+        const QString ts = at.isValid() ? at.toLocalTime().toString(QStringLiteral("HH:mm:ss")) : QString();
+        lines << QStringLiteral("%1  %2  %3  %4  %5")
+                     .arg(ts,
+                          e.value(QStringLiteral("kind")).toString(),
+                          e.value(QStringLiteral("capability")).toString(),
+                          e.value(QStringLiteral("threadId")).toString(),
+                          e.value(QStringLiteral("detail")).toString());
+    }
+    m_audit->setPlainText(lines.join(QLatin1Char('\n')));
 }
 
 void CoworkPanel::refreshAudit()
 {
+    QPointer<CoworkPanel> self(this);
     QJsonObject p{{QStringLiteral("limit"), 100}};
-    m_core->call(QStringLiteral("cowork.listAudit"), p, [this](const QJsonObject &res, const QJsonObject &err) {
-        if (!err.isEmpty()) {
+    m_core->call(QStringLiteral("cowork.listAudit"), p, [this, self](const QJsonObject &res, const QJsonObject &err) {
+        if (!self || !err.isEmpty()) {
             return;
         }
-        QStringList lines;
-        const QJsonArray entries = res.value(QStringLiteral("entries")).toArray();
-        for (const QJsonValue &ev : entries) {
-            const QJsonObject e = ev.toObject();
-            const QDateTime at = QDateTime::fromString(e.value(QStringLiteral("at")).toString(), Qt::ISODateWithMs);
-            const QString ts = at.isValid() ? at.toLocalTime().toString(QStringLiteral("HH:mm:ss")) : QString();
-            lines << QStringLiteral("%1  %2  %3  %4  %5")
-                         .arg(ts,
-                              e.value(QStringLiteral("kind")).toString(),
-                              e.value(QStringLiteral("capability")).toString(),
-                              e.value(QStringLiteral("threadId")).toString(),
-                              e.value(QStringLiteral("detail")).toString());
-        }
-        m_audit->setPlainText(lines.join(QLatin1Char('\n')));
+        m_auditEntries = res.value(QStringLiteral("entries")).toArray();
+        renderAudit(); // no-op when the log dialog isn't open (m_audit == nullptr)
     }, this);
 }
 
@@ -490,13 +533,8 @@ void CoworkPanel::handleGrantRequested(const QJsonObject &params)
     m_core->call(QStringLiteral("cowork.respondGrant"), resp, nullptr, this);
 }
 
-void CoworkPanel::revokeSelected()
+void CoworkPanel::revokeGrant(const QString &id)
 {
-    auto *item = m_grants->currentItem();
-    if (!item) {
-        return;
-    }
-    const QString id = item->data(0, Qt::UserRole).toString();
     if (id.isEmpty()) {
         return;
     }
@@ -527,17 +565,202 @@ void CoworkPanel::enableForActiveThread()
     if (m_activeThread.isEmpty()) {
         return;
     }
+    QPointer<CoworkPanel> self(this);
     QJsonObject p{{QStringLiteral("threadId"), m_activeThread}, {QStringLiteral("enabled"), true}};
-    m_core->call(QStringLiteral("cowork.setEnabled"), p, [this](const QJsonObject &, const QJsonObject &err) {
-        if (err.isEmpty()) {
-            m_status->setMessageType(KMessageWidget::Positive);
-            m_status->setText(i18n("Cowork enabled for this agent. Restart or resume it to load the desktop tools."));
+    m_core->call(QStringLiteral("cowork.setEnabled"), p, [this, self](const QJsonObject &, const QJsonObject &err) {
+        if (!self || !err.isEmpty()) {
+            return;
         }
+        m_status->setMessageType(KMessageWidget::Positive);
+        m_status->setText(i18n("Cowork enabled for this agent. Restart or resume it to load the desktop tools."));
     }, this);
+}
+
+// ---------------------------------------------------------------------------
+// Advanced dialogs
+// ---------------------------------------------------------------------------
+
+void CoworkPanel::showActivityLog()
+{
+    QDialog dlg(this);
+    dlg.setWindowTitle(i18n("Cowork — activity log"));
+    dlg.resize(560, 420);
+    auto *v = new QVBoxLayout(&dlg);
+
+    auto *filterRow = new QHBoxLayout;
+    filterRow->addWidget(new QLabel(i18n("Show:"), &dlg));
+    m_auditFilter = new QComboBox(&dlg);
+    m_auditFilter->addItem(i18n("Everything"), QString());
+    m_auditFilter->addItem(i18n("Granted"), QStringLiteral("grant"));
+    m_auditFilter->addItem(i18n("Denied"), QStringLiteral("deny"));
+    m_auditFilter->addItem(i18n("Revoked"), QStringLiteral("revoke"));
+    m_auditFilter->addItem(i18n("Used"), QStringLiteral("action"));
+    m_auditFilter->addItem(i18n("Kill switch"), QStringLiteral("kill,rearm"));
+    connect(m_auditFilter, &QComboBox::currentIndexChanged, this, [this] { renderAudit(); });
+    filterRow->addWidget(m_auditFilter, 1);
+    v->addLayout(filterRow);
+
+    m_audit = new QPlainTextEdit(&dlg);
+    m_audit->setReadOnly(true);
+    m_audit->setMaximumBlockCount(2000);
+    v->addWidget(m_audit, 1);
+
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close, &dlg);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    v->addWidget(buttons);
+
+    refreshAudit();  // repopulate m_auditEntries and render
+    renderAudit();
+    dlg.exec();
+
+    // The view lives only for the dialog's lifetime.
+    m_audit = nullptr;
+    m_auditFilter = nullptr;
+}
+
+void CoworkPanel::showPointerSettings()
+{
+    // Pointer motion defaults: sane USER-set bounds the core clamps every agent
+    // pointer move to. The agent may still ask for slower/less-exact motion within
+    // these limits, but never faster or jerkier. Saved in KConfig (group "Cowork").
+    QDialog dlg(this);
+    dlg.setWindowTitle(i18n("Cowork — pointer settings"));
+    auto *v = new QVBoxLayout(&dlg);
+
+    auto *hint = new QLabel(i18n("Limits every agent's mouse movement. Agents can go slower or "
+                                 "less exact, but never faster or jerkier than this."),
+                            &dlg);
+    hint->setWordWrap(true);
+    v->addWidget(hint);
+
+    const KConfigGroup cfg = KSharedConfig::openConfig()->group(QStringLiteral("Cowork"));
+    const int savedSpeed = cfg.readEntry("PointerSpeed", 1600);
+    const int savedAccuracy = cfg.readEntry("PointerAccuracy", 100);
+    const int savedSettle = cfg.readEntry("PointerSettleMs", 30);
+
+    auto *speedRow = new QHBoxLayout;
+    speedRow->addWidget(new QLabel(i18n("Speed:"), &dlg));
+    m_pointerSpeed = new QComboBox(&dlg);
+    m_pointerSpeed->setToolTip(i18n("How fast the agent's pointer travels. 'Instant' "
+                                    "teleports straight to the target with no visible motion."));
+    m_pointerSpeed->addItem(i18n("Instant"), 0);     // teleport, no animation
+    m_pointerSpeed->addItem(i18n("Fast"), 3000);
+    m_pointerSpeed->addItem(i18n("Normal"), 1600);   // default
+    m_pointerSpeed->addItem(i18n("Slow"), 800);
+    {
+        const int idx = m_pointerSpeed->findData(savedSpeed);
+        m_pointerSpeed->setCurrentIndex(idx >= 0 ? idx : m_pointerSpeed->findData(1600));
+    }
+    speedRow->addWidget(m_pointerSpeed, 1);
+    v->addLayout(speedRow);
+
+    m_pointerAccuracyLabel = new QLabel(i18n("Accuracy: %1%", savedAccuracy), &dlg);
+    m_pointerAccuracy = new QSlider(Qt::Horizontal, &dlg);
+    m_pointerAccuracy->setRange(0, 100);
+    m_pointerAccuracy->setValue(savedAccuracy);
+    m_pointerAccuracy->setToolTip(i18n("100% = straight, exact, robotic motion. Lower adds a "
+                                       "more human-like path (easing, overshoot, jitter) — but "
+                                       "the click always lands exactly on the target."));
+    v->addWidget(m_pointerAccuracyLabel);
+    v->addWidget(m_pointerAccuracy);
+
+    auto *settleRow = new QHBoxLayout;
+    auto *settleLabel = new QLabel(i18n("Settle before click (ms)"), &dlg);
+    settleLabel->setWordWrap(true);
+    m_pointerSettle = new QSpinBox(&dlg);
+    m_pointerSettle->setRange(0, 500);
+    m_pointerSettle->setValue(savedSettle);
+    m_pointerSettle->setToolTip(i18n("Pause after the pointer arrives, before clicking, so the "
+                                     "target has time to react to hover."));
+    settleRow->addWidget(settleLabel, 1);
+    settleRow->addWidget(m_pointerSettle);
+    v->addLayout(settleRow);
+
+    connect(m_pointerSpeed, &QComboBox::currentIndexChanged, this, &CoworkPanel::savePointerBounds);
+    connect(m_pointerAccuracy, &QSlider::valueChanged, this, [this](int val) {
+        m_pointerAccuracyLabel->setText(i18n("Accuracy: %1%", val));
+        savePointerBounds();
+    });
+    connect(m_pointerSettle, &QSpinBox::valueChanged, this, &CoworkPanel::savePointerBounds);
+
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close, &dlg);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    v->addWidget(buttons);
+
+    dlg.exec();
+
+    m_pointerSpeed = nullptr;
+    m_pointerAccuracy = nullptr;
+    m_pointerAccuracyLabel = nullptr;
+    m_pointerSettle = nullptr;
+}
+
+void CoworkPanel::showBrowserTools()
+{
+    QDialog dlg(this);
+    dlg.setWindowTitle(i18n("Cowork — browser tools"));
+    auto *v = new QVBoxLayout(&dlg);
+
+    // Browser launcher. Browsers hide their web content from the accessibility tree
+    // unless started with the right flag/env, so agents can't read or click page
+    // elements. This opens one with accessibility forced on.
+    auto *info = new QLabel(i18n("Browsers hide their page content from agents unless started "
+                                 "with accessibility enabled. Launch one from here so agents can "
+                                 "read and click page elements — fully quit the browser first if "
+                                 "it is already running."),
+                            &dlg);
+    info->setWordWrap(true);
+    v->addWidget(info);
+
+    auto *browserRow = new QHBoxLayout;
+    browserRow->addWidget(new QLabel(i18n("Open a browser agents can read:"), &dlg), 1);
+    m_browserBtn = new QToolButton(&dlg);
+    m_browserBtn->setText(i18n("Launch browser"));
+    m_browserBtn->setIcon(QIcon::fromTheme(QStringLiteral("internet-web-browser")));
+    m_browserBtn->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    m_browserBtn->setPopupMode(QToolButton::InstantPopup);
+    m_browserMenu = new QMenu(m_browserBtn);
+    m_browserBtn->setMenu(m_browserMenu);
+    connect(m_browserMenu, &QMenu::aboutToShow, this, &CoworkPanel::rebuildBrowserMenu);
+    browserRow->addWidget(m_browserBtn);
+    v->addLayout(browserRow);
+
+    // Which browser an agent opens when it calls desktop_open_browser itself.
+    auto *prefRow = new QHBoxLayout;
+    prefRow->addWidget(new QLabel(i18n("Agent's default browser:"), &dlg));
+    m_agentBrowserCombo = new QComboBox(&dlg);
+    m_agentBrowserCombo->setToolTip(i18n(
+        "When an agent opens a browser on its own, it uses this one. The agent can "
+        "only open browsers listed here — never an arbitrary program."));
+    connect(m_agentBrowserCombo, &QComboBox::currentIndexChanged, this, [this] {
+        const QString cmd = m_agentBrowserCombo->currentData().toString();
+        if (!cmd.isEmpty()) {
+            BrowserLaunch::setPreferred(cmd);
+        }
+    });
+    prefRow->addWidget(m_agentBrowserCombo, 1);
+    v->addLayout(prefRow);
+    refreshBrowserPrefCombo();
+
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close, &dlg);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    v->addWidget(buttons);
+
+    dlg.exec();
+
+    m_browserBtn = nullptr;
+    m_browserMenu = nullptr;
+    m_agentBrowserCombo = nullptr;
 }
 
 void CoworkPanel::rebuildBrowserMenu()
 {
+    if (!m_browserMenu) {
+        return;
+    }
     m_browserMenu->clear();
     const QList<BrowserLaunch::Browser> browsers = BrowserLaunch::all();
     for (const BrowserLaunch::Browser &b : browsers) {

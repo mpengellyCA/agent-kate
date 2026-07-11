@@ -75,6 +75,7 @@ add_executable(agentkate
     src/shell/ElidingLabel.cpp
     src/shell/ChipPainter.cpp
     src/cowork/CoworkPanel.cpp
+    src/cowork/CapabilityTile.cpp
     src/cowork/CoworkPortal.cpp
     src/cowork/ConsentDialog.cpp
     src/cowork/ControlConsentDialog.cpp
