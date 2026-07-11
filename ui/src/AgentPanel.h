@@ -121,6 +121,9 @@ Q_SIGNALS:
     // (a permission prompt). The roster paints this as a card marker.
     void attentionChanged(bool attention);
     void openDiff(const QString &title, const QString &diffText);
+    // Emitted after a "Stop & close" archives this agent on the core — asks the
+    // dock to remove this panel and its roster entry (the terminal close path).
+    void closeRequested();
 
 protected:
     bool eventFilter(QObject *obj, QEvent *event) override;

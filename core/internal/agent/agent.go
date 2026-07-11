@@ -142,7 +142,8 @@ type Thread struct {
 	usage       *usageMeter // measures per-turn LLM token usage and billed cost
 	alive       bool
 	pgid        int         // process-group id (== leader pid); signalled by Interrupt
-	interrupted bool        // set by Interrupt so reap() reports a user-interrupt
+	interrupted bool        // set by Interrupt so reap() reports a user-interrupt if the process dies
+	aborting    bool        // set by Interrupt while an in-band abort is pending; cleared on the aborted turn's result
 	hotCompact  *hotCompact // when non-nil, the next assistant turn is captured for a summary
 
 	co *coalescer // batches this thread's events before they reach the emit callback
@@ -456,20 +457,24 @@ func (s *Supervisor) Stop(threadID string) error {
 	return nil
 }
 
-// Interrupt halts a thread's in-flight turn *immediately* and leaves the
-// session resumable. Unlike Stop — the graceful "finish this turn, then quit"
-// path used by StopAll and panel close — this aborts generation mid-response so
-// no further tokens are billed.
+// Interrupt halts a thread's in-flight turn *immediately* while keeping the
+// process resident and the session hot. Unlike Stop — the graceful "finish this
+// turn, then quit" path used by StopAll and panel close — this aborts generation
+// mid-response so no further tokens are billed, then leaves the CLI running so the
+// next Send goes down the same stdin with no resume cost.
 //
-// Primary path is in-band: it writes Claude Code's stream-json interrupt
-// control_request, then closes stdin so the aborted process exits cleanly.
-// A spike against claude 2.1.172 (see docs/plans/04-stop-agent.md) confirmed the
-// CLI acks the frame and stops generating within ~1ms, then exits ~180ms after
-// stdin close with no signal needed; the persisted session resumes via --resume.
+// Primary path is in-band and does NOT close stdin: it writes Claude Code's
+// stream-json interrupt control_request. A spike against claude 2.1.185 confirmed
+// the CLI acks the frame (control_response) within ~100ms, emits a `result` for
+// the aborted turn, stays resident, and answers a subsequent user message from the
+// same session with full context. pumpStdout watches for that result and emits a
+// `turn_aborted` lifecycle event (process alive) so the UI resets to idle.
 //
-// Signals are the reliable fallback: if the process is still alive after a short
-// grace, we SIGINT the whole process group (claude + spawned tools), escalating
-// to SIGKILL. reap() reports this as a user-interrupt, not a crash.
+// Signals are the fallback for a hung tool (e.g. a `sleep 600` bash call the CLI
+// can't cancel in-band): if no result lands within a short grace, we SIGINT the
+// whole process group (claude + spawned tools), escalating to SIGKILL. That kills
+// the process, so reap() reports a user-interrupt and the thread goes dormant;
+// the UI's auto-resume-on-send then brings it back with context.
 func (s *Supervisor) Interrupt(threadID string) error {
 	t := s.thread(threadID)
 	if t == nil {
@@ -489,25 +494,34 @@ func (s *Supervisor) Interrupt(threadID string) error {
 		t.mu.Unlock()
 		return nil
 	}
-	t.interrupted = true
+	// Mark the abort pending but do NOT set t.interrupted yet: that flag makes
+	// reap() report a user-interrupt, and we only want that if the escalation
+	// backstop has to kill the process. A clean in-band abort keeps the process
+	// alive, so reap() never runs for it.
+	t.aborting = true
 	pgid := t.pgid
 	proc := t.cmd.Process
-	// In-band abort, then EOF to let the now-idle process exit cleanly.
+	// In-band abort. stdin stays OPEN so the process stays resident for the next
+	// message.
 	_, werr := t.stdin.Write(append(frame, '\n'))
-	_ = t.stdin.Close()
 	t.mu.Unlock()
 	if werr != nil {
 		s.log.Warn("interrupt frame write failed; relying on signal backstop",
 			"thread", threadID, "err", werr)
 	}
 
-	// Signal backstop: escalate only if the in-band abort + EOF didn't land.
-	// Much shorter than Stop's 5s grace because the intent here is immediate.
+	// Signal backstop: escalate only if the in-band abort never produced a
+	// result (a hung tool the CLI can't cancel). If the abort landed cleanly,
+	// pumpStdout has already cleared t.aborting, so we do nothing.
 	safe.Go("agent.interruptBackstop", func() {
-		time.Sleep(2 * time.Second)
-		if !s.Running(threadID) {
-			return
+		time.Sleep(3 * time.Second)
+		if !s.abortPending(threadID) {
+			return // clean in-band abort — process stays alive
 		}
+		s.log.Info("interrupt not acked in-band; escalating to signals", "thread", threadID)
+		t.mu.Lock()
+		t.interrupted = true // reap() will report a user-interrupt now
+		t.mu.Unlock()
 		if pgid > 0 {
 			_ = syscall.Kill(-pgid, syscall.SIGINT)
 		}
@@ -522,6 +536,18 @@ func (s *Supervisor) Interrupt(threadID string) error {
 		}
 	})
 	return nil
+}
+
+// abortPending reports whether a thread still has an unacknowledged in-band
+// abort in flight (the escalation backstop's trigger condition).
+func (s *Supervisor) abortPending(threadID string) bool {
+	t := s.thread(threadID)
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.alive && t.aborting
 }
 
 // StopAll terminates every running thread (used at core shutdown) and blocks
@@ -566,6 +592,11 @@ func (s *Supervisor) pumpStdout(t *Thread, r io.Reader) {
 		t.usage.Observe(raw)
 		boundary, dedup := classifyEvent(raw)
 		t.co.add(json.RawMessage(raw), boundary, dedup)
+		// A `result` while an in-band abort is pending completes the interrupt:
+		// the process stays resident, so emit `turn_aborted` (not a reap) to let
+		// the UI reset to idle and keep accepting messages on the same stdin. Do
+		// this AFTER the result event itself is buffered so ordering is preserved.
+		s.observeAbort(t, raw)
 	}
 	// Drain whatever is still buffered when the stream ends so a trailing
 	// partial batch is never stranded behind its timer.
@@ -640,6 +671,35 @@ func observeHotCompact(t *Thread, raw json.RawMessage) {
 	case "result":
 		hc.finish(nil)
 	}
+}
+
+// observeAbort completes a pending in-band interrupt when the aborted turn's
+// `result` event arrives. The process stays alive, so instead of a reap we emit
+// a `turn_aborted` lifecycle event: the UI resets to idle and the next Send goes
+// down the same stdin with no resume cost. A no-op unless an abort is pending.
+func (s *Supervisor) observeAbort(t *Thread, raw json.RawMessage) {
+	t.mu.Lock()
+	if !t.aborting {
+		t.mu.Unlock()
+		return
+	}
+	t.mu.Unlock()
+	var head struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(raw, &head) != nil || head.Type != "result" {
+		return
+	}
+	t.mu.Lock()
+	// Re-check under the lock in case the backstop fired between the two loads.
+	if !t.aborting {
+		t.mu.Unlock()
+		return
+	}
+	t.aborting = false
+	t.mu.Unlock()
+	s.log.Info("agent turn aborted in-band; process stays resident", "thread", t.ID)
+	s.emitLifecycle(t, "turn_aborted", "interrupted — session kept, ready for your next message")
 }
 
 // Compact sends a one-shot summarisation prompt to a live thread and waits

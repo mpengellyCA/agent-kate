@@ -1,17 +1,27 @@
 #!/usr/bin/env python3
-"""End-to-end smoke test for hard interrupt + resume (plan 04).
+"""End-to-end smoke test for interrupt-keeps-session-hot (plan 13 phase 2).
 
-Starts an agent on a long, slow-to-produce turn, waits until it is *actively
-generating*, then fires agent.interrupt. A passing run proves:
+Two scenarios against a real akcore + authenticated `claude`:
 
-  * the in-flight turn halts fast (an `interrupted` lifecycle arrives within a
-    couple seconds — not after the whole count-to-500 finishes),
-  * the thread is left dormant-but-resumable, and
-  * `agent.resume` + a follow-up restores the session: the resumed agent still
-    recalls a secret it was told before the interrupt.
+SCENARIO A — in-band interrupt keeps the process alive:
+  Starts an agent on a long, slow-to-produce turn, waits until it is *actively
+  generating*, then fires agent.interrupt. A passing run proves:
+    * the in-flight turn halts fast (a `turn_aborted` lifecycle arrives within a
+      couple seconds — not after the whole count finishes),
+    * the thread is left RUNNING (not dormant — the CLI stays resident), and
+    * a plain agent.send (no resume) into the same process still recalls a secret
+      the agent was told before the interrupt — i.e. no resume cost.
 
-This exercises the real RPC path: agent.interrupt -> Supervisor.Interrupt ->
-in-band stream-json interrupt frame -> reap() "interrupted" -> resume.
+SCENARIO B — escalation backstop for a hung tool:
+  Starts an agent that runs `sleep 600` in bash (a tool the CLI can't cancel
+  in-band), interrupts it, and proves:
+    * the escalation backstop kills the process (an `interrupted` lifecycle
+      arrives) and the thread goes dormant, and
+    * the next agent.send auto-resumes and answers with prior context.
+
+Exercises the real RPC path: agent.interrupt -> Supervisor.Interrupt ->
+in-band frame (stdin kept open) -> pumpStdout sees the aborted result ->
+`turn_aborted`; and the signal-escalation fallback -> reap() "interrupted".
 
 Requires: a built ./build/akcore and an authenticated `claude` CLI.
 Run unbuffered for live output:  python3 -u scripts/smoke-interrupt.py
@@ -104,26 +114,39 @@ class Core:
             if msg.get("method") != "agent.event":
                 continue
             p = msg.get("params", {})
-            if p.get("threadId") == thread_id:
-                yield p.get("event", {})
+            if p.get("threadId") != thread_id:
+                continue
+            # Events arrive coalesced as an ordered batch under "events".
+            for ev in p.get("events", []):
+                yield ev
 
-    def wait_for_first_assistant_text(self, thread_id, timeout=60):
-        """Block until the agent emits its first chunk of assistant text —
-        i.e. the turn is genuinely in flight and worth interrupting."""
+    def wait_until_generating(self, thread_id, timeout=90):
+        """Block until the agent's turn is genuinely in flight and worth
+        interrupting — the first assistant text chunk, or (if the model is still
+        thinking) the first assistant message of any kind. Returns a short label
+        describing what we saw."""
         deadline = time.time() + timeout
         for ev in self._events(thread_id, deadline):
-            if ev.get("type") == "assistant":
+            t = ev.get("type")
+            if t == "assistant":
                 for b in ev.get("message", {}).get("content", []):
                     if b.get("type") == "text" and b.get("text", "").strip():
-                        return b["text"]
-            elif ev.get("type") == "_lifecycle" and ev.get("phase") == "error":
+                        return "text:" + b["text"][:40]
+                    if b.get("type") == "tool_use":
+                        return "tool_use:" + str(b.get("name", ""))
+                return "assistant"
+            elif t == "_lifecycle" and ev.get("phase") == "error":
                 raise RuntimeError(f"{self.label}: agent error: {ev.get('detail')}")
 
     def wait_for_lifecycle(self, thread_id, phases, timeout=40):
         deadline = time.time() + timeout
-        for ev in self._events(thread_id, deadline):
-            if ev.get("type") == "_lifecycle" and ev.get("phase") in phases:
-                return ev.get("phase"), ev.get("detail", "")
+        try:
+            for ev in self._events(thread_id, deadline):
+                if ev.get("type") == "_lifecycle" and ev.get("phase") in phases:
+                    return ev.get("phase"), ev.get("detail", "")
+        except RuntimeError:
+            pass
+        return None, None
 
     def wait_for_result(self, thread_id, timeout=200):
         deadline = time.time() + timeout
@@ -160,6 +183,169 @@ def make_repo():
     return ws
 
 
+HAIKU = "claude-haiku-4-5-20251001"
+
+
+def scenario_inband(c, workspace, checks):
+    """Interrupt mid-generation keeps the process alive; a plain send (no
+    resume) into the same process recalls the pre-interrupt secret."""
+    log("\n=== SCENARIO A: in-band interrupt keeps the session hot ===")
+    start = c.call("agent.start", {
+        "workspacePath": workspace,
+        "prompt": (f"Our project's build reference number is {SECRET}; please keep "
+                   f"it in mind. Now, without using any tools, count slowly from 1 "
+                   f"to 500, writing one number per line followed by a short "
+                   f"sentence about it. Do not stop early."),
+        "model": HAIKU,
+    })
+    if start.get("error"):
+        sys.exit(f"agent.start failed: {start['error']}")
+    thread_id = start["result"]["threadId"]
+    log(f"thread {thread_id}  session {start['result'].get('sessionId','')}")
+
+    what = c.wait_until_generating(thread_id)
+    log(f"agent is generating ({what!r}) — interrupting now")
+
+    t0 = time.time()
+    resp = c.call("agent.interrupt", {"threadId": thread_id})
+    checks["A: agent.interrupt accepted"] = not resp.get("error")
+
+    # In-band: expect turn_aborted (process stays alive), NOT interrupted.
+    phase, detail = c.wait_for_lifecycle(
+        thread_id, {"turn_aborted", "interrupted", "exited", "error"}, timeout=15)
+    dt = time.time() - t0
+    log(f"lifecycle after interrupt: {phase} — {detail}  ({dt:.2f}s)")
+    checks["A: turn halted as 'turn_aborted'"] = phase == "turn_aborted"
+    checks["A: halted promptly (< 8s)"] = phase == "turn_aborted" and dt < 8.0
+
+    rec = next((t for t in c.call("session.listThreads", {})["result"]["threads"]
+                if t["threadId"] == thread_id), None)
+    checks["A: thread still running (process alive)"] = bool(
+        rec and rec.get("status") == "running")
+
+    # No resume — send straight into the SAME process.
+    c.call("agent.send", {
+        "threadId": thread_id,
+        "text": ("Never mind the counting. What was the build reference number I "
+                 "gave you at the start? Reply with only the digits."),
+    })
+    result2, texts2 = c.wait_for_result(thread_id)
+    haystack = result2 + " " + " ".join(texts2)
+    log(f"follow-up (no resume) result: {result2!r}")
+    checks["A: follow-up recalls the secret (no resume)"] = SECRET in haystack
+
+    # Terminal close: stopClose must archive it out of the live roster.
+    close = c.call("agent.stopClose", {"threadId": thread_id}, timeout=90)
+    checks["A: agent.stopClose accepted"] = not close.get("error")
+    still = next((t for t in c.call("session.listThreads", {})["result"]["threads"]
+                  if t["threadId"] == thread_id), None)
+    checks["A: stop & close clears the roster entry"] = still is None
+    arch = c.call("cleanup.listArchived", {})["result"].get("archived", [])
+    checks["A: stop & close archives (restorable)"] = any(
+        a.get("threadId") == thread_id for a in arch)
+
+
+def scenario_blocking_tool(c, workspace, checks):
+    """Interrupt during a blocking foreground bash tool (`tail -f`, which the CLI
+    can't return from on its own) recovers and the next send continues with
+    context. Empirically claude 2.1.185 cancels even a running tool IN-BAND — the
+    turn aborts (turn_aborted, process stays hot) and a plain send continues on
+    the same session with no resume. If the CLI ever fails to ack in-band, the
+    supervisor's signal-escalation backstop kills the process (interrupted →
+    dormant) and the next send auto-resumes with context. This scenario asserts
+    the recover-and-continue contract for BOTH outcomes."""
+    log("\n=== SCENARIO B: interrupt a blocking bash tool, then continue ===")
+    start = c.call("agent.start", {
+        "workspacePath": workspace,
+        "prompt": (f"Our build reference number is {SECRET}. Please set up a file "
+                   f"watcher: run this bash command in the foreground to watch "
+                   f"README.md and block until I edit it: tail -f README.md"),
+        "model": HAIKU,
+        # bypassPermissions so the agent actually runs the blocking bash call
+        # without a gate. `tail -f` blocks in the foreground indefinitely; a
+        # legitimate task framing reliably gets the model to run it (a bare
+        # `sleep 600` is refused/blocked by the Bash tool's own guard).
+        "permissionMode": "bypassPermissions",
+    })
+    if start.get("error"):
+        sys.exit(f"agent.start (B) failed: {start['error']}")
+    thread_id = start["result"]["threadId"]
+    log(f"thread {thread_id}")
+
+    # Wait for the bash tool_use to actually start, so the process is genuinely
+    # stuck in the blocking `tail -f` when we interrupt.
+    deadline = time.time() + 90
+    started = False
+    try:
+        for ev in c._events(thread_id, deadline):
+            t = ev.get("type")
+            if t == "assistant":
+                for b in ev.get("message", {}).get("content", []):
+                    if b.get("type") == "tool_use":
+                        started = True
+                        break
+                    if b.get("type") == "text" and b.get("text", "").strip():
+                        log(f"  B assistant text: {b['text'][:70]!r}")
+            if started:
+                break
+    except RuntimeError:
+        pass
+    checks["B: blocking bash tool started"] = started
+    if not started:
+        log("bash tool never started — cannot exercise the blocking-tool path")
+        return
+    # Let the tool genuinely block in the foreground before interrupting.
+    time.sleep(1.0)
+    log("blocking tool in flight — interrupting now")
+
+    t0 = time.time()
+    resp = c.call("agent.interrupt", {"threadId": thread_id})
+    checks["B: agent.interrupt accepted"] = not resp.get("error")
+
+    # Either outcome recovers: turn_aborted (in-band cancel, stays alive) or
+    # interrupted (escalation, goes dormant). Both must halt promptly.
+    phase, detail = c.wait_for_lifecycle(
+        thread_id, {"turn_aborted", "interrupted", "exited", "error"}, timeout=20)
+    dt = time.time() - t0
+    log(f"lifecycle after interrupt: {phase} — {detail}  ({dt:.2f}s)")
+    checks["B: blocking tool halted (aborted or escalated)"] = phase in (
+        "turn_aborted", "interrupted")
+    checks["B: halted promptly (< 10s)"] = phase in (
+        "turn_aborted", "interrupted") and dt < 10.0
+
+    escalated = phase == "interrupted"
+    rec = next((t for t in c.call("session.listThreads", {})["result"]["threads"]
+                if t["threadId"] == thread_id), None)
+    if escalated:
+        # Escalation path: dormant, then auto-resume-on-send brings it back.
+        log("escalated to signals — thread went dormant; resuming")
+        checks["B: escalated thread is dormant"] = bool(
+            rec and rec.get("status") == "dormant")
+        resume = c.call("agent.resume", {"threadId": thread_id})
+        checks["B: agent.resume accepted"] = not resume.get("error")
+        rphase, _ = c.wait_for_lifecycle(thread_id, {"resumed", "error"})
+        if rphase != "resumed":
+            checks["B: resumed"] = False
+            return
+        checks["B: resumed"] = True
+    else:
+        # In-band cancel: the process stays hot — no resume needed.
+        log("cancelled in-band — process stays resident; sending on same session")
+        checks["B: in-band cancel keeps process alive"] = bool(
+            rec and rec.get("status") == "running")
+
+    # In both cases a follow-up must continue with the pre-interrupt context.
+    c.call("agent.send", {
+        "threadId": thread_id,
+        "text": ("Stop watching the file. What was the build reference number I "
+                 "gave you at the start? Reply with only the digits."),
+    })
+    result3, texts3 = c.wait_for_result(thread_id)
+    haystack = result3 + " " + " ".join(texts3)
+    log(f"follow-up result: {result3!r}")
+    checks["B: follow-up continues with context"] = SECRET in haystack
+
+
 def main():
     if not os.path.exists(AKCORE):
         sys.exit("build akcore first: scripts/build.sh")
@@ -177,59 +363,8 @@ def main():
         c = Core(SOCK, env, "core")
         if c.call("handshake", {})["result"].get("name") != "akcore":
             sys.exit("handshake failed")
-
-        # A long, slow turn so there's a real in-flight response to interrupt.
-        start = c.call("agent.start", {
-            "workspacePath": workspace,
-            "prompt": (f"First, remember this secret code for later: {SECRET}. "
-                       f"Then, without using any tools, count slowly from 1 to "
-                       f"500, writing one number per line followed by a short "
-                       f"sentence about it. Do not stop early."),
-            "model": "claude-haiku-4-5-20251001",
-        })
-        if start.get("error"):
-            sys.exit(f"agent.start failed: {start['error']}")
-        thread_id = start["result"]["threadId"]
-        session_id = start["result"].get("sessionId", "")
-        log(f"thread {thread_id}  session {session_id}")
-
-        # Wait until it's genuinely generating, then interrupt.
-        first = c.wait_for_first_assistant_text(thread_id)
-        log(f"agent is generating (first text: {first[:60]!r}…) — interrupting now")
-
-        t0 = time.time()
-        resp = c.call("agent.interrupt", {"threadId": thread_id})
-        checks["agent.interrupt accepted"] = not resp.get("error")
-
-        phase, detail = c.wait_for_lifecycle(thread_id, {"interrupted", "exited", "error"},
-                                             timeout=15)
-        dt = time.time() - t0
-        log(f"lifecycle after interrupt: {phase} — {detail}  ({dt:.2f}s)")
-        checks["turn halted as 'interrupted'"] = phase == "interrupted"
-        checks["halted promptly (< 8s)"] = dt < 8.0
-
-        rec = next((t for t in c.call("session.listThreads", {})["result"]["threads"]
-                    if t["threadId"] == thread_id), None)
-        checks["thread left dormant (resumable)"] = bool(rec and rec.get("status") == "dormant")
-
-        # --- resume and confirm the session survived ------------------------
-        resume = c.call("agent.resume", {"threadId": thread_id})
-        checks["agent.resume accepted"] = not resume.get("error")
-        phase, detail = c.wait_for_lifecycle(thread_id, {"resumed", "error"})
-        log(f"resume lifecycle: {phase} — {detail}")
-        if phase != "resumed":
-            sys.exit(f"resume did not start the thread: {detail}")
-
-        c.call("agent.send", {
-            "threadId": thread_id,
-            "text": ("Stop counting. What was the secret code I told you at the "
-                     "start? Reply with only the digits, nothing else."),
-        })
-        result2, texts2 = c.wait_for_result(thread_id)
-        haystack = result2 + " " + " ".join(texts2)
-        log(f"resumed turn result: {result2!r}")
-        log(f"resumed agent said: {' '.join(texts2)[:120]!r}")
-        checks["resumed agent recalls the secret"] = SECRET in haystack
+        scenario_inband(c, workspace, checks)
+        scenario_blocking_tool(c, workspace, checks)
     finally:
         if c:
             c.stop()

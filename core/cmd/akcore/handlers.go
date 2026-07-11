@@ -349,10 +349,50 @@ func registerHandlers(d handlerDeps) {
 		return map[string]any{"ok": true}, nil
 	})
 
-	// agent.interrupt is the hard-stop counterpart to agent.stop: it aborts the
-	// in-flight turn immediately (no further tokens billed) and leaves the
-	// thread dormant-but-resumable. No hot-compaction here — interrupt is meant
-	// to be instantaneous, and spending a summary turn would defeat the purpose.
+	// agent.stopClose is the terminal "Stop & close" action: it runs the
+	// configured hot-compaction (so the conversation is summarised while the KV
+	// cache is warm), stops the process, then ARCHIVES the thread's record —
+	// moving it out of the live roster while keeping it (and its worktree and
+	// transcript) fully recoverable via the Sessions browser. Unlike agent.stop,
+	// which leaves the thread dormant-and-resumable, this clears the roster entry.
+	// The worktree is deliberately NOT removed here (that is cleanup's job), so a
+	// later Restore is lossless.
+	d.srv.Handle("agent.stopClose", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p agentStopParams
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		// Hot-compaction must run against the live session, before termination.
+		runHotCompactIfConfigured(d, p.ThreadID)
+		// Stop the process and wait for it to exit so its cooperation locks and
+		// git watch are torn down by the reap/lifecycle path before we archive.
+		if err := d.sup.Stop(p.ThreadID); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		for i := 0; i < 60 && d.sup.Running(p.ThreadID); i++ {
+			time.Sleep(100 * time.Millisecond)
+		}
+		// Archive the record (reversible). A dormant thread with no live process
+		// still has a record to archive; a thread that was never started has none.
+		if _, ok := d.sessions.Get(p.ThreadID); ok {
+			if err := d.sessions.Archive(p.ThreadID, "stop & close"); err != nil {
+				return nil, ipc.Errorf(ipc.CodeInternalError, "archive failed: "+err.Error())
+			}
+		}
+		// Drop the live-thread bookkeeping; the worktree on disk is left intact.
+		d.gitCache.Forget(p.ThreadID)
+		d.threads.remove(p.ThreadID)
+		d.log.Info("agent stopped & closed (archived)", "thread", p.ThreadID)
+		return map[string]any{"ok": true}, nil
+	})
+
+	// agent.interrupt cancels the in-flight turn immediately (no further tokens
+	// billed) while keeping the process resident and the session hot: the next
+	// agent.send goes down the same stdin with no resume cost. The supervisor
+	// emits a `turn_aborted` lifecycle event once the aborted turn's result lands
+	// (or, for a hung tool the CLI can't cancel in-band, escalates to signals and
+	// the thread goes dormant). No hot-compaction here — interrupt is meant to be
+	// instantaneous, and spending a summary turn would defeat the purpose.
 	d.srv.Handle("agent.interrupt", func(_ context.Context, raw json.RawMessage) (any, error) {
 		var p agentStopParams
 		if err := json.Unmarshal(raw, &p); err != nil {

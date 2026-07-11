@@ -666,6 +666,12 @@ void AgentDock::wireAgentPanel(int agentId, AgentPanel *panel)
             Q_EMIT activeThreadChanged(threadId);
         }
     });
+    // "Stop & close" already archived the thread on the core; here we just drop
+    // the panel and its roster entry. Deferred so we never delete the panel from
+    // inside its own reply callback.
+    connect(panel, &AgentPanel::closeRequested, this, [this, agentId] {
+        QTimer::singleShot(0, this, [this, agentId] { closeAgent(agentId); });
+    });
 }
 
 bool AgentDock::hasThread(const QString &threadId) const

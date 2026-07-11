@@ -62,6 +62,8 @@
 #include <QSignalBlocker>
 #include <QStyleOptionViewItem>
 #include <QMenu>
+#include <QMessageBox>
+#include <QPointer>
 #include <QTextDocument>
 #include <QTimer>
 #include <QToolButton>
@@ -731,19 +733,24 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     m_diffBtn = new QPushButton(
         QIcon::fromTheme(QStringLiteral("vcs-diff")), QStringLiteral("Changes"), this);
     m_diffBtn->setCursor(Qt::PointingHandCursor);
+    // "Stop & close" is the terminal action: it summarises the conversation and
+    // closes the agent (archived — reversible from the Sessions browser). To just
+    // cancel the current response and keep going, use Interrupt instead.
     m_stopBtn = new QPushButton(
-        QIcon::fromTheme(QStringLiteral("process-stop")), QStringLiteral("Stop"), this);
+        QIcon::fromTheme(QStringLiteral("process-stop")),
+        QStringLiteral("Stop && close"), this);
     m_stopBtn->setCursor(Qt::PointingHandCursor);
-    // Interrupt is distinct from Stop: it aborts only the in-flight turn (no
-    // more tokens billed) while keeping the Claude session, so you can type a
-    // new message to redirect the agent. Shown only while a turn is running.
+    // Interrupt is the prominent action while a turn runs: it cancels the
+    // in-flight response now (no more tokens billed) while keeping the session
+    // hot, so you can type a new message straight away to redirect the agent.
+    // Shown only while a turn is running (Esc also fires it — see the composer).
     m_interruptBtn = new QPushButton(
         QIcon::fromTheme(QStringLiteral("media-playback-stop")),
         QStringLiteral("Interrupt"), this);
     m_interruptBtn->setCursor(Qt::PointingHandCursor);
     m_interruptBtn->setToolTip(QStringLiteral(
-        "Interrupt the in-flight response now, keeping the session — then type a "
-        "new message to redirect the agent."));
+        "Cancel the in-flight response now (Esc), keeping the session — then type "
+        "a new message to redirect the agent."));
     m_interruptBtn->hide();
     m_sendBtn = new QPushButton(this);
     m_sendBtn->setIcon(QIcon::fromTheme(QStringLiteral("document-send")));
@@ -830,8 +837,11 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     buttons->addWidget(compactionBtn);
     buttons->addWidget(m_attachBtn);
     buttons->addWidget(m_diffBtn);
-    buttons->addWidget(m_interruptBtn);
+    // "Stop & close" sits with the setup/config group — it's the deliberate,
+    // less-frequent end-this-agent action. Interrupt is the prominent in-flight
+    // control, grouped next to Send.
     buttons->addWidget(m_stopBtn);
+    buttons->addWidget(m_interruptBtn);
     buttons->addWidget(m_sendBtn);
 
     auto *body = new QVBoxLayout;
@@ -1094,6 +1104,13 @@ bool AgentPanel::eventFilter(QObject *obj, QEvent *event)
     }
     if (obj == m_input && event->type() == QEvent::KeyPress) {
         auto *key = static_cast<QKeyEvent *>(event);
+        // Esc while a turn is in flight interrupts it (keeps the session hot) so
+        // you can redirect the agent without reaching for the toolbar button.
+        if (key->key() == Qt::Key_Escape && !m_threadId.isEmpty() && !m_dormant
+            && !m_idle) {
+            onInterruptClicked();
+            return true;
+        }
         if (key->key() == Qt::Key_Return || key->key() == Qt::Key_Enter) {
             const bool ctrl = key->modifiers().testFlag(Qt::ControlModifier);
             const bool shift = key->modifiers().testFlag(Qt::ShiftModifier);
@@ -1369,8 +1386,13 @@ void AgentPanel::refresh()
     m_sendBtn->setText(m_dormant ? QStringLiteral("Resume agent")
                                  : (running ? QStringLiteral("Send")
                                             : QStringLiteral("Start agent")));
-    m_stopBtn->setEnabled(running);
-    m_stopBtn->setToolTip(QStringLiteral("Stop this agent gracefully (resumable)"));
+    // "Stop & close" is terminal: it summarises then archives the agent (out of
+    // the roster, restorable from the Sessions browser). Available whenever a
+    // thread exists — running or dormant.
+    m_stopBtn->setEnabled(!m_threadId.isEmpty());
+    m_stopBtn->setToolTip(QStringLiteral(
+        "Summarize the conversation and close this agent. It moves to the "
+        "Sessions browser, where you can restore it later."));
     // Interrupt only makes sense while a turn is actually in flight — show it
     // then, hide it otherwise so it doesn't read as a second idle Stop.
     if (m_interruptBtn) {
@@ -2184,15 +2206,54 @@ void AgentPanel::rebuildAttachChips()
 
 void AgentPanel::onStopClicked()
 {
-    if (m_threadId.isEmpty() || m_dormant) {
+    if (m_threadId.isEmpty()) {
         return;
     }
-    // Stop is always the graceful end-this-agent path: it runs the configured
-    // Compact-on-Stop/Exit strategy (see agent.stop) and leaves the session
-    // resumable. To abort just the current turn, use Interrupt instead.
-    m_core->call(QStringLiteral("agent.stop"),
-                 QJsonObject{{QStringLiteral("threadId"), m_threadId}},
-                 nullptr, this);
+    // "Stop & close" is terminal: it summarises the conversation, then archives
+    // the agent out of the roster (restorable from the Sessions browser). To
+    // just cancel the current response and keep going, use Interrupt instead.
+    // Confirm only when a turn is actually in flight — the user could lose an
+    // in-progress response; a quiet idle/dormant agent closes without a prompt.
+    const bool turnInFlight = !m_dormant && !m_idle;
+    if (turnInFlight) {
+        if (QMessageBox::question(
+                this, i18n("Stop & close agent"),
+                i18n("This agent is still working. Stop it now, summarize the "
+                     "conversation, and close the agent? You can restore it later "
+                     "from the Sessions browser."))
+            != QMessageBox::Yes) {
+            return;
+        }
+    }
+    addNote(QStringLiteral("&#9209; stopping &amp; closing — summarizing…"),
+            QStringLiteral("sys"));
+    m_stopBtn->setEnabled(false);
+    const QString tid = m_threadId;
+    // QPointer guard: stopClose can take a moment (hot-compaction), and the panel
+    // could be torn down before the reply lands.
+    QPointer<AgentPanel> self(this);
+    m_core->call(QStringLiteral("agent.stopClose"),
+                 QJsonObject{{QStringLiteral("threadId"), tid}},
+                 [self](const QJsonObject &, const QJsonObject &error) {
+                     if (!self) {
+                         return;
+                     }
+                     if (!error.isEmpty()) {
+                         self->addNote(QStringLiteral("Could not close agent: %1")
+                                           .arg(error.value(QStringLiteral("message"))
+                                                    .toString()
+                                                    .toHtmlEscaped()),
+                                       QStringLiteral("err"));
+                         self->m_stopBtn->setEnabled(true);
+                         return;
+                     }
+                     // Archived on the core — drop the panel and roster entry. We
+                     // clear m_threadId first so ~AgentPanel doesn't re-issue a
+                     // stop against the now-unknown thread.
+                     self->m_threadId.clear();
+                     Q_EMIT self->closeRequested();
+                 },
+                 this);
 }
 
 void AgentPanel::onInterruptClicked()
@@ -2661,6 +2722,21 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             m_promoting = false;
             addNote(detail, QStringLiteral("sys"));
             refresh();
+        } else if (phase == QLatin1String("turn_aborted")) {
+            // Interrupt landed in-band: the turn was cancelled but the process
+            // stays resident and the session stays hot. Reset to idle and keep
+            // the composer live — the next Send goes down the same stdin with no
+            // resume cost. Clear any pending permission prompt for the dead turn.
+            addNote(QStringLiteral("&#9209; interrupted — session kept, "
+                                   "send a follow-up to continue"),
+                    QStringLiteral("sys"));
+            m_idle = true;
+            m_permQueue.clear();
+            m_permBar->setVisible(false);
+            m_questionBox->setVisible(false);
+            refresh();
+            // A follow-up queued during the interrupt can fire now.
+            drainSendQueue();
         } else if (phase == QLatin1String("error")) {
             addNote(QStringLiteral("agent failed: %1").arg(detail), QStringLiteral("err"));
             m_idle = false;
