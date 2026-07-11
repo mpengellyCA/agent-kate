@@ -54,4 +54,8 @@ private:
     QListWidget *m_files = nullptr;
     DiffView *m_diff = nullptr;
     QVBoxLayout *m_diffSlot = nullptr;
+
+    // Monotonic token so two quick file selections can't paint out of order:
+    // each loadDiff() bumps it and its reply discards itself if superseded.
+    quint64 m_diffReq = 0;
 };

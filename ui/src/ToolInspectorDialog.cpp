@@ -249,6 +249,7 @@ QWidget *ToolInspectorDialog::buildOverview(const QString &toolName,
         }
         auto *diff =
             new DiffView(synthesizeUnifiedDiff(path, oldText, newText), host);
+        diff->setEmptyMessage(i18n("No changes."));
         addSection(i18n("Changes"), diff, 1);
 
     } else if (name == QLatin1String("MultiEdit")) {

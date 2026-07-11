@@ -12,6 +12,9 @@
 #include <QGuiApplication>
 #include <QClipboard>
 #include <QFontMetrics>
+#include <QHelpEvent>
+#include <QToolTip>
+#include <KLocalizedString>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QMouseEvent>
@@ -758,4 +761,53 @@ bool TranscriptDelegate::editorEvent(QEvent *event, QAbstractItemModel *model,
     }
 
     return QStyledItemDelegate::editorEvent(event, model, opt, idx);
+}
+
+bool TranscriptDelegate::helpEvent(QHelpEvent *event, QAbstractItemView *view,
+                                   const QStyleOptionViewItem &opt,
+                                   const QModelIndex &idx)
+{
+    if (event->type() != QEvent::ToolTip) {
+        return QStyledItemDelegate::helpEvent(event, view, opt, idx);
+    }
+    const QPoint pos = event->pos();
+    const auto kind = TranscriptModel::Kind(idx.data(TranscriptModel::KindRole).toInt());
+
+    if (kind == TranscriptModel::Message) {
+        // An attachment chip shows its full path, marking files outside the
+        // workspace so the user knows the reference reaches beyond the project.
+        const int chip = attachmentChipAt(opt.rect, opt, idx, pos);
+        if (chip >= 0) {
+            const QJsonArray atts =
+                idx.data(TranscriptModel::AttachmentsRole).toJsonArray();
+            if (chip < atts.size()) {
+                const QJsonObject att = atts.at(chip).toObject();
+                QString tip = att.value(QStringLiteral("path")).toString();
+                if (tip.isEmpty()) {
+                    tip = att.value(QStringLiteral("name")).toString();
+                }
+                if (att.value(QStringLiteral("outside")).toBool()) {
+                    tip += QStringLiteral("\n") + i18n("(outside workspace)");
+                }
+                QToolTip::showText(event->globalPos(), tip, view);
+                return true;
+            }
+        }
+    }
+
+    if (kind == TranscriptModel::Tool
+        && idx.data(TranscriptModel::ToolVisibleRole).toBool()) {
+        if (toolInspectRect(opt.rect).contains(pos)) {
+            QToolTip::showText(event->globalPos(), i18n("Open in inspector"), view);
+            return true;
+        }
+        if (toolCopyRect(opt.rect).contains(pos)) {
+            QToolTip::showText(event->globalPos(), i18n("Copy tool call"), view);
+            return true;
+        }
+    }
+
+    QToolTip::hideText();
+    event->ignore();
+    return QStyledItemDelegate::helpEvent(event, view, opt, idx);
 }

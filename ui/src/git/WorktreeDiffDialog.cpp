@@ -137,8 +137,10 @@ WorktreeDiffDialog::WorktreeDiffDialog(CoreClient *core, const QString &threadId
         KSharedConfig::openConfig()->group(QStringLiteral("WorktreeDiffDialog"));
     resize(cfg.readEntry("size", QSize(900, 640)));
 
+    // loadFiles() selects row 0 ("All files") on return, which triggers
+    // onFileRowChanged → loadDiff(QString()) — the whole-worktree patch. We do
+    // not also call loadDiff here or the diff would be fetched twice per open.
     loadFiles();
-    loadDiff(QString()); // whole-worktree patch up front
 }
 
 WorktreeDiffDialog::~WorktreeDiffDialog()
@@ -163,11 +165,13 @@ void WorktreeDiffDialog::loadFiles()
                      }
                      const QJsonArray threads =
                          result.value(QStringLiteral("threads")).toArray();
+                     bool matched = false;
                      for (const QJsonValue &v : threads) {
                          const QJsonObject t = v.toObject();
                          if (t.value(QStringLiteral("threadId")).toString() != thread) {
                              continue;
                          }
+                         matched = true;
                          m_files->clear();
                          auto *all = new QListWidgetItem(
                              i18nc("synthetic entry showing the whole worktree diff",
@@ -195,6 +199,13 @@ void WorktreeDiffDialog::loadFiles()
                          m_files->setCurrentRow(0);
                          break;
                      }
+                     // If the snapshot has no entry for this thread the file list
+                     // stays empty and setCurrentRow(0) above never fires, so
+                     // fetch the whole-worktree patch directly (it will show the
+                     // "no uncommitted changes" empty state).
+                     if (!matched) {
+                         loadDiff(QString());
+                     }
                  },
                  this);
 }
@@ -205,13 +216,16 @@ void WorktreeDiffDialog::loadDiff(const QString &path)
         return;
     }
     QPointer<WorktreeDiffDialog> guard(this);
+    const quint64 req = ++m_diffReq;
     QJsonObject params{{QStringLiteral("threadId"), m_threadId}};
     if (!path.isEmpty()) {
         params.insert(QStringLiteral("path"), path);
     }
     m_core->call(QStringLiteral("git.diff"), params,
-                 [this, guard](const QJsonObject &result, const QJsonObject &error) {
-                     if (!guard) {
+                 [this, guard, req](const QJsonObject &result, const QJsonObject &error) {
+                     // Discard a reply that a newer selection has superseded, so
+                     // out-of-order replies can't leave a stale diff on screen.
+                     if (!guard || req != m_diffReq) {
                          return;
                      }
                      QString patch;

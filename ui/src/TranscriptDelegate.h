@@ -81,6 +81,13 @@ protected:
                      const QStyleOptionViewItem &opt,
                      const QModelIndex &idx) override;
 
+    // Tooltip routing: an attachment chip shows its full path (plus an
+    // "(outside workspace)" marker when flagged); the tool card's copy/inspect
+    // glyphs show a short label.
+    bool helpEvent(QHelpEvent *event, QAbstractItemView *view,
+                   const QStyleOptionViewItem &opt,
+                   const QModelIndex &idx) override;
+
 private:
     struct CacheEntry {
         int width = -1;  // width the height was last measured at
