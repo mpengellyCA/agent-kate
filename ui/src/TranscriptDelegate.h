@@ -4,6 +4,7 @@
 #pragma once
 
 #include <QHash>
+#include <QJsonObject>
 #include <QModelIndex>
 #include <QRect>
 #include <QStyledItemDelegate>
@@ -65,6 +66,9 @@ Q_SIGNALS:
     void editorCreated(QWidget *editor) const;
     // A link inside a Message body's selection overlay was activated.
     void anchorActivated(const QString &href) const;
+    // An attachment chip under a You message was clicked; the payload is the
+    // compact attachment object (name/kind/path/mediaType/outside).
+    void attachmentActivated(const QJsonObject &att) const;
 
 protected:
     // Hit-testing for tool expand/collapse, the copy button, the "show full
@@ -100,9 +104,22 @@ private:
     QRect toolHeaderRect(const QRect &row) const;
     QRect toolCopyRect(const QRect &row) const;
 
-    // The body-text sub-rect of a Message row (excludes the card padding and the
-    // role/timestamp line) — the exact area the selection overlay covers. `row`
-    // is the full row rect; `opt` supplies the font. Matches the translate the
-    // body draw uses in layoutRow().
-    QRect messageBodyRect(const QRect &row, const QStyleOptionViewItem &opt) const;
+    // The body-text sub-rect of a Message row (excludes the card padding, the
+    // role/timestamp line, and any attachment chip block) — the exact area the
+    // selection overlay covers. `row` is the full row rect; `opt` supplies the
+    // font; `idx` supplies the attachments so the chip block below the body is
+    // excluded. Matches the translate the body draw uses in layoutRow().
+    QRect messageBodyRect(const QRect &row, const QStyleOptionViewItem &opt,
+                          const QModelIndex &idx) const;
+
+    // Height of the attachment chip block for a Message row (0 if none),
+    // including the gap above it — used by messageBodyRect and layoutRow so the
+    // overlay never covers the chips.
+    int attachmentsBlockHeight(const QModelIndex &idx,
+                               const QStyleOptionViewItem &opt, int innerW) const;
+
+    // The index of the attachment chip a point falls in (in the row's device
+    // coordinates), or -1 — used by editorEvent to open the clicked attachment.
+    int attachmentChipAt(const QRect &row, const QStyleOptionViewItem &opt,
+                         const QModelIndex &idx, const QPoint &pos) const;
 };

@@ -87,6 +87,9 @@ public:
 Q_SIGNALS:
     void statusMessage(const QString &text);
     void openDiff(const QString &title, const QString &diffText);
+    // Routed to MainWindow to open a file (a clicked attachment chip) in the
+    // editor, making the editor visible if the layout was chat-only.
+    void openFileRequested(const QString &path);
     void agentActivated(int agentId, const QString &projectPath);
     // Emitted when the CURRENTLY-shown agent's thread id is assigned/changes (e.g. a
     // freshly-created agent's session starting). agentActivated fires on selection,

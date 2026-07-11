@@ -651,6 +651,7 @@ void AgentDock::wireAgentPanel(int agentId, AgentPanel *panel)
 {
     connect(panel, &AgentPanel::statusMessage, this, &AgentDock::statusMessage);
     connect(panel, &AgentPanel::openDiff, this, &AgentDock::openDiff);
+    connect(panel, &AgentPanel::openFileRequested, this, &AgentDock::openFileRequested);
     connect(panel, &AgentPanel::titleChanged, this,
             [this, agentId](const QString &title) { m_roster->setAgentTitle(agentId, title); });
     connect(panel, &AgentPanel::stateChanged, this,

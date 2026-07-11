@@ -9,6 +9,8 @@
 #include "TranscriptDelegate.h"
 #include "TranscriptModel.h"
 
+#include <QJsonArray>
+#include <QJsonObject>
 #include <QSignalSpy>
 #include <QStyleOptionViewItem>
 #include <QtTest>
@@ -24,6 +26,7 @@ private Q_SLOTS:
     void widthChangeEstimatesThenMeasuresExact();
     void heightCacheInvalidatesOnMutation();
     void evictionBoundsRamAndKeysResolve();
+    void attachmentsRoleRoundTrips();
 };
 
 void TranscriptModelTest::appendsGrowRowCount()
@@ -189,6 +192,52 @@ void TranscriptModelTest::evictionBoundsRamAndKeysResolve()
     QCOMPARE(m.data(m.index(liveRow), TranscriptModel::ToolResultRole).toString(),
              QStringLiteral("done"));
     QVERIFY(m.data(m.index(liveRow), TranscriptModel::ToolDoneRole).toBool());
+}
+
+// A You message can carry compact attachment metadata (plan 13 phase 4). It must
+// round-trip through AttachmentsRole so the delegate can draw one chip per file;
+// a message with no attachments returns an empty array (never garbage), and the
+// chip block grows the row's measured height (proving the delegate lays it out).
+void TranscriptModelTest::attachmentsRoleRoundTrips()
+{
+    TranscriptModel m;
+    // A plain message: no attachments.
+    m.appendMessage(QStringLiteral("You"), QStringLiteral("#1a5fb4"),
+                    QStringLiteral("plain"), QStringLiteral("plain"), false,
+                    QStringLiteral("10:00"));
+    QVERIFY(m.data(m.index(0), TranscriptModel::AttachmentsRole).toJsonArray().isEmpty());
+
+    QJsonArray atts{
+        QJsonObject{{QStringLiteral("name"), QStringLiteral("a.png")},
+                    {QStringLiteral("kind"), QStringLiteral("image")},
+                    {QStringLiteral("path"), QStringLiteral("/tmp/a.png")},
+                    {QStringLiteral("mediaType"), QStringLiteral("image/png")}},
+        QJsonObject{{QStringLiteral("name"), QStringLiteral("notes.txt")},
+                    {QStringLiteral("kind"), QStringLiteral("text")},
+                    {QStringLiteral("path"), QStringLiteral("/tmp/notes.txt")},
+                    {QStringLiteral("outside"), true}}};
+    m.appendMessage(QStringLiteral("You"), QStringLiteral("#1a5fb4"),
+                    QStringLiteral("with files"), QStringLiteral("with files"), false,
+                    QStringLiteral("10:01"), atts);
+    const QJsonArray got =
+        m.data(m.index(1), TranscriptModel::AttachmentsRole).toJsonArray();
+    QCOMPARE(got.size(), 2);
+    QCOMPARE(got.at(0).toObject().value(QStringLiteral("name")).toString(),
+             QStringLiteral("a.png"));
+    QCOMPARE(got.at(1).toObject().value(QStringLiteral("kind")).toString(),
+             QStringLiteral("text"));
+    QVERIFY(got.at(1).toObject().value(QStringLiteral("outside")).toBool());
+
+    // The attachment chip block makes the with-files row taller than the plain one
+    // (same body font/width) — the delegate lays the chips out under the body.
+    TranscriptDelegate d;
+    QStyleOptionViewItem opt;
+    opt.font = QFont();
+    opt.palette = QPalette();
+    opt.rect = QRect(0, 0, 500, 0);
+    const int plainH = d.sizeHint(opt, m.index(0)).height();
+    const int withAttH = d.sizeHint(opt, m.index(1)).height();
+    QVERIFY2(withAttH > plainH, "attachment chips must add to the message row height");
 }
 
 QTEST_MAIN(TranscriptModelTest)

@@ -80,6 +80,13 @@ type Attachment struct {
 	MediaType string `json:"mediaType"` // images, e.g. "image/png"
 	Text      string `json:"text"`      // text files: the file content
 	DataB64   string `json:"dataB64"`   // images: base64-encoded bytes
+	// Path and Outside are UI-side provenance the harness never sends to the
+	// model — they ride along so the core can persist a compact per-thread
+	// attachment sidecar (name/kind/path/mediaType/outside) that lets the UI
+	// re-draw the "You" card's attachment chips after a restart/resume, since
+	// the on-disk transcript keeps only the inlined content, not the origin.
+	Path    string `json:"path,omitempty"`
+	Outside bool   `json:"outside,omitempty"`
 }
 
 // StartOptions configures a new agent thread.

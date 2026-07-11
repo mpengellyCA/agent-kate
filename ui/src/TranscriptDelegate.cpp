@@ -12,7 +12,10 @@
 #include <QGuiApplication>
 #include <QClipboard>
 #include <QFontMetrics>
+#include <QJsonArray>
+#include <QJsonObject>
 #include <QMouseEvent>
+#include <QPixmap>
 #include <QPainter>
 #include <QTextBrowser>
 #include <QTextDocument>
@@ -29,6 +32,14 @@ constexpr int kCardPadBottom = 11;
 constexpr int kRoleRowGap = 3;    // gap under the role row
 constexpr int kNotePadX = 8;
 constexpr int kNotePadY = 1;
+// Attachment chip row under a You message body (plan 13 phase 4).
+constexpr int kChipGapTop = 8;  // gap between the body and the chip row
+constexpr int kChipH = 24;      // chip height
+constexpr int kChipVGap = 4;    // vertical gap between wrapped chip rows
+constexpr int kChipHGap = 6;    // horizontal gap between chips
+constexpr int kChipPadX = 9;    // text padding inside a chip
+constexpr int kChipIcon = 16;   // image-preview icon edge inside a chip
+constexpr int kChipMaxW = 220;  // max chip width before the name elides
 constexpr int kToolPad = 6;       // tool card inner padding
 constexpr int kToolHeaderH = 28;  // clickable header height
 constexpr int kToolCopyW = 26;    // copy hit zone on the right of the header
@@ -115,6 +126,54 @@ void configureBodyDoc(QTextDocument *doc, const QFont &font, int contentWidth,
     doc->setHtml(html);
     doc->setTextWidth(contentWidth);
 }
+
+// One laid-out attachment chip: its rect (in the coordinate space of the origin
+// passed to layoutAttachmentChips) plus the elided label and whether it carries
+// an image thumbnail.
+struct ChipLayout {
+    QRect rect;
+    QString label;   // already elided to fit
+    bool image = false;
+};
+
+// Flow-lay the attachment chips of a You message across `availW`, wrapping onto
+// further rows. `origin` is the top-left of the chip area. Returns the chips and,
+// via `outHeight`, the total height the chip block occupies (0 for no chips).
+// Shared by measure, paint and hit-test so all three agree exactly.
+QList<ChipLayout> layoutAttachmentChips(const QJsonArray &atts, const QFont &font,
+                                        const QPoint &origin, int availW, int &outHeight)
+{
+    QList<ChipLayout> chips;
+    outHeight = 0;
+    if (atts.isEmpty() || availW <= 0) {
+        return chips;
+    }
+    const QFontMetrics fm(font);
+    int x = origin.x();
+    int y = origin.y();
+    int rowH = kChipH;
+    for (const QJsonValue &av : atts) {
+        const QJsonObject att = av.toObject();
+        const bool image =
+            att.value(QStringLiteral("kind")).toString() == QLatin1String("image");
+        const QString name = att.value(QStringLiteral("name")).toString();
+        const int iconW = image ? kChipIcon + kChipHGap : 0;
+        const int textAvail = qMax(1, kChipMaxW - 2 * kChipPadX - iconW);
+        const QString label = fm.elidedText(name, Qt::ElideMiddle, textAvail);
+        const int chipW = qMin(kChipMaxW,
+                               2 * kChipPadX + iconW + fm.horizontalAdvance(label));
+        // Wrap to the next row when this chip would overflow the available width
+        // (but always place at least one chip per row).
+        if (x > origin.x() && x + chipW > origin.x() + availW) {
+            x = origin.x();
+            y += rowH + kChipVGap;
+        }
+        chips.append(ChipLayout{QRect(x, y, chipW, kChipH), label, image});
+        x += chipW + kChipHGap;
+    }
+    outHeight = (y - origin.y()) + rowH;
+    return chips;
+}
 } // namespace
 
 TranscriptDelegate::TranscriptDelegate(QObject *parent)
@@ -183,7 +242,17 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
         const int innerW = contentWidth - 2 * kCardPadX;
         auto *doc = (self->*buildDoc)(idx, qMax(1, innerW), opt);
         const int bodyH = int(doc->size().height());
-        const int total = kCardPadTop + lineH + kRoleRowGap + bodyH + kCardPadBottom;
+        // Attachment chip block under the body (You messages with attachments).
+        const QJsonArray atts =
+            idx.data(TranscriptModel::AttachmentsRole).toJsonArray();
+        int chipsH = 0;
+        if (!atts.isEmpty()) {
+            layoutAttachmentChips(atts, opt.font, QPoint(0, 0), qMax(1, innerW),
+                                  chipsH);
+        }
+        const int chipsBlock = chipsH > 0 ? kChipGapTop + chipsH : 0;
+        const int total =
+            kCardPadTop + lineH + kRoleRowGap + bodyH + chipsBlock + kCardPadBottom;
         if (painter) {
             const QRect card(rowRect.left() + contentLeft, rowRect.top(),
                              contentWidth, total);
@@ -218,13 +287,66 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
             }
 
             // Body HTML.
+            const int bodyTop = rrTop + lineH + kRoleRowGap;
             painter->save();
-            painter->translate(card.left() + kCardPadX,
-                               rrTop + lineH + kRoleRowGap);
+            painter->translate(card.left() + kCardPadX, bodyTop);
             QAbstractTextDocumentLayout::PaintContext ctx;
             ctx.palette = opt.palette;
             doc->documentLayout()->draw(painter, ctx);
             painter->restore();
+
+            // Attachment chips, laid out in the coordinate space of the card so
+            // the chip rects here match the hit-test rects in editorEvent().
+            if (chipsH > 0) {
+                const QPoint origin(card.left() + kCardPadX,
+                                    bodyTop + bodyH + kChipGapTop);
+                int dummy = 0;
+                const QList<ChipLayout> laid = layoutAttachmentChips(
+                    atts, opt.font, origin, qMax(1, innerW), dummy);
+                painter->save();
+                painter->setRenderHint(QPainter::Antialiasing, true);
+                QFont chipFont = opt.font;
+                for (int i = 0; i < laid.size(); ++i) {
+                    const ChipLayout &c = laid.at(i);
+                    const QJsonObject att = atts.at(i).toObject();
+                    // Chip background + border (palette-only).
+                    painter->setPen(opt.palette.color(QPalette::Mid));
+                    painter->setBrush(opt.palette.color(QPalette::Base));
+                    painter->drawRoundedRect(c.rect.adjusted(0, 0, -1, -1), 6, 6);
+                    int textLeft = c.rect.left() + kChipPadX;
+                    if (c.image) {
+                        // Decode the stored path into a small thumbnail. Chips on
+                        // replayed cards have only a path (no dataB64), so load
+                        // from the file; a moved file just falls back to no icon.
+                        const QString path =
+                            att.value(QStringLiteral("path")).toString();
+                        QPixmap pm(path);
+                        const QRect iconR(textLeft, c.rect.top() + (kChipH - kChipIcon) / 2,
+                                          kChipIcon, kChipIcon);
+                        if (!pm.isNull()) {
+                            painter->drawPixmap(
+                                iconR,
+                                pm.scaled(kChipIcon, kChipIcon, Qt::KeepAspectRatio,
+                                          Qt::SmoothTransformation));
+                        } else {
+                            painter->setPen(opt.palette.color(QPalette::Mid));
+                            painter->drawText(iconR, Qt::AlignCenter,
+                                              QStringLiteral("\U0001f5bc"));
+                        }
+                        textLeft += kChipIcon + kChipHGap;
+                    }
+                    painter->setFont(chipFont);
+                    painter->setPen(opt.palette.color(
+                        att.value(QStringLiteral("outside")).toBool()
+                            ? QPalette::LinkVisited
+                            : QPalette::Link));
+                    painter->drawText(
+                        QRect(textLeft, c.rect.top(),
+                              c.rect.right() - textLeft - kChipPadX + 1, c.rect.height()),
+                        Qt::AlignLeft | Qt::AlignVCenter, c.label);
+                }
+                painter->restore();
+            }
         }
         delete doc;
         return total;
@@ -409,15 +531,60 @@ QRect TranscriptDelegate::toolCopyRect(const QRect &row) const
     return QRect(right - kToolCopyW, row.top(), kToolCopyW, kToolHeaderH);
 }
 
+int TranscriptDelegate::attachmentsBlockHeight(const QModelIndex &idx,
+                                               const QStyleOptionViewItem &opt,
+                                               int innerW) const
+{
+    const QJsonArray atts = idx.data(TranscriptModel::AttachmentsRole).toJsonArray();
+    if (atts.isEmpty()) {
+        return 0;
+    }
+    int chipsH = 0;
+    layoutAttachmentChips(atts, opt.font, QPoint(0, 0), qMax(1, innerW), chipsH);
+    return chipsH > 0 ? kChipGapTop + chipsH : 0;
+}
+
 QRect TranscriptDelegate::messageBodyRect(const QRect &row,
-                                          const QStyleOptionViewItem &opt) const
+                                          const QStyleOptionViewItem &opt,
+                                          const QModelIndex &idx) const
 {
     const int lineH = QFontMetrics(opt.font).height();
     const int left = row.left() + kOuterMarginX + kCardPadX;
     const int top = row.top() + kCardPadTop + lineH + kRoleRowGap;
     const int innerW = row.width() - 2 * kOuterMarginX - 2 * kCardPadX;
-    const int bodyH = row.height() - kCardPadTop - lineH - kRoleRowGap - kCardPadBottom;
+    const int chipsBlock = attachmentsBlockHeight(idx, opt, innerW);
+    const int bodyH = row.height() - kCardPadTop - lineH - kRoleRowGap
+                      - chipsBlock - kCardPadBottom;
     return QRect(left, top, qMax(1, innerW), qMax(0, bodyH));
+}
+
+// The chip a point falls in, or -1. Recomputes the chip layout in the card's
+// coordinate space (matching paint) and tests each rect.
+int TranscriptDelegate::attachmentChipAt(const QRect &row,
+                                         const QStyleOptionViewItem &opt,
+                                         const QModelIndex &idx, const QPoint &pos) const
+{
+    const QJsonArray atts = idx.data(TranscriptModel::AttachmentsRole).toJsonArray();
+    if (atts.isEmpty()) {
+        return -1;
+    }
+    const int lineH = QFontMetrics(opt.font).height();
+    const int innerW = row.width() - 2 * kOuterMarginX - 2 * kCardPadX;
+    const int bodyTop = row.top() + kCardPadTop + lineH + kRoleRowGap;
+    const int chipsBlock = attachmentsBlockHeight(idx, opt, innerW);
+    const int bodyH = row.height() - kCardPadTop - lineH - kRoleRowGap
+                      - chipsBlock - kCardPadBottom;
+    const QPoint origin(row.left() + kOuterMarginX + kCardPadX,
+                        bodyTop + bodyH + kChipGapTop);
+    int dummy = 0;
+    const QList<ChipLayout> laid =
+        layoutAttachmentChips(atts, opt.font, origin, qMax(1, innerW), dummy);
+    for (int i = 0; i < laid.size(); ++i) {
+        if (laid.at(i).rect.contains(pos)) {
+            return i;
+        }
+    }
+    return -1;
 }
 
 // --- in-place selectable overlay (plan 13 phase 1) -----------------------
@@ -480,7 +647,7 @@ void TranscriptDelegate::updateEditorGeometry(QWidget *editor,
         != TranscriptModel::Message) {
         return;
     }
-    const QRect body = messageBodyRect(opt.rect, opt);
+    const QRect body = messageBodyRect(opt.rect, opt, idx);
     editor->setGeometry(body);
     if (auto *browser = qobject_cast<QTextBrowser *>(editor)) {
         // Re-wrap the document to the body width now the geometry is known.
@@ -540,6 +707,16 @@ bool TranscriptDelegate::editorEvent(QEvent *event, QAbstractItemModel *model,
         }
 
         if (kind == TranscriptModel::Message) {
+            // An attachment chip click opens that file (image preview / editor).
+            const int chip = attachmentChipAt(opt.rect, opt, idx, pos);
+            if (chip >= 0) {
+                const QJsonArray atts =
+                    idx.data(TranscriptModel::AttachmentsRole).toJsonArray();
+                if (chip < atts.size()) {
+                    emit attachmentActivated(atts.at(chip).toObject());
+                    return true;
+                }
+            }
             // A click on a link opens it directly (the overlay isn't up on the
             // first click). Otherwise a click on the body asks the panel to open
             // the persistent selection overlay so the text becomes selectable.
@@ -555,7 +732,7 @@ bool TranscriptDelegate::editorEvent(QEvent *event, QAbstractItemModel *model,
                 QDesktopServices::openUrl(QUrl(anchor));
                 return true;
             }
-            if (messageBodyRect(opt.rect, opt).contains(pos)) {
+            if (messageBodyRect(opt.rect, opt, idx).contains(pos)) {
                 emit messageBodyClicked(idx);
                 return true;
             }

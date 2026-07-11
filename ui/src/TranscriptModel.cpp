@@ -36,7 +36,8 @@ void TranscriptModel::enforceCap()
 
 int TranscriptModel::appendMessage(const QString &role, const QString &accentHex,
                                    const QString &bodyHtml, const QString &plain,
-                                   bool replayed, const QString &timestamp)
+                                   bool replayed, const QString &timestamp,
+                                   const QJsonArray &attachments)
 {
     Item it;
     it.kind = Message;
@@ -46,6 +47,7 @@ int TranscriptModel::appendMessage(const QString &role, const QString &accentHex
     it.plain = plain;
     it.replayed = replayed;
     it.timestamp = timestamp;
+    it.attachments = attachments;
     it.stableId = m_nextId++;
     const int row = m_items.size();
     const int key = m_base + row;
@@ -220,6 +222,8 @@ QVariant TranscriptModel::data(const QModelIndex &idx, int role) const
         return it.timestamp;
     case NoteKindRole:
         return it.noteKind;
+    case AttachmentsRole:
+        return it.attachments;
     case ToolNameRole:
         return it.toolName;
     case ToolSummaryRole:

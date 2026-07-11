@@ -121,6 +121,9 @@ Q_SIGNALS:
     // (a permission prompt). The roster paints this as a card marker.
     void attentionChanged(bool attention);
     void openDiff(const QString &title, const QString &diffText);
+    // A text/file attachment chip was clicked — ask the window to open the file
+    // in the editor (and make the editor visible if it was chat-only).
+    void openFileRequested(const QString &path);
     // Emitted after a "Stop & close" archives this agent on the core — asks the
     // dock to remove this panel and its roster entry (the terminal close path).
     void closeRequested();
@@ -196,7 +199,14 @@ private:
     // `replayed` cards (transcript restore) carry no live timestamp.
     void addMessageCard(const QString &role, const QString &accentHex,
                         const QString &bodyHtml, const QString &plainText = QString(),
-                        bool replayed = false);
+                        bool replayed = false, const QJsonArray &attachments = {});
+    // Strip the heavy body (dataB64 / text) from a live attachment array, leaving
+    // the compact chip metadata (name/kind/path/mediaType/outside) the feed row
+    // and the delegate carry. Mirrors what the core sidecar persists for replay.
+    static QJsonArray compactAttachments(const QJsonArray &attachments);
+    // Open a clicked attachment chip: image → in-place preview dialog reusing
+    // ImageView; text/file → openFileRequested so MainWindow shows it in the editor.
+    void openAttachment(const QJsonObject &att);
     void addNote(const QString &html, const QString &kind);
     void scrollFeedToBottom();
     // Show the whole-message + code-block copy menu for a feed row.
@@ -240,6 +250,11 @@ private:
     bool m_dormant = false;   // has a thread id, but no live process — resumable
     bool m_promoting = false; // a promote-to-worktree is in flight
     bool m_replaying = false; // inside loadTranscript() — don't double-count cost
+    // Attachment sidecar turns (name/kind/path/mediaType/outside per sent
+    // message that had attachments), returned by agent.transcript and consumed in
+    // order as the matching user messages are replayed so the You cards regain
+    // their chips after a resume. Cleared once replay finishes.
+    QJsonArray m_replayAttachTurns;
     bool m_dragActive = false; // an acceptable drag is hovering the panel
 
     // Running per-session usage totals, accumulated from each `result` event's

@@ -81,6 +81,7 @@ type handlerDeps struct {
 	broker     *permission.Broker
 	extensions *vsix.Manager
 	sessions   *session.Store
+	attachSide *session.AttachmentStore // per-thread attachment metadata sidecars
 	summaries  *compact.Store
 	skills     *skills.Catalog
 	gitCache   *gitstatus.Cache
@@ -88,6 +89,29 @@ type handlerDeps struct {
 	socketPath string
 	exePath    string
 	log        *slog.Logger
+}
+
+// recordAttachments appends a compact, body-free attachment sidecar entry for a
+// sent message so the UI can redraw named/clickable chips after a resume. A turn
+// with no attachments is a no-op; a write failure is logged, never fatal — chips
+// simply degrade to absent on replay.
+func recordAttachments(d handlerDeps, threadID, text string, atts []agent.Attachment) {
+	if d.attachSide == nil || len(atts) == 0 {
+		return
+	}
+	metas := make([]session.AttachmentMeta, 0, len(atts))
+	for _, a := range atts {
+		metas = append(metas, session.AttachmentMeta{
+			Name:      a.Name,
+			Kind:      a.Kind,
+			Path:      a.Path,
+			MediaType: a.MediaType,
+			Outside:   a.Outside,
+		})
+	}
+	if err := d.attachSide.Append(threadID, session.AttachmentTurn{Text: text, Attachments: metas}); err != nil {
+		d.log.Warn("could not record attachment sidecar", "thread", threadID, "err", err)
+	}
 }
 
 // registerHandlers wires the JSON-RPC methods the core serves.
@@ -121,6 +145,10 @@ func registerHandlers(d handlerDeps) {
 		threadID := agent.NewThreadID()
 		sessionID := session.NewID()
 		safe.Go("agent.startThread", func() { startAgentThread(d, threadID, sessionID, p) })
+		// The opening prompt's attachments are recorded against the new thread id
+		// (the record is created asynchronously above, but the sidecar is keyed by
+		// thread id and needs no record to exist).
+		recordAttachments(d, threadID, p.Prompt, p.Attachments)
 		return map[string]any{"threadId": threadID, "sessionId": sessionID}, nil
 	})
 
@@ -162,8 +190,21 @@ func registerHandlers(d handlerDeps) {
 		if !ok {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
 		}
+		// The attachment sidecar (compact per-thread metadata) lets the UI redraw
+		// the named/clickable chips on replayed "You" cards — the transcript keeps
+		// only the inlined attachment content, not the origin name/path. Returned
+		// as an ordered list the UI pairs with the user turns it replays.
+		var attachTurns []session.AttachmentTurn
+		if d.attachSide != nil {
+			if t, err := d.attachSide.Load(p.ThreadID); err == nil {
+				attachTurns = t
+			}
+		}
+		if attachTurns == nil {
+			attachTurns = []session.AttachmentTurn{}
+		}
 		if rec.SessionID == "" {
-			return map[string]any{"events": []json.RawMessage{}}, nil
+			return map[string]any{"events": []json.RawMessage{}, "attachments": attachTurns}, nil
 		}
 		events, err := session.ReadTranscript(rec.SessionID)
 		if err != nil {
@@ -172,7 +213,7 @@ func registerHandlers(d handlerDeps) {
 		if events == nil {
 			events = []json.RawMessage{}
 		}
-		return map[string]any{"events": events}, nil
+		return map[string]any{"events": events, "attachments": attachTurns}, nil
 	})
 
 	// agent.promote upgrades a non-isolated thread into a dedicated git
@@ -331,6 +372,9 @@ func registerHandlers(d handlerDeps) {
 		if err := d.sup.Send(p.ThreadID, p.Text, p.Attachments); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
+		// Persist a compact attachment sidecar so the "You" card's chips survive
+		// a resume; the transcript keeps only inlined content, not the origin.
+		recordAttachments(d, p.ThreadID, p.Text, p.Attachments)
 		return map[string]any{"ok": true}, nil
 	})
 
@@ -666,6 +710,9 @@ func registerHandlers(d handlerDeps) {
 		// The worktree is gone, so the thread can never be resumed — forget it.
 		_ = d.sessions.Remove(p.ThreadID)
 		_ = d.summaries.Remove(p.ThreadID)
+		if d.attachSide != nil {
+			_ = d.attachSide.Remove(p.ThreadID)
+		}
 		d.gitCache.Forget(p.ThreadID)
 		// Tell every UI client to drop this thread from its roster.
 		d.srv.Notify("agent.discarded", map[string]any{"threadId": p.ThreadID})
@@ -1437,6 +1484,9 @@ func registerHandlers(d handlerDeps) {
 		// agent.discard does, and tell every UI client to refresh.
 		_ = d.sessions.Remove(p.ThreadID)
 		_ = d.summaries.Remove(p.ThreadID)
+		if d.attachSide != nil {
+			_ = d.attachSide.Remove(p.ThreadID)
+		}
 		d.gitCache.Forget(p.ThreadID)
 		d.srv.Notify("agent.discarded", map[string]any{"threadId": p.ThreadID})
 		d.srv.Notify("git.invalidated", map[string]any{"threadIds": []string{p.ThreadID}})

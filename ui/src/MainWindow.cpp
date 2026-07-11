@@ -456,6 +456,12 @@ void MainWindow::setupUi()
             [this](const QString &title, const QString &diff) {
                 m_editor->openDiff(groupKey(), title, diff);
             });
+    // A clicked text/file attachment chip opens the file in the editor.
+    connect(m_agent, &AgentDock::openFileRequested, this,
+            [this](const QString &path) {
+                ensureEditorVisible();
+                m_editor->openFile(groupKey(), path);
+            });
     connect(m_agent, &AgentDock::projectClosed, this,
             [this](const QString &path) {
                 if (m_terminal) {

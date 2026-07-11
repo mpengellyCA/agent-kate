@@ -1,6 +1,7 @@
 #include "AgentPanel.h"
 #include "AgentChatHelpers.h"
 #include "AttachmentBuilder.h"
+#include "ImageView.h"
 #include "ProviderConfig.h"
 #include "TranscriptDelegate.h"
 #include "TranscriptModel.h"
@@ -45,6 +46,7 @@
 #include <QHBoxLayout>
 #include <QIcon>
 #include <QJsonArray>
+#include <QJsonObject>
 #include <QJsonDocument>
 #include <QKeyEvent>
 #include <QLabel>
@@ -303,6 +305,9 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
                     QDesktopServices::openUrl(QUrl(href));
                 }
             });
+    // A click on an attachment chip under a You message opens that file.
+    connect(m_delegate, &TranscriptDelegate::attachmentActivated, this,
+            &AgentPanel::openAttachment);
     // Close the overlay when its row's data changes (streaming/mutation) or the
     // model resets, so a stale editor never lingers over a re-laid-out row.
     connect(m_model, &QAbstractItemModel::dataChanged, this,
@@ -1199,6 +1204,10 @@ void AgentPanel::loadTranscript()
                      if (events.isEmpty()) {
                          return;
                      }
+                     // The attachment sidecar lets replayed You cards regain their
+                     // named chips — the transcript keeps only inlined content.
+                     m_replayAttachTurns =
+                         result.value(QStringLiteral("attachments")).toArray();
                      // Guard cumulative cost + live timestamps: replayed result
                      // events must not be counted, and replayed cards carry no
                      // synthetic send time.
@@ -1207,6 +1216,7 @@ void AgentPanel::loadTranscript()
                          renderEvent(v.toObject());
                      }
                      m_replaying = false;
+                     m_replayAttachTurns = QJsonArray();
                      addNote(QStringLiteral("— prior conversation restored —"),
                              QStringLiteral("dim"));
                      scrollFeedToBottom();
@@ -1494,12 +1504,13 @@ void AgentPanel::scrollFeedToBottom()
 
 void AgentPanel::addMessageCard(const QString &role, const QString &accentHex,
                                 const QString &bodyHtml, const QString &plainText,
-                                bool replayed)
+                                bool replayed, const QJsonArray &attachments)
 {
     const QString ts = replayed
         ? QString()
         : QLocale().toString(QTime::currentTime(), QLocale::ShortFormat);
-    m_model->appendMessage(role, accentHex, bodyHtml, plainText, replayed, ts);
+    m_model->appendMessage(role, accentHex, bodyHtml, plainText, replayed, ts,
+                           attachments);
 
     // A fresh row while the user is scrolled up flags unread content on the
     // jump-to-latest button.
@@ -1931,21 +1942,83 @@ void AgentPanel::onSendClicked()
     }
 }
 
-// addYouCard renders an outgoing user message as a "You" card in the feed.
+// compactAttachments strips the heavy body (dataB64 / text) from a live
+// attachment array, keeping only the metadata the feed row + delegate need to
+// draw named, clickable chips. This is exactly what the core sidecar persists,
+// so a live send and a replayed card carry identical chip data.
+QJsonArray AgentPanel::compactAttachments(const QJsonArray &attachments)
+{
+    QJsonArray out;
+    for (const QJsonValue &av : attachments) {
+        const QJsonObject a = av.toObject();
+        QJsonObject c{{QStringLiteral("name"), a.value(QStringLiteral("name"))},
+                      {QStringLiteral("kind"), a.value(QStringLiteral("kind"))}};
+        if (a.contains(QStringLiteral("path"))) {
+            c[QStringLiteral("path")] = a.value(QStringLiteral("path"));
+        }
+        if (a.contains(QStringLiteral("mediaType"))) {
+            c[QStringLiteral("mediaType")] = a.value(QStringLiteral("mediaType"));
+        }
+        if (a.value(QStringLiteral("outside")).toBool()) {
+            c[QStringLiteral("outside")] = true;
+        }
+        out.append(c);
+    }
+    return out;
+}
+
+// addYouCard renders an outgoing user message as a "You" card in the feed. Any
+// attachments are stored (compactly) on the row so the delegate paints one named
+// chip per file under the message body.
 void AgentPanel::addYouCard(const QString &text, const QJsonArray &attachments)
 {
-    QString youLine = text.toHtmlEscaped().replace(QLatin1Char('\n'), QLatin1String("<br>"));
-    if (!attachments.isEmpty()) {
-        if (!youLine.isEmpty()) {
-            youLine += QStringLiteral("<br>");
-        }
-        youLine += QStringLiteral("<span style='color:palette(mid)'>&#128206; %1 "
-                                  "attachment(s)</span>")
-                       .arg(attachments.size());
-    }
+    const QString youLine =
+        text.toHtmlEscaped().replace(QLatin1Char('\n'), QLatin1String("<br>"));
     addMessageCard(QStringLiteral("You"),
                    isDark(this) ? QStringLiteral("#7cb7ff") : QStringLiteral("#1a5fb4"),
-                   youLine, text, m_replaying);
+                   youLine, text, m_replaying, compactAttachments(attachments));
+}
+
+// openAttachment opens a clicked attachment chip. An image is previewed in a
+// lightweight modeless dialog reusing ImageView; a text/file attachment asks the
+// window to open it in the editor. A file whose origin path is gone (moved/
+// deleted since it was attached) degrades to a friendly status note.
+void AgentPanel::openAttachment(const QJsonObject &att)
+{
+    const QString path = att.value(QStringLiteral("path")).toString();
+    const QString name = att.value(QStringLiteral("name")).toString();
+    const bool image =
+        att.value(QStringLiteral("kind")).toString() == QLatin1String("image");
+
+    if (path.isEmpty() || !QFileInfo::exists(path)) {
+        emit statusMessage(
+            i18n("Can't open “%1” — the file has moved or been deleted since it was "
+                 "attached.",
+                 name.isEmpty() ? path : name));
+        return;
+    }
+
+    if (image) {
+        auto *dlg = new QDialog(this);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->setWindowTitle(name.isEmpty() ? i18n("Attachment") : name);
+        auto *lay = new QVBoxLayout(dlg);
+        lay->setContentsMargins(0, 0, 0, 0);
+        auto *view = new ImageView(path, dlg);
+        if (!view->isValid()) {
+            delete dlg;
+            emit statusMessage(i18n("Can't preview “%1” — it isn't a readable image.",
+                                    name.isEmpty() ? path : name));
+            return;
+        }
+        lay->addWidget(view);
+        dlg->resize(640, 520);
+        dlg->show();
+        return;
+    }
+
+    // Text / file: open it in the editor (MainWindow makes the editor visible).
+    emit openFileRequested(path);
 }
 
 // deliverMessage sends a message to the live thread right now: it shows the
@@ -2608,6 +2681,53 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
     } else if (type == QLatin1String("user")) {
         const QJsonArray content =
             ev.value(QStringLiteral("message")).toObject().value(QStringLiteral("content")).toArray();
+        // A "user" event is either the human's own message (text / image / an
+        // inlined "Attached file …" block) or the tool_result blocks the CLI
+        // echoes back after a tool runs. On replay we reconstruct the human's You
+        // card (the live path already drew it via addYouCard); tool_results are
+        // folded into their tool rows in both cases.
+        if (m_replaying) {
+            QStringList userLines;
+            bool hasInlineAttachment = false; // image block or "Attached file …" text
+            bool hasUserBlock = false;        // any non-tool_result block
+            for (const QJsonValue &bv : content) {
+                const QJsonObject b = bv.toObject();
+                const QString bt = b.value(QStringLiteral("type")).toString();
+                if (bt == QLatin1String("tool_result")) {
+                    continue;
+                }
+                hasUserBlock = true;
+                if (bt == QLatin1String("image")) {
+                    hasInlineAttachment = true;
+                } else if (bt == QLatin1String("text")) {
+                    const QString t = b.value(QStringLiteral("text")).toString();
+                    // buildUserContent (core) synthesizes "Attached file `name`:\n
+                    // ```\n…```" text blocks for text attachments — those are not
+                    // part of what the human typed, so drop them from the card
+                    // body; the sidecar re-supplies them as chips.
+                    if (t.startsWith(QLatin1String("Attached file `"))) {
+                        hasInlineAttachment = true;
+                    } else if (!t.isEmpty()) {
+                        userLines << t;
+                    }
+                }
+            }
+            if (hasUserBlock) {
+                const QString userText = userLines.join(QStringLiteral("\n"));
+                QJsonArray attachments;
+                // Pair this message with the front sidecar turn when it carried
+                // attachments and its recorded prompt matches — keeping the two in
+                // step even if some replayed user messages had no attachments.
+                if (hasInlineAttachment && !m_replayAttachTurns.isEmpty()) {
+                    const QJsonObject turn = m_replayAttachTurns.first().toObject();
+                    if (turn.value(QStringLiteral("text")).toString() == userText) {
+                        attachments = turn.value(QStringLiteral("attachments")).toArray();
+                        m_replayAttachTurns.removeFirst();
+                    }
+                }
+                addYouCard(userText, attachments);
+            }
+        }
         for (const QJsonValue &bv : content) {
             const QJsonObject b = bv.toObject();
             if (b.value(QStringLiteral("type")).toString() == QLatin1String("tool_result")) {

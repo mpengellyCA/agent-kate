@@ -127,6 +127,7 @@ func runCore() {
 		log.Error("cannot open the thread store", "err", err)
 		os.Exit(1)
 	}
+	attachSide := session.NewAttachmentStore(session.DefaultAttachmentDir())
 
 	summaries, err := compact.NewStore(compact.DefaultDir())
 	if err != nil {
@@ -283,6 +284,7 @@ func runCore() {
 		broker:     broker,
 		extensions: extensions,
 		sessions:   sessions,
+		attachSide: attachSide,
 		summaries:  summaries,
 		skills:     skillCatalog,
 		gitCache:   gitCache,

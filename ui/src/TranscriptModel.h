@@ -4,6 +4,7 @@
 #pragma once
 
 #include <QAbstractListModel>
+#include <QJsonArray>
 #include <QList>
 #include <QString>
 
@@ -46,6 +47,7 @@ public:
         ReplayedRole,  // bool — suppress the live timestamp
         TimestampRole, // short local time string
         NoteKindRole,  // colour bucket for notes
+        AttachmentsRole, // QJsonArray of compact attachment chips on a You message
         // Tool-specific.
         ToolNameRole,
         ToolSummaryRole,
@@ -68,6 +70,10 @@ public:
         bool replayed = false;
         QString timestamp;
         QString noteKind;
+        // Compact attachment chips for a You message (name/kind/path/mediaType/
+        // outside — never the body). Empty for every other row. Painted as a chip
+        // row under the message body; clicking a chip opens the file.
+        QJsonArray attachments;
         // Tool fields.
         QString toolName;
         QString toolSummary;
@@ -92,7 +98,8 @@ public:
     // eviction.
     int appendMessage(const QString &role, const QString &accentHex,
                       const QString &bodyHtml, const QString &plain, bool replayed,
-                      const QString &timestamp);
+                      const QString &timestamp,
+                      const QJsonArray &attachments = {});
     int appendNote(const QString &html, const QString &noteKind);
     int appendTool(const QString &toolName, const QString &summary,
                    const QString &detail, bool visible);
