@@ -477,6 +477,10 @@ DiffView::DiffView(const QString &unifiedDiff, QWidget *parent)
     layout->addLayout(topBar);
     layout->addWidget(m_stack, 1);
 
+    // Re-render when the interface or editor syntax theme changes so an already
+    // open diff tracks the new colours live, rather than only on its next open.
+    connect(ThemeManager::instance(), &ThemeManager::changed, this, &DiffView::rebuild);
+
     m_stack->setCurrentIndex(m_sideBySide ? 1 : 0);
     rebuild();
 }
@@ -510,7 +514,7 @@ void DiffView::rebuild()
     // Honour the app's chosen syntax theme when it names one; otherwise fall
     // back to a sensible default by light/dark.
     KSyntaxHighlighting::Theme theme;
-    const QString wanted = ThemeManager::instance()->syntaxTheme();
+    const QString wanted = ThemeManager::instance()->editorSyntaxTheme();
     if (!wanted.isEmpty()) {
         const KSyntaxHighlighting::Theme picked = repo.theme(wanted);
         if (picked.isValid()) {

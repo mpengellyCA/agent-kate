@@ -125,6 +125,7 @@ add_executable(agentkate
     src/lsp/WorkspaceSymbolDialog.cpp
     icons/agentkate.qrc
     themes/aktheme.qrc
+    konsole/akkonsole.qrc
 )
 
 target_include_directories(agentkate PRIVATE src)
@@ -229,7 +230,7 @@ if(Qt6Test_FOUND)
         src/theme/ThemeManager.cpp)
     target_include_directories(TranscriptModelTest PRIVATE src)
     target_link_libraries(TranscriptModelTest PRIVATE Qt6::Widgets Qt6::Test
-        KF6::ColorScheme KF6::ConfigCore KF6::I18n)
+        KF6::ColorScheme KF6::ConfigCore KF6::I18n KF6::SyntaxHighlighting)
     add_test(NAME TranscriptModelTest COMMAND TranscriptModelTest)
     set_tests_properties(TranscriptModelTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")

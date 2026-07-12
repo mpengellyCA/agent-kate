@@ -6,6 +6,8 @@
 #include <KColorScheme>
 #include <KConfigGroup>
 #include <KSharedConfig>
+#include <KSyntaxHighlighting/Repository>
+#include <KSyntaxHighlighting/Theme>
 
 #include <QApplication>
 #include <QDir>
@@ -16,7 +18,24 @@ namespace {
 
 constexpr const char *kConfigGroup = "Appearance";
 constexpr const char *kConfigKey = "Theme";
+constexpr const char *kEditorThemeKey = "EditorTheme";     // syntax theme override
+constexpr const char *kTerminalProfileKey = "TerminalProfile"; // Konsole profile override
 constexpr const char *kKdePrefix = "kde:"; // id form for an installed .colors scheme
+
+// The bundled Agent Kate Konsole profile names (their [General] Name entries).
+// TerminalPanel installs the matching .profile / .colorscheme files.
+constexpr const char *kMidnightTermProfile = "Agent Kate Midnight";
+constexpr const char *kDaylightTermProfile = "Agent Kate Daylight";
+
+// One highlighting repository for the process. Default-constructed, it discovers
+// both the KDE-bundled themes and Agent Kate's own themes (registered under the
+// /org.kde.syntax-highlighting/themes-addons resource prefix), matching what
+// KTextEditor, DiffView and ToolInspectorDialog each see.
+KSyntaxHighlighting::Repository &syntaxRepository()
+{
+    static KSyntaxHighlighting::Repository repo;
+    return repo;
+}
 
 // Mix two colours, `t` in [0,1] toward `b`.
 QColor blend(const QColor &a, const QColor &b, qreal t)
@@ -381,8 +400,106 @@ void ThemeManager::applyTheme(const QString &id, bool persist)
 
 void ThemeManager::applySavedOrDefault()
 {
-    const QString id = KSharedConfig::openConfig()
-                           ->group(QString::fromLatin1(kConfigGroup))
-                           .readEntry(kConfigKey, defaultId());
-    applyTheme(id, /*persist=*/false);
+    const KConfigGroup grp = KSharedConfig::openConfig()->group(QString::fromLatin1(kConfigGroup));
+    // Load the editor-theme and terminal-profile overrides first so the very
+    // first paint of any editor / terminal session already reflects the choice.
+    m_editorThemeId = grp.readEntry(kEditorThemeKey, QString());
+    m_terminalProfileId = grp.readEntry(kTerminalProfileKey, QString());
+    applyTheme(grp.readEntry(kConfigKey, defaultId()), /*persist=*/false);
+}
+
+QString ThemeManager::midnightTerminalProfile()
+{
+    return QString::fromLatin1(kMidnightTermProfile);
+}
+
+QString ThemeManager::daylightTerminalProfile()
+{
+    return QString::fromLatin1(kDaylightTermProfile);
+}
+
+QString ThemeManager::effectiveTerminalProfile() const
+{
+    if (!m_terminalProfileId.isEmpty()) {
+        return m_terminalProfileId;
+    }
+    // "Match the interface": the Agent Kate profile matching light/dark.
+    return m_colors.dark ? midnightTerminalProfile() : daylightTerminalProfile();
+}
+
+void ThemeManager::setTerminalProfile(const QString &id, bool persist)
+{
+    m_terminalProfileId = id;
+    if (persist) {
+        KConfigGroup grp = KSharedConfig::openConfig()->group(QString::fromLatin1(kConfigGroup));
+        grp.writeEntry(kTerminalProfileKey, id);
+        grp.sync();
+    }
+    Q_EMIT changed();
+}
+
+QStringList ThemeManager::availableTerminalProfiles()
+{
+    // Always offer the two bundled Agent Kate profiles, then merge in every
+    // Konsole *.profile installed on the system (read its [General] Name).
+    QStringList names{midnightTerminalProfile(), daylightTerminalProfile()};
+    const QStringList dirs =
+        QStandardPaths::locateAll(QStandardPaths::GenericDataLocation,
+                                  QStringLiteral("konsole"),
+                                  QStandardPaths::LocateDirectory);
+    for (const QString &dir : dirs) {
+        const QFileInfoList files =
+            QDir(dir).entryInfoList({QStringLiteral("*.profile")}, QDir::Files, QDir::Name);
+        for (const QFileInfo &fi : files) {
+            const KSharedConfigPtr cfg = KSharedConfig::openConfig(fi.absoluteFilePath());
+            const QString name = cfg->group(QStringLiteral("General"))
+                                     .readEntry("Name", fi.completeBaseName());
+            if (!name.isEmpty() && !names.contains(name)) {
+                names << name;
+            }
+        }
+    }
+    names.sort(Qt::CaseInsensitive);
+    return names;
+}
+
+QString ThemeManager::editorSyntaxTheme() const
+{
+    // An explicit editor-theme override wins over the interface theme.
+    if (!m_editorThemeId.isEmpty()) {
+        return m_editorThemeId;
+    }
+    // Otherwise match the interface theme's preferred syntax theme…
+    if (!m_syntaxTheme.isEmpty()) {
+        return m_syntaxTheme;
+    }
+    // …or a sensible light/dark default when it names none, so callers always
+    // receive a concrete, valid theme name.
+    const auto def = syntaxRepository().defaultTheme(
+        m_colors.dark ? KSyntaxHighlighting::Repository::DarkTheme
+                      : KSyntaxHighlighting::Repository::LightTheme);
+    return def.name();
+}
+
+void ThemeManager::setEditorTheme(const QString &id, bool persist)
+{
+    m_editorThemeId = id;
+    if (persist) {
+        KConfigGroup grp = KSharedConfig::openConfig()->group(QString::fromLatin1(kConfigGroup));
+        grp.writeEntry(kEditorThemeKey, id);
+        grp.sync();
+    }
+    Q_EMIT changed();
+}
+
+QStringList ThemeManager::availableEditorThemes()
+{
+    QStringList names;
+    const auto themes = syntaxRepository().themes();
+    names.reserve(themes.size());
+    for (const auto &t : themes) {
+        names << t.name();
+    }
+    names.sort(Qt::CaseInsensitive);
+    return names;
 }

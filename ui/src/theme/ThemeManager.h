@@ -8,6 +8,7 @@
 #include <QList>
 #include <QObject>
 #include <QString>
+#include <QStringList>
 
 // ThemeManager — the single owner of Agent Kate's appearance.
 //
@@ -39,9 +40,54 @@ public:
     const AkColors &colors() const { return m_colors; }
     bool isDark() const { return m_colors.dark; }
 
-    // The syntax-highlighting theme name to use, or empty to pick a sensible
-    // default by light/dark. Editors and the diff view honour this.
+    // The syntax-highlighting theme name that the *interface* theme prefers, or
+    // empty to pick a sensible default by light/dark. This is the "match the
+    // interface" value; most callers want editorSyntaxTheme() instead.
     QString syntaxTheme() const { return m_syntaxTheme; }
+
+    // The editor syntax theme, chosen independently of the interface palette.
+    // An empty id means "match the interface" (follow syntaxTheme()); a non-empty
+    // id names a specific KSyntaxHighlighting theme to use everywhere code is
+    // highlighted (editor, diff view, tool inspector).
+    QString editorThemeId() const { return m_editorThemeId; }
+
+    // The concrete syntax-highlighting theme name that editors and highlighted
+    // panes should use: the explicit editor-theme override when set, otherwise
+    // the interface theme's syntax theme, falling back to a light/dark default so
+    // this is always a valid, non-empty theme name.
+    QString editorSyntaxTheme() const;
+
+    // Set the editor syntax theme. An empty id restores "match the interface".
+    // Persists to KConfig's [Appearance] group unless `persist` is false (used
+    // for live preview), then emits changed() so open views re-theme.
+    void setEditorTheme(const QString &id, bool persist = true);
+
+    // Every syntax-highlighting theme name the user can pick, sorted for display.
+    static QStringList availableEditorThemes();
+
+    // The terminal (Konsole) profile, chosen independently of the interface.
+    // An empty id means "match the interface" — the Agent Kate terminal profile
+    // whose light/dark matches the current interface theme. A non-empty id names
+    // a specific Konsole profile to use for every terminal session.
+    QString terminalProfileId() const { return m_terminalProfileId; }
+
+    // The concrete Konsole profile name terminals should use: the explicit
+    // override when set, otherwise the Agent Kate profile matching the interface
+    // theme's light/dark. Always a non-empty profile name.
+    QString effectiveTerminalProfile() const;
+
+    // Set the terminal profile. An empty id restores "match the interface".
+    // Persists to KConfig's [Appearance] group unless `persist` is false (live
+    // preview), then emits changed() so open terminal sessions re-profile.
+    void setTerminalProfile(const QString &id, bool persist = true);
+
+    // Every Konsole profile name the user can pick, sorted. Always includes the
+    // two bundled Agent Kate profiles plus any profile installed on the system.
+    static QStringList availableTerminalProfiles();
+
+    // The bundled Agent Kate terminal profile names (dark / light).
+    static QString midnightTerminalProfile();
+    static QString daylightTerminalProfile();
 
     // The default theme id used on first run / when the config is empty.
     static QString defaultId();
@@ -70,5 +116,7 @@ private:
     QList<AkThemeDef> m_builtins;
     QString m_currentId;
     AkColors m_colors;
-    QString m_syntaxTheme;
+    QString m_syntaxTheme;     // syntax theme the interface theme prefers
+    QString m_editorThemeId;   // editor-theme override; empty == match interface
+    QString m_terminalProfileId; // terminal-profile override; empty == match interface
 };

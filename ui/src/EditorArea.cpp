@@ -40,16 +40,17 @@ constexpr const char *kWrappedViewTab = "editorarea_wrapped_view";
 } // namespace
 
 namespace {
-// Apply Agent Kate's bundled signature syntax theme to a KTextEditor view, so
-// the code canvas matches the navy chrome. KF6 KTextEditor exposes a per-view
-// "theme" config key; guard on it so this is a safe no-op where unsupported or
-// when no app theme is selected (the editor keeps its palette-derived default).
+// Apply the user's chosen editor syntax theme to a KTextEditor view. This is
+// ThemeManager::editorSyntaxTheme() — an explicit editor-theme override, or the
+// interface theme's syntax theme when set to "match the interface". KF6
+// KTextEditor exposes a per-view "theme" config key; guard on it so this is a
+// safe no-op where unsupported (the editor keeps its palette-derived default).
 void applyEditorTheme(KTextEditor::View *view)
 {
     if (!view) {
         return;
     }
-    const QString name = ThemeManager::instance()->syntaxTheme();
+    const QString name = ThemeManager::instance()->editorSyntaxTheme();
     if (name.isEmpty()) {
         return;
     }
@@ -472,6 +473,10 @@ void EditorArea::openFile(const QString &groupKey, const QString &path, int line
         connect(md->document(), &KTextEditor::Document::modifiedChanged, this,
                 [this, doc = md->document()] { updateTabIcon(doc); });
         clearConflictingViewShortcuts(md->view());
+        // Theme the raw-edit pane on open like the plain-text path does; without
+        // this the embedded view keeps KTextEditor's default until the next global
+        // re-theme (the "reopen Appearance to apply it" symptom).
+        applyEditorTheme(md->view());
         // Autosave the markdown/HTML document too; its reload banner is a child
         // of the RichTextView (same object name), so bannerHost is the view.
         wireAutosave(md->document(), md);

@@ -6,6 +6,7 @@
 #include <QDialog>
 #include <QString>
 
+class QComboBox;
 class QGridLayout;
 class QLabel;
 class QListWidget;
@@ -18,10 +19,11 @@ class QPushButton;
 // any installed KDE colour scheme — without the user touching System Settings.
 //
 // The left list offers every theme from ThemeManager (grouped with header rows);
-// the right pane previews the selection. Selecting a theme applies it live to the
-// whole running app (without persisting) so the user sees the real result. The
-// choice is only persisted on Ok/Apply; Cancel restores the theme that was active
-// when the dialog opened.
+// the right pane previews the selection. A combo box below picks the editor
+// syntax-highlighting theme independently — "Match interface" to follow the
+// palette above, or any specific KSyntaxHighlighting theme. Both selections apply
+// live to the running app (without persisting) so the user sees the real result;
+// they are only persisted on Ok/Apply. Cancel restores what was active on open.
 class AppearanceDialog : public QDialog
 {
     Q_OBJECT
@@ -37,14 +39,24 @@ protected:
 
 private:
     void buildThemeList();
+    void buildEditorThemeCombo();
+    void buildTerminalProfileCombo();
     void onSelectionChanged();
+    void onEditorThemeChanged();
+    void onTerminalProfileChanged();
     void updatePreview(const QString &id);
     QString selectedId() const;
+    QString selectedEditorThemeId() const;
+    QString selectedTerminalProfileId() const;
     void revertToOriginal();
 
-    QString m_originalId; // theme active when the dialog opened (for revert)
+    QString m_originalId;              // interface theme active when opened (revert)
+    QString m_originalEditorThemeId;   // editor theme active when opened (revert)
+    QString m_originalTerminalProfile; // terminal profile active when opened (revert)
 
     QListWidget *m_list = nullptr;
+    QComboBox *m_editorThemeCombo = nullptr;
+    QComboBox *m_terminalProfileCombo = nullptr;
 
     QLabel *m_previewName = nullptr;
     QLabel *m_previewDesc = nullptr;

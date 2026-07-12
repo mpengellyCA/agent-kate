@@ -1,5 +1,7 @@
 #include "TerminalPanel.h"
 
+#include "theme/ThemeManager.h"
+
 #include <KConfigGroup>
 #include <KLocalizedString>
 #include <KPluginFactory>
@@ -9,12 +11,15 @@
 
 #include <kde_terminal_interface.h>
 
+#include <QByteArray>
 #include <QDir>
+#include <QFile>
 #include <QFontMetrics>
 #include <QIcon>
 #include <QInputDialog>
 #include <QLabel>
 #include <QMenu>
+#include <QStandardPaths>
 #include <QTabBar>
 #include <QTabWidget>
 #include <QToolButton>
@@ -49,6 +54,56 @@ bool konsoleAvailable()
 {
     return KPluginMetaData(QStringLiteral("kf6/parts/konsolepart")).isValid();
 }
+
+// Apply the theme's chosen Konsole profile (colours + behaviour) to a session.
+void applyProfile(TerminalInterface *iface)
+{
+    if (iface) {
+        iface->setCurrentProfile(ThemeManager::instance()->effectiveTerminalProfile());
+    }
+}
+
+// Copy Agent Kate's bundled Konsole color schemes + profiles into the user's
+// Konsole data dir (~/.local/share/konsole) so the embedded terminal can wear a
+// scheme that matches the app themes. Konsole only discovers profiles/schemes
+// from that location, and there is no in-memory API to push raw colours to the
+// KPart. Idempotent: only writes a file when missing or out of date, and only
+// ever touches our own "AgentKate*"-named files — never the user's profiles.
+// Runs before the first session is created, so the KPart's ProfileManager sees
+// the files on its initial scan.
+void installKonsoleAssets()
+{
+    const QString dest =
+        QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation)
+        + QStringLiteral("/konsole");
+    if (!QDir().mkpath(dest)) {
+        return;
+    }
+    static const QStringList assets = {
+        QStringLiteral("AgentKateMidnight.colorscheme"),
+        QStringLiteral("AgentKateMidnight.profile"),
+        QStringLiteral("AgentKateDaylight.colorscheme"),
+        QStringLiteral("AgentKateDaylight.profile"),
+    };
+    for (const QString &name : assets) {
+        QFile res(QStringLiteral(":/konsole/") + name);
+        if (!res.open(QIODevice::ReadOnly)) {
+            continue;
+        }
+        const QByteArray want = res.readAll();
+        const QString path = dest + QLatin1Char('/') + name;
+        QFile existing(path);
+        if (existing.exists() && existing.open(QIODevice::ReadOnly)
+            && existing.readAll() == want) {
+            continue; // already up to date
+        }
+        existing.close();
+        QFile out(path);
+        if (out.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            out.write(want);
+        }
+    }
+}
 } // namespace
 
 TerminalPanel::TerminalPanel(QWidget *parent)
@@ -56,6 +111,12 @@ TerminalPanel::TerminalPanel(QWidget *parent)
     , m_workdir(QDir::homePath())
     , m_konsoleMissing(!konsoleAvailable())
 {
+    // Make our signature Konsole schemes/profiles discoverable before any part
+    // is created, so "Match interface" and the profile picker have them to use.
+    if (!m_konsoleMissing) {
+        installKonsoleAssets();
+    }
+
     m_tabs = new QTabWidget(this);
     m_tabs->setTabsClosable(true);
     m_tabs->setMovable(true);
@@ -84,6 +145,14 @@ TerminalPanel::TerminalPanel(QWidget *parent)
     connect(addButton, &QToolButton::clicked, this, &TerminalPanel::newTerminal);
     m_tabs->setCornerWidget(addButton, Qt::TopRightCorner);
     m_addButton = addButton;
+
+    // Re-profile every open session when the interface or terminal theme
+    // changes, so a live theme switch recolours running shells immediately.
+    connect(ThemeManager::instance(), &ThemeManager::changed, this, [this] {
+        for (int i = 0; i < m_tabs->count(); ++i) {
+            applyProfile(interfaceOf(m_tabs->widget(i)));
+        }
+    });
 
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
@@ -417,6 +486,8 @@ QWidget *TerminalPanel::createSession(const QString &cwd)
 
     if (auto *terminal = qobject_cast<TerminalInterface *>(part)) {
         terminal->showShellInDir(cwd);
+        // Dress the session in the theme's Konsole profile from the start.
+        applyProfile(terminal);
     }
     return container;
 }

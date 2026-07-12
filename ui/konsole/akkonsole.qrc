@@ -1,0 +1,11 @@
+<!-- Agent Kate's signature Konsole color schemes + profiles. TerminalPanel
+     copies these into the user's Konsole data dir so the embedded terminal can
+     wear a scheme that matches the app's Midnight / Daylight themes. -->
+<RCC>
+  <qresource prefix="/konsole">
+    <file>AgentKateMidnight.colorscheme</file>
+    <file>AgentKateMidnight.profile</file>
+    <file>AgentKateDaylight.colorscheme</file>
+    <file>AgentKateDaylight.profile</file>
+  </qresource>
+</RCC>

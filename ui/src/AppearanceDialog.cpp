@@ -9,6 +9,7 @@
 
 #include <QCloseEvent>
 #include <QColor>
+#include <QComboBox>
 #include <QDialogButtonBox>
 #include <QFrame>
 #include <QGridLayout>
@@ -106,6 +107,8 @@ AppearanceDialog::AppearanceDialog(QWidget *parent)
     resize(640, 460);
 
     m_originalId = ThemeManager::instance()->currentId();
+    m_originalEditorThemeId = ThemeManager::instance()->editorThemeId();
+    m_originalTerminalProfile = ThemeManager::instance()->terminalProfileId();
 
     auto *outer = new QVBoxLayout(this);
 
@@ -178,6 +181,34 @@ AppearanceDialog::AppearanceDialog(QWidget *parent)
 
     right->addStretch(1);
 
+    // --- Editor syntax theme (independent of the interface palette) ---
+    auto *editorSep = new QFrame(this);
+    editorSep->setFrameShape(QFrame::HLine);
+    outer->addWidget(editorSep);
+
+    auto *editorRow = new QHBoxLayout;
+    auto *editorLabel = new QLabel(i18n("Editor syntax theme:"), this);
+    editorRow->addWidget(editorLabel);
+    m_editorThemeCombo = new QComboBox(this);
+    m_editorThemeCombo->setToolTip(
+        i18n("The colour theme used to highlight code in the editor, diff and "
+             "inspector — independent of the interface theme above."));
+    editorLabel->setBuddy(m_editorThemeCombo);
+    editorRow->addWidget(m_editorThemeCombo, 1);
+    outer->addLayout(editorRow);
+
+    auto *terminalRow = new QHBoxLayout;
+    auto *terminalLabel = new QLabel(i18n("Terminal profile:"), this);
+    terminalRow->addWidget(terminalLabel);
+    m_terminalProfileCombo = new QComboBox(this);
+    m_terminalProfileCombo->setToolTip(
+        i18n("The Konsole profile (colours and behaviour) used by the integrated "
+             "terminal. \"Match interface\" tracks the interface theme's light or "
+             "dark variant."));
+    terminalLabel->setBuddy(m_terminalProfileCombo);
+    terminalRow->addWidget(m_terminalProfileCombo, 1);
+    outer->addLayout(terminalRow);
+
     // --- Buttons ---
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel |
                                              QDialogButtonBox::Apply,
@@ -185,20 +216,30 @@ AppearanceDialog::AppearanceDialog(QWidget *parent)
     outer->addWidget(buttons);
 
     connect(buttons, &QDialogButtonBox::accepted, this, [this] {
-        // Persist the live-previewed selection, then close.
+        // Persist the live-previewed selections, then close.
         ThemeManager::instance()->applyTheme(selectedId(), /*persist=*/true);
+        ThemeManager::instance()->setEditorTheme(selectedEditorThemeId(), /*persist=*/true);
+        ThemeManager::instance()->setTerminalProfile(selectedTerminalProfileId(), /*persist=*/true);
         accept();
     });
     connect(buttons, &QDialogButtonBox::rejected, this, &AppearanceDialog::reject);
     connect(buttons->button(QDialogButtonBox::Apply), &QPushButton::clicked, this, [this] {
         // Persist but keep the dialog open.
         ThemeManager::instance()->applyTheme(selectedId(), /*persist=*/true);
+        ThemeManager::instance()->setEditorTheme(selectedEditorThemeId(), /*persist=*/true);
+        ThemeManager::instance()->setTerminalProfile(selectedTerminalProfileId(), /*persist=*/true);
     });
 
     connect(m_list, &QListWidget::currentRowChanged, this,
             [this](int) { onSelectionChanged(); });
+    connect(m_editorThemeCombo, &QComboBox::currentIndexChanged, this,
+            [this](int) { onEditorThemeChanged(); });
+    connect(m_terminalProfileCombo, &QComboBox::currentIndexChanged, this,
+            [this](int) { onTerminalProfileChanged(); });
 
     buildThemeList();
+    buildEditorThemeCombo();
+    buildTerminalProfileCombo();
 }
 
 void AppearanceDialog::buildThemeList()
@@ -255,6 +296,68 @@ void AppearanceDialog::buildThemeList()
     }
     // Refresh the preview for the (pre-)selected row even if no signal fired.
     onSelectionChanged();
+}
+
+void AppearanceDialog::buildEditorThemeCombo()
+{
+    // Row 0 is "Match interface" (empty id); the rest are concrete theme names,
+    // whose id is the theme name itself.
+    m_editorThemeCombo->blockSignals(true);
+    m_editorThemeCombo->clear();
+    m_editorThemeCombo->addItem(i18n("Match interface (automatic)"), QString());
+    for (const QString &name : ThemeManager::availableEditorThemes()) {
+        m_editorThemeCombo->addItem(name, name);
+    }
+
+    const QString current = ThemeManager::instance()->editorThemeId();
+    int row = m_editorThemeCombo->findData(current);
+    m_editorThemeCombo->setCurrentIndex(row >= 0 ? row : 0);
+    m_editorThemeCombo->blockSignals(false);
+}
+
+QString AppearanceDialog::selectedEditorThemeId() const
+{
+    if (!m_editorThemeCombo) {
+        return m_originalEditorThemeId;
+    }
+    return m_editorThemeCombo->currentData().toString();
+}
+
+void AppearanceDialog::onEditorThemeChanged()
+{
+    // LIVE PREVIEW: apply to the running app (editors re-theme) without persisting.
+    ThemeManager::instance()->setEditorTheme(selectedEditorThemeId(), /*persist=*/false);
+}
+
+void AppearanceDialog::buildTerminalProfileCombo()
+{
+    // Row 0 is "Match interface" (empty id); the rest are Konsole profile names,
+    // whose id is the profile name itself.
+    m_terminalProfileCombo->blockSignals(true);
+    m_terminalProfileCombo->clear();
+    m_terminalProfileCombo->addItem(i18n("Match interface (automatic)"), QString());
+    for (const QString &name : ThemeManager::availableTerminalProfiles()) {
+        m_terminalProfileCombo->addItem(name, name);
+    }
+
+    const QString current = ThemeManager::instance()->terminalProfileId();
+    int row = m_terminalProfileCombo->findData(current);
+    m_terminalProfileCombo->setCurrentIndex(row >= 0 ? row : 0);
+    m_terminalProfileCombo->blockSignals(false);
+}
+
+QString AppearanceDialog::selectedTerminalProfileId() const
+{
+    if (!m_terminalProfileCombo) {
+        return m_originalTerminalProfile;
+    }
+    return m_terminalProfileCombo->currentData().toString();
+}
+
+void AppearanceDialog::onTerminalProfileChanged()
+{
+    // LIVE PREVIEW: re-profile running terminal sessions without persisting.
+    ThemeManager::instance()->setTerminalProfile(selectedTerminalProfileId(), /*persist=*/false);
 }
 
 QString AppearanceDialog::selectedId() const
@@ -345,6 +448,12 @@ void AppearanceDialog::revertToOriginal()
     // Live preview changed the running app — put back what was there on open.
     if (ThemeManager::instance()->currentId() != m_originalId) {
         ThemeManager::instance()->applyTheme(m_originalId, /*persist=*/true);
+    }
+    if (ThemeManager::instance()->editorThemeId() != m_originalEditorThemeId) {
+        ThemeManager::instance()->setEditorTheme(m_originalEditorThemeId, /*persist=*/true);
+    }
+    if (ThemeManager::instance()->terminalProfileId() != m_originalTerminalProfile) {
+        ThemeManager::instance()->setTerminalProfile(m_originalTerminalProfile, /*persist=*/true);
     }
 }
 

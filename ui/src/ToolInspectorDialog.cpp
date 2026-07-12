@@ -58,7 +58,7 @@ KSyntaxHighlighting::Theme resolveSyntaxTheme(KSyntaxHighlighting::Repository &r
                                               bool dark)
 {
     KSyntaxHighlighting::Theme theme;
-    const QString wanted = ThemeManager::instance()->syntaxTheme();
+    const QString wanted = ThemeManager::instance()->editorSyntaxTheme();
     if (!wanted.isEmpty()) {
         const KSyntaxHighlighting::Theme picked = repo.theme(wanted);
         if (picked.isValid()) {
