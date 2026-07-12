@@ -7,12 +7,14 @@
 #include <QPair>
 #include <QPersistentModelIndex>
 #include <QPointer>
+#include <QSet>
 #include <QString>
 #include <QWidget>
 
 class CoreClient;
 class TranscriptModel;
 class TranscriptDelegate;
+class WorkflowMonitor;
 class WorkingIndicator;
 class QListView;
 class QModelIndex;
@@ -253,6 +255,14 @@ private:
     // Open the full-size tool-call inspector modal for a Tool row (plan 13
     // phase 5): tool-aware Overview, full input JSON, searchable result.
     void openToolInspector(const QModelIndex &idx);
+    // Remember the most recent `Workflow` tool launch on this thread (its input +
+    // launch result), spin up a WorkflowMonitor for the chip's live label, and
+    // reveal the "Workflow" chip. Called when a Workflow tool_result lands.
+    void noteWorkflowLaunch(const QString &inputJson, const QString &resultText);
+    // Refresh the "Workflow" chip label/visibility from the monitor's state.
+    void updateWorkflowChip();
+    // Open the dedicated WorkflowMonitorDialog for the remembered workflow.
+    void openWorkflowMonitor();
     void addNote(const QString &html, const QString &kind);
     void scrollFeedToBottom();
     // Show the whole-message + code-block copy menu for a feed row.
@@ -334,6 +344,18 @@ private:
     QToolButton *m_jumpBtn = nullptr;
     bool m_jumpUnread = false; // a card arrived while detached from the bottom
     QHash<QString, int> m_toolRows; // tool_use id -> stable transcript key
+
+    // Background-Workflow tracking. A `Workflow` tool_use is recorded by its
+    // transcript key (with its input JSON) so the paired tool_result — which
+    // carries the run's Task ID / Transcript dir / Run ID — can be captured as the
+    // thread's latest followable workflow. The chip + monitor surface its status.
+    QSet<int> m_workflowToolKeys;
+    QHash<int, QString> m_workflowInputByKey;
+    QString m_workflowInput;
+    QString m_workflowResult;
+    WorkflowMonitor *m_workflowMonitor = nullptr; // drives the chip label (running/done)
+    QFrame *m_workflowBar = nullptr;
+    QPushButton *m_workflowChip = nullptr;
     // The Message row whose selection overlay is currently open (invalid = none).
     // Persistent so it tracks the row across insertions/scroll.
     QPersistentModelIndex m_selectionRow;

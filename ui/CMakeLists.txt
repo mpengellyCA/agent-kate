@@ -98,6 +98,10 @@ add_executable(agentkate
     src/TranscriptModel.cpp
     src/TranscriptDelegate.cpp
     src/ToolInspectorDialog.cpp
+    src/WorkflowMonitor.cpp
+    src/WorkflowMonitorView.cpp
+    src/WorkflowMonitorDialog.cpp
+    src/SubAgentTranscriptDialog.cpp
     src/WorktreeDashboard.cpp
     src/WorktreeCardDelegate.cpp
     src/CleanupDialog.cpp

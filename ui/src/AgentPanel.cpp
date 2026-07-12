@@ -7,6 +7,8 @@
 #include "ToolInspectorDialog.h"
 #include "TranscriptDelegate.h"
 #include "TranscriptModel.h"
+#include "WorkflowMonitor.h"
+#include "WorkflowMonitorDialog.h"
 #include "ipc/CoreClient.h"
 #include "shell/FlowLayout.h"
 #include "theme/ThemeManager.h"
@@ -738,6 +740,21 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     m_queueLayout = new FlowLayout(m_queueBar, 0, 6, 6);
     m_queueBar->setVisible(false);
 
+    // Workflow chip — appears once this thread launches a background Workflow.
+    // Opens the dedicated monitor so the fan-out run can be watched without
+    // hunting for its tool row; its label tracks the run's live state.
+    m_workflowBar = new QFrame(this);
+    auto *workflowLayout = new FlowLayout(m_workflowBar, 0, 6, 6);
+    m_workflowChip = new QPushButton(QStringLiteral("⧉ Workflow"), m_workflowBar);
+    m_workflowChip->setCursor(Qt::PointingHandCursor);
+    m_workflowChip->setToolTip(QStringLiteral(
+        "A background workflow launched by this agent — click to watch its "
+        "sub-agents and progress."));
+    connect(m_workflowChip, &QPushButton::clicked, this,
+            &AgentPanel::openWorkflowMonitor);
+    workflowLayout->addWidget(m_workflowChip);
+    m_workflowBar->setVisible(false);
+
     m_attachBtn = new QPushButton(
         QIcon::fromTheme(QStringLiteral("mail-attachment")), QStringLiteral("Attach…"), this);
     m_attachBtn->setCursor(Qt::PointingHandCursor);
@@ -874,6 +891,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     body->addWidget(m_questionBox);
     body->addWidget(m_promoteBar);
     body->addWidget(m_queueBar);
+    body->addWidget(m_workflowBar);
     body->addWidget(m_attachNotice);
     body->addWidget(m_attachBar);
     body->addWidget(m_input);
@@ -2164,6 +2182,61 @@ void AgentPanel::openToolInspector(const QModelIndex &idx)
     dlg->show();
 }
 
+void AgentPanel::noteWorkflowLaunch(const QString &inputJson, const QString &resultText)
+{
+    m_workflowInput = inputJson;
+    m_workflowResult = resultText;
+
+    // A fresh monitor drives the chip's live label (running → done) and stops
+    // polling once the run reaches a terminal state. Replaces any prior one so
+    // the chip always reflects the most recent workflow.
+    if (m_workflowMonitor) {
+        m_workflowMonitor->deleteLater();
+        m_workflowMonitor = nullptr;
+    }
+    m_workflowMonitor = new WorkflowMonitor(m_workflowInput, m_workflowResult, this);
+    connect(m_workflowMonitor, &WorkflowMonitor::changed, this,
+            &AgentPanel::updateWorkflowChip);
+    updateWorkflowChip();
+}
+
+void AgentPanel::updateWorkflowChip()
+{
+    if (!m_workflowBar || !m_workflowChip) {
+        return;
+    }
+    if (!m_workflowMonitor || !m_workflowMonitor->isValid()) {
+        m_workflowBar->setVisible(false);
+        return;
+    }
+    QString label;
+    switch (m_workflowMonitor->snapshot().state) {
+    case WorkflowMonitor::State::Completed:
+        label = QStringLiteral("⧉ Workflow · done");
+        break;
+    case WorkflowMonitor::State::Failed:
+        label = QStringLiteral("⧉ Workflow · failed");
+        break;
+    case WorkflowMonitor::State::Running:
+        label = QStringLiteral("⧉ Workflow · running");
+        break;
+    default:
+        label = QStringLiteral("⧉ Workflow");
+        break;
+    }
+    m_workflowChip->setText(label);
+    m_workflowBar->setVisible(true);
+}
+
+void AgentPanel::openWorkflowMonitor()
+{
+    if (m_workflowResult.isEmpty()) {
+        return;
+    }
+    auto *dlg = new WorkflowMonitorDialog(m_workflowInput, m_workflowResult, this);
+    dlg->show();
+}
+
 // deliverMessage sends a message to the live thread right now: it shows the
 // You card, marks the turn busy, and issues agent.send. Used both for an
 // immediate send and to drain one queued follow-up per turn boundary.
@@ -2871,6 +2944,12 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
                 if (!id.isEmpty()) {
                     m_toolRows.insert(id, key);
                 }
+                // Remember a Workflow launch by its row key so the paired
+                // tool_result (which carries the run anchors) can be captured.
+                if (name == QLatin1String("Workflow")) {
+                    m_workflowToolKeys.insert(key);
+                    m_workflowInputByKey.insert(key, detail);
+                }
                 if (!m_stickBottom) {
                     m_jumpUnread = true;
                     updateJumpButton();
@@ -2954,6 +3033,12 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
                         full.truncate(kToolResultStoreCap);
                     }
                     m_model->setToolResult(key, shown, full, truncated);
+                    // A Workflow launch result carries the run's Task ID /
+                    // Transcript dir / Run ID — capture it as this thread's latest
+                    // followable workflow and reveal the chip.
+                    if (m_workflowToolKeys.remove(key)) {
+                        noteWorkflowLaunch(m_workflowInputByKey.take(key), full);
+                    }
                     // A tool_use has exactly one tool_result; the mapping is dead
                     // once applied. Dropping it bounds m_toolRows and lets the key
                     // fall away with the row when it is eventually evicted.

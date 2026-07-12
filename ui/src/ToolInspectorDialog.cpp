@@ -4,6 +4,7 @@
 #include "ToolInspectorDialog.h"
 
 #include "DiffView.h"
+#include "WorkflowMonitorView.h"
 #include "theme/ThemeManager.h"
 
 #include <KConfigGroup>
@@ -142,6 +143,16 @@ ToolInspectorDialog::ToolInspectorDialog(const QString &toolName,
         QJsonDocument::fromJson(inputJson.toUtf8()).object();
 
     auto *tabs = new QTabWidget(this);
+
+    // A background Workflow is more than a static result: it fans out into
+    // sub-agents whose live status is on disk. Give it a first-class, live
+    // "Progress" tab (front + current) so the inspector shows what the run is
+    // actually doing, not just the launch acknowledgement.
+    if (toolName == QLatin1String("Workflow")) {
+        auto *progress = new WorkflowMonitorView(inputJson, fullResult, this);
+        tabs->addTab(progress, i18n("Progress"));
+    }
+
     tabs->addTab(buildOverview(toolName, input, fullResult), i18n("Overview"));
 
     // --- Input tab: the full JSON, monospace + JSON highlighting -----------
