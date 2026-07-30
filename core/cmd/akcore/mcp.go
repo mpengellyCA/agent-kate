@@ -28,7 +28,8 @@ type mcpBridge struct {
 	client    *ipc.Client
 	thread    string
 	workspace string
-	cowork    bool // serve the opt-in Cowork desktop tool set instead of Cooperation
+	cowork    bool   // serve the opt-in Cowork desktop tool set instead of Cooperation
+	backend   string // agent backend driving this bridge ("kimi" hides Claude-only tools)
 	log       *slog.Logger
 
 	mu  sync.Mutex // guards out across concurrent handlers
@@ -42,6 +43,7 @@ func runMCPBridge(args []string) {
 	thread := fs.String("thread", "", "agent thread id")
 	workspace := fs.String("workspace", "", "workspace path")
 	coworkMode := fs.Bool("cowork", false, "serve the opt-in KDE Cowork desktop tools instead of Cooperation")
+	backend := fs.String("backend", "", "agent backend using this bridge (\"kimi\" hides the Claude-only permission tool)")
 	_ = fs.Parse(args)
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -58,6 +60,7 @@ func runMCPBridge(args []string) {
 		thread:    *thread,
 		workspace: *workspace,
 		cowork:    *coworkMode,
+		backend:   *backend,
 		log:       log,
 		out:       bufio.NewWriter(os.Stdout),
 	}

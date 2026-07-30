@@ -21,7 +21,20 @@ func (b *mcpBridge) advertisedTools() []map[string]any {
 	if b.cowork {
 		return coworkToolDefs()
 	}
-	return toolDefs()
+	defs := toolDefs()
+	if b.backend == "kimi" {
+		// Kimi permissions flow over ACP (session/request_permission), not MCP
+		// — hide the Claude-only gate so a kimi agent never calls it.
+		filtered := make([]map[string]any, 0, len(defs))
+		for _, def := range defs {
+			if def["name"] == "request_permission" {
+				continue
+			}
+			filtered = append(filtered, def)
+		}
+		return filtered
+	}
+	return defs
 }
 
 // coworkToolDefs is the Cowork tool catalogue (plan 07 §1.1): see (list windows,

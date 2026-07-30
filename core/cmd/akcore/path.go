@@ -23,12 +23,13 @@ func augmentPath() {
 	}
 
 	candidates := []string{
-		filepath.Join(home, ".local", "bin"),       // pipx, ~/.local installs
-		filepath.Join(home, ".npm-global", "bin"),  // common `npm config set prefix` target
-		filepath.Join(home, ".bun", "bin"),         // Bun
-		filepath.Join(home, ".volta", "bin"),       // Volta
-		filepath.Join(home, ".cargo", "bin"),       // Rust
-		filepath.Join(home, "go", "bin"),           // Go binaries
+		filepath.Join(home, ".local", "bin"),      // pipx, ~/.local installs
+		filepath.Join(home, ".kimi-code", "bin"),  // Kimi Code CLI
+		filepath.Join(home, ".npm-global", "bin"), // common `npm config set prefix` target
+		filepath.Join(home, ".bun", "bin"),        // Bun
+		filepath.Join(home, ".volta", "bin"),      // Volta
+		filepath.Join(home, ".cargo", "bin"),      // Rust
+		filepath.Join(home, "go", "bin"),          // Go binaries
 		"/usr/local/bin",
 	}
 	if runtime.GOOS == "darwin" {

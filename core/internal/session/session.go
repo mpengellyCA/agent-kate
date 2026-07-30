@@ -27,16 +27,24 @@ const (
 	StatusArchived = "archived" // moved out of the live roster; reversible
 )
 
+// Agent backends. BackendClaude is empty so records written before the field
+// existed — all Claude threads — decode correctly.
+const (
+	BackendClaude = ""     // Claude Code (the `claude` CLI); the default
+	BackendKimi   = "kimi" // Kimi Code (the `kimi acp` CLI)
+)
+
 // Record is the persisted metadata for one agent thread — enough to resume it.
 type Record struct {
 	ThreadID       string            `json:"threadId"`
-	SessionID      string            `json:"sessionId"` // Claude Code session, for --resume
-	Project        string            `json:"project"`   // workspace path
+	SessionID      string            `json:"sessionId"`         // agent session, for resume (Claude Code or kimi)
+	Project        string            `json:"project"`           // workspace path
+	Backend        string            `json:"backend,omitempty"` // "" = Claude Code, "kimi" = Kimi Code; set once at start
 	Worktree       worktree.Worktree `json:"worktree"`
 	PermissionMode string            `json:"permissionMode"`
-	Effort         string            `json:"effort"` // claude --effort level; "" = Claude Code default
-	Model          string            `json:"model"`  // claude --model id; "" = Claude Code default
-	Title          string            `json:"title"`  // short summary of the opening prompt
+	Effort         string            `json:"effort"`         // claude --effort level; "" = Claude Code default
+	Model          string            `json:"model"`          // claude --model id; "" = Claude Code default
+	Title          string            `json:"title"`          // short summary of the opening prompt
 	Tags           []string          `json:"tags,omitempty"` // user/auto labels for roster organization
 	Created        time.Time         `json:"created"`
 	Updated        time.Time         `json:"updated"`

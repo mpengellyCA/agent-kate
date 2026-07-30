@@ -15,6 +15,7 @@ class QWidget;
 // agent's sticky default" (the data values match AgentPanel's combos).
 struct NewAgentChoices {
     QString task;           // optional first task, pre-filled into the composer
+    QString backend;        // claude | kimi
     QString modelId;        // "" | opus | sonnet | haiku | fable
     QString isolation;      // auto | isolated | workspace
     QString permissionMode; // acceptEdits | default | auto | bypassPermissions
@@ -35,6 +36,7 @@ public:
 
 private:
     QPlainTextEdit *m_task = nullptr;
+    QComboBox *m_backend = nullptr;
     QComboBox *m_model = nullptr;
     QCheckBox *m_sandbox = nullptr;
     QWidget *m_advanced = nullptr;

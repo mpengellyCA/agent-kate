@@ -19,7 +19,8 @@ lifecycle of the core.
                                                     │ spawns
                                   ┌─────────────────┼─────────────────┐
                                   ▼                 ▼                 ▼
-                            headless `claude`  language servers   MCP clients
+                            headless `claude`  headless `kimi acp`  language
+                            or `kimi acp`      (ACP → stream-json)  servers
 ```
 
 ### `agentkate` — C++ / Qt6 / KF6
@@ -38,9 +39,15 @@ and handles input, and delegates every subprocess and protocol concern to the co
 A single uniform supervisor for every child process. Independently runnable
 headless, which keeps the harness scriptable.
 
-- **Agent supervisor** — spawns `claude -p --output-format stream-json
-  --input-format stream-json --mcp-config <coop.json>`, one per agent thread;
-  parses stream-json events; relays them to the UI.
+- **Agent supervisor** — one agent thread per child process, events relayed to
+  the UI. Two backends, selectable per thread:
+  - *Claude Code* — spawns `claude -p --output-format stream-json
+    --input-format stream-json --mcp-config <coop.json>`; relays the stream-json
+    events verbatim.
+  - *Kimi Code* — spawns `kimi acp` (Agent Client Protocol over stdio) and
+    translates ACP session updates into the same Claude-shaped stream-json
+    events, so the UI renderer is backend-agnostic. Permissions, interrupts,
+    follow-ups, and session resume all map onto ACP methods.
 - **Worktree manager** — one `git worktree` + branch per agent thread, for true
   parallel isolation.
 - **Workspace manager** — multiple projects open at once; each is a workspace with

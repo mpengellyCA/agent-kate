@@ -604,6 +604,36 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
         rebuildModelCombo();
     });
 
+    // Backend selector: which agent harness runs this thread — Claude Code (the
+    // default, unchanged behaviour) or Kimi Code. Fixed once it starts, like the
+    // other setup combos. Choosing Kimi disables the provider/effort pickers
+    // (unsupported there) and turns the model combo into free text.
+    m_backendCombo = new QComboBox(this);
+    m_backendCombo->addItem(QStringLiteral("Claude Code"), QStringLiteral("claude"));
+    m_backendCombo->addItem(QStringLiteral("Kimi Code"), QStringLiteral("kimi"));
+    m_backendCombo->setToolTip(QStringLiteral(
+        "Which agent program runs this thread, fixed once it starts.\n"
+        "Kimi Code needs the `kimi` CLI installed; provider routing, thinking\n"
+        "effort, forking and compaction don't apply to Kimi threads."));
+    // Sticky: the last choice becomes the default for the next agent. Set before
+    // connecting so restoring "kimi" doesn't fire the handler mid-construction.
+    {
+        const QString saved = KSharedConfig::openConfig()
+                                  ->group(QStringLiteral("Agent"))
+                                  .readEntry("backend", QStringLiteral("claude"));
+        const int savedIdx = m_backendCombo->findData(saved);
+        if (savedIdx >= 0) {
+            m_backendCombo->setCurrentIndex(savedIdx);
+        }
+    }
+    connect(m_backendCombo, &QComboBox::currentIndexChanged, this, [this] {
+        KSharedConfig::openConfig()
+            ->group(QStringLiteral("Agent"))
+            .writeEntry("backend", m_backendCombo->currentData().toString());
+        rebuildModelCombo();
+        refresh();
+    });
+
     // Model selector. For Claude direct each item carries a tier token the core
     // resolves to a concrete --model id (its resolveModel is the single source of
     // truth, so the UI never hard-codes versioned model strings); for a provider
@@ -616,7 +646,11 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
         "Default leaves the provider's own configured/main model untouched."));
     connect(m_modelCombo, &QComboBox::currentIndexChanged, this, [this] {
         // Only the Claude-direct tier choice is sticky; a provider's model ids
-        // must not be persisted as the Claude model token.
+        // must not be persisted as the Claude model token, and neither must the
+        // free-text Kimi model (an editable combo).
+        if (m_modelCombo->isEditable()) {
+            return;
+        }
         if (m_providerCombo &&
             m_providerCombo->currentData().toString() != ProviderStore::directId()) {
             return;
@@ -800,6 +834,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
         auto *panel = new QWidget(menu);
         auto *form = new QFormLayout(panel);
         form->setContentsMargins(10, 8, 10, 8);
+        form->addRow(QStringLiteral("Agent backend"), m_backendCombo);
         form->addRow(QStringLiteral("When to ask"), m_modeCombo);
         form->addRow(QStringLiteral("Where it works"), m_isolationCombo);
         form->addRow(QStringLiteral("Thinking effort"), m_effortCombo);
@@ -942,12 +977,28 @@ void AgentPanel::setWorkspace(const QString &path)
 
 QString AgentPanel::currentModel() const
 {
-    return m_modelCombo ? m_modelCombo->currentData().toString() : QString();
+    if (!m_modelCombo) {
+        return QString();
+    }
+    // The Kimi backend's combo is editable free text (no item data).
+    return m_modelCombo->isEditable() ? m_modelCombo->currentText().trimmed()
+                                      : m_modelCombo->currentData().toString();
 }
 
 QString AgentPanel::currentEffort() const
 {
     return m_effortCombo ? m_effortCombo->currentData().toString() : QString();
+}
+
+void AgentPanel::preselectBackend(const QString &backend)
+{
+    if (backend.isEmpty() || !m_threadId.isEmpty()) {
+        return; // combo is frozen once a thread exists
+    }
+    const int idx = m_backendCombo->findData(backend);
+    if (idx >= 0) {
+        m_backendCombo->setCurrentIndex(idx);
+    }
 }
 
 void AgentPanel::preselectModel(const QString &modelId)
@@ -1008,13 +1059,27 @@ void AgentPanel::rebuildModelCombo()
     if (!m_modelCombo) {
         return; // provider combo may fire before the model combo is built
     }
-    const QString providerId = m_providerCombo
-        ? m_providerCombo->currentData().toString()
-        : ProviderStore::directId();
+    const bool kimi = m_backendCombo
+        && m_backendCombo->currentData().toString() == QLatin1String("kimi");
 
     QSignalBlocker block(m_modelCombo);
     m_modelCombo->clear();
 
+    if (kimi) {
+        // Kimi takes an optional free-text model id (empty = the CLI's own
+        // configured default) — an editable combo, since the UI doesn't
+        // enumerate the kimi model set. Provider/effort don't apply.
+        m_modelCombo->setEditable(true);
+        m_modelCombo->lineEdit()->clear();
+        m_modelCombo->lineEdit()->setPlaceholderText(
+            QStringLiteral("kimi default (e.g. kimi-code/kimi-for-coding)"));
+        return;
+    }
+    m_modelCombo->setEditable(false);
+
+    const QString providerId = m_providerCombo
+        ? m_providerCombo->currentData().toString()
+        : ProviderStore::directId();
     if (providerId.isEmpty() || providerId == ProviderStore::directId()) {
         // Claude tiers — the core's resolveModel maps these to concrete ids.
         m_modelCombo->addItem(QStringLiteral("Default model"), QString());
@@ -1185,36 +1250,41 @@ bool AgentPanel::eventFilter(QObject *obj, QEvent *event)
     return QWidget::eventFilter(obj, event);
 }
 
-void AgentPanel::setDormant(const QString &threadId, const QString &title, bool isolated)
+void AgentPanel::setDormant(const QString &threadId, const QString &title, bool isolated,
+                            const QString &backend)
 {
     m_threadId = threadId;
     Q_EMIT threadIdChanged(m_threadId);
     m_dormant = true;
     m_isolated = isolated;
+    m_backend = backend;
     loadTranscript();
     // Pull the thread's persisted compaction strategy and reflect it in the
     // dropdown — overrides whatever sticky default the panel was showing.
-    const QString tid = m_threadId;
-    m_core->call(QStringLiteral("agent.summaryStatus"),
-                 QJsonObject{{QStringLiteral("threadId"), tid}},
-                 [this, tid](const QJsonObject &result, const QJsonObject &) {
-                     if (tid != m_threadId) {
-                         return;
-                     }
-                     const QString strategy =
-                         result.value(QStringLiteral("strategy")).toString();
-                     if (!strategy.isEmpty()) {
-                         const int idx = m_compactCombo->findData(strategy);
-                         if (idx >= 0) {
-                             QSignalBlocker blocker(m_compactCombo);
-                             m_compactCombo->setCurrentIndex(idx);
+    // Kimi threads have no compaction support, so there's nothing to pull.
+    if (m_backend != QLatin1String("kimi")) {
+        const QString tid = m_threadId;
+        m_core->call(QStringLiteral("agent.summaryStatus"),
+                     QJsonObject{{QStringLiteral("threadId"), tid}},
+                     [this, tid](const QJsonObject &result, const QJsonObject &) {
+                         if (tid != m_threadId) {
+                             return;
                          }
-                     }
-                     QSignalBlocker blocker(m_compactStrip);
-                     m_compactStrip->setChecked(
-                         result.value(QStringLiteral("strip")).toBool(false));
-                 },
-                 this);
+                         const QString strategy =
+                             result.value(QStringLiteral("strategy")).toString();
+                         if (!strategy.isEmpty()) {
+                             const int idx = m_compactCombo->findData(strategy);
+                             if (idx >= 0) {
+                                 QSignalBlocker blocker(m_compactCombo);
+                                 m_compactCombo->setCurrentIndex(idx);
+                             }
+                         }
+                         QSignalBlocker blocker(m_compactStrip);
+                         m_compactStrip->setChecked(
+                             result.value(QStringLiteral("strip")).toBool(false));
+                     },
+                     this);
+    }
     addNote(QStringLiteral("dormant agent · %1 — Resume to continue.")
                 .arg(title.toHtmlEscaped()),
             QStringLiteral("sys"));
@@ -1224,13 +1294,15 @@ void AgentPanel::setDormant(const QString &threadId, const QString &title, bool 
 }
 
 void AgentPanel::adoptRunningThread(const QString &threadId, const QString &sourceThreadId,
-                                    const QString &title, bool isolated)
+                                    const QString &title, bool isolated,
+                                    const QString &backend)
 {
     m_threadId = threadId;
     Q_EMIT threadIdChanged(m_threadId);
     m_dormant = false;
     m_idle = true; // the fork is live and waiting for its first turn/follow-up
     m_isolated = isolated;
+    m_backend = backend;
     // A fork bills its own fresh session — start the cost meter from zero.
     m_sessionCostUsd = 0.0;
     m_sessionInTokens = 0;
@@ -1311,6 +1383,10 @@ void AgentPanel::loadTranscriptFrom(const QString &fromThreadId)
 
 void AgentPanel::pushCompactStrategy()
 {
+    // Kimi threads have no compaction support — the core rejects the call.
+    if (m_backend == QLatin1String("kimi")) {
+        return;
+    }
     if (m_threadId.isEmpty() || !m_core || !m_core->isConnected()) {
         return;
     }
@@ -1325,6 +1401,12 @@ void AgentPanel::pushCompactStrategy()
 
 void AgentPanel::runCompactNow(const QString &model)
 {
+    // Kimi threads have no compaction support — the core rejects the call.
+    if (m_backend == QLatin1String("kimi")) {
+        addNote(QStringLiteral("Compaction is not supported for Kimi Code agents."),
+                QStringLiteral("dim"));
+        return;
+    }
     if (m_threadId.isEmpty() || !m_core || !m_core->isConnected()) {
         addNote(QStringLiteral("Cannot compact: no thread or core is offline."),
                 QStringLiteral("err"));
@@ -1369,7 +1451,10 @@ void AgentPanel::runCompactNow(const QString &model)
 
 void AgentPanel::doResume()
 {
-    addNote(QStringLiteral("resuming the Claude Code session…"), QStringLiteral("sys"));
+    addNote(m_backend == QLatin1String("kimi")
+                ? QStringLiteral("resuming the Kimi Code session…")
+                : QStringLiteral("resuming the Claude Code session…"),
+            QStringLiteral("sys"));
     QJsonObject params{{QStringLiteral("threadId"), m_threadId}};
     // Re-attach the provider (with its API token) when this panel started the
     // thread on one this session — the core never persists the token, so a
@@ -1399,6 +1484,12 @@ void AgentPanel::doResume()
 void AgentPanel::resume()
 {
     if (!m_dormant || m_threadId.isEmpty()) {
+        return;
+    }
+    // Kimi threads have no compaction support — resume straight away instead of
+    // checking summary status / offering a pre-resume compact.
+    if (m_backend == QLatin1String("kimi")) {
+        doResume();
         return;
     }
     const QString tid = m_threadId;
@@ -1494,15 +1585,23 @@ void AgentPanel::refresh()
         m_interruptBtn->setVisible(running && !m_idle);
     }
     m_diffBtn->setEnabled(running);
-    // Fork needs a conversation to branch from — any thread with a session on
-    // disk (running or dormant) qualifies; the core rejects an empty session.
+    // Forking is Claude-only: a Kimi thread can't be forked (the core rejects
+    // agent.fork), so the button stays disabled for one.
+    const bool threadKimi = m_backend == QLatin1String("kimi");
     if (m_forkBtn) {
-        m_forkBtn->setEnabled(!m_threadId.isEmpty());
+        m_forkBtn->setEnabled(!m_threadId.isEmpty() && !threadKimi);
+        m_forkBtn->setToolTip(
+            threadKimi
+                ? QStringLiteral("Forking is not supported for Kimi Code agents.")
+                : QStringLiteral(
+                    "Continue this conversation as a new agent on a different model or "
+                    "thinking effort, keeping the full context. The original is untouched."));
     }
     // Compact-now needs a thread on disk (running or dormant). The Hot Opus
     // menu item is the only one that further needs the thread to be live.
+    // Kimi threads have no compaction support at all.
     if (m_compactNowBtn) {
-        m_compactNowBtn->setEnabled(!m_threadId.isEmpty());
+        m_compactNowBtn->setEnabled(!m_threadId.isEmpty() && !threadKimi);
         if (auto *menu = m_compactNowBtn->menu()) {
             const auto actions = menu->actions();
             if (!actions.isEmpty()) {
@@ -1511,20 +1610,27 @@ void AgentPanel::refresh()
         }
     }
     if (m_compactNowMenu) {
-        m_compactNowMenu->setEnabled(!m_threadId.isEmpty());
+        m_compactNowMenu->setEnabled(!m_threadId.isEmpty() && !threadKimi);
         const auto actions = m_compactNowMenu->actions();
         if (!actions.isEmpty()) {
             actions.first()->setEnabled(running); // "Hot Opus (live thread)"
         }
     }
+    m_compactCombo->setEnabled(!threadKimi);
+    m_compactStrip->setEnabled(!threadKimi);
+
     // Permission, isolation, effort, model and desktop access are fixed once a
-    // thread exists (they are baked into the agent's launch).
+    // thread exists (they are baked into the agent's launch). A not-yet-started
+    // Kimi pick further disables the pickers that don't apply to that backend.
+    const bool pickerKimi = m_backendCombo
+        && m_backendCombo->currentData().toString() == QLatin1String("kimi");
+    m_backendCombo->setEnabled(m_threadId.isEmpty());
     m_modeCombo->setEnabled(m_threadId.isEmpty());
     m_isolationCombo->setEnabled(m_threadId.isEmpty());
-    m_effortCombo->setEnabled(m_threadId.isEmpty());
-    m_providerCombo->setEnabled(m_threadId.isEmpty());
+    m_effortCombo->setEnabled(m_threadId.isEmpty() && !pickerKimi);
+    m_providerCombo->setEnabled(m_threadId.isEmpty() && !pickerKimi);
     m_modelCombo->setEnabled(m_threadId.isEmpty());
-    m_coworkCheck->setEnabled(m_threadId.isEmpty());
+    m_coworkCheck->setEnabled(m_threadId.isEmpty() && !pickerKimi);
 
     // Offer promotion while a thread runs non-isolated in the workspace.
     m_promoteBar->setVisible(!m_threadId.isEmpty() && !m_isolated && !m_promoting);
@@ -1571,6 +1677,11 @@ void AgentPanel::refresh()
             text = QStringLiteral("Working · %1").arg(where);
             st = AgentRoles::AgentStatus::Working;
         }
+    }
+    // Badge Kimi Code threads so the roster card shows which backend drives
+    // this agent ("" / "claude" threads stay unmarked — the common case).
+    if (threadKimi) {
+        text.prepend(QStringLiteral("Kimi · "));
     }
     // Append the running session cost as a quiet suffix once any has accrued.
     // Kept on the same subtitle so the roster card reflects it too.
@@ -1982,7 +2093,11 @@ void AgentPanel::onSendClicked()
     // here it cannot be resolved at launch either.)
     QJsonObject providerJson;
     QString startedProviderId;
-    if (m_threadId.isEmpty() && m_providerCombo) {
+    // A Kimi Code start skips provider routing entirely (the core rejects a
+    // provider combined with backend=kimi).
+    const bool startingKimi = m_threadId.isEmpty() && m_backendCombo
+        && m_backendCombo->currentData().toString() == QLatin1String("kimi");
+    if (m_threadId.isEmpty() && m_providerCombo && !startingKimi) {
         const ProviderProfile prof =
             ProviderStore::byId(m_providerCombo->currentData().toString());
         if (prof.routed()) {
@@ -2049,11 +2164,17 @@ void AgentPanel::onSendClicked()
         QJsonObject startParams{
             {QStringLiteral("workspacePath"), m_workspace},
             {QStringLiteral("prompt"), text},
+            {QStringLiteral("backend"), m_backendCombo->currentData().toString()},
             {QStringLiteral("permissionMode"), m_modeCombo->currentData().toString()},
             {QStringLiteral("isolation"), m_isolationCombo->currentData().toString()},
-            {QStringLiteral("effort"), m_effortCombo->currentData().toString()},
-            {QStringLiteral("model"), m_modelCombo->currentData().toString()},
-            {QStringLiteral("coworkEnabled"), m_coworkCheck->isChecked()},
+            // Effort, provider routing and Cowork don't apply to Kimi Code
+            // (the core rejects them); its model is the editable combo's text.
+            {QStringLiteral("effort"),
+             startingKimi ? QString() : m_effortCombo->currentData().toString()},
+            {QStringLiteral("model"),
+             startingKimi ? m_modelCombo->currentText().trimmed()
+                          : m_modelCombo->currentData().toString()},
+            {QStringLiteral("coworkEnabled"), !startingKimi && m_coworkCheck->isChecked()},
             {QStringLiteral("attachments"), attachments}};
         if (!providerJson.isEmpty()) {
             startParams.insert(QStringLiteral("provider"), providerJson);
@@ -2071,6 +2192,8 @@ void AgentPanel::onSendClicked()
                          }
                          m_threadId = result.value(QStringLiteral("threadId")).toString();
                          Q_EMIT threadIdChanged(m_threadId);
+                         // The core echoes the backend that actually started.
+                         m_backend = result.value(QStringLiteral("backend")).toString();
                          // Apply the user's chosen compaction strategy now
                          // that the thread exists on the server.
                          pushCompactStrategy();

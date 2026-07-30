@@ -16,6 +16,7 @@ import (
 	"agentkate/internal/cowork"
 	"agentkate/internal/gitstatus"
 	"agentkate/internal/ipc"
+	"agentkate/internal/kimi"
 	"agentkate/internal/permission"
 	"agentkate/internal/safe"
 	"agentkate/internal/search"
@@ -41,7 +42,8 @@ type agentStartParams struct {
 	Prompt         string             `json:"prompt"`
 	PermissionMode string             `json:"permissionMode"`
 	Effort         string             `json:"effort"`    // claude --effort level; "" = default
-	Model          string             `json:"model"`     // claude --model id; "" = Claude Code default
+	Model          string             `json:"model"`     // model id; "" = backend default
+	Backend        string             `json:"backend"`   // "" / "claude" = Claude Code, "kimi" = Kimi Code
 	Isolation      string             `json:"isolation"` // worktree.Mode*; "" = auto
 	Attachments    []agent.Attachment `json:"attachments"`
 	CoworkEnabled  bool               `json:"coworkEnabled"`      // opt into the KDE Cowork desktop tools
@@ -76,6 +78,7 @@ type coopPostNoteParams struct {
 type handlerDeps struct {
 	srv        *ipc.Server
 	sup        *agent.Supervisor
+	ksup       *kimi.Supervisor
 	coop       *coop.State
 	threads    *threadRegistry
 	broker     *permission.Broker
@@ -89,6 +92,45 @@ type handlerDeps struct {
 	socketPath string
 	exePath    string
 	log        *slog.Logger
+}
+
+// --- backend routing -------------------------------------------------------
+// Per-thread operations route to the supervisor that owns the thread: the
+// Claude supervisor, or for backend="kimi" threads the kimi supervisor. The
+// live supervisors answer first (a record may not be persisted yet); the
+// session store answers for dormant threads.
+
+func (d handlerDeps) isKimiThread(threadID string) bool {
+	if d.ksup != nil && d.ksup.Running(threadID) {
+		return true
+	}
+	rec, ok := d.sessions.Get(threadID)
+	return ok && rec.Backend == session.BackendKimi
+}
+
+func (d handlerDeps) agentRunning(threadID string) bool {
+	return d.sup.Running(threadID) || (d.ksup != nil && d.ksup.Running(threadID))
+}
+
+func (d handlerDeps) agentSend(threadID, text string, atts []agent.Attachment) error {
+	if d.ksup != nil && d.ksup.Running(threadID) {
+		return d.ksup.Send(threadID, text, atts)
+	}
+	return d.sup.Send(threadID, text, atts)
+}
+
+func (d handlerDeps) agentStop(threadID string) error {
+	if d.ksup != nil && d.ksup.Running(threadID) {
+		return d.ksup.Stop(threadID)
+	}
+	return d.sup.Stop(threadID)
+}
+
+func (d handlerDeps) agentInterrupt(threadID string) error {
+	if d.ksup != nil && d.ksup.Running(threadID) {
+		return d.ksup.Interrupt(threadID)
+	}
+	return d.sup.Interrupt(threadID)
 }
 
 // recordAttachments appends a compact, body-free attachment sidecar entry for a
@@ -140,6 +182,26 @@ func registerHandlers(d handlerDeps) {
 		if p.WorkspacePath == "" || p.Prompt == "" {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "workspacePath and prompt are required")
 		}
+		switch p.Backend {
+		case "", "claude":
+			p.Backend = session.BackendClaude
+		case session.BackendKimi:
+		default:
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown backend "+p.Backend)
+		}
+		// The kimi backend speaks ACP to the kimi CLI directly; provider routing
+		// and the Cowork desktop server are Claude-only, and compaction is
+		// rejected per-thread (agent.setCompactStrategy / agent.compactNow).
+		if p.Backend == session.BackendKimi {
+			if p.Provider.Routed() {
+				return nil, ipc.Errorf(ipc.CodeInvalidParams,
+					"provider routing is not supported for the kimi backend")
+			}
+			if p.CoworkEnabled {
+				return nil, ipc.Errorf(ipc.CodeInvalidParams,
+					"cowork is not supported for the kimi backend")
+			}
+		}
 		// Start asynchronously so this reply — which carries the threadId —
 		// always reaches the UI before any streamed event for the thread.
 		threadID := agent.NewThreadID()
@@ -149,7 +211,18 @@ func registerHandlers(d handlerDeps) {
 		// (the record is created asynchronously above, but the sidecar is keyed by
 		// thread id and needs no record to exist).
 		recordAttachments(d, threadID, p.Prompt, p.Attachments)
-		return map[string]any{"threadId": threadID, "sessionId": sessionID}, nil
+		// Echo the backend so the UI knows which one actually started; kimi
+		// assigns its own session id, so its sessionId is empty here and is
+		// captured from the init event instead.
+		replyBackend := p.Backend
+		if replyBackend == "" {
+			replyBackend = "claude"
+		}
+		reply := map[string]any{"threadId": threadID, "sessionId": sessionID, "backend": replyBackend}
+		if p.Backend == session.BackendKimi {
+			reply["sessionId"] = ""
+		}
+		return reply, nil
 	})
 
 	// agent.resume re-launches a dormant thread on its persisted Claude Code
@@ -169,10 +242,20 @@ func registerHandlers(d handlerDeps) {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
 		}
 		if rec.SessionID == "" {
+			if rec.Backend == session.BackendKimi {
+				return nil, ipc.Errorf(ipc.CodeInvalidParams,
+					"thread has no Kimi Code session to resume")
+			}
 			return nil, ipc.Errorf(ipc.CodeInvalidParams,
 				"thread has no Claude Code session to resume")
 		}
-		safe.Go("agent.resumeThread", func() { resumeAgentThread(d, rec, p.Provider) })
+		safe.Go("agent.resumeThread", func() {
+			if rec.Backend == session.BackendKimi {
+				resumeKimiThread(d, rec)
+			} else {
+				resumeAgentThread(d, rec, p.Provider)
+			}
+		})
 		return map[string]any{"threadId": rec.ThreadID, "sessionId": rec.SessionID}, nil
 	})
 
@@ -202,6 +285,18 @@ func registerHandlers(d handlerDeps) {
 		}
 		if attachTurns == nil {
 			attachTurns = []session.AttachmentTurn{}
+		}
+		// Kimi threads have no Claude transcript file; their transcript is the
+		// core-side translated-event log the kimi supervisor appends to live.
+		if rec.Backend == session.BackendKimi {
+			events, err := kimi.ReadTranscript("", p.ThreadID)
+			if err != nil {
+				return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+			}
+			if events == nil {
+				events = []json.RawMessage{}
+			}
+			return map[string]any{"events": events, "attachments": attachTurns}, nil
 		}
 		if rec.SessionID == "" {
 			return map[string]any{"events": []json.RawMessage{}, "attachments": attachTurns}, nil
@@ -235,6 +330,10 @@ func registerHandlers(d handlerDeps) {
 		if !ok {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
 		}
+		if src.Backend == session.BackendKimi {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams,
+				"forking is not supported for kimi threads")
+		}
 		if src.SessionID == "" {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams,
 				"this agent has no conversation yet to fork")
@@ -258,6 +357,10 @@ func registerHandlers(d handlerDeps) {
 		rec, ok := d.sessions.Get(p.ThreadID)
 		if !ok {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		}
+		if rec.Backend == session.BackendKimi {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams,
+				"promoting is not supported for kimi threads")
 		}
 		if rec.Worktree.Isolated {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams,
@@ -399,7 +502,7 @@ func registerHandlers(d handlerDeps) {
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
-		if err := d.sup.Send(p.ThreadID, p.Text, p.Attachments); err != nil {
+		if err := d.agentSend(p.ThreadID, p.Text, p.Attachments); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
 		// Persist a compact attachment sidecar so the "You" card's chips survive
@@ -417,7 +520,7 @@ func registerHandlers(d handlerDeps) {
 		// the supervisor terminates the process; cold strategies fire from
 		// the exit lifecycle handler instead.
 		runHotCompactIfConfigured(d, p.ThreadID)
-		if err := d.sup.Stop(p.ThreadID); err != nil {
+		if err := d.agentStop(p.ThreadID); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
 		return map[string]any{"ok": true}, nil
@@ -444,12 +547,12 @@ func registerHandlers(d handlerDeps) {
 		// A dormant thread has already been reaped, so the supervisor no longer
 		// tracks it and Stop reports "unknown thread" — that is the normal
 		// dormant state, not an error, so ignore it and proceed to archive.
-		if d.sup.Running(p.ThreadID) {
-			if err := d.sup.Stop(p.ThreadID); err != nil {
+		if d.agentRunning(p.ThreadID) {
+			if err := d.agentStop(p.ThreadID); err != nil {
 				return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 			}
 		}
-		for i := 0; i < 60 && d.sup.Running(p.ThreadID); i++ {
+		for i := 0; i < 60 && d.agentRunning(p.ThreadID); i++ {
 			time.Sleep(100 * time.Millisecond)
 		}
 		// Archive the record (reversible). A dormant thread with no live process
@@ -478,7 +581,7 @@ func registerHandlers(d handlerDeps) {
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
-		if err := d.sup.Interrupt(p.ThreadID); err != nil {
+		if err := d.agentInterrupt(p.ThreadID); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
 		return map[string]any{"ok": true}, nil
@@ -580,6 +683,7 @@ func registerHandlers(d handlerDeps) {
 				"project":  r.Project,
 				"title":    r.Title,
 				"status":   r.Status,
+				"backend":  r.Backend,
 				"branch":   r.Worktree.Branch,
 				"path":     r.Worktree.Path,
 				"isolated": r.Worktree.Isolated,
@@ -739,7 +843,7 @@ func registerHandlers(d handlerDeps) {
 		if !ok {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
 		}
-		_ = d.sup.Stop(p.ThreadID)
+		_ = d.agentStop(p.ThreadID)
 		if err := worktree.Remove(wt); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
 		}
@@ -769,6 +873,10 @@ func registerHandlers(d handlerDeps) {
 		s := compact.Strategy(p.Strategy)
 		if p.Strategy != "" && !s.Valid() {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown strategy "+p.Strategy)
+		}
+		if d.isKimiThread(p.ThreadID) {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams,
+				"compaction is not supported for kimi threads")
 		}
 		if err := d.sessions.Update(p.ThreadID, func(r *session.Record) {
 			r.CompactStrategy = p.Strategy
@@ -830,6 +938,10 @@ func registerHandlers(d handlerDeps) {
 		rec, ok := d.sessions.Get(p.ThreadID)
 		if !ok {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		}
+		if rec.Backend == session.BackendKimi {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams,
+				"compaction is not supported for kimi threads")
 		}
 		if rec.SessionID == "" {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "thread has no Claude Code session yet")
@@ -1038,24 +1150,15 @@ func registerHandlers(d handlerDeps) {
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
-		id, ch := d.broker.Open()
-		d.srv.Notify("permission.requested", map[string]any{
-			"threadId":  p.ThreadID,
-			"requestId": id,
-			"toolName":  p.ToolName,
-			"input":     p.Input,
-		})
-		select {
-		case dec := <-ch:
-			res := map[string]any{"allow": dec.Allow}
-			if len(dec.UpdatedInput) > 0 {
-				res["updatedInput"] = dec.UpdatedInput
-			}
-			return res, nil
-		case <-time.After(8 * time.Minute):
-			d.broker.Close(id)
+		dec, ok := askHumanPermission(d.srv, d.broker, p.ThreadID, p.ToolName, p.Input)
+		if !ok {
 			return map[string]any{"allow": false}, nil
 		}
+		res := map[string]any{"allow": dec.Allow}
+		if len(dec.UpdatedInput) > 0 {
+			res["updatedInput"] = dec.UpdatedInput
+		}
+		return res, nil
 	})
 
 	d.srv.Handle("permission.respond", func(_ context.Context, raw json.RawMessage) (any, error) {
@@ -2234,6 +2337,28 @@ func normalizeTags(in []string) []string {
 		}
 	}
 	return out
+}
+
+// askHumanPermission opens a broker request, pushes the permission.requested
+// notification to the UI, and blocks until the human answers via
+// permission.respond or the 8-minute safety timeout fires. It is shared by
+// the Claude MCP bridge's permission.request RPC and the kimi ACP permission
+// bridge, so both backends present the identical UI approval flow.
+func askHumanPermission(srv *ipc.Server, broker *permission.Broker, threadID, toolName string, input json.RawMessage) (permission.Decision, bool) {
+	id, ch := broker.Open()
+	srv.Notify("permission.requested", map[string]any{
+		"threadId":  threadID,
+		"requestId": id,
+		"toolName":  toolName,
+		"input":     input,
+	})
+	select {
+	case dec := <-ch:
+		return dec, true
+	case <-time.After(8 * time.Minute):
+		broker.Close(id)
+		return permission.Decision{}, false
+	}
 }
 
 // emitLifecycle pushes a synthetic _lifecycle agent event to the UI.

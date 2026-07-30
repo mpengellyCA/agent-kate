@@ -12,6 +12,7 @@
 #include <QLabel>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QSignalBlocker>
 #include <QVBoxLayout>
 
 NewAgentDialog::NewAgentDialog(const QString &projectName, QWidget *parent)
@@ -42,14 +43,32 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, QWidget *parent)
     // The two choices most people care about, in plain language.
     auto *form = new QFormLayout;
     form->setLabelAlignment(Qt::AlignLeft);
+    m_backend = new QComboBox(this);
+    m_backend->addItem(i18n("Claude Code"), QStringLiteral("claude"));
+    m_backend->addItem(i18n("Kimi Code"), QStringLiteral("kimi"));
+    m_backend->setToolTip(i18n("Which agent program runs this task. Kimi Code needs the kimi CLI installed."));
+    form->addRow(i18n("Which agent?"), m_backend);
     m_model = new QComboBox(this);
-    m_model->addItem(i18n("Use my default"), QString());
-    m_model->addItem(i18n("Smartest (Opus)"), QStringLiteral("opus"));
-    m_model->addItem(i18n("Balanced (Sonnet)"), QStringLiteral("sonnet"));
-    m_model->addItem(i18n("Fastest (Haiku)"), QStringLiteral("haiku"));
     m_model->setToolTip(i18n("Which model powers this agent. Smarter is more capable; faster is cheaper."));
     form->addRow(i18n("How clever?"), m_model);
     root->addLayout(form);
+
+    // The model list follows the backend: Claude tiers for Claude Code, just
+    // the CLI default for Kimi Code (its model is free-text on the panel).
+    auto rebuildModels = [this] {
+        const bool kimi =
+            m_backend->currentData().toString() == QLatin1String("kimi");
+        QSignalBlocker block(m_model);
+        m_model->clear();
+        m_model->addItem(i18n("Use my default"), QString());
+        if (!kimi) {
+            m_model->addItem(i18n("Smartest (Opus)"), QStringLiteral("opus"));
+            m_model->addItem(i18n("Balanced (Sonnet)"), QStringLiteral("sonnet"));
+            m_model->addItem(i18n("Fastest (Haiku)"), QStringLiteral("haiku"));
+        }
+    };
+    rebuildModels();
+    connect(m_backend, &QComboBox::currentIndexChanged, this, rebuildModels);
 
     m_sandbox = new QCheckBox(
         i18n("Work in a private copy, so changes don't touch my files until I approve"), this);
@@ -99,6 +118,7 @@ NewAgentChoices NewAgentDialog::choices() const
 {
     NewAgentChoices c;
     c.task = m_task->toPlainText().trimmed();
+    c.backend = m_backend->currentData().toString();
     c.modelId = m_model->currentData().toString();
     c.isolation = m_sandbox->isChecked() ? QStringLiteral("isolated")
                                          : QStringLiteral("workspace");

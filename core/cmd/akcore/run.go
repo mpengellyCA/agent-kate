@@ -21,6 +21,7 @@ import (
 	"agentkate/internal/gitstatus"
 	"agentkate/internal/ipc"
 	"agentkate/internal/kde"
+	"agentkate/internal/kimi"
 	"agentkate/internal/permission"
 	"agentkate/internal/safe"
 	"agentkate/internal/session"
@@ -159,11 +160,13 @@ func runCore() {
 	// --resume targets the latest session rather than the stale start-time id.
 	lastSessionID := map[string]string{}
 
-	// The agent supervisor relays every thread event to the UI as a
+	// The agent supervisors relay every thread event to the UI as a
 	// notification, so the agent panel can render the conversation live. Events
 	// arrive pre-coalesced as an ordered batch; we forward the whole batch in a
-	// single notification and run the per-event side effects in order.
-	sup := agent.NewSupervisor("", log, func(threadID string, events []json.RawMessage) {
+	// single notification and run the per-event side effects in order. Both
+	// backends share this one relay — the kimi supervisor already translates
+	// its ACP traffic into the same Claude-shaped events.
+	relayEvents := func(threadID string, events []json.RawMessage) {
 		if len(events) == 0 {
 			return
 		}
@@ -228,9 +231,9 @@ func runCore() {
 				})
 				// Cold-exit compaction runs only on a normal exit; a user
 				// interrupt is meant to be immediate, so we don't spend a turn
-				// summarising it.
+				// summarising it. Kimi threads have no compaction support.
 				if probe.Phase == "exited" {
-					if rec, ok := sessions.Get(threadID); ok {
+					if rec, ok := sessions.Get(threadID); ok && rec.Backend != session.BackendKimi {
 						strat := compact.Strategy(rec.CompactStrategy).Resolve()
 						if strat.RunsOnExit() && strat != compact.ExitOpusHot {
 							coldCompacts.spawn(log, sessions, summaries, rec, strat)
@@ -239,7 +242,17 @@ func runCore() {
 				}
 			}
 		}
-	})
+	}
+	sup := agent.NewSupervisor("", log, relayEvents)
+	// The kimi supervisor drives Kimi Code threads (`kimi acp`, ACP). Its
+	// permission asks go through the same broker + permission.requested
+	// notification the Claude MCP bridge uses, so the UI approval flow is
+	// identical across backends.
+	ksup := kimi.NewSupervisor("", log, relayEvents,
+		func(threadID, toolName string, input json.RawMessage) bool {
+			dec, ok := askHumanPermission(srv, broker, threadID, toolName, input)
+			return ok && dec.Allow
+		}, "")
 
 	// --- KDE Plasma Cowork (opt-in desktop see/control; off by default) --------
 	// The shared D-Bus client and consent authority are constructed eagerly so the
@@ -279,6 +292,7 @@ func runCore() {
 	deps := handlerDeps{
 		srv:        srv,
 		sup:        sup,
+		ksup:       ksup,
 		coop:       coopState,
 		threads:    threads,
 		broker:     broker,
@@ -305,7 +319,7 @@ func runCore() {
 		shutdownOnce.Do(func() {
 			running := 0
 			for _, rec := range sessions.List("") {
-				if sup.Running(rec.ThreadID) {
+				if sup.Running(rec.ThreadID) || ksup.Running(rec.ThreadID) {
 					running++
 				}
 			}
@@ -315,6 +329,7 @@ func runCore() {
 			runHotCompactsAtShutdown(deps, progress)
 			progress("stopping", "", 0, running)
 			sup.StopAll()
+			ksup.StopAll()
 			// Cold-exit compactions were spawned from the exit lifecycle as each
 			// thread reaped; drain them (bounded) before we let the process exit.
 			progress("draining", "", 0, 0)

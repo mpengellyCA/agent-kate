@@ -393,7 +393,7 @@ void AgentDock::newAgentInActiveProjectGuided()
         return;
     }
     const NewAgentChoices c = dlg.choices();
-    AgentPanel *panel = addAgent(project, c.modelId);
+    AgentPanel *panel = addAgent(project, c.modelId, c.backend);
     if (!panel) {
         return;
     }
@@ -654,7 +654,8 @@ void AgentDock::pushActiveWorktree(const QString &worktreePath)
     emit activeWorktreeChanged(worktreePath);
 }
 
-AgentPanel *AgentDock::addAgent(const QString &projectPath, const QString &model)
+AgentPanel *AgentDock::addAgent(const QString &projectPath, const QString &model,
+                                const QString &backend)
 {
     const int id = ++m_counter;
     auto *panel = new AgentPanel(m_core, m_stack);
@@ -663,7 +664,9 @@ AgentPanel *AgentDock::addAgent(const QString &projectPath, const QString &model
 
     m_roster->addAgent(projectPath, id, i18n("Agent %1", id));
     wireAgentPanel(id, panel);
-    // Apply a pre-picked model before the first start (the combo is still free).
+    // Apply a pre-picked backend + model before the first start (the combos are
+    // still free). Backend first — it decides what the model combo offers.
+    panel->preselectBackend(backend);
     panel->preselectModel(model);
     // Set the workspace after wiring so the panel's first refresh() reaches the
     // roster — that's what seeds the card's initial status dot and subtitle.
@@ -676,7 +679,8 @@ AgentPanel *AgentDock::addAgent(const QString &projectPath, const QString &model
 // addDormantAgent restores a persisted, not-running thread into the roster
 // without stealing focus from the active agent.
 AgentPanel *AgentDock::addDormantAgent(const QString &project, const QString &threadId,
-                                       const QString &title, bool isolated)
+                                       const QString &title, bool isolated,
+                                       const QString &backend)
 {
     const int id = ++m_counter;
     auto *panel = new AgentPanel(m_core, m_stack);
@@ -692,7 +696,7 @@ AgentPanel *AgentDock::addDormantAgent(const QString &project, const QString &th
         m_roster->setAgentTitlePinned(id, title);
     }
     wireAgentPanel(id, panel);
-    panel->setDormant(threadId, label, isolated); // emits dormantChanged
+    panel->setDormant(threadId, label, isolated, backend); // emits dormantChanged
     return panel;
 }
 
@@ -774,9 +778,15 @@ void AgentDock::restoreThreads(const QString &project)
                                                    .toObject()
                                                    .value(QStringLiteral("isolated"))
                                                    .toBool();
+                         // "" / "claude" = Claude Code; "kimi" badges the card
+                         // and disables the Claude-only affordances (fork,
+                         // compaction) on the restored panel.
+                         const QString backend =
+                             rec.value(QStringLiteral("backend")).toString();
                          AgentPanel *panel = addDormantAgent(
                              project, threadId,
-                             rec.value(QStringLiteral("title")).toString(), isolated);
+                             rec.value(QStringLiteral("title")).toString(), isolated,
+                             backend);
                          // Seed the roster card's tag chips from the persisted set.
                          QStringList tags;
                          const QJsonArray tagArr =
@@ -1038,6 +1048,11 @@ void AgentDock::forkAgent(int agentId)
         emit statusMessage(i18n("Start the agent before forking it"));
         return;
     }
+    // Forking is Claude-only — the core rejects agent.fork for Kimi threads.
+    if (e->panel->backend() == QLatin1String("kimi")) {
+        emit statusMessage(i18n("Forking is not supported for Kimi Code agents"));
+        return;
+    }
     const QString sourceTitle = m_roster->agentTitle(agentId);
     ForkAgentDialog dlg(sourceTitle, e->panel->currentModel(),
                         e->panel->currentEffort(), m_dialogParent);
@@ -1090,7 +1105,8 @@ void AgentDock::forkAgent(int agentId)
             self->wireAgentPanel(id, panel);
             // Forks always run in their own isolated worktree (core branches one
             // from the source HEAD).
-            panel->adoptRunningThread(newThreadId, sourceThreadId, label, /*isolated=*/true);
+            panel->adoptRunningThread(newThreadId, sourceThreadId, label, /*isolated=*/true,
+                                      result.value(QStringLiteral("backend")).toString());
             self->m_roster->setCurrentAgent(id); // bring the fork to the front
             emit self->statusMessage(i18n("Forked into “%1”", label));
         },

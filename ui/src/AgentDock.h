@@ -140,9 +140,11 @@ private:
     void pushActiveWorktree(const QString &worktreePath);
 
     void ensureProject(const QString &path);
-    AgentPanel *addAgent(const QString &projectPath, const QString &model = QString());
+    AgentPanel *addAgent(const QString &projectPath, const QString &model = QString(),
+                         const QString &backend = QString());
     AgentPanel *addDormantAgent(const QString &project, const QString &threadId,
-                                const QString &title, bool isolated);
+                                const QString &title, bool isolated,
+                                const QString &backend = QString());
     void renameAgent(int agentId);
     // Fork an agent: show the Fork dialog prefilled from the source, call
     // agent.fork, then adopt the newly-started thread into its own roster panel.

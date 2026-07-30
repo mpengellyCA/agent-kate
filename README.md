@@ -4,9 +4,10 @@
 
 A **native multi-agent coding arena**. Agent Kate is a fast, non-webview desktop
 application that embeds the **Kate editor engine** (`KTextEditor`) and
-orchestrates multiple **Claude Code** instances working across one or many
-projects at once — with agents and the human cooperating through a shared MCP
-server.
+orchestrates multiple **Claude Code** and **Kimi Code** instances working across
+one or many projects at once — with agents and the human cooperating through a
+shared MCP server. The backend (Claude Code or Kimi Code) is chosen per agent
+thread; both can run side by side in the same workspace.
 
 It is our own *harness and arena* for coding agents. Where others wrap a web
 GUI and put each agent thread on a bare git branch, Agent Kate renders natively
@@ -20,8 +21,8 @@ Two processes, one repo, connected by a local JSON-RPC bus:
   (instant native syntax highlighting), project tree, agent panels. Pure
   rendering and input.
 - **`akcore`** — Go orchestration core. Supervises every subprocess: headless
-  `claude` agents, language servers, and the Cooperation MCP server. Manages
-  git worktrees and workspaces. Runnable headless.
+  `claude` and `kimi acp` agent threads, language servers, and the Cooperation
+  MCP server. Manages git worktrees and workspaces. Runnable headless.
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for detail.
 
@@ -51,7 +52,8 @@ Project tree, editor, git log, and diff view together:
 ## Build
 
 Prerequisites (Arch): `qt6-base`, `ktexteditor`, `syntax-highlighting`,
-`extra-cmake-modules`, `cmake`, `ninja`, `go`, plus the `claude` CLI.
+`extra-cmake-modules`, `cmake`, `ninja`, `go`, plus the `claude` CLI and/or the
+`kimi` CLI (only the backend(s) you actually use are needed at runtime).
 
 The `scripts/ak` helper is the single entry point for everyday tasks (run any
 subcommand with `--help` for options):
@@ -80,8 +82,9 @@ a more interactive, developer-friendly multi-agent environment.
 
 I am building Agent Kate as a KDE Plasma user tired of slow Chromium- and
 Java-based IDEs, and I wanted something tailored to agentic development on
-Linux with Claude Code. Other harnesses like Codex and OpenCode could be added
-— I have no personal need for them, so PRs are welcome.
+Linux. Claude Code and Kimi Code are supported as agent backends; other
+harnesses like Codex and OpenCode could be added — I have no personal need for
+them, so PRs are welcome.
 
 This project was, by and large, coded directly by Claude Opus 4.7.
 

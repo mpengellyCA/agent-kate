@@ -70,6 +70,11 @@ public:
     QString currentModel() const;
     QString currentEffort() const;
 
+    // The backend harness driving this thread: "" or "claude" = Claude Code,
+    // "kimi" = Kimi Code. Empty until the thread is bound (start reply, fork
+    // adoption or dormant restore).
+    QString backend() const { return m_backend; }
+
     // Bind this fresh panel to a thread the core has ALREADY started (a fork):
     // adopt the running thread id and go live. The fork's own session id is
     // minted asynchronously (--fork-session), so the inherited conversation is
@@ -77,7 +82,13 @@ public:
     // has the transcript on disk. Unlike setDormant, the process is running, so
     // there is no Resume step.
     void adoptRunningThread(const QString &threadId, const QString &sourceThreadId,
-                            const QString &title, bool isolated);
+                            const QString &title, bool isolated,
+                            const QString &backend = QString());
+
+    // Pre-pick the agent backend ("claude" | "kimi") before the first start.
+    // No-op once a thread exists (the combo is frozen then) or if the id isn't
+    // an offered choice.
+    void preselectBackend(const QString &backend);
 
     // Pre-pick the start model by its id ("opus", "sonnet", …) before the first
     // start. No-op once a thread exists (the combo is frozen then) or if the id
@@ -94,7 +105,8 @@ public:
 
     // Bind this panel to a persisted-but-not-running thread; resume() relaunches
     // it through the core's agent.resume.
-    void setDormant(const QString &threadId, const QString &title, bool isolated);
+    void setDormant(const QString &threadId, const QString &title, bool isolated,
+                    const QString &backend = QString());
     // resume() may first prompt the user to choose a compaction model when no
     // current summary is on disk, then dispatch to doResume() for the actual
     // agent.resume call.
@@ -382,7 +394,13 @@ private:
     QComboBox *m_isolationCombo = nullptr;
     QComboBox *m_effortCombo = nullptr;
     QComboBox *m_providerCombo = nullptr; // third-party API provider (or Claude direct)
+    // Which agent harness runs this thread: Claude Code (default) or Kimi Code.
+    // Fixed once the thread starts, like the other setup combos.
+    QComboBox *m_backendCombo = nullptr;
     QComboBox *m_modelCombo = nullptr;
+    // Backend of the bound thread ("" or "claude" = Claude Code, "kimi" = Kimi
+    // Code), taken from the agent.start reply or the dormant-thread record.
+    QString m_backend;
     // Id of the provider this thread was started with, so a same-session resume
     // can re-attach a KWallet-held API token the core never persists. Empty for
     // Claude direct.
