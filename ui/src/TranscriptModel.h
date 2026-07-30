@@ -128,6 +128,10 @@ public:
     // has already been evicted.
     void setToolResult(int key, const QString &shown, const QString &fullResult,
                        bool truncated);
+    // Attach image chips to a tool row (a tool_result carrying image blocks —
+    // e.g. a screenshot). Chips are {name, kind, path} like a message's; the
+    // delegate paints them under the tool header.
+    void setToolAttachments(int key, const QJsonArray &attachments);
     // Expand the truncated result to its full text in place (the old
     // "Show full output" affordance). `row` is a *current* position: these are
     // called synchronously by the delegate from a live QModelIndex, so no

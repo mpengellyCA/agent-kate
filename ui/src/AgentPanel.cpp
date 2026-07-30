@@ -4,6 +4,7 @@
 #include "AttachmentBuilder.h"
 #include "ImageView.h"
 #include "ProviderConfig.h"
+#include "SubAgentTranscriptDialog.h"
 #include "ToolInspectorDialog.h"
 #include "TranscriptDelegate.h"
 #include "TranscriptModel.h"
@@ -58,6 +59,7 @@
 #include <QLayout>
 #include <QListView>
 #include <QListWidget>
+#include <QStandardPaths>
 #include <QMouseEvent>
 #include <QPaintEvent>
 #include <QPainter>
@@ -785,6 +787,13 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     workflowLayout->addWidget(m_workflowChip);
     m_workflowBar->setVisible(false);
 
+    // Background-work tray: one chip per CLI background task (a
+    // run_in_background shell or an async subagent). Hidden until a task
+    // starts; chips flip to ✓ when their task completes.
+    m_jobsBar = new QFrame(this);
+    m_jobsFlow = new FlowLayout(m_jobsBar, 0, 6, 6);
+    m_jobsBar->setVisible(false);
+
     m_attachBtn = new QPushButton(
         QIcon::fromTheme(QStringLiteral("mail-attachment")), QStringLiteral("Attach…"), this);
     m_attachBtn->setCursor(Qt::PointingHandCursor);
@@ -923,6 +932,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     body->addWidget(m_promoteBar);
     body->addWidget(m_queueBar);
     body->addWidget(m_workflowBar);
+    body->addWidget(m_jobsBar);
     body->addWidget(m_attachNotice);
     body->addWidget(m_attachBar);
     body->addWidget(m_input);
@@ -2640,6 +2650,136 @@ void AgentPanel::openToolInspector(const QModelIndex &idx)
     dlg->show();
 }
 
+void AgentPanel::handleTaskEvent(const QString &subtype, const QJsonObject &ev)
+{
+    // Stale task chatter from a replayed transcript would show dead jobs as
+    // running — the tray is live-only.
+    if (m_replaying) {
+        return;
+    }
+    if (subtype == QLatin1String("task_started")) {
+        const QString id = ev.value(QStringLiteral("task_id")).toString();
+        if (id.isEmpty() || m_bgJobs.contains(id)) {
+            return;
+        }
+        BgJob job;
+        job.id = id;
+        job.description = ev.value(QStringLiteral("description")).toString();
+        job.taskType = ev.value(QStringLiteral("task_type")).toString();
+        const QString toolUseId = ev.value(QStringLiteral("tool_use_id")).toString();
+        if (!toolUseId.isEmpty()) {
+            m_taskByToolUse.insert(toolUseId, id);
+        }
+        job.chip = new QPushButton(m_jobsBar);
+        job.chip->setCursor(Qt::PointingHandCursor);
+        connect(job.chip, &QPushButton::clicked, this,
+                [this, id] { openBackgroundJob(id); });
+        m_jobsFlow->addWidget(job.chip);
+        m_bgJobs.insert(id, job);
+        updateJobsBar();
+        return;
+    }
+    if (subtype == QLatin1String("task_notification")
+        || subtype == QLatin1String("task_updated")) {
+        const QString id = ev.value(QStringLiteral("task_id")).toString();
+        auto it = m_bgJobs.find(id);
+        if (it == m_bgJobs.end()) {
+            return;
+        }
+        const QString outputFile = ev.value(QStringLiteral("output_file")).toString();
+        if (!outputFile.isEmpty()) {
+            it->outputFile = outputFile;
+        }
+        const QString status =
+            subtype == QLatin1String("task_notification")
+                ? ev.value(QStringLiteral("status")).toString()
+                : ev.value(QStringLiteral("patch"))
+                      .toObject()
+                      .value(QStringLiteral("status"))
+                      .toString();
+        if (!status.isEmpty() && status != QLatin1String("running") && !it->done) {
+            it->done = true;
+            // The CLI's human-readable completion line, e.g. «Background
+            // command "…" completed (exit code 0)».
+            const QString summary = ev.value(QStringLiteral("summary")).toString();
+            if (!summary.isEmpty()) {
+                addNote(summary.toHtmlEscaped(),
+                        status == QLatin1String("completed") ? QStringLiteral("ok")
+                                                             : QStringLiteral("err"));
+            }
+        }
+        updateJobsBar();
+        return;
+    }
+    if (subtype == QLatin1String("background_tasks_changed")) {
+        // The authoritative set of still-running tasks; anything of ours not
+        // in it has finished (catches an update we might have missed).
+        QSet<QString> live;
+        const QJsonArray tasks = ev.value(QStringLiteral("tasks")).toArray();
+        for (const QJsonValue &v : tasks) {
+            live.insert(v.toObject().value(QStringLiteral("task_id")).toString());
+        }
+        for (auto it = m_bgJobs.begin(); it != m_bgJobs.end(); ++it) {
+            if (!live.contains(it.key())) {
+                it->done = true;
+            }
+        }
+        updateJobsBar();
+    }
+}
+
+void AgentPanel::openBackgroundJob(const QString &taskId)
+{
+    const auto it = m_bgJobs.constFind(taskId);
+    if (it == m_bgJobs.constEnd()) {
+        return;
+    }
+    if (it->outputFile.isEmpty()) {
+        emit statusMessage(i18n("No output yet — try again in a moment"));
+        return;
+    }
+    // A subagent's output file is a stream-json transcript — show it as a live
+    // chat; a shell's output file is plain text — open it in the editor.
+    if (it->taskType == QLatin1String("local_bash")) {
+        emit openFileRequested(it->outputFile);
+        return;
+    }
+    auto *dlg = new SubAgentTranscriptDialog(
+        it->outputFile,
+        it->description.isEmpty() ? i18n("Sub-agent") : it->description, this);
+    dlg->show();
+}
+
+void AgentPanel::updateJobsBar()
+{
+    if (!m_jobsBar) {
+        return;
+    }
+    int visible = 0;
+    for (auto it = m_bgJobs.begin(); it != m_bgJobs.end(); ++it) {
+        if (!it->chip) {
+            continue;
+        }
+        const bool agent = it->taskType != QLatin1String("local_bash");
+        QString label = it->description.simplified();
+        if (label.length() > 40) {
+            label = label.left(39) + QChar(0x2026);
+        }
+        const QString icon = it->done
+            ? QStringLiteral("✓")
+            : (agent ? QStringLiteral("\U0001f916") : QStringLiteral("⚙"));
+        it->chip->setText(icon + QStringLiteral(" ") + label);
+        it->chip->setToolTip(
+            (it->done ? i18n("Finished background task — click to open its output")
+                      : i18n("Running in the background — click to watch its output"))
+            + (it->outputFile.isEmpty()
+                   ? QString()
+                   : QStringLiteral("\n") + it->outputFile));
+        ++visible;
+    }
+    m_jobsBar->setVisible(visible > 0);
+}
+
 void AgentPanel::noteWorkflowLaunch(const QString &inputJson, const QString &resultText)
 {
     m_workflowInput = inputJson;
@@ -3371,8 +3511,18 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
     }
 
     if (type == QLatin1String("system")) {
-        // Only the init system event is worth showing in the feed.
-        if (ev.value(QStringLiteral("subtype")).toString() != QLatin1String("init")) {
+        const QString subtype = ev.value(QStringLiteral("subtype")).toString();
+        // The CLI's background-task lifecycle (run_in_background shells and
+        // async subagents) drives the jobs tray, not the feed.
+        if (subtype == QLatin1String("task_started")
+            || subtype == QLatin1String("task_updated")
+            || subtype == QLatin1String("task_notification")
+            || subtype == QLatin1String("background_tasks_changed")) {
+            handleTaskEvent(subtype, ev);
+            return;
+        }
+        // Beyond those, only the init system event is worth showing in the feed.
+        if (subtype != QLatin1String("init")) {
             return;
         }
         // A kimi init event carries the session's config options (model /
@@ -3572,11 +3722,72 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
                         full.truncate(kToolResultStoreCap);
                     }
                     m_model->setToolResult(key, shown, full, truncated);
+                    // Image blocks in the result (screenshots and the like)
+                    // become clickable thumbnail chips on the tool row. The
+                    // bytes go to the cache dir — the transcript model holds
+                    // only paths, so a screenshot-heavy session can't balloon
+                    // the feed's memory.
+                    const auto images =
+                        agentkate::toolResultImages(b.value(QStringLiteral("content")));
+                    if (!images.isEmpty()) {
+                        const QString dir =
+                            QStandardPaths::writableLocation(QStandardPaths::CacheLocation)
+                            + QStringLiteral("/tool-images");
+                        QDir().mkpath(dir);
+                        QJsonArray atts;
+                        for (int i = 0; i < images.size() && i < 6; ++i) {
+                            QString ext = QStringLiteral("png");
+                            const QString mt = images.at(i).first;
+                            if (mt == QLatin1String("image/jpeg")) {
+                                ext = QStringLiteral("jpg");
+                            } else if (mt == QLatin1String("image/gif")) {
+                                ext = QStringLiteral("gif");
+                            } else if (mt == QLatin1String("image/webp")) {
+                                ext = QStringLiteral("webp");
+                            }
+                            const QString path = dir
+                                + QStringLiteral("/%1-%2-%3.%4")
+                                      .arg(m_threadId)
+                                      .arg(key)
+                                      .arg(i + 1)
+                                      .arg(ext);
+                            QFile f(path);
+                            if (!f.open(QIODevice::WriteOnly)) {
+                                continue;
+                            }
+                            f.write(images.at(i).second);
+                            f.close();
+                            atts.append(QJsonObject{
+                                {QStringLiteral("name"), QFileInfo(path).fileName()},
+                                {QStringLiteral("kind"), QStringLiteral("image")},
+                                {QStringLiteral("path"), path}});
+                        }
+                        if (!atts.isEmpty()) {
+                            m_model->setToolAttachments(key, atts);
+                        }
+                    }
                     // A Workflow launch result carries the run's Task ID /
                     // Transcript dir / Run ID — capture it as this thread's latest
                     // followable workflow and reveal the chip.
                     if (m_workflowToolKeys.remove(key)) {
                         noteWorkflowLaunch(m_workflowInputByKey.take(key), full);
+                    }
+                    // A background task's launch result names its output file
+                    // ("Output is being written to: …" for shells,
+                    // "output_file: …" for async subagents) — capture it so
+                    // the tray chip can open the output before completion.
+                    const auto taskIt = m_taskByToolUse.constFind(id);
+                    if (taskIt != m_taskByToolUse.constEnd()) {
+                        auto jobIt = m_bgJobs.find(taskIt.value());
+                        if (jobIt != m_bgJobs.end() && jobIt->outputFile.isEmpty()) {
+                            static const QRegularExpression pathRe(QStringLiteral(
+                                "(?:Output is being written to:|output_file:)\\s*(\\S+?\\.output)"));
+                            const QRegularExpressionMatch m = pathRe.match(full);
+                            if (m.hasMatch()) {
+                                jobIt->outputFile = m.captured(1);
+                                updateJobsBar();
+                            }
+                        }
                     }
                     // A tool_use has exactly one tool_result; the mapping is dead
                     // once applied. Dropping it bounds m_toolRows and lets the key
@@ -3745,6 +3956,12 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
         } else if (phase == QLatin1String("exited")
                    || phase == QLatin1String("interrupted")) {
             const bool wasInterrupt = phase == QLatin1String("interrupted");
+            // Background tasks are children of the agent process — they ended
+            // with it. Their output files persist, so chips stay clickable.
+            for (auto it = m_bgJobs.begin(); it != m_bgJobs.end(); ++it) {
+                it->done = true;
+            }
+            updateJobsBar();
             addNote(wasInterrupt
                         ? QStringLiteral("&#9209; stopped (resumable) — send a "
                                          "follow-up to continue this session")

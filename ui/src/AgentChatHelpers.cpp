@@ -71,6 +71,27 @@ QString toolResultText(const QJsonValue &content)
     return parts.join(QLatin1Char('\n'));
 }
 
+QList<QPair<QString, QByteArray>> toolResultImages(const QJsonValue &content)
+{
+    QList<QPair<QString, QByteArray>> out;
+    for (const QJsonValue &v : content.toArray()) {
+        const QJsonObject o = v.toObject();
+        if (o.value(QStringLiteral("type")).toString() != QLatin1String("image")) {
+            continue;
+        }
+        const QJsonObject src = o.value(QStringLiteral("source")).toObject();
+        if (src.value(QStringLiteral("type")).toString() != QLatin1String("base64")) {
+            continue;
+        }
+        const QByteArray data = QByteArray::fromBase64(
+            src.value(QStringLiteral("data")).toString().toLatin1());
+        if (!data.isEmpty()) {
+            out.append({src.value(QStringLiteral("media_type")).toString(), data});
+        }
+    }
+    return out;
+}
+
 QString activityFor(const QString &tool)
 {
     if (tool == QLatin1String("Bash")) {

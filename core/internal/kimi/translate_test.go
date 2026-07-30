@@ -277,6 +277,31 @@ func TestPlanBecomesTodoWrite(t *testing.T) {
 		   {"content":"Add a test","status":"pending"}]}}]}}`)
 }
 
+// A tool result carrying image blocks passes them through as Claude-shaped
+// base64 image blocks (the UI renders thumbnail chips); text-only results
+// keep the plain-string shape.
+func TestToolResultImagesPassThrough(t *testing.T) {
+	tr := newTranslator("s1", "", nil)
+	tr.update(upd("tool_call", map[string]any{
+		"toolCallId": "tc1", "title": "screenshot", "kind": "other",
+		"status": "pending", "rawInput": map[string]any{},
+	}))
+	got := tr.update(upd("tool_call_update", map[string]any{
+		"toolCallId": "tc1", "status": "completed",
+		"content": []any{
+			map[string]any{"type": "content", "content": map[string]any{
+				"type": "text", "text": "captured"}},
+			map[string]any{"type": "content", "content": map[string]any{
+				"type": "image", "data": "aGk=", "mimeType": "image/png"}},
+		},
+	}))
+	assertEvents(t, got,
+		`{"type":"user","message":{"role":"user","content":[
+		  {"type":"tool_result","tool_use_id":"tc1","content":[
+		   {"type":"text","text":"captured"},
+		   {"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGk="}}]}]}}`)
+}
+
 // The permission bridge reads the best-known tool name and parsed input for
 // its prompt to the human.
 func TestToolForPermission(t *testing.T) {

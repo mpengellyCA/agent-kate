@@ -71,11 +71,14 @@ func newTranslator(sessionID, model string, configOptions []ConfigOption) *trans
 }
 
 // acpContent is an ACP content block. Kimi wraps streamed text in a
-// {"type":"content","content":{...}} envelope, hence the recursion.
+// {"type":"content","content":{...}} envelope, hence the recursion. Image
+// blocks carry base64 data + mimeType.
 type acpContent struct {
-	Type    string      `json:"type"`
-	Text    string      `json:"text"`
-	Content *acpContent `json:"content"`
+	Type     string      `json:"type"`
+	Text     string      `json:"text"`
+	Data     string      `json:"data"`
+	MimeType string      `json:"mimeType"`
+	Content  *acpContent `json:"content"`
 }
 
 // contentText concatenates the text found in a content block list.
@@ -89,6 +92,21 @@ func contentText(blocks []acpContent) string {
 		sb.WriteString(b.Text)
 	}
 	return sb.String()
+}
+
+// contentImages collects the image blocks from a content block list.
+func contentImages(blocks []acpContent) []acpContent {
+	var out []acpContent
+	for _, b := range blocks {
+		if b.Type == "content" && b.Content != nil {
+			out = append(out, contentImages([]acpContent{*b.Content})...)
+			continue
+		}
+		if b.Type == "image" && b.Data != "" {
+			out = append(out, b)
+		}
+	}
+	return out
 }
 
 // marshalEvent is the shared event constructor; a marshal failure on these
@@ -398,15 +416,36 @@ func (t *translator) emitToolUseLocked(toolCallID string) json.RawMessage {
 // t.mu.
 func (t *translator) toolResultLocked(toolCallID, status string, rawOutput, blocks json.RawMessage) json.RawMessage {
 	delete(t.toolCalls, toolCallID)
-	content := ""
+	text := ""
 	if len(rawOutput) > 0 {
 		// rawOutput may be a plain string or a structured object; the UI's
 		// tool-result rendering expects text either way.
-		if err := json.Unmarshal(rawOutput, &content); err != nil {
-			content = string(rawOutput)
+		if err := json.Unmarshal(rawOutput, &text); err != nil {
+			text = string(rawOutput)
 		}
 	} else {
-		content = contentText(decodeContent(blocks))
+		text = contentText(decodeContent(blocks))
+	}
+	// Image blocks (e.g. a screenshot result) ride through as Claude-shaped
+	// base64 image blocks so the UI's thumbnail chips render them; text-only
+	// results keep the plain-string shape.
+	var content any = text
+	if images := contentImages(decodeContent(blocks)); len(images) > 0 {
+		arr := []map[string]any{}
+		if text != "" {
+			arr = append(arr, map[string]any{"type": "text", "text": text})
+		}
+		for _, img := range images {
+			arr = append(arr, map[string]any{
+				"type": "image",
+				"source": map[string]any{
+					"type":       "base64",
+					"media_type": img.MimeType,
+					"data":       img.Data,
+				},
+			})
+		}
+		content = arr
 	}
 	block := map[string]any{
 		"type":        "tool_result",

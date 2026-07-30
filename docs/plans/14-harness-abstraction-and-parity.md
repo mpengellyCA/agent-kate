@@ -1,6 +1,6 @@
 # 14 — Harness Abstraction & Feature Parity (agent systems rework)
 
-> **Status: in progress — P1–P3 landed.** Follows the Kimi Code backend branch
+> **Status: in progress — P1–P4 landed.** Follows the Kimi Code backend branch
 > (`kimi-code-backend`, `e0e9594` + review fixes `5a20c66`). Seven phases;
 > land sequentially, one commit per phase, built green (`scripts/build.sh`,
 > `go test ./...` incl. `-race`, `ctest --test-dir build`), smoke-verified
@@ -240,9 +240,39 @@ real use; after approving ExitPlanMode the CLI leaves plan mode itself but
 the mode combo keeps showing "Plan first" (we don't guess the CLI's new
 mode). Slash commands are sent as plain user text for both backends.
 
-**P4 — Working-visibility (L).** Background-jobs tray (background shells +
-BashOutput polling), Task-subagent monitor reusing the WorkflowMonitor
-pattern, non-text tool results (images) rendered.
+**P4 — Working-visibility (L). ✅ LANDED.** The plan's sketch assumed
+BashOutput polling and Task sidechain nesting — BOTH assumptions were wrong
+on the installed CLI, and the real mechanisms are better. Verified against
+claude 2.1.220 by driving stream-json:
+- The CLI reports its background work as dedicated system events:
+  `task_started {task_id, tool_use_id, description, task_type}`,
+  `background_tasks_changed {tasks[]}` (the authoritative running set),
+  `task_updated {patch.status}`, and `task_notification {status,
+  output_file, summary}` on completion. No BashOutput polling needed.
+- Background shells and ASYNC subagents both write an on-disk output file
+  (`…/tasks/<id>.output`); a subagent's is a full stream-json JSONL
+  transcript. The subagent tool here is named `Agent` (async), not `Task`.
+- The parent session JSONL contains ZERO sidechain records on this CLI —
+  the sidechain-nesting idea is dead; the output-file route replaces it.
+
+What landed: a background-work tray (chips per task: ⚙ shell / 🤖 subagent,
+✓ when done; completion summaries as feed notes; the running set reconciled
+from background_tasks_changed; all jobs marked done when the agent exits).
+Clicking a shell chip opens its output file in the editor; clicking a
+subagent chip opens SubAgentTranscriptDialog on its transcript — live
+tailing, à la WorkflowMonitor, exactly as hoped, just fed by task events
+instead of launch-result regex. Output paths are also captured from the
+launch tool_result text as a fallback before the notification arrives.
+Image tool_results (screenshots etc.): decoded to the cache dir
+(`~/.cache/agentkate/tool-images/`), rendered as clickable thumbnail chips
+under the tool header (collapsed AND expanded), opening the image preview;
+the kimi translator passes ACP image blocks through as Claude-shaped base64
+image blocks so both backends feed the same path. Sync-Task CLIs (no task
+events) degrade gracefully: the generic tool row still renders.
+Deferred: no cache eviction for tool images yet (OS cache dir, small
+files); noted for a cleanup pass. Also observed: `system/thinking_tokens`
+events (a live thinking-size ticker) — earmarked for P5's working
+indicator.
 
 **P5 — Observability (M).** Context-fill meter, toolMeter/usageMeter surfaced
 in the AI Inspector, turn-duration stats on the working indicator,

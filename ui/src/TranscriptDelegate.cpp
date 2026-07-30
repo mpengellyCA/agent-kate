@@ -475,6 +475,17 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
     const bool done = idx.data(TranscriptModel::ToolDoneRole).toBool();
 
     int total = kToolHeaderH;
+    // Image chips (a tool_result carrying image blocks, e.g. a screenshot)
+    // sit directly under the header in both states — the image usually IS the
+    // result, so it reads first; the expanded detail shifts below it.
+    const QJsonArray toolAtts =
+        idx.data(TranscriptModel::AttachmentsRole).toJsonArray();
+    int toolChipsH = 0;
+    if (!toolAtts.isEmpty()) {
+        layoutAttachmentChips(toolAtts, opt.font, QPoint(0, 0),
+                              qMax(1, contentWidth - 2 * kDetailPadX), toolChipsH);
+        total += toolChipsH + kToolPad;
+    }
     // Detail (input JSON + result) measured with the mono document only when open.
     QTextDocument *detailDoc = nullptr;
     QTextDocument *resultDoc = nullptr;
@@ -545,8 +556,51 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
         painter->drawText(copyR, Qt::AlignCenter, QStringLiteral("⧉"));
         painter->restore();
 
+        if (toolChipsH > 0) {
+            const QPoint origin(card.left() + kDetailPadX, card.top() + kToolHeaderH);
+            int dummy = 0;
+            const QList<ChipLayout> laid = layoutAttachmentChips(
+                toolAtts, opt.font, origin,
+                qMax(1, contentWidth - 2 * kDetailPadX), dummy);
+            painter->save();
+            painter->setRenderHint(QPainter::Antialiasing, true);
+            for (int i = 0; i < laid.size(); ++i) {
+                const ChipLayout &c = laid.at(i);
+                const QJsonObject att = toolAtts.at(i).toObject();
+                painter->setPen(opt.palette.color(QPalette::Mid));
+                painter->setBrush(opt.palette.color(QPalette::Base));
+                painter->drawRoundedRect(c.rect.adjusted(0, 0, -1, -1), 6, 6);
+                int textLeft = c.rect.left() + kChipPadX;
+                if (c.image) {
+                    const QString path = att.value(QStringLiteral("path")).toString();
+                    QPixmap pm(path);
+                    const QRect iconR(textLeft, c.rect.top() + (kChipH - kChipIcon) / 2,
+                                      kChipIcon, kChipIcon);
+                    if (!pm.isNull()) {
+                        painter->drawPixmap(iconR,
+                                            pm.scaled(kChipIcon, kChipIcon,
+                                                      Qt::KeepAspectRatio,
+                                                      Qt::SmoothTransformation));
+                    } else {
+                        painter->setPen(opt.palette.color(QPalette::Mid));
+                        painter->drawText(iconR, Qt::AlignCenter,
+                                          QStringLiteral("\U0001f5bc"));
+                    }
+                    textLeft += kChipIcon + kChipHGap;
+                }
+                painter->setFont(opt.font);
+                painter->setPen(opt.palette.color(QPalette::Link));
+                painter->drawText(QRect(textLeft, c.rect.top(),
+                                        c.rect.right() - textLeft - kChipPadX + 1,
+                                        c.rect.height()),
+                                  Qt::AlignLeft | Qt::AlignVCenter, c.label);
+            }
+            painter->restore();
+        }
+
         if (expanded) {
-            int y = card.top() + kToolHeaderH + kToolPad;
+            int y = card.top() + kToolHeaderH
+                    + (toolChipsH > 0 ? toolChipsH + kToolPad : 0) + kToolPad;
             QFont mono = opt.font;
             mono.setFamily(QStringLiteral("monospace"));
             painter->save();
@@ -801,6 +855,24 @@ bool TranscriptDelegate::editorEvent(QEvent *event, QAbstractItemModel *model,
 
         if (kind == TranscriptModel::Tool
             && idx.data(TranscriptModel::ToolVisibleRole).toBool()) {
+            // An image chip (screenshot result) opens its preview.
+            const QJsonArray toolAtts =
+                idx.data(TranscriptModel::AttachmentsRole).toJsonArray();
+            if (!toolAtts.isEmpty()) {
+                const int availW =
+                    opt.rect.width() - 2 * kOuterMarginX - 2 * kDetailPadX;
+                const QPoint origin(opt.rect.left() + kOuterMarginX + kDetailPadX,
+                                    opt.rect.top() + kToolHeaderH);
+                int dummy = 0;
+                const QList<ChipLayout> laid = layoutAttachmentChips(
+                    toolAtts, opt.font, origin, qMax(1, availW), dummy);
+                for (int i = 0; i < laid.size(); ++i) {
+                    if (laid.at(i).rect.contains(pos)) {
+                        emit attachmentActivated(toolAtts.at(i).toObject());
+                        return true;
+                    }
+                }
+            }
             // "Open in inspector" glyph — opens the full tool-call modal.
             if (toolInspectRect(opt.rect).contains(pos)) {
                 emit inspectToolRequested(idx);

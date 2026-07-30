@@ -29,6 +29,7 @@ private Q_SLOTS:
     void attachmentsRoleRoundTrips();
     void thinkingRowExpands();
     void checklistUpdatesInPlace();
+    void toolAttachmentsAddChips();
 };
 
 void TranscriptModelTest::appendsGrowRowCount()
@@ -312,6 +313,42 @@ void TranscriptModelTest::checklistUpdatesInPlace()
         m.appendNote(QStringLiteral("n"), QStringLiteral("sys"));
     }
     QVERIFY(!m.setChecklist(key, v1));
+}
+
+// A tool row that received image blocks in its result (plan 14 P4) carries
+// attachment chips: they round-trip through the role and grow the collapsed
+// row's measured height (the delegate lays the chip row under the header).
+void TranscriptModelTest::toolAttachmentsAddChips()
+{
+    TranscriptModel m;
+    const int key = m.appendTool(QStringLiteral("desktop_screenshot"),
+                                 QStringLiteral("whole screen"), QStringLiteral("{}"),
+                                 true);
+    TranscriptDelegate d;
+    QStyleOptionViewItem opt;
+    opt.font = QFont();
+    opt.palette = QPalette();
+    opt.rect = QRect(0, 0, 500, 0);
+    const int bare = d.sizeHint(opt, m.index(0)).height();
+
+    m.setToolResult(key, QStringLiteral("captured"), QStringLiteral("captured"), false);
+    m.setToolAttachments(key,
+                         QJsonArray{QJsonObject{
+                             {QStringLiteral("name"), QStringLiteral("shot-1.png")},
+                             {QStringLiteral("kind"), QStringLiteral("image")},
+                             {QStringLiteral("path"), QStringLiteral("/tmp/none.png")}}});
+    const QJsonArray got =
+        m.data(m.index(0), TranscriptModel::AttachmentsRole).toJsonArray();
+    QCOMPARE(got.size(), 1);
+    QCOMPARE(got.at(0).toObject().value(QStringLiteral("kind")).toString(),
+             QStringLiteral("image"));
+    const int withChips = d.sizeHint(opt, m.index(0)).height();
+    QVERIFY2(withChips > bare, "image chips must add to the collapsed tool row height");
+
+    // A non-tool row refuses tool attachments (guarded setter).
+    const int note = m.appendNote(QStringLiteral("n"), QStringLiteral("sys"));
+    m.setToolAttachments(note, got);
+    QVERIFY(m.data(m.index(1), TranscriptModel::AttachmentsRole).toJsonArray().isEmpty());
 }
 
 QTEST_MAIN(TranscriptModelTest)

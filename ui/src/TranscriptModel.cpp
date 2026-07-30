@@ -152,6 +152,16 @@ void TranscriptModel::setToolResult(int key, const QString &shown,
     touched(row);
 }
 
+void TranscriptModel::setToolAttachments(int key, const QJsonArray &attachments)
+{
+    const int row = rowForKey(key);
+    if (row < 0 || m_items.at(row).kind != Tool) {
+        return;
+    }
+    m_items[row].attachments = attachments;
+    touched(row);
+}
+
 void TranscriptModel::expandToolResult(int row)
 {
     if (row < 0 || row >= m_items.size()) {

@@ -268,6 +268,16 @@ private:
     // Open the full-size tool-call inspector modal for a Tool row (plan 13
     // phase 5): tool-aware Overview, full input JSON, searchable result.
     void openToolInspector(const QModelIndex &idx);
+    // Background work tray (plan 14 P4). The claude CLI reports its
+    // background tasks — run_in_background shells and async subagents — as
+    // system events (task_started / task_updated / task_notification /
+    // background_tasks_changed, verified against claude 2.1.220). Each task
+    // gets a chip: running "⚙ description", done "✓ description"; clicking
+    // opens the task's output file (a live subagent transcript viewer for
+    // agent tasks, the editor for shell output).
+    void handleTaskEvent(const QString &subtype, const QJsonObject &ev);
+    void openBackgroundJob(const QString &taskId);
+    void updateJobsBar();
     // Remember the most recent `Workflow` tool launch on this thread (its input +
     // launch result), spin up a WorkflowMonitor for the chip's live label, and
     // reveal the "Workflow" chip. Called when a Workflow tool_result lands.
@@ -393,6 +403,19 @@ private:
     // names only).
     QList<QPair<QString, QString>> m_slashCommands;
     QListWidget *m_slashPopup = nullptr;
+    // One background task (shell or async subagent) reported by the CLI.
+    struct BgJob {
+        QString id;          // CLI task_id
+        QString description;
+        QString taskType;    // "local_bash" | agent kinds
+        QString outputFile;  // parsed from the tool result / task_notification
+        bool done = false;
+        QPushButton *chip = nullptr;
+    };
+    QHash<QString, BgJob> m_bgJobs;         // by task_id
+    QHash<QString, QString> m_taskByToolUse; // tool_use_id -> task_id
+    QFrame *m_jobsBar = nullptr;
+    FlowLayout *m_jobsFlow = nullptr;
 
     // Background-Workflow tracking. A `Workflow` tool_use is recorded by its
     // transcript key (with its input JSON) so the paired tool_result — which

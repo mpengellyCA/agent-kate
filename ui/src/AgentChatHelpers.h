@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <QByteArray>
+#include <QList>
+#include <QPair>
 #include <QString>
 
 class QJsonObject;
@@ -26,6 +29,11 @@ QString permSummary(const QString &toolName, const QJsonObject &input);
 // toolResultText pulls plain text out of a tool_result content value, which may
 // be a bare string or an array of content blocks.
 QString toolResultText(const QJsonValue &content);
+
+// toolResultImages pulls base64 image blocks out of a tool_result content
+// value (e.g. a screenshot tool's result), decoded, as (mediaType, bytes)
+// pairs. Text-only results return an empty list.
+QList<QPair<QString, QByteArray>> toolResultImages(const QJsonValue &content);
 
 // activityFor maps a tool name to a personable status line for the
 // "Agent Kate at work" indicator.
