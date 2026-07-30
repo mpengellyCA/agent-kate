@@ -27,6 +27,8 @@ private Q_SLOTS:
     void heightCacheInvalidatesOnMutation();
     void evictionBoundsRamAndKeysResolve();
     void attachmentsRoleRoundTrips();
+    void thinkingRowExpands();
+    void checklistUpdatesInPlace();
 };
 
 void TranscriptModelTest::appendsGrowRowCount()
@@ -238,6 +240,78 @@ void TranscriptModelTest::attachmentsRoleRoundTrips()
     const int plainH = d.sizeHint(opt, m.index(0)).height();
     const int withAttH = d.sizeHint(opt, m.index(1)).height();
     QVERIFY2(withAttH > plainH, "attachment chips must add to the message row height");
+}
+
+// A thinking row (plan 14 P2) starts collapsed to its one-line preview and
+// grows when expanded — same collapse contract as a tool row, distinct kind.
+void TranscriptModelTest::thinkingRowExpands()
+{
+    TranscriptModel m;
+    const int key = m.appendThinking(
+        QStringLiteral("<p>long reasoning<br>line two<br>line three</p>"),
+        QStringLiteral("long reasoning\nline two\nline three"),
+        QStringLiteral("long reasoning"));
+    QCOMPARE(TranscriptModel::Kind(m.data(m.index(key), TranscriptModel::KindRole).toInt()),
+             TranscriptModel::Thinking);
+    QCOMPARE(m.data(m.index(key), TranscriptModel::ToolSummaryRole).toString(),
+             QStringLiteral("long reasoning"));
+
+    TranscriptDelegate d;
+    QStyleOptionViewItem opt;
+    opt.font = QFont();
+    opt.palette = QPalette();
+    opt.rect = QRect(0, 0, 500, 0);
+    const int collapsed = d.sizeHint(opt, m.index(key)).height();
+    QVERIFY(collapsed > 0);
+    m.setExpanded(key, true);
+    const int expanded = d.sizeHint(opt, m.index(key)).height();
+    QVERIFY2(expanded > collapsed, "expanded thinking row must be taller than collapsed");
+}
+
+// The plan checklist (plan 14 P2) is ONE card updated in place: each TodoWrite
+// replaces the items rather than appending a stale copy; an evicted card
+// reports false so the caller appends anew.
+void TranscriptModelTest::checklistUpdatesInPlace()
+{
+    TranscriptModel m;
+    const QJsonArray v1{
+        QJsonObject{{QStringLiteral("content"), QStringLiteral("read code")},
+                    {QStringLiteral("status"), QStringLiteral("in_progress")}}};
+    const int key = m.appendChecklist(v1);
+    QCOMPARE(m.rowCount(), 1);
+    QCOMPARE(TranscriptModel::Kind(m.data(m.index(key), TranscriptModel::KindRole).toInt()),
+             TranscriptModel::Checklist);
+
+    const QJsonArray v2{
+        QJsonObject{{QStringLiteral("content"), QStringLiteral("read code")},
+                    {QStringLiteral("status"), QStringLiteral("completed")}},
+        QJsonObject{{QStringLiteral("content"), QStringLiteral("fix bug")},
+                    {QStringLiteral("status"), QStringLiteral("pending")}}};
+    QSignalSpy spy(&m, &QAbstractItemModel::dataChanged);
+    QVERIFY(m.setChecklist(key, v2));
+    QCOMPARE(m.rowCount(), 1); // updated in place, no second card
+    QCOMPARE(spy.count(), 1);
+    QCOMPARE(m.data(m.index(0), TranscriptModel::ChecklistRole).toJsonArray().size(), 2);
+
+    // More items → taller card (the delegate lays out one line per item).
+    TranscriptDelegate d;
+    QStyleOptionViewItem opt;
+    opt.font = QFont();
+    opt.palette = QPalette();
+    opt.rect = QRect(0, 0, 500, 0);
+    const int twoItems = d.sizeHint(opt, m.index(0)).height();
+    QJsonArray v3 = v2;
+    v3.append(QJsonObject{{QStringLiteral("content"), QStringLiteral("add test")},
+                          {QStringLiteral("status"), QStringLiteral("pending")}});
+    QVERIFY(m.setChecklist(key, v3));
+    const int threeItems = d.sizeHint(opt, m.index(0)).height();
+    QVERIFY2(threeItems > twoItems, "an extra checklist item must add a line");
+
+    // Evict the card off the front; the stale key then reports false.
+    for (int i = 0; i < 6000; ++i) {
+        m.appendNote(QStringLiteral("n"), QStringLiteral("sys"));
+    }
+    QVERIFY(!m.setChecklist(key, v1));
 }
 
 QTEST_MAIN(TranscriptModelTest)

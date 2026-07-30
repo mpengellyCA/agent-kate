@@ -44,16 +44,43 @@ func assertEvents(t *testing.T, got []json.RawMessage, want ...string) {
 }
 
 func TestInitEvent(t *testing.T) {
-	tr := newTranslator("session_abc", "kimi-code/k3")
+	tr := newTranslator("session_abc", "kimi-code/k3", nil)
 	assertEvents(t, []json.RawMessage{tr.initEvent()},
 		`{"type":"system","subtype":"init","session_id":"session_abc","model":"kimi-code/k3"}`)
+}
+
+// The handshake's config options (model / thinking / mode enumerations) ride
+// into the init event so the UI can populate real pickers.
+func TestInitEventCarriesConfigOptions(t *testing.T) {
+	tr := newTranslator("s1", "kimi-code/k3", []ConfigOption{{
+		ID: "model", Name: "Model", Category: "model", CurrentValue: "kimi-code/k3",
+		Options: []ConfigOptionValue{
+			{Value: "kimi-code/k3", Name: "K3"},
+			{Value: "kimi-code/kimi-for-coding", Name: "K2.7 Coding"},
+		},
+	}, {
+		ID: "mode", Name: "Mode", Category: "mode", CurrentValue: "default",
+		Options: []ConfigOptionValue{
+			{Value: "default", Name: "Default", Description: "Manual approvals."},
+			{Value: "yolo", Name: "YOLO", Description: "Auto-approve tools."},
+		},
+	}})
+	assertEvents(t, []json.RawMessage{tr.initEvent()},
+		`{"type":"system","subtype":"init","session_id":"s1","model":"kimi-code/k3",
+		  "configOptions":[
+		   {"id":"model","name":"Model","category":"model","currentValue":"kimi-code/k3",
+		    "options":[{"value":"kimi-code/k3","name":"K3"},
+		               {"value":"kimi-code/kimi-for-coding","name":"K2.7 Coding"}]},
+		   {"id":"mode","name":"Mode","category":"mode","currentValue":"default",
+		    "options":[{"value":"default","name":"Default","description":"Manual approvals."},
+		               {"value":"yolo","name":"YOLO","description":"Auto-approve tools."}]}]}`)
 }
 
 // Text deltas accumulate silently and flush as ONE assistant event when a
 // tool_call interrupts the message — the UI appends one card per event, so
 // partial snapshots must never be emitted.
 func TestTextChunksFlushOnToolCall(t *testing.T) {
-	tr := newTranslator("s1", "")
+	tr := newTranslator("s1", "", nil)
 	if ev := tr.update(upd("agent_message_chunk", map[string]any{
 		"content": map[string]any{"type": "text", "text": "Hello "},
 	})); len(ev) != 0 {
@@ -75,7 +102,7 @@ func TestTextChunksFlushOnToolCall(t *testing.T) {
 
 // Buffered text flushes ahead of the result event at turn end.
 func TestTextFlushAtEndTurn(t *testing.T) {
-	tr := newTranslator("s1", "")
+	tr := newTranslator("s1", "", nil)
 	tr.update(upd("agent_message_chunk", map[string]any{
 		"content": map[string]any{"type": "text", "text": "done"},
 	}))
@@ -89,7 +116,7 @@ func TestTextFlushAtEndTurn(t *testing.T) {
 // rather than in the tool_call itself. The tool card ships once the snapshot
 // parses — exactly once — carrying the parsed input.
 func TestStreamedInputSnapshot(t *testing.T) {
-	tr := newTranslator("s1", "")
+	tr := newTranslator("s1", "", nil)
 	if ev := tr.update(upd("tool_call", map[string]any{
 		"toolCallId": "tc1", "title": "Bash", "kind": "execute", "status": "pending",
 	})); len(ev) != 0 {
@@ -120,7 +147,7 @@ func TestStreamedInputSnapshot(t *testing.T) {
 
 // A failed tool call maps to an is_error tool_result.
 func TestToolResultFailed(t *testing.T) {
-	tr := newTranslator("s1", "")
+	tr := newTranslator("s1", "", nil)
 	tr.update(upd("tool_call", map[string]any{
 		"toolCallId": "tc9", "title": "Bash", "kind": "execute",
 		"status": "pending", "rawInput": map[string]any{"command": "false"},
@@ -153,9 +180,9 @@ func TestToolNameMapping(t *testing.T) {
 
 // Updates with no Claude-shaped counterpart are dropped silently.
 func TestIgnoredUpdates(t *testing.T) {
-	tr := newTranslator("s1", "")
+	tr := newTranslator("s1", "", nil)
 	for _, kind := range []string{
-		"agent_thought_chunk", "plan", "config_option_update", "available_commands_update",
+		"config_option_update", "available_commands_update",
 	} {
 		if ev := tr.update(upd(kind, map[string]any{
 			"content": map[string]any{"type": "text", "text": "ignored"},
@@ -163,12 +190,83 @@ func TestIgnoredUpdates(t *testing.T) {
 			t.Errorf("%s emitted %d events, want 0", kind, len(ev))
 		}
 	}
+	// An empty plan update carries nothing to render either.
+	if ev := tr.update(upd("plan", map[string]any{"entries": []any{}})); len(ev) != 0 {
+		t.Errorf("empty plan emitted %d events, want 0", len(ev))
+	}
+}
+
+// Thought deltas accumulate silently and flush as ONE thinking-block assistant
+// event when the visible message resumes — reasoning reads before the text it
+// led to, exactly one card each.
+func TestThoughtChunksFlushBeforeText(t *testing.T) {
+	tr := newTranslator("s1", "", nil)
+	for _, chunk := range []string{"Let me think", " about this."} {
+		if ev := tr.update(upd("agent_thought_chunk", map[string]any{
+			"content": map[string]any{"type": "text", "text": chunk},
+		})); len(ev) != 0 {
+			t.Fatalf("thought chunk emitted %d events, want 0", len(ev))
+		}
+	}
+	got := tr.update(upd("agent_message_chunk", map[string]any{
+		"content": map[string]any{"type": "text", "text": "Answer."},
+	}))
+	assertEvents(t, got,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"Let me think about this."}]}}`)
+	got = tr.endTurn()
+	assertEvents(t, got,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Answer."}]}}`,
+		`{"type":"result","subtype":"success","is_error":false,"session_id":"s1"}`)
+}
+
+// A thought followed directly by a tool call (no visible text in between)
+// flushes ahead of the tool card; a thought pending at turn end flushes ahead
+// of the result.
+func TestThoughtFlushOnToolCallAndEndTurn(t *testing.T) {
+	tr := newTranslator("s1", "", nil)
+	tr.update(upd("agent_thought_chunk", map[string]any{
+		"content": map[string]any{"type": "text", "text": "check the dir"},
+	}))
+	got := tr.update(upd("tool_call", map[string]any{
+		"toolCallId": "tc1", "title": "Bash", "kind": "execute",
+		"status": "pending", "rawInput": map[string]any{"command": "ls"},
+	}))
+	assertEvents(t, got,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"check the dir"}]}}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tc1","name":"Bash","input":{"command":"ls"}}]}}`)
+
+	tr.update(upd("agent_thought_chunk", map[string]any{
+		"content": map[string]any{"type": "text", "text": "all done"},
+	}))
+	got = tr.endTurn()
+	assertEvents(t, got,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"all done"}]}}`,
+		`{"type":"result","subtype":"success","is_error":false,"session_id":"s1"}`)
+}
+
+// An ACP plan update becomes the TodoWrite tool_use shape the Claude harness
+// produces, so both backends feed the one checklist card in the UI.
+func TestPlanBecomesTodoWrite(t *testing.T) {
+	tr := newTranslator("s1", "", nil)
+	got := tr.update(upd("plan", map[string]any{
+		"entries": []any{
+			map[string]any{"content": "Read the code", "priority": "high", "status": "completed"},
+			map[string]any{"content": "Fix the bug", "priority": "high", "status": "in_progress"},
+			map[string]any{"content": "Add a test", "priority": "medium", "status": "pending"},
+		},
+	}))
+	assertEvents(t, got,
+		`{"type":"assistant","message":{"role":"assistant","content":[
+		  {"type":"tool_use","id":"acp-plan","name":"TodoWrite","input":{"todos":[
+		   {"content":"Read the code","status":"completed"},
+		   {"content":"Fix the bug","status":"in_progress"},
+		   {"content":"Add a test","status":"pending"}]}}]}}`)
 }
 
 // The permission bridge reads the best-known tool name and parsed input for
 // its prompt to the human.
 func TestToolForPermission(t *testing.T) {
-	tr := newTranslator("s1", "")
+	tr := newTranslator("s1", "", nil)
 	tr.update(upd("tool_call", map[string]any{
 		"toolCallId": "tc1", "title": "Bash", "kind": "execute", "status": "pending",
 	}))

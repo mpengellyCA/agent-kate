@@ -338,12 +338,12 @@ func (s *Supervisor) handshake(t *Thread, opts StartOptions) error {
 		method = "session/resume"
 		sessionParams["sessionId"] = opts.SessionID
 	}
+	// The full config-option set (model / thinking / mode enumerations, each
+	// with values and display names) rides into the translator's init event so
+	// the UI can offer real pickers instead of free-text fields.
 	var sessionRes struct {
-		SessionID     string `json:"sessionId"`
-		ConfigOptions []struct {
-			ID           string `json:"id"`
-			CurrentValue string `json:"currentValue"`
-		} `json:"configOptions"`
+		SessionID     string         `json:"sessionId"`
+		ConfigOptions []ConfigOption `json:"configOptions"`
 	}
 	if err := t.client.call(ctx, method, sessionParams, &sessionRes); err != nil {
 		return fmt.Errorf("acp %s: %w", method, err)
@@ -379,15 +379,20 @@ func (s *Supervisor) handshake(t *Thread, opts StartOptions) error {
 			model = ""
 		}
 	}
-	if model == "" {
-		for _, co := range sessionRes.ConfigOptions {
-			if co.ID == "model" {
-				model = co.CurrentValue
-			}
+	for i, co := range sessionRes.ConfigOptions {
+		if co.ID != "model" {
+			continue
+		}
+		if model == "" {
+			model = co.CurrentValue
+		} else {
+			// Keep the init event's option set consistent with the model we
+			// just applied, so the UI's picker shows the real current value.
+			sessionRes.ConfigOptions[i].CurrentValue = model
 		}
 	}
 	t.mu.Lock()
-	t.tr = newTranslator(sessionID, model)
+	t.tr = newTranslator(sessionID, model, sessionRes.ConfigOptions)
 	t.mu.Unlock()
 	return nil
 }

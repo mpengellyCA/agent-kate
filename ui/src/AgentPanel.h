@@ -276,6 +276,13 @@ private:
     // Open the dedicated WorkflowMonitorDialog for the remembered workflow.
     void openWorkflowMonitor();
     void addNote(const QString &html, const QString &kind);
+    // Append a collapsed thinking card for a reasoning block (both harnesses
+    // emit the same thinking-block shape; kimi via the translator).
+    void addThinkingCard(const QString &thought);
+    // Fold a TodoWrite tool_use into the plan checklist card: the existing
+    // card updates in place; a fresh one is appended if none exists (or it
+    // was evicted).
+    void updateChecklistCard(const QJsonArray &todos);
     void scrollFeedToBottom();
     // Show the whole-message + code-block copy menu for a feed row.
     void showFeedContextMenu(const QModelIndex &idx, const QPoint &globalPos);
@@ -356,6 +363,10 @@ private:
     QToolButton *m_jumpBtn = nullptr;
     bool m_jumpUnread = false; // a card arrived while detached from the bottom
     QHash<QString, int> m_toolRows; // tool_use id -> stable transcript key
+    // Stable key of the plan checklist card (-1 = none yet). Each TodoWrite /
+    // ACP plan update rewrites this one card in place, so the feed carries the
+    // current plan rather than a trail of stale copies.
+    int m_checklistKey = -1;
 
     // Background-Workflow tracking. A `Workflow` tool_use is recorded by its
     // transcript key (with its input JSON) so the paired tool_result — which

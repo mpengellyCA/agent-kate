@@ -1,6 +1,6 @@
 # 14 — Harness Abstraction & Feature Parity (agent systems rework)
 
-> **Status: in progress — P1 landed.** Follows the Kimi Code backend branch
+> **Status: in progress — P1–P2 landed.** Follows the Kimi Code backend branch
 > (`kimi-code-backend`, `e0e9594` + review fixes `5a20c66`). Seven phases;
 > land sequentially, one commit per phase, built green (`scripts/build.sh`,
 > `go test ./...` incl. `-race`, `ctest --test-dir build`), smoke-verified
@@ -186,10 +186,30 @@ What the implementation added beyond the sketch:
   supervisor, mirroring `internal/kimi/thread_test.go`; cmd/akcore's shell
   fake still covers the compaction flow.
 
-**P2 — Rendering parity quick wins (M).** Thinking cards (both harnesses —
-translator maps `agent_thought_chunk` to a thinking block), TodoWrite/plan
-checklist card, result extras (num_turns, denials, per-model usage in the
-inspector), kimi model enumeration from `configOptions`.
+**P2 — Rendering parity quick wins (M). ✅ LANDED.** Thinking cards (both
+harnesses — translator maps `agent_thought_chunk` to a thinking block),
+TodoWrite/plan checklist card (ONE card per thread, updated in place — the
+current plan, not a trail of stale copies; translator maps ACP `plan` to the
+TodoWrite tool_use shape so both backends feed it), result extras (num_turns,
+denials, per-model usage in the inspector; error-result `result` text now
+surfaces — success text is deliberately skipped, it duplicates the last
+assistant message), kimi model enumeration from `configOptions`.
+Facts verified against the real binaries while implementing:
+- kimi 0.30 `session/new` configOptions: `model` (4 models w/ display names),
+  `thinking` (low/high/max — the effort analogue), `mode`
+  (default/plan/auto/yolo, with descriptions — the approval-mode analogue).
+  This ANSWERS P3's "kimi approval-mode investigation": map "when to ask" to
+  the `mode` config option. All three are persisted UI-side (KConfig
+  `Agent/kimiOpt-<id>`) from the init event for P3 to consume.
+- kimi 0.30 exposes no usage accounting (prompt response carries only
+  stopReason) — the gap-list "verify against kimi ≥0.30" is settled: no
+  usage for kimi until upstream adds it.
+- claude result event: `modelUsage` is camelCase per model and includes
+  `contextWindow` — the honest denominator for P5's context-fill meter;
+  `num_turns`/`modelUsage` are session-cumulative snapshots (latest wins),
+  `permission_denials` is per-turn.
+- claude init event carries `slash_commands`/`tools`/`agents`/`skills` (P3's
+  autocomplete feed) — confirmed present on claude 2.1.x.
 
 **P3 — Session control (L).** Verify the CLI's control_request subtypes
 against the installed `claude` (never assume); wire mid-session model /

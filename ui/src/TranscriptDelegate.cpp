@@ -356,6 +356,118 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
         return total;
     }
 
+    if (kind == TranscriptModel::Thinking) {
+        // A quiet, collapsible reasoning row: no card frame, just a dim header
+        // line ("▸ 💭 Thinking · preview") that expands to the dim body.
+        const bool expanded = idx.data(TranscriptModel::ToolExpandedRole).toBool();
+        int total = kToolHeaderH;
+        QTextDocument *bodyDoc = nullptr;
+        int bodyH = 0;
+        const int bodyW = contentWidth - 2 * kDetailPadX;
+        if (expanded) {
+            bodyDoc = (self->*buildDoc)(idx, qMax(1, bodyW), opt);
+            bodyH = int(bodyDoc->size().height());
+            total += kToolPad + bodyH + kToolPad;
+        }
+        if (painter) {
+            const QString arrow = expanded ? QStringLiteral("▾") : QStringLiteral("▸");
+            const QString preview = idx.data(TranscriptModel::ToolSummaryRole).toString();
+            const QString header = QStringLiteral("%1  \U0001f4ad %2   %3")
+                                       .arg(arrow, i18n("Thinking"), preview);
+            const QRect hdr(rowRect.left() + contentLeft + 8, rowRect.top(),
+                            contentWidth - 16, kToolHeaderH);
+            painter->save();
+            painter->setPen(opt.palette.color(QPalette::Mid));
+            painter->drawText(hdr, Qt::AlignLeft | Qt::AlignVCenter,
+                              fm.elidedText(header, Qt::ElideRight, hdr.width()));
+            painter->restore();
+            if (bodyDoc) {
+                painter->save();
+                painter->translate(rowRect.left() + contentLeft + kDetailPadX,
+                                   rowRect.top() + kToolHeaderH + kToolPad);
+                QAbstractTextDocumentLayout::PaintContext ctx;
+                ctx.palette = opt.palette;
+                ctx.palette.setColor(QPalette::Text, ThemeManager::palette().agentIdle);
+                bodyDoc->documentLayout()->draw(painter, ctx);
+                painter->restore();
+            }
+        }
+        delete bodyDoc;
+        return total;
+    }
+
+    if (kind == TranscriptModel::Checklist) {
+        // The agent's plan: a bordered card listing every item with a status
+        // glyph. Always fully visible — the plan is the thing to watch.
+        const QJsonArray items = idx.data(TranscriptModel::ChecklistRole).toJsonArray();
+        const int itemH = lineH + 4;
+        const int total = kToolHeaderH + items.size() * itemH + kToolPad;
+        if (painter) {
+            const QRect card(rowRect.left() + contentLeft, rowRect.top(),
+                             contentWidth, total);
+            painter->save();
+            painter->setRenderHint(QPainter::Antialiasing, true);
+            painter->setPen(opt.palette.color(QPalette::Mid));
+            painter->setBrush(Qt::NoBrush);
+            painter->drawRoundedRect(card.adjusted(0, 0, -1, -1), 7, 7);
+            painter->restore();
+
+            int done = 0;
+            for (const QJsonValue &v : items) {
+                if (v.toObject().value(QStringLiteral("status")).toString()
+                    == QLatin1String("completed")) {
+                    ++done;
+                }
+            }
+            const QString header =
+                QStringLiteral("☑ %1   %2")
+                    .arg(i18n("Plan"),
+                         i18nc("checklist progress", "%1 of %2 done", done, items.size()));
+            painter->save();
+            painter->setPen(opt.palette.color(QPalette::WindowText));
+            QFont bold = opt.font;
+            bold.setBold(true);
+            painter->setFont(bold);
+            painter->drawText(QRect(card.left() + 8, card.top(), card.width() - 16,
+                                    kToolHeaderH),
+                              Qt::AlignLeft | Qt::AlignVCenter,
+                              fm.elidedText(header, Qt::ElideRight, card.width() - 16));
+            painter->restore();
+
+            int y = card.top() + kToolHeaderH;
+            painter->save();
+            for (const QJsonValue &v : items) {
+                const QJsonObject item = v.toObject();
+                const QString status =
+                    item.value(QStringLiteral("status")).toString();
+                const QString text = item.value(QStringLiteral("content")).toString();
+                QString glyph = QStringLiteral("☐"); // ☐ pending
+                QFont f = opt.font;
+                QColor pen = opt.palette.color(QPalette::WindowText);
+                if (status == QLatin1String("completed")) {
+                    glyph = QStringLiteral("✓"); // ✓
+                    f.setStrikeOut(true);
+                    pen = opt.palette.color(QPalette::Mid);
+                } else if (status == QLatin1String("in_progress")) {
+                    glyph = QStringLiteral("▸"); // ▸
+                    f.setBold(true);
+                    pen = ThemeManager::palette().agentRunning;
+                }
+                painter->setFont(f);
+                painter->setPen(pen);
+                const QRect line(card.left() + kDetailPadX, y,
+                                 card.width() - 2 * kDetailPadX, itemH);
+                painter->drawText(line, Qt::AlignLeft | Qt::AlignVCenter,
+                                  QFontMetrics(f).elidedText(
+                                      glyph + QStringLiteral("  ") + text,
+                                      Qt::ElideRight, line.width()));
+                y += itemH;
+            }
+            painter->restore();
+        }
+        return total;
+    }
+
     // --- Tool card -------------------------------------------------------
     const QString name = idx.data(TranscriptModel::ToolNameRole).toString();
     const QString summary = idx.data(TranscriptModel::ToolSummaryRole).toString();
@@ -721,6 +833,17 @@ bool TranscriptDelegate::editorEvent(QEvent *event, QAbstractItemModel *model,
             // Header toggles expand/collapse.
             if (toolHeaderRect(opt.rect).contains(pos)) {
                 tm->setExpanded(idx.row(), !idx.data(TranscriptModel::ToolExpandedRole).toBool());
+                return true;
+            }
+            return false;
+        }
+
+        if (kind == TranscriptModel::Thinking) {
+            // The header line toggles the reasoning body open/closed.
+            if (QRect(opt.rect.left(), opt.rect.top(), opt.rect.width(), kToolHeaderH)
+                    .contains(pos)) {
+                tm->setExpanded(idx.row(),
+                                !idx.data(TranscriptModel::ToolExpandedRole).toBool());
                 return true;
             }
             return false;

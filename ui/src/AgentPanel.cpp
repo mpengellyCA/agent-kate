@@ -981,9 +981,17 @@ QString AgentPanel::currentModel() const
     if (!m_modelCombo) {
         return QString();
     }
-    // The Kimi backend's combo is editable free text (no item data).
-    return m_modelCombo->isEditable() ? m_modelCombo->currentText().trimmed()
-                                      : m_modelCombo->currentData().toString();
+    if (!m_modelCombo->isEditable()) {
+        return m_modelCombo->currentData().toString();
+    }
+    // The Kimi backend's combo is editable: a picked dropdown item shows its
+    // display label ("K3 — kimi-code/k3") but must send its data value; text
+    // that matches no item is a hand-typed model id, sent verbatim.
+    const int idx = m_modelCombo->currentIndex();
+    if (idx >= 0 && m_modelCombo->currentText() == m_modelCombo->itemText(idx)) {
+        return m_modelCombo->itemData(idx).toString();
+    }
+    return m_modelCombo->currentText().trimmed();
 }
 
 QString AgentPanel::currentEffort() const
@@ -1068,12 +1076,29 @@ void AgentPanel::rebuildModelCombo()
 
     if (kimi) {
         // Kimi takes an optional free-text model id (empty = the CLI's own
-        // configured default) — an editable combo, since the UI doesn't
-        // enumerate the kimi model set. Provider/effort don't apply.
+        // configured default). Once a kimi session has run, the CLI's real
+        // model list (discovered from the handshake and persisted from the
+        // init event) fills the dropdown; the combo stays editable so a new
+        // id can still be typed before any session existed.
         m_modelCombo->setEditable(true);
         m_modelCombo->lineEdit()->clear();
         m_modelCombo->lineEdit()->setPlaceholderText(
-            QStringLiteral("kimi default (e.g. kimi-code/kimi-for-coding)"));
+            i18n("kimi default (e.g. kimi-code/kimi-for-coding)"));
+        const QStringList models = KSharedConfig::openConfig()
+                                       ->group(QStringLiteral("Agent"))
+                                       .readEntry("kimiOpt-model", QStringList());
+        for (const QString &entry : models) {
+            const QString value = entry.section(QLatin1Char('|'), 0, 0);
+            const QString name = entry.section(QLatin1Char('|'), 1);
+            if (!value.isEmpty()) {
+                m_modelCombo->addItem(
+                    name.isEmpty() ? value
+                                   : QStringLiteral("%1 — %2").arg(name, value),
+                    value);
+            }
+        }
+        m_modelCombo->setCurrentIndex(-1);
+        m_modelCombo->lineEdit()->clear();
         return;
     }
     m_modelCombo->setEditable(false);
@@ -1762,6 +1787,36 @@ void AgentPanel::addMessageCard(const QString &role, const QString &accentHex,
 void AgentPanel::addNote(const QString &html, const QString &kind)
 {
     m_model->appendNote(html, kind);
+    if (!m_stickBottom) {
+        m_jumpUnread = true;
+        updateJumpButton();
+    }
+}
+
+void AgentPanel::addThinkingCard(const QString &thought)
+{
+    const QString trimmed = thought.trimmed();
+    if (trimmed.isEmpty()) {
+        return;
+    }
+    // Preview: the first line, elide-ready (the delegate elides to width).
+    QString preview = trimmed.section(QLatin1Char('\n'), 0, 0).simplified();
+    if (preview.length() > 120) {
+        preview = preview.left(119) + QChar(0x2026);
+    }
+    m_model->appendThinking(agentkate::markdownToHtml(trimmed), trimmed, preview);
+    if (!m_stickBottom) {
+        m_jumpUnread = true;
+        updateJumpButton();
+    }
+}
+
+void AgentPanel::updateChecklistCard(const QJsonArray &todos)
+{
+    if (m_checklistKey >= 0 && m_model->setChecklist(m_checklistKey, todos)) {
+        return; // updated in place
+    }
+    m_checklistKey = m_model->appendChecklist(todos);
     if (!m_stickBottom) {
         m_jumpUnread = true;
         updateJumpButton();
@@ -3023,6 +3078,34 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
         if (ev.value(QStringLiteral("subtype")).toString() != QLatin1String("init")) {
             return;
         }
+        // A kimi init event carries the session's config options (model /
+        // thinking / mode enumerations straight from the CLI). Persist each
+        // as "value|name" pairs so the pickers can offer the real lists on
+        // the next agent instead of free-text fields.
+        const QJsonArray configOptions =
+            ev.value(QStringLiteral("configOptions")).toArray();
+        if (!configOptions.isEmpty()) {
+            KConfigGroup cfg =
+                KSharedConfig::openConfig()->group(QStringLiteral("Agent"));
+            for (const QJsonValue &ov : configOptions) {
+                const QJsonObject opt = ov.toObject();
+                const QString id = opt.value(QStringLiteral("id")).toString();
+                if (id.isEmpty()) {
+                    continue;
+                }
+                QStringList entries;
+                const QJsonArray values = opt.value(QStringLiteral("options")).toArray();
+                for (const QJsonValue &vv : values) {
+                    const QJsonObject val = vv.toObject();
+                    entries << val.value(QStringLiteral("value")).toString()
+                                   + QLatin1Char('|')
+                                   + val.value(QStringLiteral("name")).toString();
+                }
+                if (!entries.isEmpty()) {
+                    cfg.writeEntry(QStringLiteral("kimiOpt-") + id, entries);
+                }
+            }
+        }
         QStringList mcp;
         const QJsonArray servers = ev.value(QStringLiteral("mcp_servers")).toArray();
         for (const QJsonValue &v : servers) {
@@ -3051,12 +3134,29 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
                                    agentkate::markdownToHtml(t), t, m_replaying);
                     m_working->setActivity(QString()); // text → generic reasoning
                 }
+            } else if (bt == QLatin1String("thinking")) {
+                addThinkingCard(b.value(QStringLiteral("thinking")).toString());
+            } else if (bt == QLatin1String("redacted_thinking")) {
+                // The reasoning exists but is encrypted — show that it
+                // happened rather than dropping it silently.
+                addThinkingCard(i18n("(this thinking block was redacted for safety)"));
             } else if (bt == QLatin1String("tool_use")) {
                 const QString name = b.value(QStringLiteral("name")).toString();
                 // The permission gate and question tool are surfaced by their
                 // own UI, so don't also list them as raw tool calls.
                 if (name.contains(QLatin1String("request_permission"))
                     || name == QLatin1String("AskUserQuestion")) {
+                    continue;
+                }
+                // The agent's todo list renders as the live plan checklist,
+                // not a generic tool row. Its tool_result carries only an ack,
+                // so the tool_use id is deliberately not tracked.
+                if (name == QLatin1String("TodoWrite")) {
+                    updateChecklistCard(b.value(QStringLiteral("input"))
+                                            .toObject()
+                                            .value(QStringLiteral("todos"))
+                                            .toArray());
+                    m_working->setActivity(agentkate::activityFor(name));
                     continue;
                 }
                 const QJsonObject input = b.value(QStringLiteral("input")).toObject();
@@ -3195,6 +3295,9 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
         const bool haveUsage = inTok || outTok || cacheRead || cacheCreate || costUsd > 0.0;
 
         QString head = err ? i18n("turn ended with an error") : i18n("turn complete");
+        // Tools the human declined this turn — worth a visible trace, since a
+        // denial usually explains why the agent changed course.
+        const int denied = ev.value(QStringLiteral("permission_denials")).toArray().size();
         if (haveUsage) {
             const QLocale loc;
             const qlonglong promptTotal = inTok + cacheRead + cacheCreate;
@@ -3212,6 +3315,10 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
                 line += i18nc("turn duration suffix", " · %1s",
                               loc.toString(durationMs / 1000.0, 'f', 1));
             }
+            if (denied > 0) {
+                line += i18ncp("denied-permissions suffix", " · %1 tool denied",
+                               " · %1 tools denied", denied);
+            }
             addNote(line.toHtmlEscaped(), err ? QStringLiteral("err") : QStringLiteral("dim"));
             // Accumulate session totals — but never while replaying the
             // transcript, or historical turns would be double-counted.
@@ -3223,6 +3330,15 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
         } else {
             addNote(err ? QStringLiteral("✗ ") + head : QStringLiteral("✓ ") + head,
                     err ? QStringLiteral("err") : QStringLiteral("ok"));
+        }
+        // An error result often carries the CLI's explanation in `result`
+        // (e.g. what error_max_turns or an API failure actually hit) — text no
+        // assistant event ever showed. Surface it instead of dropping it.
+        if (err) {
+            const QString why = ev.value(QStringLiteral("result")).toString().trimmed();
+            if (!why.isEmpty()) {
+                addNote(why.toHtmlEscaped(), QStringLiteral("err"));
+            }
         }
         m_idle = true;
         refresh();

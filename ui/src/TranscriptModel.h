@@ -31,9 +31,11 @@ class TranscriptModel : public QAbstractListModel
     Q_OBJECT
 public:
     enum Kind {
-        Note,    // a quiet, dim/coloured status line
-        Message, // a role-tagged card (You / Agent Kate) with an HTML body
-        Tool,    // a collapsible tool call
+        Note,     // a quiet, dim/coloured status line
+        Message,  // a role-tagged card (You / Agent Kate) with an HTML body
+        Tool,     // a collapsible tool call
+        Thinking, // the model's reasoning — collapsed header, expandable body
+        Checklist, // the agent's plan / todo list, updated in place
     };
 
     // Custom roles the delegate reads. Past UserRole to stay clear of Qt's
@@ -58,6 +60,7 @@ public:
         ToolDoneRole,      // bool — result has arrived (✓ vs ⋯)
         ToolExpandedRole,  // bool — detail revealed
         ToolVisibleRole,   // bool — honours the showTools setting
+        ChecklistRole,     // QJsonArray of {content, status} items
         StableIdRole,      // quintptr — per-row identity for the delegate cache
     };
 
@@ -74,7 +77,9 @@ public:
         // outside — never the body). Empty for every other row. Painted as a chip
         // row under the message body; clicking a chip opens the file.
         QJsonArray attachments;
-        // Tool fields.
+        // Tool fields. A Thinking row reuses toolSummary (the one-line
+        // preview) and toolExpanded (whether the body is revealed); its body
+        // lives in html/plain like a message.
         QString toolName;
         QString toolSummary;
         QString toolDetail;
@@ -84,6 +89,9 @@ public:
         bool toolDone = false;
         bool toolExpanded = false;
         bool toolVisible = true;
+        // Checklist items ({content, status} objects, status one of
+        // pending / in_progress / completed). Empty for every other row.
+        QJsonArray checklist;
         // Monotonic identity, bumped on every mutation so the delegate's
         // (id → height) cache misses and re-measures exactly this row.
         quintptr stableId = 0;
@@ -103,6 +111,16 @@ public:
     int appendNote(const QString &html, const QString &noteKind);
     int appendTool(const QString &toolName, const QString &summary,
                    const QString &detail, bool visible);
+    // A thinking card: collapsed to `preview` until expanded to the rendered
+    // `bodyHtml` (plain kept for copy).
+    int appendThinking(const QString &bodyHtml, const QString &plain,
+                       const QString &preview);
+    // The agent's plan. `items` is an array of {content, status} objects. A
+    // new plan usually *updates* the existing card via setChecklist.
+    int appendChecklist(const QJsonArray &items);
+    // Replace a checklist card's items in place (the plan evolved). Returns
+    // false if the row was evicted — append a fresh card instead.
+    bool setChecklist(int key, const QJsonArray &items);
 
     // Fill in a tool row's result once its tool_result event arrives. `key` is
     // the stable key from appendTool (a tool_result arrives after a round-trip,

@@ -20,13 +20,38 @@ type translator struct {
 	sessionID string
 	model     string
 
-	text strings.Builder // accumulated agent_message_chunk deltas
+	// configOptions is the session's config-option set from the handshake
+	// (model / thinking / mode enumerations), embedded in the init event so
+	// the UI can populate real pickers instead of free-text fields.
+	configOptions []ConfigOption
+
+	text    strings.Builder // accumulated agent_message_chunk deltas
+	thought strings.Builder // accumulated agent_thought_chunk deltas
 
 	// toolCalls tracks each in-flight tool call so its tool_use event can be
 	// emitted exactly once, with the best input known at the time: kimi
 	// streams the raw input JSON as content snapshots on tool_call_update
 	// (status in_progress) rather than in the tool_call itself.
 	toolCalls map[string]*toolCallState
+}
+
+// ConfigOption is one session config option from the ACP handshake, normalised
+// for the init event. Kimi 0.30 exposes three: "model" (the model list),
+// "thinking" (low/high/max — the effort analogue) and "mode"
+// (default/plan/auto/yolo — the approval-mode analogue).
+type ConfigOption struct {
+	ID           string              `json:"id"`
+	Name         string              `json:"name"`
+	Category     string              `json:"category,omitempty"`
+	CurrentValue string              `json:"currentValue"`
+	Options      []ConfigOptionValue `json:"options,omitempty"`
+}
+
+// ConfigOptionValue is one selectable value of a ConfigOption.
+type ConfigOptionValue struct {
+	Value       string `json:"value"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
 }
 
 type toolCallState struct {
@@ -36,11 +61,12 @@ type toolCallState struct {
 	emitted bool   // the tool_use event has been emitted
 }
 
-func newTranslator(sessionID, model string) *translator {
+func newTranslator(sessionID, model string, configOptions []ConfigOption) *translator {
 	return &translator{
-		sessionID: sessionID,
-		model:     model,
-		toolCalls: make(map[string]*toolCallState),
+		sessionID:     sessionID,
+		model:         model,
+		configOptions: configOptions,
+		toolCalls:     make(map[string]*toolCallState),
 	}
 }
 
@@ -77,16 +103,21 @@ func marshalEvent(v map[string]any) json.RawMessage {
 
 // initEvent is the synthetic session-start event, shaped like the init system
 // event `claude` emits. The run loop persists session_id from it; the UI shows
-// the model line.
+// the model line and reads configOptions (a kimi-only extension field) to
+// populate the model/thinking/mode pickers with what the CLI actually offers.
 func (t *translator) initEvent() json.RawMessage {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return marshalEvent(map[string]any{
+	ev := map[string]any{
 		"type":       "system",
 		"subtype":    "init",
 		"session_id": t.sessionID,
 		"model":      t.model,
-	})
+	}
+	if len(t.configOptions) > 0 {
+		ev["configOptions"] = t.configOptions
+	}
+	return marshalEvent(ev)
 }
 
 // toolName maps an ACP tool kind/title onto the Claude tool name the UI knows
@@ -147,6 +178,7 @@ func (t *translator) update(params json.RawMessage) []json.RawMessage {
 			Status        string          `json:"status"`
 			RawInput      json.RawMessage `json:"rawInput"`
 			RawOutput     json.RawMessage `json:"rawOutput"`
+			Entries       []planEntry     `json:"entries"` // plan updates
 		} `json:"update"`
 	}
 	if json.Unmarshal(params, &p) != nil {
@@ -159,9 +191,47 @@ func (t *translator) update(params json.RawMessage) []json.RawMessage {
 
 	switch u.SessionUpdate {
 	case "agent_message_chunk":
-		// Buffer the delta; it ships when a tool_call or the turn end flushes it.
+		// Buffer the delta; it ships when a tool_call or the turn end flushes
+		// it. The first message chunk after thought chunks marks the thought
+		// as finished — ship it now so the cards read in order.
+		events := t.flushThoughtLocked()
 		t.text.WriteString(contentText(decodeContent(u.Content)))
+		return events
+
+	case "agent_thought_chunk":
+		// Buffer the reasoning delta; it ships as one thinking block when the
+		// visible message resumes, a tool call lands, or the turn ends.
+		t.thought.WriteString(contentText(decodeContent(u.Content)))
 		return nil
+
+	case "plan":
+		// The agent's plan / todo list. Translate into the same TodoWrite
+		// tool_use shape the Claude harness produces, so both backends feed
+		// the one checklist card in the UI. ACP and TodoWrite share the
+		// status vocabulary (pending / in_progress / completed).
+		if len(u.Entries) == 0 {
+			return nil
+		}
+		todos := make([]map[string]any, 0, len(u.Entries))
+		for _, e := range u.Entries {
+			todos = append(todos, map[string]any{
+				"content": e.Content,
+				"status":  e.Status,
+			})
+		}
+		events := t.flushPendingLocked()
+		return append(events, marshalEvent(map[string]any{
+			"type": "assistant",
+			"message": map[string]any{
+				"role": "assistant",
+				"content": []map[string]any{{
+					"type":  "tool_use",
+					"id":    "acp-plan",
+					"name":  "TodoWrite",
+					"input": map[string]any{"todos": todos},
+				}},
+			},
+		}))
 
 	case "tool_call":
 		st := &toolCallState{title: u.Title, kind: u.Kind}
@@ -171,7 +241,7 @@ func (t *translator) update(params json.RawMessage) []json.RawMessage {
 			st.input = txt
 		}
 		t.toolCalls[u.ToolCallID] = st
-		events := t.flushTextLocked()
+		events := t.flushPendingLocked()
 		// Emit the card immediately only when the input is already known in
 		// full (a spec-style rawInput); otherwise wait for the streamed
 		// snapshot to become parseable so the card shows the real command.
@@ -199,9 +269,9 @@ func (t *translator) update(params json.RawMessage) []json.RawMessage {
 		// Emit the tool card as soon as the input snapshot parses (typically
 		// just before the permission request), or force it at completion.
 		if !st.emitted && (parseableObject(st.input) || done) {
-			// A tool card is an assistant event; flush any pending text first
-			// so the conversation reads in order.
-			events := t.flushTextLocked()
+			// A tool card is an assistant event; flush any pending thought and
+			// text first so the conversation reads in order.
+			events := t.flushPendingLocked()
 			if ev := t.emitToolUseLocked(u.ToolCallID); ev != nil {
 				events = append(events, ev)
 			}
@@ -215,9 +285,16 @@ func (t *translator) update(params json.RawMessage) []json.RawMessage {
 		}
 		return nil
 	}
-	// agent_thought_chunk, plan, config_option_update, available_commands_update
-	// and friends have no Claude-shaped counterpart the UI renders — dropped.
+	// config_option_update, available_commands_update and friends have no
+	// Claude-shaped counterpart the UI renders yet — dropped (P3 wires them).
 	return nil
+}
+
+// planEntry is one item of an ACP plan update.
+type planEntry struct {
+	Content  string `json:"content"`
+	Priority string `json:"priority"`
+	Status   string `json:"status"`
 }
 
 // parseableObject reports whether raw parses as a JSON object.
@@ -244,6 +321,31 @@ func (t *translator) flushTextLocked() []json.RawMessage {
 			"content": []map[string]any{{"type": "text", "text": text}},
 		},
 	})}
+}
+
+// flushThoughtLocked ships the buffered reasoning as a single assistant event
+// carrying a thinking block — the same shape the Claude harness emits, so the
+// UI's thinking card renders both backends. No-op when empty. Caller holds t.mu.
+func (t *translator) flushThoughtLocked() []json.RawMessage {
+	if t.thought.Len() == 0 {
+		return nil
+	}
+	thought := t.thought.String()
+	t.thought.Reset()
+	return []json.RawMessage{marshalEvent(map[string]any{
+		"type": "assistant",
+		"message": map[string]any{
+			"role":    "assistant",
+			"content": []map[string]any{{"type": "thinking", "thinking": thought}},
+		},
+	})}
+}
+
+// flushPendingLocked ships buffered thought then text, preserving the order
+// they streamed in (reasoning always precedes the visible message it led to).
+// Caller holds t.mu.
+func (t *translator) flushPendingLocked() []json.RawMessage {
+	return append(t.flushThoughtLocked(), t.flushTextLocked()...)
 }
 
 // emitToolUseLocked emits the tool_use assistant event for a call exactly
@@ -302,13 +404,14 @@ func (t *translator) toolResultLocked(toolCallID, status string, rawOutput, bloc
 	})
 }
 
-// endTurn flushes any buffered assistant text and appends the turn's result
-// event. ACP exposes no usage accounting, so the event carries none — the UI
-// already defaults missing usage fields to zero.
+// endTurn flushes any buffered assistant thought and text and appends the
+// turn's result event. ACP exposes no usage accounting (verified against kimi
+// 0.30: session/prompt responses carry only stopReason), so the event carries
+// none — the UI already defaults missing usage fields to zero.
 func (t *translator) endTurn() []json.RawMessage {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	events := t.flushTextLocked()
+	events := t.flushPendingLocked()
 	return append(events, marshalEvent(map[string]any{
 		"type":       "result",
 		"subtype":    "success",

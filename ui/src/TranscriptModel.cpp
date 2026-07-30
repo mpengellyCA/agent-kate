@@ -93,6 +93,50 @@ int TranscriptModel::appendTool(const QString &toolName, const QString &summary,
     return key;
 }
 
+int TranscriptModel::appendThinking(const QString &bodyHtml, const QString &plain,
+                                    const QString &preview)
+{
+    Item it;
+    it.kind = Thinking;
+    it.html = bodyHtml;
+    it.plain = plain;
+    it.toolSummary = preview;
+    it.stableId = m_nextId++;
+    const int row = m_items.size();
+    const int key = m_base + row;
+    beginInsertRows({}, row, row);
+    m_items.append(it);
+    endInsertRows();
+    enforceCap();
+    return key;
+}
+
+int TranscriptModel::appendChecklist(const QJsonArray &items)
+{
+    Item it;
+    it.kind = Checklist;
+    it.checklist = items;
+    it.stableId = m_nextId++;
+    const int row = m_items.size();
+    const int key = m_base + row;
+    beginInsertRows({}, row, row);
+    m_items.append(it);
+    endInsertRows();
+    enforceCap();
+    return key;
+}
+
+bool TranscriptModel::setChecklist(int key, const QJsonArray &items)
+{
+    const int row = rowForKey(key);
+    if (row < 0 || m_items.at(row).kind != Checklist) {
+        return false; // evicted (or the key is stale) — caller appends anew
+    }
+    m_items[row].checklist = items;
+    touched(row);
+    return true;
+}
+
 void TranscriptModel::setToolResult(int key, const QString &shown,
                                     const QString &fullResult, bool truncated)
 {
@@ -242,6 +286,8 @@ QVariant TranscriptModel::data(const QModelIndex &idx, int role) const
         return it.toolExpanded;
     case ToolVisibleRole:
         return it.toolVisible;
+    case ChecklistRole:
+        return it.checklist;
     case StableIdRole:
         return QVariant::fromValue<quintptr>(it.stableId);
     default:

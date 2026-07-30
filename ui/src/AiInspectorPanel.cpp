@@ -78,6 +78,9 @@ void AiInspectorPanel::setActiveThread(const QString &threadId)
     m_inTok = m_outTok = m_cacheRead = m_cacheCreate = 0;
     m_costUsd = 0.0;
     m_toolCalls = 0;
+    m_numTurns = 0;
+    m_denials = 0;
+    m_modelUsage = QJsonObject();
     updateTotals();
 }
 
@@ -141,6 +144,17 @@ void AiInspectorPanel::handleEvent(const QJsonObject &ev)
         m_cacheCreate +=
             usage.value(QStringLiteral("cache_creation_input_tokens")).toVariant().toLongLong();
         m_costUsd += ev.value(QStringLiteral("total_cost_usd")).toDouble();
+        // num_turns and modelUsage are session-cumulative in each result —
+        // take the latest snapshot; permission_denials arrive per turn.
+        const int turns = ev.value(QStringLiteral("num_turns")).toInt();
+        if (turns > 0) {
+            m_numTurns = turns;
+        }
+        m_denials += ev.value(QStringLiteral("permission_denials")).toArray().size();
+        const QJsonObject perModel = ev.value(QStringLiteral("modelUsage")).toObject();
+        if (!perModel.isEmpty()) {
+            m_modelUsage = perModel;
+        }
         updateTotals();
     }
 }
@@ -158,6 +172,31 @@ void AiInspectorPanel::updateTotals()
                          loc.toString(m_outTok), loc.toString(m_cacheRead + m_cacheCreate));
     if (m_costUsd > 0.0) {
         line += i18nc("inspector cost suffix", " · $%1", loc.toString(m_costUsd, 'f', 4));
+    }
+    if (m_numTurns > 0) {
+        line += i18ncp("inspector turn count suffix", " · %1 turn", " · %1 turns",
+                       m_numTurns);
+    }
+    if (m_denials > 0) {
+        line += i18ncp("inspector denial count suffix", " · %1 denial",
+                       " · %1 denials", m_denials);
+    }
+    // One line per model the session touched (the CLI splits usage by model —
+    // subagents and background tasks can run on cheaper tiers than the main
+    // loop). Values are session-cumulative snapshots straight from the CLI.
+    const QStringList models = m_modelUsage.keys();
+    for (const QString &model : models) {
+        const QJsonObject u = m_modelUsage.value(model).toObject();
+        QString entry = i18nc(
+            "inspector per-model usage line: model, in tokens, out tokens",
+            "%1 · in %2 · out %3", model,
+            loc.toString(u.value(QStringLiteral("inputTokens")).toVariant().toLongLong()),
+            loc.toString(u.value(QStringLiteral("outputTokens")).toVariant().toLongLong()));
+        const double cost = u.value(QStringLiteral("costUSD")).toDouble();
+        if (cost > 0.0) {
+            entry += i18nc("inspector cost suffix", " · $%1", loc.toString(cost, 'f', 4));
+        }
+        line += QLatin1Char('\n') + entry;
     }
     m_totals->setText(line);
 }

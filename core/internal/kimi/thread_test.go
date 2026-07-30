@@ -17,12 +17,15 @@ import (
 // session/new + session/resume, session/set_config_option, session/prompt,
 // session/cancel and the session/request_permission reverse request:
 //
-//   - any other prompt streams two text deltas, a tool_call (rawInput inline),
-//     its completed tool_call_update, then answers stopReason "end_turn";
+//   - any other prompt streams a thought delta, a plan update, two text
+//     deltas, a tool_call (rawInput inline), its completed tool_call_update,
+//     then answers stopReason "end_turn";
 //   - a prompt containing "wait-cancel" streams one delta and holds the
 //     response until session/cancel arrives, then answers "cancelled";
 //   - a prompt containing "perm" asks permission (reverse request, numeric id
-//     0 — kimi's style) and echoes the selected optionId in its reply text.
+//     0 — kimi's style) and echoes the selected optionId in its reply text;
+//   - session/new reports a configOptions set (model enumeration), the shape
+//     kimi 0.30 returns.
 func fakeKimiScript(t *testing.T) string {
 	t.Helper()
 	if _, err := os.Stat("/usr/bin/env"); err != nil {
@@ -58,7 +61,12 @@ for line in sys.stdin:
             "agentInfo": {"name": "fake-kimi", "version": "0"}}})
     elif method in ("session/new", "session/load", "session/resume"):
         send({"jsonrpc": "2.0", "id": fid,
-              "result": {"sessionId": sid, "configOptions": []}})
+              "result": {"sessionId": sid, "configOptions": [
+                  {"type": "select", "id": "model", "name": "Model",
+                   "category": "model", "currentValue": "kimi-code/k3",
+                   "options": [
+                       {"value": "kimi-code/k3", "name": "K3"},
+                       {"value": "kimi-code/kimi-for-coding", "name": "K2.7 Coding"}]}]}})
     elif method == "session/set_config_option":
         send({"jsonrpc": "2.0", "id": fid, "result": {"configOptions": []}})
     elif method == "session/cancel":
@@ -88,6 +96,10 @@ for line in sys.stdin:
                                  {"optionId": "reject", "kind": "reject_once"}]}})
             perm_prompt = fid
         else:
+            upd({"sessionUpdate": "agent_thought_chunk",
+                 "content": {"type": "text", "text": "pondering"}})
+            upd({"sessionUpdate": "plan", "entries": [
+                {"content": "list files", "priority": "high", "status": "in_progress"}]})
             upd({"sessionUpdate": "agent_message_chunk",
                  "content": {"type": "text", "text": "Hello "}})
             upd({"sessionUpdate": "agent_message_chunk",
@@ -208,8 +220,9 @@ func testLogger() *slog.Logger {
 }
 
 // TestKimiThreadTurn drives a full turn through the fake kimi and checks the
-// translated event sequence: init, one assistant text card, the tool card,
-// its result, and the turn result.
+// translated event sequence: init (with config options), the thinking card,
+// the plan checklist, one assistant text card, the tool card, its result, and
+// the turn result.
 func TestKimiThreadTurn(t *testing.T) {
 	kimiBin := fakeKimiScript(t)
 	eventDir := t.TempDir()
@@ -230,7 +243,8 @@ func TestKimiThreadTurn(t *testing.T) {
 
 	col.waitFor(t, "turn result", isResult)
 	seq := col.snapshot()
-	wantTypes := []string{"system", "assistant", "assistant", "user", "result"}
+	wantTypes := []string{"system", "assistant", "assistant", "assistant",
+		"assistant", "user", "result"}
 	if len(seq) != len(wantTypes) {
 		t.Fatalf("emitted %d events, want %d: %s", len(seq), len(wantTypes), seq)
 	}
@@ -240,6 +254,46 @@ func TestKimiThreadTurn(t *testing.T) {
 		if ev["type"] != wt {
 			t.Errorf("event %d type = %v, want %s (%s)", i, ev["type"], wt, seq[i])
 		}
+	}
+	// The init event carries the handshake's config options (model list).
+	var initHead struct {
+		ConfigOptions []ConfigOption `json:"configOptions"`
+	}
+	_ = json.Unmarshal(seq[0], &initHead)
+	if len(initHead.ConfigOptions) != 1 || initHead.ConfigOptions[0].ID != "model" ||
+		len(initHead.ConfigOptions[0].Options) != 2 {
+		t.Errorf("init configOptions = %+v, want the model enumeration", initHead.ConfigOptions)
+	}
+	// The thought delta arrives as a thinking block, the plan as a TodoWrite
+	// tool_use — the shapes the UI's thinking and checklist cards consume.
+	var thinkEv struct {
+		Message struct {
+			Content []struct {
+				Type     string `json:"type"`
+				Thinking string `json:"thinking"`
+			} `json:"content"`
+		} `json:"message"`
+	}
+	_ = json.Unmarshal(seq[1], &thinkEv)
+	if len(thinkEv.Message.Content) != 1 || thinkEv.Message.Content[0].Type != "thinking" ||
+		thinkEv.Message.Content[0].Thinking != "pondering" {
+		t.Errorf("event 1 = %s, want a thinking block \"pondering\"", seq[1])
+	}
+	var planEv struct {
+		Message struct {
+			Content []struct {
+				Type  string `json:"type"`
+				Name  string `json:"name"`
+				Input struct {
+					Todos []map[string]any `json:"todos"`
+				} `json:"input"`
+			} `json:"content"`
+		} `json:"message"`
+	}
+	_ = json.Unmarshal(seq[2], &planEv)
+	if len(planEv.Message.Content) != 1 || planEv.Message.Content[0].Name != "TodoWrite" ||
+		len(planEv.Message.Content[0].Input.Todos) != 1 {
+		t.Errorf("event 2 = %s, want a TodoWrite tool_use with one todo", seq[2])
 	}
 
 	// Every translated event lands in the thread's event log — its transcript.

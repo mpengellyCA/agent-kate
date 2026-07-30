@@ -3,7 +3,9 @@
 
 #include "NewAgentDialog.h"
 
+#include <KConfigGroup>
 #include <KLocalizedString>
+#include <KSharedConfig>
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -53,8 +55,10 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, QWidget *parent)
     form->addRow(i18n("How clever?"), m_model);
     root->addLayout(form);
 
-    // The model list follows the backend: Claude tiers for Claude Code, just
-    // the CLI default for Kimi Code (its model is free-text on the panel).
+    // The model list follows the backend: Claude tiers for Claude Code; for
+    // Kimi Code the CLI's own model list, as discovered from the last kimi
+    // session's handshake (until one has run, only the default is offered —
+    // the panel's Setup menu additionally takes a free-text id).
     auto rebuildModels = [this] {
         const bool kimi =
             m_backend->currentData().toString() == QLatin1String("kimi");
@@ -65,6 +69,17 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, QWidget *parent)
             m_model->addItem(i18n("Smartest (Opus)"), QStringLiteral("opus"));
             m_model->addItem(i18n("Balanced (Sonnet)"), QStringLiteral("sonnet"));
             m_model->addItem(i18n("Fastest (Haiku)"), QStringLiteral("haiku"));
+            return;
+        }
+        const QStringList models = KSharedConfig::openConfig()
+                                       ->group(QStringLiteral("Agent"))
+                                       .readEntry("kimiOpt-model", QStringList());
+        for (const QString &entry : models) {
+            const QString value = entry.section(QLatin1Char('|'), 0, 0);
+            const QString name = entry.section(QLatin1Char('|'), 1);
+            if (!value.isEmpty()) {
+                m_model->addItem(name.isEmpty() ? value : name, value);
+            }
         }
     };
     rebuildModels();

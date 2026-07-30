@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QHash>
+#include <QJsonObject>
 #include <QString>
 #include <QWidget>
 
@@ -8,7 +9,6 @@ class CoreClient;
 class QTreeWidget;
 class QTreeWidgetItem;
 class QLabel;
-class QJsonObject;
 class QJsonArray;
 
 // AiInspectorPanel shows a live tool-call timeline and token/cost spend for the
@@ -44,4 +44,9 @@ private:
     qlonglong m_cacheCreate = 0;
     double m_costUsd = 0.0;
     int m_toolCalls = 0;
+    // Extras from the result event: the CLI reports num_turns and modelUsage
+    // as session-cumulative snapshots (latest wins); denials accumulate.
+    int m_numTurns = 0;
+    int m_denials = 0;
+    QJsonObject m_modelUsage; // model id -> {inputTokens, outputTokens, costUSD, …}
 };
