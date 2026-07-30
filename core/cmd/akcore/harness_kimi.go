@@ -61,12 +61,14 @@ func (h *kimiHarness) Launch(spec harness.StartSpec) (harness.Launched, error) {
 	if err != nil {
 		return harness.Launched{}, err
 	}
-	// Kimi assigns its own session id during the ACP handshake.
+	// Kimi assigns its own session id during the ACP handshake, and downgrades a
+	// rejected model/thinking/mode to its default — report what the handshake
+	// actually applied (not the request) so the record replays reality.
 	return harness.Launched{
 		SessionID:      th.SessionID(),
-		Model:          spec.Model,
-		Effort:         spec.Effort,
-		PermissionMode: spec.PermissionMode,
+		Model:          th.Model(),
+		Effort:         th.Thinking(),
+		PermissionMode: th.Mode(),
 	}, nil
 }
 

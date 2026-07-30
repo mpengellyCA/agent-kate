@@ -31,14 +31,14 @@
 #include <algorithm>
 
 namespace {
-// session.preview / session.forget read Claude Code's on-disk transcript store;
-// only a tier-model engine keeps one. A discovered-model engine (e.g. Kimi) has
-// no such file — so those rows show metadata instead of a preview, and can't be
-// forgotten from here. This is a trait check, never a backend-name compare.
+// session.preview / session.forget read a harness's on-disk transcript store.
+// A harness whose transcript lives only in the core's event log (e.g. Kimi) has
+// none — so those rows show metadata instead of a preview, and can't be
+// forgotten from here. Bound to a dedicated capability, never inferred from the
+// model vocabulary (which conflates two unrelated affordances).
 bool backendHasTranscript(const QString &backend)
 {
-    return HarnessRegistry::self()->traits(backend).modelPicker
-        == QLatin1String("tiers");
+    return HarnessRegistry::self()->traits(backend).transcriptPreview;
 }
 
 // relativeTime renders a timestamp as a short, human "… ago" string.

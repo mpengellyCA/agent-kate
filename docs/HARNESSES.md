@@ -77,6 +77,7 @@ Declare `Capabilities()` honestly — every flag gates real behavior:
 | `ProviderRouting` | provider overlays in the Engine picker + agent.start validation |
 | `Cowork` | the desktop MCP server + the panel checkbox |
 | `EffortLive` | whether the effort picker stays live while running |
+| `TranscriptPreview` | whether the session browser can preview/forget an on-disk transcript store (false = the transcript lives only in the core's event log) |
 | `MintsSessionID` | whether the core pre-mints the session id (claude `--session-id`) or your CLI assigns one that `Launch` reports back |
 | `ModelPicker` | `tiers` (fixed tokens the core resolves) vs `discovered` (per-session enumeration + free text) |
 | `PermissionModes` / `Efforts` | static vocabularies; empty = discovered per session via `configOptions` |

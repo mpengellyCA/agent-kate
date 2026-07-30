@@ -19,8 +19,8 @@ lifecycle of the core.
                                                     │ spawns
                                   ┌─────────────────┼─────────────────┐
                                   ▼                 ▼                 ▼
-                            headless `claude`  headless `kimi acp`  language
-                            or `kimi acp`      (ACP → stream-json)  servers
+                            headless `claude`  language servers   MCP clients
+                            or `kimi acp`
 ```
 
 ### `agentkate` — C++ / Qt6 / KF6

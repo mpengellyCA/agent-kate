@@ -142,13 +142,14 @@ func isStreamClosed(err error) bool {
 	return errors.As(err, &ae) && ae.Message == errStreamClosed.Error()
 }
 
-// send registers cb for the response and writes the request. The callback
-// runs on the read-loop goroutine.
-func (c *acpClient) send(method string, params any, cb func(acpFrame)) error {
+// send registers cb for the response and writes the request, returning the
+// pending-callback key so a synchronous caller can unregister it on timeout.
+// The callback runs on the read-loop goroutine.
+func (c *acpClient) send(method string, params any, cb func(acpFrame)) (string, error) {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
-		return errStreamClosed
+		return "", errStreamClosed
 	}
 	c.nextID++
 	id := c.nextID
@@ -165,15 +166,16 @@ func (c *acpClient) send(method string, params any, cb func(acpFrame)) error {
 		c.mu.Lock()
 		delete(c.pending, key)
 		c.mu.Unlock()
-		return err
+		return key, err
 	}
-	return nil
+	return key, nil
 }
 
 // call performs a synchronous request, waiting for the response or ctx.
 func (c *acpClient) call(ctx context.Context, method string, params, out any) error {
 	ch := make(chan acpFrame, 1)
-	if err := c.send(method, params, func(f acpFrame) { ch <- f }); err != nil {
+	key, err := c.send(method, params, func(f acpFrame) { ch <- f })
+	if err != nil {
 		return err
 	}
 	select {
@@ -186,6 +188,11 @@ func (c *acpClient) call(ctx context.Context, method string, params, out any) er
 		}
 		return nil
 	case <-ctx.Done():
+		// Unregister the callback so a peer that never answers doesn't leak a
+		// pending-map entry for the process's lifetime.
+		c.mu.Lock()
+		delete(c.pending, key)
+		c.mu.Unlock()
 		return ctx.Err()
 	}
 }

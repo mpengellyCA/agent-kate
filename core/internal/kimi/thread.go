@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -78,6 +79,17 @@ type Thread struct {
 	interrupted bool // set when the interrupt backstop had to kill; reap() reports a user-interrupt
 	cancelling  bool // a session/cancel is in flight; the last prompt completion clears it
 	stopping    bool // a Stop is in flight; suppresses turn_aborted and rejects new Sends
+	// Config the handshake actually applied. Kimi downgrades a CLI-rejected
+	// model/thinking/mode to its default, so these can differ from StartOptions
+	// — the record must hold what is really running, so resume replays reality.
+	appliedModel    string
+	appliedThinking string
+	appliedMode     string
+	// stderr accumulated before the session went live (stderrLive), kept as a
+	// bounded tail for a handshake-failure diagnostic; once live, new lines
+	// surface as _stderr cards instead.
+	stderrTail []string
+	stderrLive bool
 	// activePrompts counts session/prompt requests awaiting their response.
 	// Normally 0 or 1 (ACP allows one turn per session; kimi rejects overlap),
 	// but a rejected overlapping prompt completes independently and must not
@@ -98,6 +110,35 @@ func (t *Thread) SessionID() string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.sessionID
+}
+
+// Model, Thinking and Mode report the config the handshake actually applied
+// (a rejected request is downgraded to the CLI default), so the caller records
+// reality rather than the request.
+func (t *Thread) Model() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.appliedModel
+}
+
+func (t *Thread) Thinking() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.appliedThinking
+}
+
+func (t *Thread) Mode() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.appliedMode
+}
+
+// stderrTailString returns the buffered pre-handshake stderr as a single line,
+// for a handshake-failure diagnostic.
+func (t *Thread) stderrTailString() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return strings.Join(t.stderrTail, "; ")
 }
 
 // Supervisor owns the set of running kimi threads. It mirrors agent.Supervisor
@@ -276,36 +317,79 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 		}
 	}
 
-	// The ACP handshake runs synchronously so a failure (kimi missing, not
-	// logged in, bad session id) is reported through Start's error return —
-	// the caller turns it into an "error" lifecycle event, exactly like a
-	// failed Claude spawn. On failure the child is killed and reaped inline:
-	// no thread was ever registered, so no "exited" lifecycle event follows.
-	if err := s.handshake(t, opts); err != nil {
+	// Drain stderr from the moment the child starts — before the handshake, not
+	// after — so a chatty startup (verbose logging, a noisy shell rc) can't fill
+	// the OS pipe buffer and stall the handshake into a spurious timeout. Until
+	// the session is live the pump buffers lines as a tail for a failure
+	// diagnostic; afterwards it emits them as _stderr cards.
+	stderrDone := make(chan struct{})
+	safe.Go("kimi.pumpStderr", func() { s.pumpStderr(t, stderr, stderrDone) })
+
+	// teardown kills the process group (not just the leader — a handshake that
+	// failed after session/new may already have spawned children), lets the
+	// stderr pump drain the closing pipe, then reaps. Used by both failure
+	// exits below; no thread was ever registered, so no "exited" event follows.
+	teardown := func() {
 		_ = stdin.Close()
-		_ = cmd.Process.Kill()
+		if t.pgid > 0 {
+			_ = syscall.Kill(-t.pgid, syscall.SIGKILL)
+		} else {
+			_ = cmd.Process.Kill()
+		}
+		select {
+		case <-stderrDone:
+		case <-time.After(2 * time.Second):
+		}
 		_ = cmd.Wait()
+		t.mu.Lock()
 		if t.logFile != nil {
 			_ = t.logFile.Close()
 			t.logFile = nil
 		}
+		t.mu.Unlock()
+	}
+
+	// The ACP handshake runs synchronously so a failure (kimi missing, not
+	// logged in, bad session id) is reported through Start's error return —
+	// the caller turns it into an "error" lifecycle event, exactly like a
+	// failed Claude spawn. The drained stderr tail rides along so the user sees
+	// why (the RPC error alone rarely says).
+	if err := s.handshake(t, opts); err != nil {
+		teardown()
+		if tail := t.stderrTailString(); tail != "" {
+			err = fmt.Errorf("%w (kimi stderr: %s)", err, tail)
+		}
 		return nil, err
 	}
 
+	// Register atomically: a double resume (say a double-clicked Resume) can
+	// race two Starts to here, and a blind overwrite would strand the loser's
+	// live process — the winner's reap() would delete the map entry and
+	// deregister it. Refuse the duplicate so the race loser fails cleanly.
 	s.mu.Lock()
+	if _, dup := s.threads[t.ID]; dup {
+		s.mu.Unlock()
+		teardown()
+		return nil, fmt.Errorf("thread %q already running", t.ID)
+	}
 	s.threads[t.ID] = t
 	s.mu.Unlock()
 
 	s.log.Info("kimi process spawned", "thread", t.ID, "dir", opts.WorkDir,
 		"pid", cmd.Process.Pid, "session", t.SessionID())
 
-	safe.Go("kimi.pumpStderr", func() { s.pumpStderr(t, stderr) })
 	s.reapWG.Add(1)
 	safe.Go("kimi.reap", func() { s.reap(t) })
 
 	// Session start, shaped like claude's init system event — the run loop
 	// persists the session id from it and the UI shows the model line.
 	s.emitEvents(t, []json.RawMessage{t.tr.initEvent()})
+
+	// The session is live: from here, stderr lines surface as _stderr cards
+	// (in order, after the init event) rather than feeding the failure tail.
+	t.mu.Lock()
+	t.stderrLive = true
+	t.mu.Unlock()
 
 	// Replay a command list announced during the handshake (see pendingCmds).
 	t.mu.Lock()
@@ -381,58 +465,54 @@ func (s *Supervisor) handshake(t *Thread, opts StartOptions) error {
 	t.sessionID = sessionID
 	t.mu.Unlock()
 
-	// Model: empty leaves the CLI's configured default; otherwise set it via
-	// the unified config-option dispatcher. A bad alias is a warning, not a
-	// failed start — the thread can still run on the default model.
-	model := opts.Model
-	if model != "" {
-		if err := t.client.call(ctx, "session/set_config_option", map[string]any{
-			"sessionId": sessionID,
-			"configId":  "model",
-			"value":     model,
-		}, nil); err != nil {
-			s.log.Warn("could not set kimi model; using the CLI default",
-				"thread", t.ID, "model", model, "err", err)
-			model = ""
-		}
-	}
-	for i, co := range sessionRes.ConfigOptions {
-		if co.ID != "model" {
-			continue
-		}
-		if model == "" {
-			model = co.CurrentValue
-		} else {
-			// Keep the init event's option set consistent with the model we
-			// just applied, so the UI's picker shows the real current value.
-			sessionRes.ConfigOptions[i].CurrentValue = model
-		}
-	}
-	// Thinking level and approval mode ride the same config-option dispatcher.
-	// Like the model, a rejected value is a warning, never a failed start.
-	for _, opt := range []struct{ id, value string }{
-		{"thinking", opts.Thinking},
-		{"mode", opts.Mode},
-	} {
-		if opt.value == "" {
-			continue
-		}
-		if err := t.client.call(ctx, "session/set_config_option", map[string]any{
-			"sessionId": sessionID,
-			"configId":  opt.id,
-			"value":     opt.value,
-		}, nil); err != nil {
-			s.log.Warn("could not set kimi config option; using the CLI default",
-				"thread", t.ID, "option", opt.id, "value", opt.value, "err", err)
-			continue
-		}
-		for i := range sessionRes.ConfigOptions {
-			if sessionRes.ConfigOptions[i].ID == opt.id {
-				sessionRes.ConfigOptions[i].CurrentValue = opt.value
+	// configValue reads an option's CLI default straight from the handshake's
+	// set — the value that applies when a request is empty or gets rejected.
+	configValue := func(id string) string {
+		for _, co := range sessionRes.ConfigOptions {
+			if co.ID == id {
+				return co.CurrentValue
 			}
 		}
+		return ""
 	}
+	// setOption applies one config option and returns the value that actually
+	// took effect: the request when the CLI accepted it, else the CLI default —
+	// for an empty request, or a rejected one. Kimi downgrades a rejected value
+	// silently, so reporting the request as applied would make the record claim
+	// a model/mode the agent is not running; the caller records what this
+	// returns instead. A rejection is a warning, never a failed start. The init
+	// event's option set is kept consistent so the UI picker shows the real
+	// current value.
+	setOption := func(id, value string) string {
+		if value != "" {
+			if err := t.client.call(ctx, "session/set_config_option", map[string]any{
+				"sessionId": sessionID,
+				"configId":  id,
+				"value":     value,
+			}, nil); err != nil {
+				s.log.Warn("could not set kimi config option; using the CLI default",
+					"thread", t.ID, "option", id, "value", value, "err", err)
+				value = ""
+			}
+		}
+		if value == "" {
+			value = configValue(id)
+		}
+		for i := range sessionRes.ConfigOptions {
+			if sessionRes.ConfigOptions[i].ID == id {
+				sessionRes.ConfigOptions[i].CurrentValue = value
+			}
+		}
+		return value
+	}
+	model := setOption("model", opts.Model)
+	thinking := setOption("thinking", opts.Thinking)
+	mode := setOption("mode", opts.Mode)
+
 	t.mu.Lock()
+	t.appliedModel = model
+	t.appliedThinking = thinking
+	t.appliedMode = mode
 	t.tr = newTranslator(sessionID, model, sessionRes.ConfigOptions)
 	t.mu.Unlock()
 	return nil
@@ -490,7 +570,7 @@ func (s *Supervisor) Send(threadID, text string, attachments []agent.Attachment)
 	if stopping {
 		return fmt.Errorf("thread %q is stopping", threadID)
 	}
-	err := t.client.send("session/prompt", map[string]any{
+	_, err := t.client.send("session/prompt", map[string]any{
 		"sessionId": sid,
 		"prompt":    buildPromptContent(text, attachments),
 	}, func(f acpFrame) { s.onPromptDone(t, f) })
@@ -596,8 +676,13 @@ func (s *Supervisor) Interrupt(threadID string) error {
 
 	safe.Go("kimi.interruptBackstop", func() {
 		time.Sleep(s.cancelBackstopDelay)
-		if !s.cancelPending(threadID) {
-			return // clean cancel — process stays alive
+		// Signal only the exact thread this backstop was armed for. If the
+		// original was reaped during the sleep and its id reused by a resumed
+		// thread, s.thread(threadID) is now a different *Thread — the captured
+		// pgid is stale and must not be signalled (pgid reuse could hit an
+		// unrelated process).
+		if s.thread(threadID) != t || !s.cancelPending(threadID) {
+			return // clean cancel, or a different thread now owns this id
 		}
 		s.log.Info("cancel not acked; escalating to signals", "thread", threadID)
 		t.mu.Lock()
@@ -607,7 +692,7 @@ func (s *Supervisor) Interrupt(threadID string) error {
 			_ = syscall.Kill(-pgid, syscall.SIGINT)
 		}
 		time.Sleep(s.cancelKillDelay)
-		if !s.Running(threadID) {
+		if s.thread(threadID) != t || !s.Running(threadID) {
 			return
 		}
 		if pgid > 0 {
@@ -671,6 +756,7 @@ func (s *Supervisor) Stop(threadID string) error {
 func (s *Supervisor) closeStdin(t *Thread) {
 	t.mu.Lock()
 	proc := t.cmd.Process
+	pgid := t.pgid
 	_ = t.stdin.Close()
 	t.mu.Unlock()
 	safe.Go("kimi.stopKillBackstop", func() {
@@ -678,7 +764,14 @@ func (s *Supervisor) closeStdin(t *Thread) {
 		t.mu.Lock()
 		stillAlive := t.alive
 		t.mu.Unlock()
-		if stillAlive && proc != nil {
+		if !stillAlive {
+			return
+		}
+		// Kill the whole group (kimi plus anything it spawned), like the
+		// interrupt backstop and the probe teardown — not just the leader.
+		if pgid > 0 {
+			_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		} else if proc != nil {
 			_ = proc.Kill()
 		}
 	})
@@ -867,7 +960,12 @@ func (s *Supervisor) onAgentRequest(t *Thread, f acpFrame) {
 	})
 }
 
-func (s *Supervisor) pumpStderr(t *Thread, r io.Reader) {
+// maxStderrTailLines bounds the pre-handshake stderr buffer kept for a failure
+// diagnostic — a hung startup could otherwise stream unbounded.
+const maxStderrTailLines = 20
+
+func (s *Supervisor) pumpStderr(t *Thread, r io.Reader, done chan<- struct{}) {
+	defer close(done)
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 32*1024), 1024*1024)
 	for sc.Scan() {
@@ -876,7 +974,20 @@ func (s *Supervisor) pumpStderr(t *Thread, r io.Reader) {
 			continue
 		}
 		s.log.Debug("kimi stderr", "thread", t.ID, "line", line)
-		s.emitSynthetic(t, "_stderr", line)
+		t.mu.Lock()
+		live := t.stderrLive
+		if !live {
+			// Pre-handshake noise: buffer a bounded tail rather than emitting
+			// out-of-order cards before the session's init event.
+			t.stderrTail = append(t.stderrTail, line)
+			if len(t.stderrTail) > maxStderrTailLines {
+				t.stderrTail = t.stderrTail[len(t.stderrTail)-maxStderrTailLines:]
+			}
+		}
+		t.mu.Unlock()
+		if live {
+			s.emitSynthetic(t, "_stderr", line)
+		}
 	}
 }
 

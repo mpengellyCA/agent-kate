@@ -40,6 +40,7 @@ HarnessTraits claudeDefaults()
     t.fork = t.compaction = t.promote = true;
     t.providerRouting = t.cowork = true;
     t.usageReporting = t.sessionBrowse = true;
+    t.transcriptPreview = true; // claude keeps the on-disk session store
     t.modelPicker = QStringLiteral("tiers");
     t.permissionModes = {QStringLiteral("acceptEdits"), QStringLiteral("default"),
                          QStringLiteral("plan"), QStringLiteral("auto"),
@@ -56,6 +57,9 @@ HarnessTraits kimiDefaults()
     t.displayName = QStringLiteral("Kimi Code");
     t.badge = QStringLiteral("Kimi");
     t.effortLive = true;
+    t.sessionBrowse = true; // session/list via a one-shot probe (mirrors the Go adapter)
+    // transcriptPreview stays false: kimi's transcript is the core's event log,
+    // not a previewable/forgettable on-disk store.
     t.modelPicker = QStringLiteral("discovered");
     return t;
 }
@@ -74,6 +78,7 @@ HarnessTraits fromJson(const QJsonObject &o)
     t.effortLive = o.value(QStringLiteral("effortLive")).toBool();
     t.usageReporting = o.value(QStringLiteral("usageReporting")).toBool();
     t.sessionBrowse = o.value(QStringLiteral("sessionBrowse")).toBool();
+    t.transcriptPreview = o.value(QStringLiteral("transcriptPreview")).toBool();
     t.modelPicker = o.value(QStringLiteral("modelPicker")).toString();
     t.permissionModes.clear();
     const QJsonArray modes = o.value(QStringLiteral("permissionModes")).toArray();
@@ -205,6 +210,16 @@ void HarnessRegistry::persistDiscoveredOptions(const QString &harnessId,
             cfg.writeEntry(t.optionKey(id), entries);
         }
     }
+}
+
+void HarnessRegistry::applyDiscoveredOptions(const QString &harnessId,
+                                             const QJsonArray &configOptions)
+{
+    persistDiscoveredOptions(harnessId, configOptions);
+    // Mirror the discoverOptions probe path (ensureDiscovered): notify so the
+    // roster "+ New Agent" menu and any open pickers rebuild from the fresh
+    // cache instead of only picking it up on the next app start.
+    emit changed();
 }
 
 HarnessTraits HarnessRegistry::traits(const QString &id) const

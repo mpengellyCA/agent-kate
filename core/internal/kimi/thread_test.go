@@ -33,7 +33,7 @@ func fakeKimiScript(t *testing.T) string {
 	}
 	path := filepath.Join(t.TempDir(), "fake-kimi")
 	script := `#!/usr/bin/env python3
-import json, sys
+import json, sys, os, signal
 
 sid = "session_fake-0001"
 pending_prompt = None  # prompt id held until session/cancel
@@ -73,6 +73,15 @@ for line in sys.stdin:
                   "error": {"code": -32602, "message": "unknown value: bad"}})
         else:
             send({"jsonrpc": "2.0", "id": fid, "result": {"configOptions": []}})
+    elif method == "session/list":
+        # One session left behind by a DiscoverOptions/ListSessions probe (its
+        # cwd is this very throwaway probe dir), one real session — ListSessions
+        # must drop the probe one by its temp-dir prefix.
+        send({"jsonrpc": "2.0", "id": fid, "result": {"sessions": [
+            {"sessionId": "sess-probe", "cwd": os.getcwd(),
+             "title": "probe leftover", "updatedAt": "2026-07-30T10:00:00Z"},
+            {"sessionId": "sess-real", "cwd": "/home/fake/project",
+             "title": "real work", "updatedAt": "2026-07-30T11:00:00Z"}]}})
     elif method == "session/cancel":
         if pending_prompt is not None:
             send({"jsonrpc": "2.0", "id": pending_prompt,
@@ -88,6 +97,22 @@ for line in sys.stdin:
                  "title": "Bash", "kind": "execute", "status": "in_progress",
                  "rawInput": {"command": "sleep 600"}})
             pending_prompt = fid
+        elif "hang-turn" in text:
+            # A turn that never acks the cancel and ignores SIGINT, forcing the
+            # backstop to escalate all the way to SIGKILL.
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            upd({"sessionUpdate": "tool_call", "toolCallId": "tc-hang",
+                 "title": "Bash", "kind": "execute", "status": "in_progress",
+                 "rawInput": {"command": "sleep 600"}})
+            # No response, no pending_prompt: session/cancel is ignored too.
+        elif "die-mid-turn" in text:
+            # The process exits mid-turn without ever answering the prompt — the
+            # supervisor must NOT synthesise a result for a turn that isn't coming.
+            upd({"sessionUpdate": "tool_call", "toolCallId": "tc-die",
+                 "title": "Bash", "kind": "execute", "status": "in_progress",
+                 "rawInput": {"command": "boom"}})
+            sys.stdout.flush()
+            os._exit(1)
         elif "perm" in text:
             upd({"sessionUpdate": "tool_call", "toolCallId": "tc-perm",
                  "title": "Bash", "kind": "execute", "status": "pending",
@@ -516,6 +541,121 @@ func TestKimiSetConfigOption(t *testing.T) {
 	sup.StopAll()
 	if err := sup.SetConfigOption(th.ID, "model", "kimi-code/k3"); err == nil {
 		t.Error("SetConfigOption on a stopped thread succeeded; it should be rejected")
+	}
+}
+
+// TestKimiInterruptEscalation covers the signal backstop on a hung turn: a
+// turn that never acks session/cancel and ignores SIGINT must be SIGKILLed, so
+// reap() reports phase "interrupted" and the thread resumes afterwards. This is
+// the riskiest path in the package and TestKimiInterruptIdle only covers the
+// no-op cases.
+func TestKimiInterruptEscalation(t *testing.T) {
+	kimiBin := fakeKimiScript(t)
+	col := &eventCollector{}
+	sup := NewSupervisor(kimiBin, testLogger(), col.add, nil, t.TempDir())
+	sup.cancelBackstopDelay = 100 * time.Millisecond
+	sup.cancelKillDelay = 100 * time.Millisecond
+
+	th, err := sup.Start(StartOptions{ID: "t-esc", WorkDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if err := sup.Send(th.ID, "hang-turn", nil); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	col.waitFor(t, "in-flight tool call", hasToolUse)
+	if err := sup.Interrupt(th.ID); err != nil {
+		t.Fatalf("interrupt: %v", err)
+	}
+	// The cancel is never acked and SIGINT is ignored, so the backstop escalates
+	// to SIGKILL; reap() then reports a user-interrupt, not a plain exit.
+	col.waitFor(t, "interrupted lifecycle", isLifecycle("interrupted"))
+	deadline := time.Now().Add(5 * time.Second)
+	for sup.Running(th.ID) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if sup.Running(th.ID) {
+		t.Fatal("thread still running after the interrupt backstop escalated")
+	}
+	// A killed-by-interrupt thread stays resumable on its id (the exit was
+	// deliberate, the session survives).
+	if _, err := sup.Start(StartOptions{
+		ID: "t-esc", WorkDir: t.TempDir(),
+		SessionID: "session_fake-0001", Resume: true,
+	}); err != nil {
+		t.Fatalf("resume after interrupt: %v", err)
+	}
+	col.waitFor(t, "post-resume init", func(ev map[string]any) bool {
+		return ev["type"] == "system" && ev["subtype"] == "init"
+	})
+	sup.StopAll()
+}
+
+// TestKimiMidTurnDeath covers a process that exits mid-turn without answering
+// the prompt: onPromptDone sees the stream close (isStreamClosed) and must NOT
+// synthesise a result event for a turn that will never complete — reap reports
+// the plain exit instead.
+func TestKimiMidTurnDeath(t *testing.T) {
+	kimiBin := fakeKimiScript(t)
+	col := &eventCollector{}
+	sup := NewSupervisor(kimiBin, testLogger(), col.add, nil, t.TempDir())
+
+	th, err := sup.Start(StartOptions{ID: "t-die", WorkDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if err := sup.Send(th.ID, "die-mid-turn", nil); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	col.waitFor(t, "exited lifecycle", isLifecycle("exited"))
+	if i := col.indexOf(isResult); i >= 0 {
+		t.Errorf("synthetic result at index %d for a turn that never completed", i)
+	}
+	if sup.Running(th.ID) {
+		t.Error("thread still running after mid-turn death")
+	}
+	sup.StopAll()
+}
+
+// TestKimiListSessionsFiltersProbes covers session/list's probe filtering: a
+// session left in kimi's store by a one-shot probe (cwd under the temp
+// probe-dir prefix) is dropped; a real session is kept.
+func TestKimiListSessionsFiltersProbes(t *testing.T) {
+	kimiBin := fakeKimiScript(t)
+	sup := NewSupervisor(kimiBin, testLogger(),
+		func(string, []json.RawMessage) {}, nil, t.TempDir())
+
+	sessions, err := sup.ListSessions("")
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("ListSessions returned %d sessions, want 1 (the probe leftover filtered): %+v",
+			len(sessions), sessions)
+	}
+	if sessions[0].SessionID != "sess-real" || sessions[0].Cwd != "/home/fake/project" {
+		t.Errorf("kept session = %+v, want the non-probe sess-real", sessions[0])
+	}
+}
+
+// TestKimiDiscoverOptions covers the one-shot config-option probe and its cache:
+// the model enumeration comes back, and a second call serves it without a
+// re-probe.
+func TestKimiDiscoverOptions(t *testing.T) {
+	kimiBin := fakeKimiScript(t)
+	sup := NewSupervisor(kimiBin, testLogger(),
+		func(string, []json.RawMessage) {}, nil, t.TempDir())
+
+	opts, err := sup.DiscoverOptions()
+	if err != nil {
+		t.Fatalf("DiscoverOptions: %v", err)
+	}
+	if len(opts) != 1 || opts[0].ID != "model" || len(opts[0].Options) != 2 {
+		t.Fatalf("DiscoverOptions = %+v, want the model enumeration", opts)
+	}
+	opts2, err := sup.DiscoverOptions()
+	if err != nil || len(opts2) != 1 {
+		t.Fatalf("cached DiscoverOptions = %+v, %v", opts2, err)
 	}
 }
 

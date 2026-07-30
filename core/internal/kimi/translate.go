@@ -293,11 +293,21 @@ func (t *translator) update(params json.RawMessage) []json.RawMessage {
 
 	case "tool_call_update":
 		st := t.toolCalls[u.ToolCallID]
+		synthesized := false
 		if st == nil {
 			st = &toolCallState{}
 			t.toolCalls[u.ToolCallID] = st
+			synthesized = true
 		}
 		done := u.Status == "completed" || u.Status == "failed"
+		// A completion (or failure) for a tool call we never saw announced —
+		// no preceding tool_call, so the state was just synthesized here with no
+		// title/kind/input — has no real tool_use to show. Emit only its result,
+		// never a phantom "Tool" card with empty input.
+		if synthesized && done {
+			return []json.RawMessage{
+				t.toolResultLocked(u.ToolCallID, u.Status, u.RawOutput, u.Content)}
+		}
 		// While the call runs, content carries the accumulating raw-input JSON
 		// snapshot; once done it carries the tool's output instead.
 		if !done {

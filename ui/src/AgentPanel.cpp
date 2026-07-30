@@ -1033,7 +1033,12 @@ QString AgentPanel::currentModel() const
     // that matches no item is a hand-typed model id, sent verbatim.
     const int idx = m_modelCombo->currentIndex();
     if (idx >= 0 && m_modelCombo->currentText() == m_modelCombo->itemText(idx)) {
-        return m_modelCombo->itemData(idx).toString();
+        const QString data = m_modelCombo->itemData(idx).toString();
+        if (!data.isEmpty()) {
+            return data;
+        }
+        // A dataless current item is a stray hand-typed entry (or one Qt
+        // auto-inserted): fall through and send its text verbatim.
     }
     return m_modelCombo->currentText().trimmed();
 }
@@ -1428,6 +1433,10 @@ void AgentPanel::rebuildModelCombo()
         // init event) fills the dropdown; the combo stays editable so a new
         // id can still be typed before any session existed.
         m_modelCombo->setEditable(true);
+        // Never let Qt's default InsertAtBottom append the hand-typed id as a
+        // dataless dropdown item: currentModel() would then read its empty
+        // itemData and silently send model:"" instead of the typed id.
+        m_modelCombo->setInsertPolicy(QComboBox::NoInsert);
         m_modelCombo->lineEdit()->clear();
         m_modelCombo->lineEdit()->setPlaceholderText(
             i18n("CLI default — or type a model id"));
@@ -2011,8 +2020,11 @@ void AgentPanel::refresh()
     m_modelCombo->setEnabled(m_threadId.isEmpty() || running);
     m_coworkCheck->setEnabled(m_threadId.isEmpty() && traits.cowork);
 
-    // Offer promotion while a thread runs non-isolated in the workspace.
-    m_promoteBar->setVisible(!m_threadId.isEmpty() && !m_isolated && !m_promoting);
+    // Offer promotion while a thread runs non-isolated in the workspace — but
+    // only on a harness that supports it (the core rejects agent.promote
+    // otherwise), like fork/compaction/cowork above.
+    m_promoteBar->setVisible(!m_threadId.isEmpty() && !m_isolated && !m_promoting
+                             && traits.promote);
 
     // "Agent Kate at work" indicator: animate while a turn is actually computing.
     m_working->setActive(running && !m_idle && m_permQueue.isEmpty());
@@ -3337,6 +3349,15 @@ void AgentPanel::onPromoteClicked()
     if (m_threadId.isEmpty() || m_isolated || m_promoting) {
         return;
     }
+    const HarnessTraits t = currentTraits();
+    if (!t.promote) {
+        // The bar is normally hidden for these harnesses; guard anyway so the
+        // core never sees a promote it would only reject, mirroring runCompactNow.
+        addNote(i18n("Moving to a private copy is not supported for %1 agents.",
+                     t.displayName),
+                QStringLiteral("dim"));
+        return;
+    }
     m_promoting = true;
     addNote(QStringLiteral("moving to a private copy — the agent will restart in "
                            "its own sandbox…"),
@@ -3719,8 +3740,17 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
         const QJsonArray configOptions =
             ev.value(QStringLiteral("configOptions")).toArray();
         if (!configOptions.isEmpty()) {
-            HarnessRegistry::persistDiscoveredOptions(currentTraits().id,
-                                                      configOptions);
+            if (m_replaying) {
+                // Replaying a stored transcript: the vocabulary was already
+                // learned when this session first ran live — persist quietly.
+                HarnessRegistry::persistDiscoveredOptions(currentTraits().id,
+                                                          configOptions);
+            } else {
+                // A live session's real vocabulary: notify so the roster quick
+                // menu and other panels' pickers rebuild now, not on restart.
+                HarnessRegistry::self()->applyDiscoveredOptions(currentTraits().id,
+                                                                configOptions);
+            }
         }
         // The claude init event lists the session's slash commands (names
         // only) — the composer's autocomplete feed.

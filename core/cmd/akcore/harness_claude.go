@@ -40,11 +40,12 @@ func (h *claudeHarness) Capabilities() harness.Capabilities {
 		Cowork:          true,
 		// Verified against claude 2.1.220: set_model / set_permission_mode
 		// exist mid-session, set_effort does not — effort is start-time only.
-		EffortLive:     false,
-		UsageReporting: true,
-		SessionBrowse:  true,
-		MintsSessionID: true,
-		ModelPicker:    harness.ModelPickerTiers,
+		EffortLive:        false,
+		UsageReporting:    true,
+		SessionBrowse:     true,
+		TranscriptPreview: true, // claude keeps the on-disk session store
+		MintsSessionID:    true,
+		ModelPicker:       harness.ModelPickerTiers,
 		PermissionModes: []string{
 			"acceptEdits", "default", "plan", "auto", "bypassPermissions",
 		},

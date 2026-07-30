@@ -417,7 +417,18 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 	// With Setpgid the child is the leader of a new group whose id is its pid.
 	t.pgid = cmd.Process.Pid
 
+	// Register atomically: a double resume (say a double-clicked Resume) can
+	// race two Starts to here, and a blind overwrite would strand the loser's
+	// live process — the winner's reap() would delete the map entry and
+	// deregister it. Refuse the duplicate so the race loser fails cleanly.
 	s.mu.Lock()
+	if _, dup := s.threads[t.ID]; dup {
+		s.mu.Unlock()
+		_ = stdin.Close()
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return nil, fmt.Errorf("thread %q already running", t.ID)
+	}
 	s.threads[t.ID] = t
 	s.mu.Unlock()
 
@@ -622,8 +633,12 @@ func (s *Supervisor) Interrupt(threadID string) error {
 	// pumpStdout has already cleared t.aborting, so we do nothing.
 	safe.Go("agent.interruptBackstop", func() {
 		time.Sleep(s.interruptBackstopDelay)
-		if !s.abortPending(threadID) {
-			return // clean in-band abort — process stays alive
+		// Signal only the exact thread this backstop was armed for. If the
+		// original was reaped during the sleep and its id reused by a resumed
+		// thread, s.thread(threadID) is now a different *Thread — the captured
+		// pgid is stale and must not be signalled.
+		if s.thread(threadID) != t || !s.abortPending(threadID) {
+			return // clean in-band abort, or a different thread now owns this id
 		}
 		s.log.Info("interrupt not acked in-band; escalating to signals", "thread", threadID)
 		t.mu.Lock()
@@ -633,7 +648,7 @@ func (s *Supervisor) Interrupt(threadID string) error {
 			_ = syscall.Kill(-pgid, syscall.SIGINT)
 		}
 		time.Sleep(s.interruptKillDelay)
-		if !s.Running(threadID) {
+		if s.thread(threadID) != t || !s.Running(threadID) {
 			return
 		}
 		if pgid > 0 {

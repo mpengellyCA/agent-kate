@@ -45,6 +45,11 @@ type Capabilities struct {
 	EffortLive      bool `json:"effortLive"`      // thinking effort adjustable mid-session
 	UsageReporting  bool `json:"usageReporting"`  // tokens/cost in result events
 	SessionBrowse   bool `json:"sessionBrowse"`   // on-disk session discovery (session.browse)
+	// TranscriptPreview: the harness keeps a previewable, forgettable on-disk
+	// transcript store (session.preview / session.forget). False for harnesses
+	// whose transcript lives only in the core's translated-event log (kimi), so
+	// the session browser shows metadata instead of a preview and hides Forget.
+	TranscriptPreview bool `json:"transcriptPreview"`
 	// MintsSessionID: the core pre-mints the session id and passes it to the
 	// CLI (claude --session-id). False = the CLI assigns its own during the
 	// handshake, so agent.start replies with an empty sessionId and the id is

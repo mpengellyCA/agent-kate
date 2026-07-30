@@ -15,14 +15,15 @@ func TestHarnessCapabilities(t *testing.T) {
 		t.Errorf("claude identity = %q/%q/%q", claude.ID, claude.DisplayName, claude.Badge)
 	}
 	for name, got := range map[string]bool{
-		"Fork":            claude.Fork,
-		"Compaction":      claude.Compaction,
-		"Promote":         claude.Promote,
-		"ProviderRouting": claude.ProviderRouting,
-		"Cowork":          claude.Cowork,
-		"UsageReporting":  claude.UsageReporting,
-		"SessionBrowse":   claude.SessionBrowse,
-		"MintsSessionID":  claude.MintsSessionID,
+		"Fork":              claude.Fork,
+		"Compaction":        claude.Compaction,
+		"Promote":           claude.Promote,
+		"ProviderRouting":   claude.ProviderRouting,
+		"Cowork":            claude.Cowork,
+		"UsageReporting":    claude.UsageReporting,
+		"SessionBrowse":     claude.SessionBrowse,
+		"TranscriptPreview": claude.TranscriptPreview,
+		"MintsSessionID":    claude.MintsSessionID,
 	} {
 		if !got {
 			t.Errorf("claude capability %s = false, want true", name)
@@ -44,13 +45,14 @@ func TestHarnessCapabilities(t *testing.T) {
 		t.Errorf("kimi identity = %q/%q/%q", kimi.ID, kimi.DisplayName, kimi.Badge)
 	}
 	for name, got := range map[string]bool{
-		"Fork":            kimi.Fork,
-		"Compaction":      kimi.Compaction,
-		"Promote":         kimi.Promote,
-		"ProviderRouting": kimi.ProviderRouting,
-		"Cowork":          kimi.Cowork,
-		"UsageReporting":  kimi.UsageReporting,
-		"MintsSessionID":  kimi.MintsSessionID,
+		"Fork":              kimi.Fork,
+		"Compaction":        kimi.Compaction,
+		"Promote":           kimi.Promote,
+		"ProviderRouting":   kimi.ProviderRouting,
+		"Cowork":            kimi.Cowork,
+		"UsageReporting":    kimi.UsageReporting,
+		"TranscriptPreview": kimi.TranscriptPreview,
+		"MintsSessionID":    kimi.MintsSessionID,
 	} {
 		if got {
 			t.Errorf("kimi capability %s = true, want false (honestly gated, not emulated)", name)

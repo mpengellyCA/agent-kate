@@ -31,6 +31,7 @@ struct HarnessTraits {
     bool effortLive = false; // thinking effort adjustable mid-session
     bool usageReporting = false;
     bool sessionBrowse = false;
+    bool transcriptPreview = false; // previewable/forgettable on-disk transcript
 
     QString modelPicker = QStringLiteral("tiers"); // "tiers" | "discovered"
     // Static vocabularies (wire values; the UI owns the human labels). Empty =
@@ -74,6 +75,11 @@ public:
     // the discovered "value|name" enumerations.
     static void persistDiscoveredOptions(const QString &harnessId,
                                          const QJsonArray &configOptions);
+    // Persist discovered options AND emit changed() so the roster quick menu
+    // and open pickers rebuild — the notifying counterpart of the static
+    // persist, for callers (a live session's init event) outside the probe path.
+    void applyDiscoveredOptions(const QString &harnessId,
+                                const QJsonArray &configOptions);
 
     // Traits for a harness id. The empty id (legacy records) resolves to the
     // default engine; an unknown id gets claude-shaped defaults under its own

@@ -84,6 +84,13 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, CoreClient *core,
         QSignalBlocker blockModel(m_model);
         QSignalBlocker blockPerm(m_permission);
         QSignalBlocker blockEffort(m_effort);
+        // Preserve the user's picks across the rebuild — a late capability fetch
+        // or option probe fires HarnessRegistry::changed, and clobbering the
+        // selection to the first entry after they have chosen is the bug this
+        // guards against (AgentPanel::rebuildEngineCombo uses the same pattern).
+        const QString prevModel = m_model->currentData().toString();
+        const QString prevPerm = m_permission->currentData().toString();
+        const QString prevEffort = m_effort->currentData().toString();
         m_model->clear();
         m_permission->clear();
         m_effort->clear();
@@ -123,6 +130,15 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, CoreClient *core,
                 m_effort->addItem(HarnessRegistry::effortLabel(effort), effort);
             }
         }
+        const auto restore = [](QComboBox *combo, const QString &data) {
+            const int idx = combo->findData(data);
+            if (idx >= 0) {
+                combo->setCurrentIndex(idx);
+            }
+        };
+        restore(m_model, prevModel);
+        restore(m_permission, prevPerm);
+        restore(m_effort, prevEffort);
     };
     // Selecting a discovered-model engine (e.g. Kimi) with no cached option
     // lists probes the CLI once so the lists fill before the agent starts; the
