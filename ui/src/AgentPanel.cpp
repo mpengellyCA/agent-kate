@@ -642,6 +642,11 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
         KSharedConfig::openConfig()
             ->group(QStringLiteral("Agent"))
             .writeEntry("engine", m_engineCombo->currentData().toString());
+        // A discovered-model engine may have no cached option lists yet —
+        // probe once now so the pickers fill before the agent ever starts.
+        // The HarnessRegistry::changed connection below rebuilds the combos
+        // when the result lands.
+        HarnessRegistry::self()->ensureDiscovered(m_core, selectedHarnessId());
         rebuildModelCombo();
         rebuildModeCombo();
         rebuildEffortCombo();
@@ -664,6 +669,10 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
         }
         refresh();
     });
+    // A sticky discovered-model engine restored above bypasses the change
+    // handler — probe its option lists now too (a no-op for "tiers" engines,
+    // a cached vocabulary, or a core that is not connected yet).
+    HarnessRegistry::self()->ensureDiscovered(m_core, selectedHarnessId());
 
     // Model selector. For Claude direct each item carries a tier token the core
     // resolves to a concrete --model id (its resolveModel is the single source of
@@ -3705,31 +3714,13 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
         // (model / thinking / mode enumerations straight from the CLI).
         // Persist each as "value|name" pairs under the harness's option key so
         // the pickers can offer the real lists on the next agent instead of
-        // free-text fields.
+        // free-text fields. The registry owns the write — the agent.discover-
+        // Options probe persists the identical shape.
         const QJsonArray configOptions =
             ev.value(QStringLiteral("configOptions")).toArray();
         if (!configOptions.isEmpty()) {
-            const HarnessTraits t = currentTraits();
-            KConfigGroup cfg =
-                KSharedConfig::openConfig()->group(QStringLiteral("Agent"));
-            for (const QJsonValue &ov : configOptions) {
-                const QJsonObject opt = ov.toObject();
-                const QString id = opt.value(QStringLiteral("id")).toString();
-                if (id.isEmpty()) {
-                    continue;
-                }
-                QStringList entries;
-                const QJsonArray values = opt.value(QStringLiteral("options")).toArray();
-                for (const QJsonValue &vv : values) {
-                    const QJsonObject val = vv.toObject();
-                    entries << val.value(QStringLiteral("value")).toString()
-                                   + QLatin1Char('|')
-                                   + val.value(QStringLiteral("name")).toString();
-                }
-                if (!entries.isEmpty()) {
-                    cfg.writeEntry(t.optionKey(id), entries);
-                }
-            }
+            HarnessRegistry::persistDiscoveredOptions(currentTraits().id,
+                                                      configOptions);
         }
         // The claude init event lists the session's slash commands (names
         // only) — the composer's autocomplete feed.

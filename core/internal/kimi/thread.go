@@ -122,6 +122,14 @@ type Supervisor struct {
 	// each thread's "exited" lifecycle event has been delivered before shutdown
 	// proceeds (same guarantee agent.Supervisor makes).
 	reapWG sync.WaitGroup
+
+	// One-shot DiscoverOptions probe cache: the CLI's config-option vocabulary
+	// is stable for the process lifetime, so one successful probe serves every
+	// later call. Guarded by its own mutex (held across the probe — see
+	// DiscoverOptions) so a slow probe never blocks the thread map.
+	discoverMu     sync.Mutex
+	discovered     bool
+	discoveredOpts []ConfigOption
 }
 
 // NewSupervisor creates a kimi supervisor. An empty kimiBin defaults to "kimi"
@@ -325,17 +333,9 @@ func (s *Supervisor) handshake(t *Thread, opts StartOptions) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	if err := t.client.call(ctx, "initialize", map[string]any{
-		"protocolVersion": 1,
-		// fs/terminal capabilities are deliberately NOT advertised: kimi then
-		// does its own file I/O and shell execution locally instead of
-		// reverse-RPCing them back to us.
-		"clientCapabilities": map[string]any{
-			"fs":       map[string]any{"readTextFile": false, "writeTextFile": false},
-			"terminal": false,
-		},
-		"clientInfo": map[string]any{"name": "agentkate", "version": "1"},
-	}, nil); err != nil {
+	// The request body is shared with the one-shot probes (discover.go) so the
+	// CLI always sees the same client capabilities.
+	if err := t.client.call(ctx, "initialize", initializeParams(), nil); err != nil {
 		return fmt.Errorf("acp initialize: %w", err)
 	}
 

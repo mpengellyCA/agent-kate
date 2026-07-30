@@ -6,10 +6,12 @@
 #include <QHash>
 #include <QList>
 #include <QObject>
+#include <QSet>
 #include <QString>
 #include <QStringList>
 
 class CoreClient;
+class QJsonArray;
 
 // HarnessTraits mirrors one harness's capability set from the core's
 // agent.capabilities RPC (core/internal/harness). Every backend-specific
@@ -59,6 +61,20 @@ public:
     // when they differ from what is currently served.
     void fetch(CoreClient *core);
 
+    // Ensure the discovered option enumerations (model / thinking / mode) for
+    // a discovered-model harness are cached locally. No-op for "tiers"
+    // harnesses, when the cache (Agent/<id>Opt-model) is already populated, or
+    // while a probe is in flight. On success persists the same "value|name"
+    // entries the init event writes, then emits changed() so open pickers
+    // rebuild. A failed probe leaves today's placeholders (and is retried on
+    // the next call) — it never blocks an agent start.
+    void ensureDiscovered(CoreClient *core, const QString &harnessId);
+    // Persist a configOptions array (the init-event / agent.discoverOptions
+    // shape) to the harness's per-option KConfig keys — the single writer for
+    // the discovered "value|name" enumerations.
+    static void persistDiscoveredOptions(const QString &harnessId,
+                                         const QJsonArray &configOptions);
+
     // Traits for a harness id. The empty id (legacy records) resolves to the
     // default engine; an unknown id gets claude-shaped defaults under its own
     // name, so nothing crashes against a newer core.
@@ -79,4 +95,5 @@ private:
 
     QHash<QString, HarnessTraits> m_traits;
     QStringList m_order;
+    QSet<QString> m_discovering; // harness ids with a probe in flight
 };

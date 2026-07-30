@@ -14,6 +14,21 @@ class QToolButton;
 class QTreeWidget;
 class QTreeWidgetItem;
 
+// One entry in the "+ New Agent" quick menu: either an engine section header,
+// or a concrete {engine, model} launch choice listed under it.
+struct EngineChoice {
+    QString backend;     // harness id; empty on a header row
+    QString model;       // tier token / discovered model id; "" = engine default
+    QString label;       // menu text
+    bool header = false; // a non-clickable engine section title
+
+    bool operator==(const EngineChoice &o) const
+    {
+        return backend == o.backend && model == o.model && label == o.label
+            && header == o.header;
+    }
+};
+
 // AgentRoster is the left-hand navigation tree: projects as top-level rows,
 // their agents nested beneath, each with a live status dot. Selecting an agent
 // activates its conversation; selecting a project focuses that project.
@@ -63,8 +78,9 @@ public:
     void removeProject(const QString &path);
     void setCurrentAgent(int agentId);
 
-    // The models offered by the "+ New Agent" dropdown (id, display label).
-    void setModelChoices(const QList<QPair<QString, QString>> &models);
+    // The engines + models offered by the "+ New Agent" dropdown, grouped by
+    // engine (header rows) with concrete launch choices beneath each.
+    void setEngineChoices(const QList<EngineChoice> &choices);
 
     // Programmatic equivalents of the context-menu git actions, so the window's
     // Agent menu can act on the active agent through the same wiring (these emit
@@ -77,9 +93,10 @@ public:
 Q_SIGNALS:
     void openProjectRequested();
     void newAgentRequested(const QString &projectPath);
-    // newAgentWithModelRequested carries a pre-picked model id; addAgent
-    // forwards it into the panel's model combo before the first start.
-    void newAgentWithModelRequested(const QString &projectPath, const QString &model);
+    // newAgentWithEngineRequested carries a pre-picked engine + model; addAgent
+    // forwards both into the panel before the first start.
+    void newAgentWithEngineRequested(const QString &projectPath,
+                                     const QString &backend, const QString &model);
     void closeProjectRequested(const QString &projectPath);
     void closeOtherProjectsRequested(const QString &keepProjectPath);
     void openTerminalRequested(const QString &projectPath);
@@ -143,7 +160,7 @@ private:
     QAction *m_tagFilterEmptyAct = nullptr; // "No tags yet" placeholder
     QAction *m_tagFilterSeparator = nullptr;
     QAction *m_tagFilterClearAct = nullptr;
-    QList<QPair<QString, QString>> m_models;
+    QList<EngineChoice> m_engineChoices;
     // Drives the Working status-badge arc sweep; runs only while at least one
     // agent is Working, and repaints just those rows (~10fps).
     QTimer *m_workingTimer = nullptr;

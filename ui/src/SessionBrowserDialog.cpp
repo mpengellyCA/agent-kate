@@ -1,5 +1,6 @@
 #include "SessionBrowserDialog.h"
 #include "ipc/CoreClient.h"
+#include "state/HarnessTraits.h"
 
 #include <KConfigGroup>
 #include <KGuiItem>
@@ -30,6 +31,16 @@
 #include <algorithm>
 
 namespace {
+// session.preview / session.forget read Claude Code's on-disk transcript store;
+// only a tier-model engine keeps one. A discovered-model engine (e.g. Kimi) has
+// no such file — so those rows show metadata instead of a preview, and can't be
+// forgotten from here. This is a trait check, never a backend-name compare.
+bool backendHasTranscript(const QString &backend)
+{
+    return HarnessRegistry::self()->traits(backend).modelPicker
+        == QLatin1String("tiers");
+}
+
 // relativeTime renders a timestamp as a short, human "… ago" string.
 QString relativeTime(const QDateTime &when)
 {
@@ -57,15 +68,15 @@ SessionBrowserDialog::SessionBrowserDialog(CoreClient *core, QWidget *parent)
     : QDialog(parent)
     , m_core(core)
 {
-    setWindowTitle(i18n("Resume a Claude Code Session"));
+    setWindowTitle(i18n("Resume a Session"));
     resize(640, 500);
 
     auto *layout = new QVBoxLayout(this);
 
     auto *intro = new QLabel(
-        i18n("Pick a past Claude Code conversation to continue in Agent Kate. "
-             "Every session on disk is listed — including ones started in the "
-             "claude CLI directly."),
+        i18n("Pick a past conversation to continue in Agent Kate. Sessions from "
+             "every engine are listed — including ones started in the CLI "
+             "directly."),
         this);
     intro->setWordWrap(true);
     layout->addWidget(intro);
@@ -187,14 +198,21 @@ void SessionBrowserDialog::populate(const QJsonArray &sessions)
         const QString sessionId = s.value(QStringLiteral("sessionId")).toString();
         const QString project = s.value(QStringLiteral("project")).toString();
         const QString title = s.value(QStringLiteral("title")).toString();
+        const QString backend = s.value(QStringLiteral("backend")).toString();
         const bool attached = s.value(QStringLiteral("attached")).toBool();
-        const QDateTime modified = QDateTime::fromString(
-            s.value(QStringLiteral("modified")).toString(), Qt::ISODate);
+        const QString updatedStr = s.value(QStringLiteral("updated")).toString();
+        const QDateTime updated =
+            QDateTime::fromString(updatedStr, Qt::ISODate);
 
         QString meta = project;
-        const QString rel = relativeTime(modified);
+        const QString rel = relativeTime(updated);
         if (!rel.isEmpty()) {
             meta += QStringLiteral("  ·  ") + rel;
+        }
+        // Mark non-default engines (Claude is the unmarked default: empty badge).
+        const QString badge = HarnessRegistry::self()->traits(backend).badge;
+        if (!badge.isEmpty()) {
+            meta += QStringLiteral("  ·  ") + badge;
         }
         if (attached) {
             meta += QStringLiteral("  ·  already in Agent Kate");
@@ -204,13 +222,13 @@ void SessionBrowserDialog::populate(const QJsonArray &sessions)
         item->setData(Qt::UserRole, sessionId);
         item->setData(Qt::UserRole + 1, project);
         item->setData(Qt::UserRole + 2, title);
-        item->setData(Qt::UserRole + 3,
-                      s.value(QStringLiteral("modified")).toString());
+        item->setData(Qt::UserRole + 3, updatedStr);
         item->setData(Qt::UserRole + 4, attached);
+        item->setData(Qt::UserRole + 5, backend);
         item->setToolTip(sessionId);
     }
     m_status->setText(sessions.isEmpty()
-                          ? i18n("No Claude Code sessions found.")
+                          ? i18n("No sessions found.")
                           : i18n("%1 session(s).", sessions.size()));
     applySort();
     applyFilter();
@@ -288,9 +306,12 @@ void SessionBrowserDialog::updateActionButtons()
     QListWidgetItem *current = m_list->currentItem();
     const bool valid = current != nullptr && !current->isHidden();
     m_attachButton->setEnabled(valid);
-    // Forget is refused for attached sessions — the agent must be removed first.
+    // Forget is refused for attached sessions (remove the agent first) and for
+    // engines with no on-disk transcript to delete.
     const bool attached = valid && current->data(Qt::UserRole + 4).toBool();
-    m_forgetButton->setEnabled(valid && !attached);
+    const bool forgettable =
+        valid && backendHasTranscript(current->data(Qt::UserRole + 5).toString());
+    m_forgetButton->setEnabled(forgettable && !attached);
 }
 
 void SessionBrowserDialog::attachSelected()
@@ -306,6 +327,7 @@ void SessionBrowserDialog::attachSelected()
     const QString sessionId = item->data(Qt::UserRole).toString();
     const QString project = item->data(Qt::UserRole + 1).toString();
     const QString title = item->data(Qt::UserRole + 2).toString();
+    const QString backend = item->data(Qt::UserRole + 5).toString();
 
     m_attachButton->setEnabled(false);
     m_status->setText(i18n("Attaching session…"));
@@ -314,7 +336,8 @@ void SessionBrowserDialog::attachSelected()
     m_core->call(QStringLiteral("session.attach"),
                  QJsonObject{{QStringLiteral("sessionId"), sessionId},
                              {QStringLiteral("project"), project},
-                             {QStringLiteral("title"), title}},
+                             {QStringLiteral("title"), title},
+                             {QStringLiteral("backend"), backend}},
                  [self, project, title](const QJsonObject &result,
                                         const QJsonObject &error) {
                      if (!self) {
@@ -401,7 +424,8 @@ void SessionBrowserDialog::showContextMenu(const QPoint &pos)
     QAction *resume = menu.addAction(i18n("Resume Session"));
     QAction *forget = menu.addAction(
         QIcon::fromTheme(QStringLiteral("edit-delete")), i18n("Forget…"));
-    forget->setEnabled(!item->data(Qt::UserRole + 4).toBool());
+    forget->setEnabled(!item->data(Qt::UserRole + 4).toBool()
+                       && backendHasTranscript(item->data(Qt::UserRole + 5).toString()));
     QAction *chosen = menu.exec(m_list->viewport()->mapToGlobal(pos));
     if (chosen == resume) {
         attachSelected();
@@ -423,6 +447,25 @@ void SessionBrowserDialog::loadPreview()
         return; // already showing this one
     }
     m_previewSessionId = sessionId;
+    const QString backend = item->data(Qt::UserRole + 5).toString();
+    if (!backendHasTranscript(backend)) {
+        // No on-disk transcript to preview — show the row's metadata instead.
+        const QString title =
+            item->data(Qt::UserRole + 2).toString().toHtmlEscaped();
+        const QString project =
+            item->data(Qt::UserRole + 1).toString().toHtmlEscaped();
+        const QString engine =
+            HarnessRegistry::self()->traits(backend).displayName.toHtmlEscaped();
+        const QDateTime updated = QDateTime::fromString(
+            item->data(Qt::UserRole + 3).toString(), Qt::ISODate);
+        QString html = QStringLiteral("<p><b>%1</b></p>").arg(title);
+        html += i18n("<p>Engine: %1<br>Project: %2<br>Last active: %3</p>", engine,
+                     project, relativeTime(updated).toHtmlEscaped());
+        html += i18n("<p><i>No preview for this engine — resume the session to "
+                     "see the conversation.</i></p>");
+        m_preview->setHtml(html);
+        return;
+    }
     if (!m_core || !m_core->isConnected()) {
         return;
     }

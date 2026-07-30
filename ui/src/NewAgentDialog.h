@@ -10,6 +10,7 @@ class QPlainTextEdit;
 class QComboBox;
 class QCheckBox;
 class QWidget;
+class CoreClient;
 
 // The choices a guided New Agent dialog collects. Empty strings mean "leave the
 // agent's sticky default" (the data values match AgentPanel's combos).
@@ -31,11 +32,13 @@ class NewAgentDialog : public QDialog
 {
     Q_OBJECT
 public:
-    explicit NewAgentDialog(const QString &projectName, QWidget *parent = nullptr);
+    explicit NewAgentDialog(const QString &projectName, CoreClient *core,
+                            QWidget *parent = nullptr);
 
     NewAgentChoices choices() const;
 
 private:
+    CoreClient *m_core = nullptr; // for the lazy discovered-option probe
     QPlainTextEdit *m_task = nullptr;
     QComboBox *m_engine = nullptr; // harness + optional provider overlay
     QComboBox *m_model = nullptr;

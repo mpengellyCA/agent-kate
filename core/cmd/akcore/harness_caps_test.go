@@ -50,7 +50,6 @@ func TestHarnessCapabilities(t *testing.T) {
 		"ProviderRouting": kimi.ProviderRouting,
 		"Cowork":          kimi.Cowork,
 		"UsageReporting":  kimi.UsageReporting,
-		"SessionBrowse":   kimi.SessionBrowse,
 		"MintsSessionID":  kimi.MintsSessionID,
 	} {
 		if got {
@@ -59,6 +58,9 @@ func TestHarnessCapabilities(t *testing.T) {
 	}
 	if !kimi.EffortLive {
 		t.Error("kimi EffortLive = false; session/set_config_option works mid-session")
+	}
+	if !kimi.SessionBrowse {
+		t.Error("kimi SessionBrowse = false; session/list works via a one-shot probe")
 	}
 	if kimi.ModelPicker != harness.ModelPickerDiscovered {
 		t.Errorf("kimi ModelPicker = %q, want discovered", kimi.ModelPicker)

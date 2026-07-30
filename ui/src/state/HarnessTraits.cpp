@@ -4,7 +4,9 @@
 #include "HarnessTraits.h"
 #include "../ipc/CoreClient.h"
 
+#include <KConfigGroup>
 #include <KLocalizedString>
+#include <KSharedConfig>
 
 #include <QJsonArray>
 #include <QJsonObject>
@@ -136,6 +138,73 @@ void HarnessRegistry::fetch(CoreClient *core)
             emit changed();
         },
         this);
+}
+
+void HarnessRegistry::ensureDiscovered(CoreClient *core, const QString &harnessId)
+{
+    const HarnessTraits t = traits(harnessId);
+    if (t.modelPicker != QLatin1String("discovered")) {
+        return; // static vocabulary — nothing to probe
+    }
+    // Already cached, from an earlier probe or a past session's init event?
+    // The model list is the sentinel: it is always present when any probe or
+    // init event has been persisted.
+    const QStringList cached =
+        KSharedConfig::openConfig()
+            ->group(QStringLiteral("Agent"))
+            .readEntry(t.optionKey(QStringLiteral("model")), QStringList());
+    if (!cached.isEmpty()) {
+        return;
+    }
+    if (!core || !core->isConnected() || m_discovering.contains(t.id)) {
+        return;
+    }
+    m_discovering.insert(t.id);
+    const QString id = t.id;
+    core->call(
+        QStringLiteral("agent.discoverOptions"),
+        QJsonObject{{QStringLiteral("backend"), id}},
+        [this, id](const QJsonObject &result, const QJsonObject &error) {
+            m_discovering.remove(id);
+            if (!error.isEmpty()) {
+                // Failed probe (CLI missing, not logged in, …): keep today's
+                // placeholder pickers; the next selection retries.
+                return;
+            }
+            const QJsonArray configOptions =
+                result.value(QStringLiteral("configOptions")).toArray();
+            if (configOptions.isEmpty()) {
+                return;
+            }
+            persistDiscoveredOptions(id, configOptions);
+            emit changed(); // open pickers rebuild from the fresh cache
+        },
+        this);
+}
+
+void HarnessRegistry::persistDiscoveredOptions(const QString &harnessId,
+                                               const QJsonArray &configOptions)
+{
+    const HarnessTraits t = self()->traits(harnessId);
+    KConfigGroup cfg = KSharedConfig::openConfig()->group(QStringLiteral("Agent"));
+    for (const QJsonValue &ov : configOptions) {
+        const QJsonObject opt = ov.toObject();
+        const QString id = opt.value(QStringLiteral("id")).toString();
+        if (id.isEmpty()) {
+            continue;
+        }
+        QStringList entries;
+        const QJsonArray values = opt.value(QStringLiteral("options")).toArray();
+        for (const QJsonValue &vv : values) {
+            const QJsonObject val = vv.toObject();
+            entries << val.value(QStringLiteral("value")).toString()
+                           + QLatin1Char('|')
+                           + val.value(QStringLiteral("name")).toString();
+        }
+        if (!entries.isEmpty()) {
+            cfg.writeEntry(t.optionKey(id), entries);
+        }
+    }
 }
 
 HarnessTraits HarnessRegistry::traits(const QString &id) const

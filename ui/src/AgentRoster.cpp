@@ -334,15 +334,15 @@ void AgentRoster::openFileManager(const QString &path) const
     QDesktopServices::openUrl(QUrl::fromLocalFile(path));
 }
 
-void AgentRoster::setModelChoices(const QList<QPair<QString, QString>> &models)
+void AgentRoster::setEngineChoices(const QList<EngineChoice> &choices)
 {
-    // Same value-unchanged guard as the other setters: an identical model list
+    // Same value-unchanged guard as the other setters: an identical choice list
     // would rebuild an identical dropdown menu, so skip the teardown/repopulate
-    // (QList<QPair<QString, QString>> compares element-wise).
-    if (models == m_models) {
+    // (EngineChoice compares field-wise).
+    if (choices == m_engineChoices) {
         return;
     }
-    m_models = models;
+    m_engineChoices = choices;
     // Tear down any previous menu first so every path (including the empty one)
     // replaces it without leaking. setMenu(nullptr) detaches but does not delete
     // the old QMenu, so do it explicitly.
@@ -350,15 +350,21 @@ void AgentRoster::setModelChoices(const QList<QPair<QString, QString>> &models)
         m_newButton->setMenu(nullptr);
         old->deleteLater();
     }
-    if (models.isEmpty()) {
+    if (choices.isEmpty()) {
         return;
     }
     auto *menu = new QMenu(m_newButton);
-    for (const auto &m : models) {
-        QAction *act = menu->addAction(m.second);
-        const QString id = m.first;
-        connect(act, &QAction::triggered, this,
-                [this, id] { emit newAgentWithModelRequested(selectedProject(), id); });
+    for (const EngineChoice &c : choices) {
+        if (c.header) {
+            menu->addSection(c.label); // non-clickable engine section title
+            continue;
+        }
+        QAction *act = menu->addAction(c.label);
+        const QString backend = c.backend;
+        const QString model = c.model;
+        connect(act, &QAction::triggered, this, [this, backend, model] {
+            emit newAgentWithEngineRequested(selectedProject(), backend, model);
+        });
     }
     m_newButton->setMenu(menu);
 }

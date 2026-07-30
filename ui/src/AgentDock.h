@@ -140,6 +140,11 @@ private:
     void pushActiveWorktree(const QString &worktreePath);
 
     void ensureProject(const QString &path);
+    // (Re)build the roster's "+ New Agent" quick menu from the harness
+    // registry: an engine section per harness, its tier tokens or cached
+    // discovered models beneath. Called at startup and on HarnessRegistry
+    // changes (a capability refresh or a landed option probe).
+    void seedEngineChoices();
     AgentPanel *addAgent(const QString &projectPath, const QString &model = QString(),
                          const QString &backend = QString());
     AgentPanel *addDormantAgent(const QString &project, const QString &threadId,

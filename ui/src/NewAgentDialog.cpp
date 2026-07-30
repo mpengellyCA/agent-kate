@@ -19,8 +19,10 @@
 #include <QSignalBlocker>
 #include <QVBoxLayout>
 
-NewAgentDialog::NewAgentDialog(const QString &projectName, QWidget *parent)
+NewAgentDialog::NewAgentDialog(const QString &projectName, CoreClient *core,
+                               QWidget *parent)
     : QDialog(parent)
+    , m_core(core)
 {
     setWindowTitle(i18nc("@title:window", "New Agent"));
 
@@ -122,7 +124,21 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, QWidget *parent)
             }
         }
     };
-    connect(m_engine, &QComboBox::currentIndexChanged, this, rebuildBackendChoices);
+    // Selecting a discovered-model engine (e.g. Kimi) with no cached option
+    // lists probes the CLI once so the lists fill before the agent starts; the
+    // HarnessRegistry::changed handler below repopulates the combos when the
+    // result lands. A no-op for tier engines or an already-cached vocabulary.
+    auto probeEngine = [this] {
+        HarnessRegistry::self()->ensureDiscovered(
+            m_core, m_engine->currentData().toString().section(QLatin1Char('|'), 0, 0));
+    };
+    connect(m_engine, &QComboBox::currentIndexChanged, this, [rebuildBackendChoices,
+                                                              probeEngine] {
+        probeEngine();
+        rebuildBackendChoices();
+    });
+    connect(HarnessRegistry::self(), &HarnessRegistry::changed, this,
+            rebuildBackendChoices);
 
     m_sandbox = new QCheckBox(
         i18n("Work in a private copy, so changes don't touch my files until I approve"), this);
@@ -147,7 +163,8 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, QWidget *parent)
     root->addWidget(m_advanced);
     connect(advToggle, &QCheckBox::toggled, m_advanced, &QWidget::setVisible);
     // All three per-backend combos exist now — populate them for the default
-    // backend selection.
+    // backend selection, and probe that engine's option lists if discovered.
+    probeEngine();
     rebuildBackendChoices();
 
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);

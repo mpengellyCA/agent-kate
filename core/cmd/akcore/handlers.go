@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -15,8 +16,8 @@ import (
 	"agentkate/internal/coop"
 	"agentkate/internal/cowork"
 	"agentkate/internal/gitstatus"
-	"agentkate/internal/ipc"
 	"agentkate/internal/harness"
+	"agentkate/internal/ipc"
 	"agentkate/internal/permission"
 	"agentkate/internal/safe"
 	"agentkate/internal/search"
@@ -203,6 +204,31 @@ func registerHandlers(d handlerDeps) {
 			list = append(list, h.Capabilities())
 		}
 		return map[string]any{"harnesses": list}, nil
+	})
+
+	// agent.discoverOptions probes a harness's live configuration vocabulary
+	// (model / thinking / mode enumerations, with display names) WITHOUT
+	// starting a thread, so the UI can offer real pickers before the first
+	// agent ever runs. Static-vocabulary harnesses return an empty list.
+	d.srv.Handle("agent.discoverOptions", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			Backend string `json:"backend"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		h, ok := d.harnesses.Get(p.Backend)
+		if !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown backend "+p.Backend)
+		}
+		opts, err := h.DiscoverOptions()
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		if opts == nil {
+			opts = []harness.DiscoveredOption{}
+		}
+		return map[string]any{"configOptions": opts}, nil
 	})
 
 	d.srv.Handle("agent.start", func(_ context.Context, raw json.RawMessage) (any, error) {
@@ -394,12 +420,25 @@ func registerHandlers(d handlerDeps) {
 		return map[string]any{"threads": records}, nil
 	})
 
-	// session.browse lists every Claude Code session transcript on disk, so the
-	// user can attach any past conversation — even ones Agent Kate did not start.
+	// session.browse merges every browse-capable harness's discoverable past
+	// sessions (Claude Code transcripts on disk, kimi's session store), so the
+	// user can attach any past conversation — even ones Agent Kate did not
+	// start. A harness whose listing fails is skipped, never fatal: the others
+	// still return.
 	d.srv.Handle("session.browse", func(_ context.Context, _ json.RawMessage) (any, error) {
-		found, err := session.Discover()
-		if err != nil {
-			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		var found []harness.BrowsableSession
+		for _, h := range d.harnesses.All() {
+			caps := h.Capabilities()
+			if !caps.SessionBrowse {
+				continue
+			}
+			list, err := h.BrowseSessions()
+			if err != nil {
+				d.log.Warn("session browse failed; skipping harness",
+					"harness", caps.ID, "err", err)
+				continue
+			}
+			found = append(found, list...)
 		}
 		known := map[string]bool{}
 		for _, r := range d.sessions.List("") {
@@ -408,22 +447,29 @@ func registerHandlers(d handlerDeps) {
 		for i := range found {
 			found[i].Attached = known[found[i].SessionID]
 		}
+		// Newest first across harnesses. Every adapter emits second-precision
+		// UTC RFC3339, so string order is time order.
+		sort.SliceStable(found, func(i, j int) bool {
+			return found[i].Updated > found[j].Updated
+		})
 		if len(found) > 500 {
-			found = found[:500] // Discover sorts newest-first
+			found = found[:500]
 		}
 		if found == nil {
-			found = []session.Discovered{}
+			found = []harness.BrowsableSession{}
 		}
 		return map[string]any{"sessions": found}, nil
 	})
 
-	// session.attach turns a discovered Claude Code session into a dormant
-	// Agent Kate thread, which the UI then resumes like any other.
+	// session.attach turns a discovered past session into a dormant Agent Kate
+	// thread, which the UI then resumes like any other. backend names the
+	// owning harness (empty = the default).
 	d.srv.Handle("session.attach", func(_ context.Context, raw json.RawMessage) (any, error) {
 		var p struct {
 			SessionID string `json:"sessionId"`
 			Project   string `json:"project"`
 			Title     string `json:"title"`
+			Backend   string `json:"backend"`
 		}
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
@@ -432,22 +478,34 @@ func registerHandlers(d handlerDeps) {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams,
 				"sessionId and project are required")
 		}
-		// Never attach the same Claude Code session twice.
+		h, ok := d.harnesses.Get(p.Backend)
+		if !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown backend "+p.Backend)
+		}
+		// Never attach the same session twice.
 		if rec, ok := d.sessions.GetBySession(p.SessionID); ok {
 			return map[string]any{"threadId": rec.ThreadID, "alreadyAttached": true}, nil
+		}
+		// A harness with a static mode vocabulary gets the conservative
+		// apply-edits default the attach flow always used; a discovered
+		// vocabulary stays empty — the CLI's own default applies at resume.
+		mode := ""
+		if len(h.Capabilities().PermissionModes) > 0 {
+			mode = "acceptEdits"
 		}
 		threadID := agent.NewThreadID()
 		rec := session.Record{
 			ThreadID:  threadID,
 			SessionID: p.SessionID,
 			Project:   p.Project,
+			Backend:   p.Backend,
 			Worktree: worktree.Worktree{
 				ThreadID: threadID,
 				RepoRoot: p.Project,
 				Path:     p.Project,
 				Isolated: false, // resume in the conversation's own directory
 			},
-			PermissionMode: "acceptEdits",
+			PermissionMode: mode,
 			Title:          summarizePrompt(p.Title),
 			Created:        time.Now(),
 			Status:         session.StatusDormant,

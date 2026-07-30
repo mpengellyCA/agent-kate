@@ -59,6 +59,31 @@ type Capabilities struct {
 	Efforts         []string `json:"efforts"`
 }
 
+// DiscoveredOption mirrors one CLI config-option enumeration (the shape the
+// init event already carries), for harnesses whose vocabulary is discovered.
+type DiscoveredOption struct {
+	ID      string                  `json:"id"`
+	Name    string                  `json:"name"`
+	Options []DiscoveredOptionValue `json:"options"`
+}
+
+// DiscoveredOptionValue is one selectable value of a DiscoveredOption.
+type DiscoveredOptionValue struct {
+	Value string `json:"value"`
+	Name  string `json:"name"`
+}
+
+// BrowsableSession is one discoverable past session in the neutral browse
+// shape session.browse serves — whichever harness owns it.
+type BrowsableSession struct {
+	SessionID string `json:"sessionId"`
+	Backend   string `json:"backend"` // owning harness id
+	Project   string `json:"project"` // cwd the session ran in
+	Title     string `json:"title"`
+	Updated   string `json:"updated"`  // RFC3339, UTC
+	Attached  bool   `json:"attached"` // filled by the handler
+}
+
 // StartSpec is the harness-neutral launch request. Adapters translate it into
 // their CLI's own options; fields a harness doesn't support are validated
 // away by the capability gates before Launch is ever called, so an adapter
@@ -116,6 +141,16 @@ type Harness interface {
 	// caller persists reality. An unsupported option returns an error naming
 	// the harness.
 	SetOption(threadID, option, value string) (applied string, err error)
+
+	// DiscoverOptions probes the harness's live configuration vocabulary
+	// (model / effort / mode enumerations, with display names) without
+	// starting a thread. Static-vocabulary harnesses (ModelPicker "tiers")
+	// return (nil, nil). Implementations may cache.
+	DiscoverOptions() ([]DiscoveredOption, error)
+
+	// BrowseSessions returns this harness's discoverable past sessions. Only
+	// called for harnesses whose Capabilities().SessionBrowse is true.
+	BrowseSessions() ([]BrowsableSession, error)
 }
 
 // Registry holds the registered harnesses. It is built once at startup and

@@ -8,6 +8,7 @@
 #include "AutoOrganizeDialog.h"
 #include "TagEditorDialog.h"
 #include "ipc/CoreClient.h"
+#include "state/HarnessTraits.h"
 
 #include <QDir>
 #include <QFileDialog>
@@ -45,14 +46,15 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
             addAgent(p);
         }
     });
-    connect(m_roster, &AgentRoster::newAgentWithModelRequested, this,
-            [this](const QString &project, const QString &model) {
+    connect(m_roster, &AgentRoster::newAgentWithEngineRequested, this,
+            [this](const QString &project, const QString &backend,
+                   const QString &model) {
                 QString p = project;
                 if (p.isEmpty() && !m_projects.isEmpty()) {
                     p = m_projects.constLast();
                 }
                 if (!p.isEmpty()) {
-                    addAgent(p, model);
+                    addAgent(p, model, backend);
                 }
             });
     connect(m_roster, &AgentRoster::closeProjectRequested, this, &AgentDock::closeProject);
@@ -64,14 +66,12 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
     connect(m_roster, &AgentRoster::forkRequested, this, &AgentDock::forkAgent);
     connect(m_roster, &AgentRoster::projectFocused, this, &AgentDock::projectFocused);
 
-    // Seed the "+ New Agent" model dropdown. Ids must match AgentPanel's combo.
-    m_roster->setModelChoices({
-        {QString(), i18n("Default model")},
-        {QStringLiteral("opus"), i18n("Opus")},
-        {QStringLiteral("sonnet"), i18n("Sonnet")},
-        {QStringLiteral("haiku"), i18n("Haiku")},
-        {QStringLiteral("fable"), i18n("Fable")},
-    });
+    // Seed the "+ New Agent" quick menu from the harness registry, and keep it
+    // current as capabilities land or an option probe fills in a discovered
+    // engine's models.
+    seedEngineChoices();
+    connect(HarnessRegistry::self(), &HarnessRegistry::changed, this,
+            &AgentDock::seedEngineChoices);
     connect(m_roster, &AgentRoster::agentActivated, this, [this](int id) {
         if (Entry *e = entryById(id)) {
             m_stack->setCurrentWidget(e->panel);
@@ -388,7 +388,7 @@ void AgentDock::newAgentInActiveProjectGuided()
     if (project.isEmpty()) {
         return;
     }
-    NewAgentDialog dlg(QDir(project).dirName(), m_dialogParent);
+    NewAgentDialog dlg(QDir(project).dirName(), m_core, m_dialogParent);
     if (dlg.exec() != QDialog::Accepted) {
         return;
     }
@@ -656,6 +656,40 @@ void AgentDock::pushActiveWorktree(const QString &worktreePath)
     }
     m_lastEmittedWorktree = worktreePath;
     emit activeWorktreeChanged(worktreePath);
+}
+
+void AgentDock::seedEngineChoices()
+{
+    QList<EngineChoice> choices;
+    for (const HarnessTraits &t : HarnessRegistry::self()->all()) {
+        choices.append({QString(), QString(), t.displayName, true}); // section
+        if (t.modelPicker == QLatin1String("tiers")) {
+            // Tier tokens — ids must match AgentPanel's model combo.
+            choices.append({t.id, QString(), i18n("Default model"), false});
+            choices.append({t.id, QStringLiteral("opus"), i18n("Opus"), false});
+            choices.append({t.id, QStringLiteral("sonnet"), i18n("Sonnet"), false});
+            choices.append({t.id, QStringLiteral("haiku"), i18n("Haiku"), false});
+            choices.append({t.id, QStringLiteral("fable"), i18n("Fable"), false});
+            continue;
+        }
+        // Discovered-model engine: the CLI's own default, plus any models a
+        // past probe or session has cached (empty until one runs — the full
+        // "New Agent…" dialog and the panel Setup menu offer the probe path).
+        choices.append(
+            {t.id, QString(), i18n("%1 (default model)", t.displayName), false});
+        const QStringList models =
+            KSharedConfig::openConfig()
+                ->group(QStringLiteral("Agent"))
+                .readEntry(t.optionKey(QStringLiteral("model")), QStringList());
+        for (const QString &entry : models) {
+            const QString value = entry.section(QLatin1Char('|'), 0, 0);
+            const QString name = entry.section(QLatin1Char('|'), 1);
+            if (!value.isEmpty()) {
+                choices.append({t.id, value, name.isEmpty() ? value : name, false});
+            }
+        }
+    }
+    m_roster->setEngineChoices(choices);
 }
 
 AgentPanel *AgentDock::addAgent(const QString &projectPath, const QString &model,

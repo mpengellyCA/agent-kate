@@ -7,6 +7,8 @@ package kimi
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -20,6 +22,47 @@ func liveKimiBin(t *testing.T) string {
 		t.Skipf("kimi binary %q not found: %v", bin, err)
 	}
 	return bin
+}
+
+// TestLiveDiscoverAndList exercises the token-free probes — session/new's
+// config-option enumeration (DiscoverOptions) and session/list (ListSessions) —
+// against the real kimi CLI. Neither sends a prompt, so no model inference (or
+// token spend) occurs and the test passes even when the model backend is
+// rate-limited.
+func TestLiveDiscoverAndList(t *testing.T) {
+	kimiBin := liveKimiBin(t)
+	sup := NewSupervisor(kimiBin, testLogger(), nil, nil, t.TempDir())
+
+	opts, err := sup.DiscoverOptions()
+	if err != nil {
+		t.Fatalf("DiscoverOptions: %v", err)
+	}
+	var haveModel bool
+	for _, o := range opts {
+		if o.ID == "model" && len(o.Options) > 0 {
+			haveModel = true
+		}
+	}
+	if !haveModel {
+		t.Errorf("DiscoverOptions returned no model enumeration: %+v", opts)
+	}
+	// Cached: a second call must serve the same set without re-probing.
+	if opts2, err := sup.DiscoverOptions(); err != nil || len(opts2) != len(opts) {
+		t.Errorf("second DiscoverOptions = %d opts, err %v; want %d cached",
+			len(opts2), err, len(opts))
+	}
+
+	// session/list must succeed (may be empty) and must not surface the
+	// throwaway sessions the probes above left behind.
+	sessions, err := sup.ListSessions("")
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	for _, s := range sessions {
+		if strings.HasPrefix(s.Cwd, filepath.Join(os.TempDir(), probeDirPrefix)) {
+			t.Errorf("ListSessions leaked a probe session: %q", s.Cwd)
+		}
+	}
 }
 
 // TestLiveSmoke drives a real `kimi acp` child through a prompt that needs a

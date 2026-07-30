@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"time"
 
 	"agentkate/internal/agent"
 	"agentkate/internal/harness"
@@ -108,6 +109,34 @@ func (h *claudeHarness) ReadTranscript(threadID, sessionID string) ([]json.RawMe
 		return nil, nil // no session yet — nothing to replay
 	}
 	return session.ReadTranscript(sessionID)
+}
+
+// DiscoverOptions: Claude's vocabulary is static (tier tokens plus the fixed
+// mode/effort lists in Capabilities) — there is nothing to probe.
+func (h *claudeHarness) DiscoverOptions() ([]harness.DiscoveredOption, error) {
+	return nil, nil
+}
+
+// BrowseSessions wraps the on-disk transcript discovery in the neutral browse
+// shape, so session.browse treats every browse-capable harness the same.
+func (h *claudeHarness) BrowseSessions() ([]harness.BrowsableSession, error) {
+	found, err := session.Discover()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]harness.BrowsableSession, 0, len(found))
+	for _, f := range found {
+		out = append(out, harness.BrowsableSession{
+			SessionID: f.SessionID,
+			Backend:   h.Capabilities().ID,
+			Project:   f.Project,
+			Title:     f.Title,
+			// Second-precision UTC, matching the other adapters, so the merged
+			// browse list sorts correctly as plain strings.
+			Updated: f.Modified.UTC().Format(time.RFC3339),
+		})
+	}
+	return out, nil
 }
 
 func (h *claudeHarness) SetOption(threadID, option, value string) (string, error) {

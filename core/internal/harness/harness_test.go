@@ -21,6 +21,8 @@ func (f fakeHarness) ReadTranscript(string, string) ([]json.RawMessage, error) {
 	return nil, nil
 }
 func (f fakeHarness) SetOption(string, string, string) (string, error) { return "", nil }
+func (f fakeHarness) DiscoverOptions() ([]DiscoveredOption, error)     { return nil, nil }
+func (f fakeHarness) BrowseSessions() ([]BrowsableSession, error)      { return nil, nil }
 
 func TestRegistryLookupAndOrder(t *testing.T) {
 	r := NewRegistry("claude")
