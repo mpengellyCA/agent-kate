@@ -314,13 +314,35 @@ func TestKimiPermissionBridge(t *testing.T) {
 }
 
 // TestKimiResume covers session/resume: the thread re-attaches its prior kimi
-// session and emits a fresh init event for it.
+// session, emits a fresh init event for it, and APPENDS to the existing
+// translated-event log — the log is the transcript the UI replays, so a
+// resume must never truncate the history before it.
 func TestKimiResume(t *testing.T) {
 	kimiBin := fakeKimiScript(t)
+	eventDir := t.TempDir()
 	col := &eventCollector{}
-	sup := NewSupervisor(kimiBin, testLogger(), col.add, nil, t.TempDir())
+	sup := NewSupervisor(kimiBin, testLogger(), col.add, nil, eventDir)
 
-	th, err := sup.Start(StartOptions{
+	// First life: a fresh thread runs one turn, then stops.
+	th, err := sup.Start(StartOptions{ID: "t-kimi4", WorkDir: t.TempDir(), Prompt: "hello"})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	col.waitFor(t, "turn result", isResult)
+	if err := sup.Stop(th.ID); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	col.waitFor(t, "exited lifecycle", isLifecycle("exited"))
+	before, err := ReadTranscript(eventDir, th.ID)
+	if err != nil {
+		t.Fatalf("ReadTranscript: %v", err)
+	}
+	if len(before) == 0 {
+		t.Fatal("no transcript after the first life")
+	}
+
+	// Second life: resume re-attaches the same kimi session.
+	th2, err := sup.Start(StartOptions{
 		ID:        "t-kimi4",
 		WorkDir:   t.TempDir(),
 		SessionID: "session_fake-0001",
@@ -329,12 +351,64 @@ func TestKimiResume(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resume: %v", err)
 	}
-	if got := th.SessionID(); got != "session_fake-0001" {
+	if got := th2.SessionID(); got != "session_fake-0001" {
 		t.Errorf("SessionID = %q, want session_fake-0001", got)
 	}
-	col.waitFor(t, "init event", func(ev map[string]any) bool {
+	col.waitFor(t, "post-resume init event", func(ev map[string]any) bool {
 		return ev["type"] == "system" && ev["subtype"] == "init" &&
 			ev["session_id"] == "session_fake-0001"
 	})
+
+	// The prior history survived and the resume's init event was appended.
+	after, err := ReadTranscript(eventDir, th.ID)
+	if err != nil {
+		t.Fatalf("ReadTranscript after resume: %v", err)
+	}
+	if len(after) <= len(before) {
+		t.Fatalf("transcript did not grow across resume: %d -> %d events", len(before), len(after))
+	}
+	if string(after[0]) != string(before[0]) {
+		t.Errorf("resume rewrote the transcript head:\n before: %s\n after:  %s",
+			before[0], after[0])
+	}
+	sup.StopAll()
+}
+
+// TestKimiInterruptIdle: an interrupt with no turn in flight — and an
+// interrupt after a turn has already completed — must be a no-op. Neither may
+// arm the signal backstop, which would kill the healthy resident process a
+// few seconds later.
+func TestKimiInterruptIdle(t *testing.T) {
+	kimiBin := fakeKimiScript(t)
+	col := &eventCollector{}
+	sup := NewSupervisor(kimiBin, testLogger(), col.add, nil, t.TempDir())
+	sup.cancelBackstopDelay = 50 * time.Millisecond
+	sup.cancelKillDelay = 20 * time.Millisecond
+
+	th, err := sup.Start(StartOptions{ID: "t-kimi5", WorkDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if err := sup.Interrupt(th.ID); err != nil {
+		t.Fatalf("idle interrupt: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond) // ample time for a mis-armed backstop
+	if !sup.Running(th.ID) {
+		t.Fatal("idle interrupt killed the process; it must be a no-op")
+	}
+
+	// The thread still takes a normal turn, and interrupting AFTER that turn
+	// completed (a cancel racing natural completion) is again a no-op.
+	if err := sup.Send(th.ID, "hello", nil); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	col.waitFor(t, "turn result", isResult)
+	if err := sup.Interrupt(th.ID); err != nil {
+		t.Fatalf("post-turn interrupt: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if !sup.Running(th.ID) {
+		t.Fatal("post-turn interrupt killed the process; it must be a no-op")
+	}
 	sup.StopAll()
 }

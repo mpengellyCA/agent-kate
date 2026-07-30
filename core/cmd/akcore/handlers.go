@@ -241,6 +241,14 @@ func registerHandlers(d handlerDeps) {
 		if !ok {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
 		}
+		// A double resume (say, a double-clicked Resume button) would spawn a
+		// second process on the same thread id and corrupt the supervisor's
+		// thread registry — the first process's reap would deregister the
+		// second. One live process per thread, both backends.
+		if d.agentRunning(p.ThreadID) {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams,
+				"thread "+p.ThreadID+" is already running")
+		}
 		if rec.SessionID == "" {
 			if rec.Backend == session.BackendKimi {
 				return nil, ipc.Errorf(ipc.CodeInvalidParams,
@@ -289,7 +297,7 @@ func registerHandlers(d handlerDeps) {
 		// Kimi threads have no Claude transcript file; their transcript is the
 		// core-side translated-event log the kimi supervisor appends to live.
 		if rec.Backend == session.BackendKimi {
-			events, err := kimi.ReadTranscript("", p.ThreadID)
+			events, err := d.ksup.ReadTranscript(p.ThreadID)
 			if err != nil {
 				return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
 			}

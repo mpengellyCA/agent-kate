@@ -268,9 +268,13 @@ func (t *translator) emitToolUseLocked(toolCallID string) json.RawMessage {
 	})
 }
 
-// toolResultLocked builds the user/tool_result event for a finished call.
-// Caller holds t.mu.
+// toolResultLocked builds the user/tool_result event for a finished call and
+// drops the call's tracking state — a long thread makes thousands of tool
+// calls, and the raw-input snapshots would otherwise accumulate for its whole
+// life. Safe: the permission lookup always precedes completion. Caller holds
+// t.mu.
 func (t *translator) toolResultLocked(toolCallID, status string, rawOutput, blocks json.RawMessage) json.RawMessage {
+	delete(t.toolCalls, toolCallID)
 	content := ""
 	if len(rawOutput) > 0 {
 		// rawOutput may be a plain string or a structured object; the UI's

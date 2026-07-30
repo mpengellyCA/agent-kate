@@ -614,7 +614,8 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     m_backendCombo->setToolTip(QStringLiteral(
         "Which agent program runs this thread, fixed once it starts.\n"
         "Kimi Code needs the `kimi` CLI installed; provider routing, thinking\n"
-        "effort, forking and compaction don't apply to Kimi threads."));
+        "effort, when-to-ask, forking and compaction don't apply to Kimi\n"
+        "threads — Kimi always asks before gated actions."));
     // Sticky: the last choice becomes the default for the next agent. Set before
     // connecting so restoring "kimi" doesn't fire the handler mid-construction.
     {
@@ -1616,16 +1617,19 @@ void AgentPanel::refresh()
             actions.first()->setEnabled(running); // "Hot Opus (live thread)"
         }
     }
-    m_compactCombo->setEnabled(!threadKimi);
-    m_compactStrip->setEnabled(!threadKimi);
-
     // Permission, isolation, effort, model and desktop access are fixed once a
     // thread exists (they are baked into the agent's launch). A not-yet-started
-    // Kimi pick further disables the pickers that don't apply to that backend.
-    const bool pickerKimi = m_backendCombo
+    // Kimi pick further disables the pickers that don't apply to that backend —
+    // including "When to ask": kimi permissions flow over ACP and always ask,
+    // so offering the mode combo would silently ignore the user's choice.
+    // Picker state only matters before a thread exists — a bound thread's
+    // backend is m_backend, and the combo may hold a stale sticky default.
+    const bool pickerKimi = m_threadId.isEmpty() && m_backendCombo
         && m_backendCombo->currentData().toString() == QLatin1String("kimi");
+    m_compactCombo->setEnabled(!threadKimi && !pickerKimi);
+    m_compactStrip->setEnabled(!threadKimi && !pickerKimi);
     m_backendCombo->setEnabled(m_threadId.isEmpty());
-    m_modeCombo->setEnabled(m_threadId.isEmpty());
+    m_modeCombo->setEnabled(m_threadId.isEmpty() && !pickerKimi);
     m_isolationCombo->setEnabled(m_threadId.isEmpty());
     m_effortCombo->setEnabled(m_threadId.isEmpty() && !pickerKimi);
     m_providerCombo->setEnabled(m_threadId.isEmpty() && !pickerKimi);
@@ -2165,7 +2169,10 @@ void AgentPanel::onSendClicked()
             {QStringLiteral("workspacePath"), m_workspace},
             {QStringLiteral("prompt"), text},
             {QStringLiteral("backend"), m_backendCombo->currentData().toString()},
-            {QStringLiteral("permissionMode"), m_modeCombo->currentData().toString()},
+            // Kimi has no permission modes — it always asks over ACP. Send
+            // empty rather than a mode the core would silently drop.
+            {QStringLiteral("permissionMode"),
+             startingKimi ? QString() : m_modeCombo->currentData().toString()},
             {QStringLiteral("isolation"), m_isolationCombo->currentData().toString()},
             // Effort, provider routing and Cowork don't apply to Kimi Code
             // (the core rejects them); its model is the editable combo's text.

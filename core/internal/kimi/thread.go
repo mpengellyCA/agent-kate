@@ -74,7 +74,13 @@ type Thread struct {
 	alive       bool
 	pgid        int  // process-group id (== leader pid); signalled by the interrupt backstop
 	interrupted bool // set when the interrupt backstop had to kill; reap() reports a user-interrupt
-	cancelling  bool // a session/cancel is in flight; the cancelled result completes it
+	cancelling  bool // a session/cancel is in flight; the last prompt completion clears it
+	// activePrompts counts session/prompt requests awaiting their response.
+	// Normally 0 or 1 (ACP allows one turn per session; kimi rejects overlap),
+	// but a rejected overlapping prompt completes independently and must not
+	// clear the real turn's in-flight state — hence a counter, not a bool.
+	// Interrupt is a no-op at 0: nothing to cancel means nothing to backstop.
+	activePrompts int
 	logFile     *os.File
 }
 
@@ -98,6 +104,12 @@ type Supervisor struct {
 	mu      sync.Mutex
 	threads map[string]*Thread
 
+	// Interrupt-backstop timings: how long an unacknowledged session/cancel may
+	// stay pending before the process group is SIGINTed, and how long after
+	// that before SIGKILL. Overridable in tests; the defaults suit real kimi.
+	cancelBackstopDelay time.Duration
+	cancelKillDelay     time.Duration
+
 	// reapWG tracks every in-flight reap() goroutine; StopAll waits on it so
 	// each thread's "exited" lifecycle event has been delivered before shutdown
 	// proceeds (same guarantee agent.Supervisor makes).
@@ -115,12 +127,14 @@ func NewSupervisor(kimiBin string, log *slog.Logger, emit EventFunc, perm Permis
 		eventDir = DefaultEventDir()
 	}
 	return &Supervisor{
-		kimiBin:  kimiBin,
-		log:      log,
-		emit:     emit,
-		perm:     perm,
-		eventDir: eventDir,
-		threads:  make(map[string]*Thread),
+		kimiBin:             kimiBin,
+		log:                 log,
+		emit:                emit,
+		perm:                perm,
+		eventDir:            eventDir,
+		cancelBackstopDelay: 3 * time.Second,
+		cancelKillDelay:     2 * time.Second,
+		threads:             make(map[string]*Thread),
 	}
 }
 
@@ -142,6 +156,13 @@ func DefaultEventDir() string {
 // eventLogPath returns the per-thread translated-event log.
 func (s *Supervisor) eventLogPath(threadID string) string {
 	return filepath.Join(s.eventDir, threadID+".jsonl")
+}
+
+// ReadTranscript returns the translated events logged for a thread from this
+// supervisor's own event directory — use this rather than the package-level
+// ReadTranscript so a non-default eventDir can never diverge from the handler.
+func (s *Supervisor) ReadTranscript(threadID string) ([]json.RawMessage, error) {
+	return ReadTranscript(s.eventDir, threadID)
 }
 
 // ReadTranscript returns the translated events logged for a kimi thread, in
@@ -224,9 +245,15 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 	safe.Go("kimi.acpRead", func() { t.client.readLoop(stdout) })
 
 	// The translated-event log is the thread's transcript; a start failure is
-	// logged, never fatal — replay simply degrades to empty.
+	// logged, never fatal — replay simply degrades to empty. A resumed thread
+	// APPENDS: the existing log is the history the UI replays, so truncating
+	// here would erase the conversation up to the resume.
+	logFlags := os.O_CREATE | os.O_WRONLY | os.O_TRUNC
+	if opts.Resume {
+		logFlags = os.O_CREATE | os.O_WRONLY | os.O_APPEND
+	}
 	if err := os.MkdirAll(s.eventDir, 0o755); err == nil {
-		if lf, err := os.OpenFile(s.eventLogPath(id), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644); err == nil {
+		if lf, err := os.OpenFile(s.eventLogPath(id), logFlags, 0o644); err == nil {
 			t.logFile = lf
 		} else {
 			s.log.Warn("kimi event log unavailable", "thread", id, "err", err)
@@ -244,6 +271,7 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 		_ = cmd.Wait()
 		if t.logFile != nil {
 			_ = t.logFile.Close()
+			t.logFile = nil
 		}
 		return nil, err
 	}
@@ -328,7 +356,12 @@ func (s *Supervisor) handshake(t *Thread, opts StartOptions) error {
 	if sessionID == "" {
 		return fmt.Errorf("acp %s: no sessionId in response", method)
 	}
+	// Locked: the read loop is already running and reads sessionID/tr under
+	// t.mu (a notification can arrive while the handshake is still applying
+	// the model below).
+	t.mu.Lock()
 	t.sessionID = sessionID
+	t.mu.Unlock()
 
 	// Model: empty leaves the CLI's configured default; otherwise set it via
 	// the unified config-option dispatcher. A bad alias is a warning, not a
@@ -352,7 +385,9 @@ func (s *Supervisor) handshake(t *Thread, opts StartOptions) error {
 			}
 		}
 	}
+	t.mu.Lock()
 	t.tr = newTranslator(sessionID, model)
+	t.mu.Unlock()
 	return nil
 }
 
@@ -397,20 +432,47 @@ func (s *Supervisor) Send(threadID, text string, attachments []agent.Attachment)
 	t.mu.Lock()
 	alive := t.alive
 	sid := t.sessionID
+	if alive {
+		t.activePrompts++ // Interrupt has something to cancel from here on
+	}
 	t.mu.Unlock()
 	if !alive {
 		return fmt.Errorf("thread %q is not running", threadID)
 	}
-	return t.client.send("session/prompt", map[string]any{
+	err := t.client.send("session/prompt", map[string]any{
 		"sessionId": sid,
 		"prompt":    buildPromptContent(text, attachments),
 	}, func(f acpFrame) { s.onPromptDone(t, f) })
+	if err != nil {
+		t.mu.Lock()
+		if t.activePrompts > 0 {
+			t.activePrompts--
+		}
+		t.mu.Unlock()
+	}
+	return err
 }
 
 // onPromptDone completes a turn: the prompt response's stopReason becomes the
 // result event. Runs on the ACP read-loop goroutine, after every session/update
 // for the turn has already been translated.
 func (s *Supervisor) onPromptDone(t *Thread, f acpFrame) {
+	// This prompt is over, however it ended — success, error or stream close.
+	// Clearing cancelling once no prompt remains in flight (not just on
+	// stopReason "cancelled") is what keeps the interrupt backstop from
+	// SIGINTing a healthy process when a cancel races the turn's natural
+	// completion: ACP treats a cancel of a finished turn as a no-op, so no
+	// "cancelled" stop reason ever arrives.
+	t.mu.Lock()
+	if t.activePrompts > 0 {
+		t.activePrompts--
+	}
+	if t.activePrompts == 0 {
+		t.cancelling = false
+	}
+	tr := t.tr
+	t.mu.Unlock()
+
 	if f.Error != nil {
 		// A stream close means the process died — reap() reports the exit, so
 		// don't synthesize a turn result for a turn that isn't coming.
@@ -433,11 +495,8 @@ func (s *Supervisor) onPromptDone(t *Thread, f acpFrame) {
 		StopReason string `json:"stopReason"`
 	}
 	_ = json.Unmarshal(f.Result, &res)
-	s.emitEvents(t, t.tr.endTurn())
+	s.emitEvents(t, tr.endTurn())
 	if res.StopReason == "cancelled" {
-		t.mu.Lock()
-		t.cancelling = false
-		t.mu.Unlock()
 		s.emitLifecycle(t, "turn_aborted", "interrupted — session kept, ready for your next message")
 	}
 }
@@ -461,6 +520,13 @@ func (s *Supervisor) Interrupt(threadID string) error {
 		t.mu.Unlock()
 		return nil
 	}
+	if t.activePrompts == 0 {
+		// Nothing in flight to cancel. Sending a cancel anyway would arm the
+		// backstop with no prompt response coming to disarm it, and a few
+		// seconds later it would kill a perfectly idle resident process.
+		t.mu.Unlock()
+		return nil
+	}
 	t.cancelling = true
 	sid := t.sessionID
 	pgid := t.pgid
@@ -473,7 +539,7 @@ func (s *Supervisor) Interrupt(threadID string) error {
 	}
 
 	safe.Go("kimi.interruptBackstop", func() {
-		time.Sleep(3 * time.Second)
+		time.Sleep(s.cancelBackstopDelay)
 		if !s.cancelPending(threadID) {
 			return // clean cancel — process stays alive
 		}
@@ -484,7 +550,7 @@ func (s *Supervisor) Interrupt(threadID string) error {
 		if pgid > 0 {
 			_ = syscall.Kill(-pgid, syscall.SIGINT)
 		}
-		time.Sleep(2 * time.Second)
+		time.Sleep(s.cancelKillDelay)
 		if !s.Running(threadID) {
 			return
 		}
@@ -674,9 +740,6 @@ func (s *Supervisor) reap(t *Thread) {
 	t.mu.Lock()
 	t.alive = false
 	interrupted := t.interrupted
-	if t.logFile != nil {
-		_ = t.logFile.Close()
-	}
 	t.mu.Unlock()
 
 	s.mu.Lock()
@@ -693,7 +756,16 @@ func (s *Supervisor) reap(t *Thread) {
 		detail = "exited: " + err.Error()
 	}
 	s.log.Info("kimi thread ended", "thread", t.ID, "phase", phase, "detail", detail)
+	// Emit before closing the log so the exit note lands in the transcript,
+	// then nil the handle so any straggler (a late stderr line) skips the
+	// write instead of hitting a closed file.
 	s.emitLifecycle(t, phase, detail)
+	t.mu.Lock()
+	if t.logFile != nil {
+		_ = t.logFile.Close()
+		t.logFile = nil
+	}
+	t.mu.Unlock()
 }
 
 // emitEvents logs and relays a batch of translated events. Every translated
