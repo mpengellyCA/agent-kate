@@ -1826,6 +1826,12 @@ void MainWindow::onAgentActivated(int agentId, const QString &projectPath,
     if (m_coworkPanel) {
         m_coworkPanel->setActiveThread(m_agent->currentThreadId(), QString());
     }
+    // Re-point the Agent Activity inspector too. Without this it only tracked
+    // threadIdChanged (thread creation), so selecting a different
+    // already-running agent left it showing the previous thread's activity.
+    if (m_inspectorPanel) {
+        m_inspectorPanel->setActiveThread(m_agent->currentThreadId());
+    }
     if (m_openWorktreeTerminalAct) {
         m_openWorktreeTerminalAct->setEnabled(
             m_agent && !m_agent->worktreePathForAgent(agentId).isEmpty());

@@ -1,6 +1,7 @@
 # 14 — Harness Abstraction & Feature Parity (agent systems rework)
 
-> **Status: in progress — P1–P4 landed.** Follows the Kimi Code backend branch
+> **Status: in progress — P1–P5 landed (parity complete). Next: P6 registry
+> refactor, then the optional P7 spike.** Follows the Kimi Code backend branch
 > (`kimi-code-backend`, `e0e9594` + review fixes `5a20c66`). Seven phases;
 > land sequentially, one commit per phase, built green (`scripts/build.sh`,
 > `go test ./...` incl. `-race`, `ctest --test-dir build`), smoke-verified
@@ -274,9 +275,28 @@ files); noted for a cleanup pass. Also observed: `system/thinking_tokens`
 events (a live thinking-size ticker) — earmarked for P5's working
 indicator.
 
-**P5 — Observability (M).** Context-fill meter, toolMeter/usageMeter surfaced
-in the AI Inspector, turn-duration stats on the working indicator,
-permission countdown. (No fake ETAs — elapsed + historical averages only.)
+**P5 — Observability (M). ✅ LANDED.** Context-fill meter ("ctx N%" on the
+header/roster subtitle + a fuller line in the Agent Activity inspector; the
+denominator is modelUsage.contextWindow from the result event — the P2
+discovery — attributed to whichever model carries the main conversation;
+kimi reports no usage, so it honestly shows nothing there). Per-tool token
+spend in the inspector ("by tool: Read ×12 ~48k tok …"), computed
+client-side from the same events the core's toolMeter observes — no new RPC
+was needed; the core meters stay slog-only (P6 may expose them by RPC if
+the two ever need to agree exactly). Turn timing on the working indicator:
+right-aligned elapsed (shown after 3s, ~1s repaint granularity) plus the
+session's average turn duration from the CLI's own duration_ms — elapsed +
+history only, no fake ETAs. The `system/thinking_tokens` ticker feeds the
+indicator's activity line ("thinking… ~1.2k tokens"). Permission-request
+countdown: the core now advertises timeoutSeconds on permission.requested
+(single source of truth with the broker's 8-minute deadline); the bar shows
+"expires in m:ss" for the last two minutes and, on expiry, drops the dead
+prompt with a note — fixing the pre-existing bug where the bar sat open
+after the broker had already denied and Approve silently no-oped.
+Background-job chips gained a running-elapsed suffix (15s refresh).
+Bonus fix: the Agent Activity inspector is now re-pointed when the active
+agent changes (it previously only tracked thread creation, so switching
+between running agents left it on the old thread).
 
 **P6 — Harness registry refactor (L).** The `Harness` interface + capability
 registry + `agent.capabilities` RPC + UI traits + Engine picker; delete every

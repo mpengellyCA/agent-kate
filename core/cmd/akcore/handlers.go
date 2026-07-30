@@ -2425,18 +2425,24 @@ func normalizeTags(in []string) []string {
 // permission.respond or the 8-minute safety timeout fires. It is shared by
 // the Claude MCP bridge's permission.request RPC and the kimi ACP permission
 // bridge, so both backends present the identical UI approval flow.
+// permissionTimeout bounds how long a permission request may wait for the
+// human. Advertised in the permission.requested notification so the UI's
+// countdown always matches the broker's actual deadline.
+const permissionTimeout = 8 * time.Minute
+
 func askHumanPermission(srv *ipc.Server, broker *permission.Broker, threadID, toolName string, input json.RawMessage) (permission.Decision, bool) {
 	id, ch := broker.Open()
 	srv.Notify("permission.requested", map[string]any{
-		"threadId":  threadID,
-		"requestId": id,
-		"toolName":  toolName,
-		"input":     input,
+		"threadId":       threadID,
+		"requestId":      id,
+		"toolName":       toolName,
+		"input":          input,
+		"timeoutSeconds": int(permissionTimeout / time.Second),
 	})
 	select {
 	case dec := <-ch:
 		return dec, true
-	case <-time.After(8 * time.Minute):
+	case <-time.After(permissionTimeout):
 		broker.Close(id)
 		return permission.Decision{}, false
 	}

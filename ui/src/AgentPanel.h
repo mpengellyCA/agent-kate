@@ -249,6 +249,11 @@ private:
     void answerPermission(bool allow);
     void buildQuestionForm(const QJsonObject &req);
     void onQuestionSubmit();
+    // Count the visible permission prompt down to the core broker's deadline
+    // (advertised as timeoutSeconds on permission.requested); when it passes,
+    // drop the dead prompt — the core has already answered "no".
+    void startPermCountdown(const QJsonObject &req);
+    void tickPermCountdown();
     void refresh();
 
     // The conversation feed — a virtualized model/view (plan 10 phase 2).
@@ -409,6 +414,7 @@ private:
         QString description;
         QString taskType;    // "local_bash" | agent kinds
         QString outputFile;  // parsed from the tool result / task_notification
+        qint64 startedMs = 0;
         bool done = false;
         QPushButton *chip = nullptr;
     };
@@ -416,6 +422,20 @@ private:
     QHash<QString, QString> m_taskByToolUse; // tool_use_id -> task_id
     QFrame *m_jobsBar = nullptr;
     FlowLayout *m_jobsFlow = nullptr;
+    QTimer *m_jobsTimer = nullptr; // refreshes running chips' elapsed suffix
+    // Observability (plan 14 P5). Context fill: the latest turn's prompt-side
+    // tokens vs the model's context window (from modelUsage) — the number
+    // that predicts auto-compaction. Turn timing: running average of the
+    // CLI-reported per-turn wall times, shown on the working indicator.
+    qlonglong m_ctxPromptTokens = 0;
+    qlonglong m_ctxWindow = 0;
+    qlonglong m_turnDurTotalMs = 0;
+    int m_turnDurCount = 0;
+    // Permission countdown: the broker denies after its timeout; the bar
+    // counts down to that deadline and expires the prompt in step with it.
+    QTimer *m_permTimer = nullptr;
+    QString m_permBaseHtml;
+    qint64 m_permDeadlineMs = 0;
 
     // Background-Workflow tracking. A `Workflow` tool_use is recorded by its
     // transcript key (with its input JSON) so the paired tool_result — which

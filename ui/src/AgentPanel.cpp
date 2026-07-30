@@ -139,11 +139,15 @@ public:
         m_timer->setInterval(70);
         connect(m_timer, &QTimer::timeout, this, [this] {
             m_angle = (m_angle + 26) % 360;
-            // The message text only rotates every 48 ticks; on those ticks
-            // repaint the whole widget, otherwise invalidate just the small
-            // spinner rect so the wide message isn't re-rendered every 70ms.
-            if (++m_ticks % 48 == 0) {
+            ++m_ticks;
+            // The message text only rotates every 48 ticks; the elapsed clock
+            // needs a full repaint about once a second (14 ticks ≈ 0.98s).
+            // Other ticks invalidate just the small spinner rect so the wide
+            // message isn't re-rendered every 70ms.
+            if (m_ticks % 48 == 0) {
                 ++m_genericIndex;
+                update();
+            } else if (m_startedMs > 0 && m_ticks % 14 == 0) {
                 update();
             } else {
                 update(spinnerRect());
@@ -169,6 +173,22 @@ public:
         }
         m_activity = message;
         update();
+    }
+
+    // The current turn's start time (epoch ms). Latched by the panel at send
+    // time — NOT on setActive, which also toggles around permission prompts
+    // and would restart the clock mid-turn. 0 hides the elapsed readout.
+    void setTurnStart(qint64 epochMs)
+    {
+        m_startedMs = epochMs;
+        update();
+    }
+
+    // Average of this session's past turn durations; 0 hides the suffix. An
+    // honest "running 4m · turns avg 2m" beats a fake ETA.
+    void setAverageTurnMs(qint64 ms)
+    {
+        m_avgMs = ms;
     }
 
 protected:
@@ -212,11 +232,53 @@ protected:
         textCol.setAlpha(200);
         p.setPen(textCol);
         const int textX = int(cx + d / 2 + 12);
-        p.drawText(QRect(textX, 0, width() - textX, height()),
-                   Qt::AlignVCenter | Qt::AlignLeft, msg);
+
+        // Right-aligned honest timing: elapsed this turn, plus the session's
+        // average turn length once known. No ETAs — just what's measured.
+        QString timing;
+        if (m_startedMs > 0) {
+            const qint64 elapsed = QDateTime::currentMSecsSinceEpoch() - m_startedMs;
+            if (elapsed >= 3000) {
+                timing = fmtDur(elapsed);
+                if (m_avgMs > 0) {
+                    timing = i18nc("working indicator timing: elapsed, average",
+                                   "%1 · turns avg %2", timing, fmtDur(m_avgMs));
+                }
+            }
+        }
+        int rightW = 0;
+        if (!timing.isEmpty()) {
+            QColor dim = textCol;
+            dim.setAlpha(140);
+            p.setPen(dim);
+            const QFontMetrics fm(font());
+            rightW = fm.horizontalAdvance(timing) + 10;
+            p.drawText(QRect(width() - rightW, 0, rightW - 4, height()),
+                       Qt::AlignVCenter | Qt::AlignRight, timing);
+            p.setPen(textCol);
+        }
+        const QFontMetrics fm(font());
+        p.drawText(QRect(textX, 0, width() - textX - rightW, height()),
+                   Qt::AlignVCenter | Qt::AlignLeft,
+                   fm.elidedText(msg, Qt::ElideRight, width() - textX - rightW));
     }
 
 private:
+    // fmtDur renders a duration the way a person says it: "42s", "2m 10s",
+    // "1h 12m".
+    static QString fmtDur(qint64 ms)
+    {
+        const qint64 secs = ms / 1000;
+        if (secs < 60) {
+            return i18nc("duration in seconds", "%1s", secs);
+        }
+        if (secs < 3600) {
+            return i18nc("duration minutes+seconds", "%1m %2s", secs / 60, secs % 60);
+        }
+        return i18nc("duration hours+minutes", "%1h %2m", secs / 3600,
+                     (secs % 3600) / 60);
+    }
+
     // The bounding box of the rotating arc (matching paintEvent's geometry),
     // padded for the pen width — the only region the per-tick repaint touches.
     QRect spinnerRect() const
@@ -247,6 +309,8 @@ private:
     int m_ticks = 0;
     int m_genericIndex = 0;
     bool m_active = false;
+    qint64 m_startedMs = 0; // current turn's start (epoch ms); 0 = no readout
+    qint64 m_avgMs = 0;     // average past turn duration; 0 = unknown
 };
 
 AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
@@ -2009,6 +2073,13 @@ void AgentPanel::refresh()
     if (sessionTok > 0) {
         text += QStringLiteral(" · %1 tok").arg(QLocale().toString(sessionTok));
     }
+    // Context fill — the number that predicts auto-compaction. Only shown
+    // once real figures exist (kimi reports no usage, so it never appears
+    // there rather than showing a made-up zero).
+    if (m_ctxPromptTokens > 0 && m_ctxWindow > 0) {
+        text += i18nc("context-fill suffix, percent of context window used",
+                      " · ctx %1%", int((m_ctxPromptTokens * 100) / m_ctxWindow));
+    }
     m_header->setText(QStringLiteral("<span style='color:%1'>&#9679;</span>&nbsp;&nbsp;%2")
                           .arg(dot, text.toHtmlEscaped()));
     emit statusChanged(int(st));
@@ -2489,13 +2560,19 @@ void AgentPanel::onSendClicked()
     rebuildAttachChips();
 
     if (m_threadId.isEmpty()) {
-        // A fresh session — start the cost meter from zero.
+        // A fresh session — start the meters from zero.
         m_sessionCostUsd = 0.0;
         m_sessionInTokens = 0;
         m_sessionOutTokens = 0;
+        m_ctxPromptTokens = 0;
+        m_ctxWindow = 0;
+        m_turnDurTotalMs = 0;
+        m_turnDurCount = 0;
+        m_working->setAverageTurnMs(0);
         addYouCard(text, attachments);
         m_idle = false;
         m_working->setActivity(QString()); // a new turn starts in generic mode
+        m_working->setTurnStart(QDateTime::currentMSecsSinceEpoch());
 
         QString title = text.simplified();
         if (title.isEmpty()) {
@@ -2666,6 +2743,7 @@ void AgentPanel::handleTaskEvent(const QString &subtype, const QJsonObject &ev)
         job.id = id;
         job.description = ev.value(QStringLiteral("description")).toString();
         job.taskType = ev.value(QStringLiteral("task_type")).toString();
+        job.startedMs = QDateTime::currentMSecsSinceEpoch();
         const QString toolUseId = ev.value(QStringLiteral("tool_use_id")).toString();
         if (!toolUseId.isEmpty()) {
             m_taskByToolUse.insert(toolUseId, id);
@@ -2756,6 +2834,8 @@ void AgentPanel::updateJobsBar()
         return;
     }
     int visible = 0;
+    bool anyRunning = false;
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
     for (auto it = m_bgJobs.begin(); it != m_bgJobs.end(); ++it) {
         if (!it->chip) {
             continue;
@@ -2768,7 +2848,16 @@ void AgentPanel::updateJobsBar()
         const QString icon = it->done
             ? QStringLiteral("✓")
             : (agent ? QStringLiteral("\U0001f916") : QStringLiteral("⚙"));
-        it->chip->setText(icon + QStringLiteral(" ") + label);
+        QString text = icon + QStringLiteral(" ") + label;
+        // Elapsed suffix for long-running jobs — honest "still going" signal.
+        if (!it->done && it->startedMs > 0) {
+            anyRunning = true;
+            const qint64 mins = (now - it->startedMs) / 60000;
+            if (mins >= 1) {
+                text += i18nc("background job elapsed minutes", " · %1m", mins);
+            }
+        }
+        it->chip->setText(text);
         it->chip->setToolTip(
             (it->done ? i18n("Finished background task — click to open its output")
                       : i18n("Running in the background — click to watch its output"))
@@ -2778,6 +2867,19 @@ void AgentPanel::updateJobsBar()
         ++visible;
     }
     m_jobsBar->setVisible(visible > 0);
+    // Tick the elapsed suffixes while anything runs; quiesce when nothing does.
+    if (anyRunning) {
+        if (!m_jobsTimer) {
+            m_jobsTimer = new QTimer(this);
+            m_jobsTimer->setInterval(15000);
+            connect(m_jobsTimer, &QTimer::timeout, this, &AgentPanel::updateJobsBar);
+        }
+        if (!m_jobsTimer->isActive()) {
+            m_jobsTimer->start();
+        }
+    } else if (m_jobsTimer) {
+        m_jobsTimer->stop();
+    }
 }
 
 void AgentPanel::noteWorkflowLaunch(const QString &inputJson, const QString &resultText)
@@ -2844,6 +2946,7 @@ void AgentPanel::deliverMessage(const QString &text, const QJsonArray &attachmen
     m_idle = false;
     m_errored = false; // a fresh turn clears any prior failure state
     m_working->setActivity(QString()); // a new turn starts in generic mode
+    m_working->setTurnStart(QDateTime::currentMSecsSinceEpoch());
     m_core->call(QStringLiteral("agent.send"),
                  QJsonObject{{QStringLiteral("threadId"), m_threadId},
                              {QStringLiteral("text"), text},
@@ -3295,7 +3398,13 @@ void AgentPanel::onPermissionRequested(const QJsonObject &params)
         || params.value(QStringLiteral("threadId")).toString() != m_threadId) {
         return;
     }
-    m_permQueue.append(params);
+    // Stamp the arrival so the bar can count down to the broker's deadline
+    // (the core denies the request when its timeout fires — previously the
+    // bar just sat there and an Approve after expiry silently no-oped).
+    QJsonObject stamped = params;
+    stamped.insert(QStringLiteral("receivedAtMs"),
+                   double(QDateTime::currentMSecsSinceEpoch()));
+    m_permQueue.append(stamped);
     const QString tool = params.value(QStringLiteral("toolName")).toString();
     if (tool == QLatin1String("AskUserQuestion")) {
         addNote(QStringLiteral("&#10067; the agent is asking a question"),
@@ -3320,6 +3429,7 @@ void AgentPanel::showNextPermission()
     const QJsonObject req = m_permQueue.constFirst();
     if (req.value(QStringLiteral("toolName")).toString() == QLatin1String("AskUserQuestion")) {
         buildQuestionForm(req);
+        startPermCountdown(req);
         return;
     }
     const QString tool = req.value(QStringLiteral("toolName")).toString();
@@ -3336,25 +3446,87 @@ void AgentPanel::showNextPermission()
         if (plan.length() > 1200) {
             plan = plan.left(1200) + QChar(0x2026);
         }
-        m_permLabel->setText(
+        m_permBaseHtml =
             i18n("&#128203;&nbsp; The agent finished planning and wants to start "
                  "making changes.")
             + (plan.isEmpty()
                    ? QString()
                    : QStringLiteral("<br><tt>%1</tt>")
                          .arg(plan.toHtmlEscaped().replace(QLatin1Char('\n'),
-                                                           QLatin1String("<br>")))));
+                                                           QLatin1String("<br>"))));
+        m_permLabel->setText(m_permBaseHtml);
         m_permBar->setVisible(true);
+        startPermCountdown(req);
         return;
     }
     QString summary = agentkate::permSummary(tool, req.value(QStringLiteral("input")).toObject());
     if (summary.length() > 240) {
         summary = summary.left(240) + QChar(0x2026);
     }
-    m_permLabel->setText(
+    m_permBaseHtml =
         QStringLiteral("&#128274;&nbsp; Allow the agent to use <b>%1</b>?<br><tt>%2</tt>")
-            .arg(tool.toHtmlEscaped(), summary.toHtmlEscaped()));
+            .arg(tool.toHtmlEscaped(), summary.toHtmlEscaped());
+    m_permLabel->setText(m_permBaseHtml);
     m_permBar->setVisible(true);
+    startPermCountdown(req);
+}
+
+void AgentPanel::startPermCountdown(const QJsonObject &req)
+{
+    const qint64 receivedAt =
+        qint64(req.value(QStringLiteral("receivedAtMs")).toDouble());
+    const int timeoutSecs = req.value(QStringLiteral("timeoutSeconds")).toInt(480);
+    if (receivedAt <= 0 || timeoutSecs <= 0) {
+        m_permDeadlineMs = 0;
+        return; // no stamp (e.g. a replayed prompt) — no countdown
+    }
+    m_permDeadlineMs = receivedAt + qint64(timeoutSecs) * 1000;
+    if (!m_permTimer) {
+        m_permTimer = new QTimer(this);
+        m_permTimer->setInterval(1000);
+        connect(m_permTimer, &QTimer::timeout, this, &AgentPanel::tickPermCountdown);
+    }
+    m_permTimer->start();
+}
+
+void AgentPanel::tickPermCountdown()
+{
+    if ((!m_permBar->isVisible() && !m_questionBox->isVisible())
+        || m_permDeadlineMs <= 0) {
+        if (m_permTimer) {
+            m_permTimer->stop();
+        }
+        return;
+    }
+    const qint64 remainMs = m_permDeadlineMs - QDateTime::currentMSecsSinceEpoch();
+    if (remainMs <= 0) {
+        // The broker's deadline passed: the core has already told the agent
+        // no. Drop the dead prompt so an Approve can't silently no-op.
+        if (m_permTimer) {
+            m_permTimer->stop();
+        }
+        if (!m_permQueue.isEmpty()) {
+            m_permQueue.takeFirst();
+        }
+        m_permBar->setVisible(false);
+        m_questionBox->setVisible(false);
+        addNote(i18n("&#9200; the permission request timed out — the agent was "
+                     "told no"),
+                QStringLiteral("err"));
+        showNextPermission();
+        refresh();
+        return;
+    }
+    // Show the countdown only once it gets close — a "7:59" ticking from the
+    // first second reads as pressure, not information.
+    if (m_permBar->isVisible() && remainMs <= 120 * 1000) {
+        const int secs = int(remainMs / 1000);
+        m_permLabel->setText(
+            m_permBaseHtml
+            + i18nc("permission expiry countdown (m:ss)",
+                    "<br><i>expires in %1:%2</i>", secs / 60,
+                    QStringLiteral("%1").arg(secs % 60, 2, 10, QLatin1Char('0'))));
+    }
 }
 
 void AgentPanel::answerPermission(bool allow)
@@ -3519,6 +3691,20 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             || subtype == QLatin1String("task_notification")
             || subtype == QLatin1String("background_tasks_changed")) {
             handleTaskEvent(subtype, ev);
+            return;
+        }
+        // The CLI's live thinking-size ticker: an honest "what is it doing
+        // right now" for the working indicator during long reasoning.
+        if (subtype == QLatin1String("thinking_tokens")) {
+            if (!m_replaying) {
+                const qlonglong n =
+                    ev.value(QStringLiteral("estimated_tokens")).toVariant().toLongLong();
+                if (n > 0) {
+                    m_working->setActivity(
+                        i18n("Agent Kate is thinking… (~%1 tokens)",
+                             QLocale().toString(n)));
+                }
+            }
             return;
         }
         // Beyond those, only the init system event is worth showing in the feed.
@@ -3847,6 +4033,31 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
                 m_sessionInTokens += inTok;
                 m_sessionOutTokens += outTok;
             }
+            // Context-fill meter: the latest turn's prompt total is what the
+            // context currently holds; the window comes from modelUsage (the
+            // entry doing the main conversation — the one with the most
+            // prompt-side tokens). This is the number that predicts
+            // auto-compaction.
+            if (promptTotal > 0) {
+                m_ctxPromptTokens = promptTotal;
+            }
+            const QJsonObject perModel = ev.value(QStringLiteral("modelUsage")).toObject();
+            qlonglong best = -1;
+            for (auto it = perModel.constBegin(); it != perModel.constEnd(); ++it) {
+                const QJsonObject u = it.value().toObject();
+                const qlonglong promptSide =
+                    u.value(QStringLiteral("inputTokens")).toVariant().toLongLong()
+                    + u.value(QStringLiteral("cacheReadInputTokens")).toVariant().toLongLong()
+                    + u.value(QStringLiteral("cacheCreationInputTokens"))
+                          .toVariant()
+                          .toLongLong();
+                const qlonglong window =
+                    u.value(QStringLiteral("contextWindow")).toVariant().toLongLong();
+                if (window > 0 && promptSide > best) {
+                    best = promptSide;
+                    m_ctxWindow = window;
+                }
+            }
         } else {
             addNote(err ? QStringLiteral("✗ ") + head : QStringLiteral("✓ ") + head,
                     err ? QStringLiteral("err") : QStringLiteral("ok"));
@@ -3860,6 +4071,15 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
                 addNote(why.toHtmlEscaped(), QStringLiteral("err"));
             }
         }
+        // Turn timing: fold this turn into the session's average and stop the
+        // elapsed readout. duration_ms is the CLI's own wall time; fall back
+        // to nothing rather than guessing.
+        if (!m_replaying && durationMs > 0) {
+            m_turnDurTotalMs += durationMs;
+            ++m_turnDurCount;
+            m_working->setAverageTurnMs(m_turnDurTotalMs / m_turnDurCount);
+        }
+        m_working->setTurnStart(0);
         m_idle = true;
         refresh();
         // The turn boundary is the moment a queued follow-up can fire.
@@ -3903,11 +4123,16 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             m_dormant = false;
             m_idle = true;
             m_errored = false; // resuming clears any prior failure state
-            // A resumed process bills a fresh session — restart the meter so the
-            // header doesn't show a stale/zero cost as new turns accrue.
+            // A resumed process bills a fresh session — restart the meters so
+            // the header doesn't show stale figures as new turns accrue.
             m_sessionCostUsd = 0.0;
             m_sessionInTokens = 0;
             m_sessionOutTokens = 0;
+            m_ctxPromptTokens = 0;
+            m_ctxWindow = 0;
+            m_turnDurTotalMs = 0;
+            m_turnDurCount = 0;
+            m_working->setAverageTurnMs(0);
             addNote(detail + QStringLiteral(" · ready for a follow-up"),
                     QStringLiteral("sys"));
             emit dormantChanged(false);

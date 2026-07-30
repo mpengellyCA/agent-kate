@@ -36,6 +36,14 @@ private:
     QLabel *m_totals = nullptr;
     QTreeWidget *m_timeline = nullptr;
     QHash<QString, QTreeWidgetItem *> m_rows; // tool_use id -> timeline row
+    QHash<QString, QString> m_toolNameById;   // tool_use id -> tool name
+    // Per-tool output totals — where the context tokens actually go (the UI
+    // counterpart of the core's toolMeter, fed by the same events).
+    struct ToolTotals {
+        int calls = 0;
+        qlonglong chars = 0;
+    };
+    QHash<QString, ToolTotals> m_perTool;
 
     // Accumulated usage for the active thread (reset on thread switch).
     qlonglong m_inTok = 0;
@@ -49,4 +57,8 @@ private:
     int m_numTurns = 0;
     int m_denials = 0;
     QJsonObject m_modelUsage; // model id -> {inputTokens, outputTokens, costUSD, …}
+    // Context fill: latest turn's prompt-side tokens vs the main model's
+    // context window — the number that predicts auto-compaction.
+    qlonglong m_ctxPromptTokens = 0;
+    qlonglong m_ctxWindow = 0;
 };

@@ -5,6 +5,8 @@
 
 #include <KLocalizedString>
 
+#include <algorithm>
+
 #include <QHeaderView>
 #include <QJsonArray>
 #include <QJsonObject>
@@ -75,12 +77,16 @@ void AiInspectorPanel::setActiveThread(const QString &threadId)
     // A live view: each thread starts fresh (the on-disk transcript has history).
     m_timeline->clear();
     m_rows.clear();
+    m_toolNameById.clear();
+    m_perTool.clear();
     m_inTok = m_outTok = m_cacheRead = m_cacheCreate = 0;
     m_costUsd = 0.0;
     m_toolCalls = 0;
     m_numTurns = 0;
     m_denials = 0;
     m_modelUsage = QJsonObject();
+    m_ctxPromptTokens = 0;
+    m_ctxWindow = 0;
     updateTotals();
 }
 
@@ -112,6 +118,7 @@ void AiInspectorPanel::handleEvent(const QJsonObject &ev)
             auto *item = new QTreeWidgetItem(m_timeline, {name, detail, i18n("running…")});
             if (!id.isEmpty()) {
                 m_rows.insert(id, item);
+                m_toolNameById.insert(id, name);
             }
             ++m_toolCalls;
             m_timeline->scrollToItem(item);
@@ -134,7 +141,16 @@ void AiInspectorPanel::handleEvent(const QJsonObject &ev)
             }
             const QString text = agentkate::toolResultText(b.value(QStringLiteral("content")));
             item->setText(2, resultSummary(text, b.value(QStringLiteral("is_error")).toBool()));
+            // Roll the output size into the per-tool totals — where the
+            // context tokens actually go (mirrors the core's toolMeter).
+            const QString name = m_toolNameById.take(id);
+            if (!name.isEmpty()) {
+                ToolTotals &tot = m_perTool[name];
+                ++tot.calls;
+                tot.chars += text.size();
+            }
         }
+        updateTotals();
     } else if (type == QLatin1String("result")) {
         const QJsonObject usage = ev.value(QStringLiteral("usage")).toObject();
         m_inTok += usage.value(QStringLiteral("input_tokens")).toVariant().toLongLong();
@@ -154,6 +170,32 @@ void AiInspectorPanel::handleEvent(const QJsonObject &ev)
         const QJsonObject perModel = ev.value(QStringLiteral("modelUsage")).toObject();
         if (!perModel.isEmpty()) {
             m_modelUsage = perModel;
+        }
+        // Context fill: this turn's prompt-side tokens against the context
+        // window of whichever model carries the main conversation (largest
+        // prompt-side share of modelUsage).
+        const qlonglong promptTotal =
+            usage.value(QStringLiteral("input_tokens")).toVariant().toLongLong()
+            + usage.value(QStringLiteral("cache_read_input_tokens")).toVariant().toLongLong()
+            + usage.value(QStringLiteral("cache_creation_input_tokens"))
+                  .toVariant()
+                  .toLongLong();
+        if (promptTotal > 0) {
+            m_ctxPromptTokens = promptTotal;
+        }
+        qlonglong best = -1;
+        for (auto it = perModel.constBegin(); it != perModel.constEnd(); ++it) {
+            const QJsonObject u = it.value().toObject();
+            const qlonglong promptSide =
+                u.value(QStringLiteral("inputTokens")).toVariant().toLongLong()
+                + u.value(QStringLiteral("cacheReadInputTokens")).toVariant().toLongLong()
+                + u.value(QStringLiteral("cacheCreationInputTokens")).toVariant().toLongLong();
+            const qlonglong window =
+                u.value(QStringLiteral("contextWindow")).toVariant().toLongLong();
+            if (window > 0 && promptSide > best) {
+                best = promptSide;
+                m_ctxWindow = window;
+            }
         }
         updateTotals();
     }
@@ -180,6 +222,29 @@ void AiInspectorPanel::updateTotals()
     if (m_denials > 0) {
         line += i18ncp("inspector denial count suffix", " · %1 denial",
                        " · %1 denials", m_denials);
+    }
+    if (m_ctxPromptTokens > 0 && m_ctxWindow > 0) {
+        line += i18nc("inspector context-fill line: percent, window size",
+                      "\ncontext %1% full (of %2 tokens)",
+                      int((m_ctxPromptTokens * 100) / m_ctxWindow),
+                      loc.toString(m_ctxWindow));
+    }
+    // Where the context went, by tool: the biggest output producers first
+    // (est. tokens ≈ chars/4, mirroring the core's toolMeter).
+    if (!m_perTool.isEmpty()) {
+        QStringList names = m_perTool.keys();
+        std::sort(names.begin(), names.end(), [this](const QString &a, const QString &b) {
+            return m_perTool.value(a).chars > m_perTool.value(b).chars;
+        });
+        QStringList parts;
+        for (int i = 0; i < names.size() && i < 4; ++i) {
+            const ToolTotals &t = m_perTool.value(names.at(i));
+            parts << i18nc("per-tool spend entry: name, calls, est tokens",
+                           "%1 ×%2 ~%3 tok", names.at(i), t.calls,
+                           loc.toString(qlonglong(t.chars / 4)));
+        }
+        line += i18nc("inspector per-tool spend line", "\nby tool: %1",
+                      parts.join(QStringLiteral(" · ")));
     }
     // One line per model the session touched (the CLI splits usage by model —
     // subagents and background tasks can run on cheaper tiers than the main
