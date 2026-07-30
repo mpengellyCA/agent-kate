@@ -55,6 +55,8 @@ type StartOptions struct {
 	SessionID   string             // with Resume: the kimi session to re-attach
 	Resume      bool               // true: session/resume an existing kimi session
 	Model       string             // kimi model alias (config option "model"); "" = CLI default
+	Thinking    string             // kimi thinking level (config option "thinking"); "" = CLI default
+	Mode        string             // kimi approval mode (config option "mode"); "" = CLI default
 	MCPServers  []MCPServer        // forwarded to session/new (the Cooperation bridge)
 }
 
@@ -82,6 +84,11 @@ type Thread struct {
 	// clear the real turn's in-flight state — hence a counter, not a bool.
 	// Interrupt is a no-op at 0: nothing to cancel means nothing to backstop.
 	activePrompts int
+	// pendingCmds holds the latest available_commands_update that arrived
+	// BEFORE the handshake finished (kimi announces its command list during
+	// session setup, when the translator doesn't exist yet). Start replays it
+	// right after the init event so the UI's slash autocomplete is fed.
+	pendingCmds json.RawMessage
 	logFile     *os.File
 }
 
@@ -292,6 +299,16 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 	// persists the session id from it and the UI shows the model line.
 	s.emitEvents(t, []json.RawMessage{t.tr.initEvent()})
 
+	// Replay a command list announced during the handshake (see pendingCmds).
+	t.mu.Lock()
+	pendingCmds := t.pendingCmds
+	t.pendingCmds = nil
+	tr := t.tr
+	t.mu.Unlock()
+	if pendingCmds != nil {
+		s.emitEvents(t, tr.update(pendingCmds))
+	}
+
 	// A fresh thread gets its opening turn now. A resumed thread has none —
 	// it waits for the user's next message (same contract as agent.Start).
 	if opts.Prompt != "" || len(opts.Attachments) > 0 {
@@ -389,6 +406,30 @@ func (s *Supervisor) handshake(t *Thread, opts StartOptions) error {
 			// Keep the init event's option set consistent with the model we
 			// just applied, so the UI's picker shows the real current value.
 			sessionRes.ConfigOptions[i].CurrentValue = model
+		}
+	}
+	// Thinking level and approval mode ride the same config-option dispatcher.
+	// Like the model, a rejected value is a warning, never a failed start.
+	for _, opt := range []struct{ id, value string }{
+		{"thinking", opts.Thinking},
+		{"mode", opts.Mode},
+	} {
+		if opt.value == "" {
+			continue
+		}
+		if err := t.client.call(ctx, "session/set_config_option", map[string]any{
+			"sessionId": sessionID,
+			"configId":  opt.id,
+			"value":     opt.value,
+		}, nil); err != nil {
+			s.log.Warn("could not set kimi config option; using the CLI default",
+				"thread", t.ID, "option", opt.id, "value", opt.value, "err", err)
+			continue
+		}
+		for i := range sessionRes.ConfigOptions {
+			if sessionRes.ConfigOptions[i].ID == opt.id {
+				sessionRes.ConfigOptions[i].CurrentValue = opt.value
+			}
 		}
 	}
 	t.mu.Lock()
@@ -709,11 +750,52 @@ func (s *Supervisor) onNotification(t *Thread, method string, params json.RawMes
 	}
 	t.mu.Lock()
 	tr := t.tr
-	t.mu.Unlock()
 	if tr == nil {
-		return // pre-handshake chatter (available_commands etc.)
+		// Pre-handshake chatter. The command list is worth keeping — kimi
+		// announces it during session setup, and the UI's slash autocomplete
+		// wants it — so stash the latest for Start to replay post-handshake.
+		var probe struct {
+			Update struct {
+				SessionUpdate string `json:"sessionUpdate"`
+			} `json:"update"`
+		}
+		if json.Unmarshal(params, &probe) == nil &&
+			probe.Update.SessionUpdate == "available_commands_update" {
+			t.pendingCmds = append(json.RawMessage(nil), params...)
+		}
+		t.mu.Unlock()
+		return
 	}
+	t.mu.Unlock()
 	s.emitEvents(t, tr.update(params))
+}
+
+// SetConfigOption applies one session config option (model / thinking / mode)
+// to a running thread mid-session, via the same session/set_config_option the
+// handshake uses. The CLI's rejection (e.g. an unknown value) is returned.
+func (s *Supervisor) SetConfigOption(threadID, configID, value string) error {
+	t := s.thread(threadID)
+	if t == nil {
+		return fmt.Errorf("unknown thread %q", threadID)
+	}
+	t.mu.Lock()
+	alive := t.alive
+	stopping := t.stopping
+	sid := t.sessionID
+	t.mu.Unlock()
+	if !alive {
+		return fmt.Errorf("thread %q is not running", threadID)
+	}
+	if stopping {
+		return fmt.Errorf("thread %q is stopping", threadID)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return t.client.call(ctx, "session/set_config_option", map[string]any{
+		"sessionId": sid,
+		"configId":  configID,
+		"value":     value,
+	}, nil)
 }
 
 // onAgentRequest answers an agent→client request. Only

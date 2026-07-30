@@ -179,6 +179,10 @@ func (t *translator) update(params json.RawMessage) []json.RawMessage {
 			RawInput      json.RawMessage `json:"rawInput"`
 			RawOutput     json.RawMessage `json:"rawOutput"`
 			Entries       []planEntry     `json:"entries"` // plan updates
+			AvailableCommands []struct {
+				Name        string `json:"name"`
+				Description string `json:"description"`
+			} `json:"availableCommands"` // available_commands_update
 		} `json:"update"`
 	}
 	if json.Unmarshal(params, &p) != nil {
@@ -233,6 +237,23 @@ func (t *translator) update(params json.RawMessage) []json.RawMessage {
 			},
 		}))
 
+	case "available_commands_update":
+		// The CLI's slash-command list. There is no claude stream-json
+		// counterpart event, so this ships as the synthetic `_commands` type
+		// (underscore = Agent-Kate-injected, like _lifecycle) feeding the
+		// composer's autocomplete.
+		cmds := make([]map[string]any, 0, len(u.AvailableCommands))
+		for _, c := range u.AvailableCommands {
+			cmds = append(cmds, map[string]any{
+				"name":        c.Name,
+				"description": c.Description,
+			})
+		}
+		return []json.RawMessage{marshalEvent(map[string]any{
+			"type":     "_commands",
+			"commands": cmds,
+		})}
+
 	case "tool_call":
 		st := &toolCallState{title: u.Title, kind: u.Kind}
 		if len(u.RawInput) > 0 {
@@ -285,8 +306,8 @@ func (t *translator) update(params json.RawMessage) []json.RawMessage {
 		}
 		return nil
 	}
-	// config_option_update, available_commands_update and friends have no
-	// Claude-shaped counterpart the UI renders yet — dropped (P3 wires them).
+	// config_option_update and friends have no Claude-shaped counterpart the
+	// UI renders — dropped.
 	return nil
 }
 

@@ -68,7 +68,11 @@ for line in sys.stdin:
                        {"value": "kimi-code/k3", "name": "K3"},
                        {"value": "kimi-code/kimi-for-coding", "name": "K2.7 Coding"}]}]}})
     elif method == "session/set_config_option":
-        send({"jsonrpc": "2.0", "id": fid, "result": {"configOptions": []}})
+        if f["params"].get("value") == "bad":
+            send({"jsonrpc": "2.0", "id": fid,
+                  "error": {"code": -32602, "message": "unknown value: bad"}})
+        else:
+            send({"jsonrpc": "2.0", "id": fid, "result": {"configOptions": []}})
     elif method == "session/cancel":
         if pending_prompt is not None:
             send({"jsonrpc": "2.0", "id": pending_prompt,
@@ -485,6 +489,33 @@ func TestKimiGracefulStopMidTurn(t *testing.T) {
 	}
 	if sup.Running(th.ID) {
 		t.Error("thread still running after stop + exited lifecycle")
+	}
+}
+
+// TestKimiSetConfigOption covers mid-session config changes (model /
+// thinking / mode): success resolves, and the CLI's rejection propagates so
+// the UI can show it and revert the picker.
+func TestKimiSetConfigOption(t *testing.T) {
+	kimiBin := fakeKimiScript(t)
+	col := &eventCollector{}
+	sup := NewSupervisor(kimiBin, testLogger(), col.add, nil, t.TempDir())
+
+	th, err := sup.Start(StartOptions{ID: "t-kimi7", WorkDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if err := sup.SetConfigOption(th.ID, "model", "kimi-code/kimi-for-coding"); err != nil {
+		t.Errorf("SetConfigOption(model): %v", err)
+	}
+	if err := sup.SetConfigOption(th.ID, "mode", "yolo"); err != nil {
+		t.Errorf("SetConfigOption(mode): %v", err)
+	}
+	if err := sup.SetConfigOption(th.ID, "model", "bad"); err == nil {
+		t.Error("SetConfigOption(bad) succeeded; the CLI's rejection should propagate")
+	}
+	sup.StopAll()
+	if err := sup.SetConfigOption(th.ID, "model", "kimi-code/k3"); err == nil {
+		t.Error("SetConfigOption on a stopped thread succeeded; it should be rejected")
 	}
 }
 

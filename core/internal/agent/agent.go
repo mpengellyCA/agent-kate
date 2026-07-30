@@ -169,7 +169,13 @@ type Thread struct {
 	// Interrupt is a no-op at 0: aborting an idle CLI would arm a backstop no
 	// result can ever disarm, killing a healthy resident process seconds later.
 	turnsInFlight int
-	hotCompact    *hotCompact // when non-nil, the next assistant turn is captured for a summary
+	// controls maps an in-flight control_request's request_id to the waiter
+	// for its control_response, so SetModel / SetPermissionMode can report
+	// the CLI's actual verdict (e.g. "not a recognized model id") instead of
+	// fire-and-forgetting. Interrupt deliberately does not wait (its backstop
+	// covers the no-ack case).
+	controls   map[string]chan controlOutcome
+	hotCompact *hotCompact // when non-nil, the next assistant turn is captured for a summary
 
 	co *coalescer // batches this thread's events before they reach the emit callback
 }
@@ -260,6 +266,12 @@ func (c *coalescer) takeLocked() []json.RawMessage {
 	batch := c.pending
 	c.pending = nil
 	return batch
+}
+
+// controlOutcome is the CLI's answer to one control_request: an empty err
+// means the subtype succeeded.
+type controlOutcome struct {
+	err string
 }
 
 // hotCompact tracks an in-flight Hot-Opus compaction: assistant text is
@@ -633,6 +645,84 @@ func (s *Supervisor) Interrupt(threadID string) error {
 	return nil
 }
 
+// SetModel switches the model for the thread's NEXT turn via the CLI's
+// set_model control request — the same mechanism the interactive /model
+// command uses. Verified against claude 2.1.220: the switch is real (the
+// following turn runs and bills on the new model) and an unrecognised id is
+// rejected with a clear error, which is returned here.
+func (s *Supervisor) SetModel(threadID, model string) error {
+	return s.sendControl(threadID, "set_model", map[string]any{"model": model})
+}
+
+// SetPermissionMode switches the permission mode mid-session via the CLI's
+// set_permission_mode control request (valid modes per claude 2.1.220:
+// acceptEdits, auto, bypassPermissions, default, dontAsk, plan).
+func (s *Supervisor) SetPermissionMode(threadID, mode string) error {
+	return s.sendControl(threadID, "set_permission_mode", map[string]any{"mode": mode})
+}
+
+// controlTimeout bounds how long a control request may wait for its response.
+// The CLI answers set_model / set_permission_mode immediately (~ms), so a
+// timeout means the process is wedged or dying.
+const controlTimeout = 10 * time.Second
+
+// sendControl writes one control_request and waits (bounded) for its
+// control_response, returning the CLI's error verbatim if it rejected the
+// request.
+func (s *Supervisor) sendControl(threadID, subtype string, fields map[string]any) error {
+	t := s.thread(threadID)
+	if t == nil {
+		return fmt.Errorf("unknown thread %q", threadID)
+	}
+	req := map[string]any{"subtype": subtype}
+	for k, v := range fields {
+		req[k] = v
+	}
+	reqID := "ak-" + subtype + "-" + NewThreadID()
+	frame, err := json.Marshal(map[string]any{
+		"type":       "control_request",
+		"request_id": reqID,
+		"request":    req,
+	})
+	if err != nil {
+		return err
+	}
+	ch := make(chan controlOutcome, 1)
+	t.mu.Lock()
+	if !t.alive {
+		t.mu.Unlock()
+		return fmt.Errorf("thread %q is not running", threadID)
+	}
+	if t.stopping {
+		t.mu.Unlock()
+		return fmt.Errorf("thread %q is stopping", threadID)
+	}
+	if t.controls == nil {
+		t.controls = make(map[string]chan controlOutcome)
+	}
+	t.controls[reqID] = ch
+	_, werr := t.stdin.Write(append(frame, '\n'))
+	if werr != nil {
+		delete(t.controls, reqID)
+		t.mu.Unlock()
+		return fmt.Errorf("write to agent: %w", werr)
+	}
+	t.mu.Unlock()
+
+	select {
+	case out := <-ch:
+		if out.err != "" {
+			return fmt.Errorf("%s", out.err)
+		}
+		return nil
+	case <-time.After(controlTimeout):
+		t.mu.Lock()
+		delete(t.controls, reqID)
+		t.mu.Unlock()
+		return fmt.Errorf("%s: no response from the agent", subtype)
+	}
+}
+
 // abortPending reports whether a thread still has an unacknowledged in-band
 // abort in flight (the escalation backstop's trigger condition).
 func (s *Supervisor) abortPending(threadID string) bool {
@@ -686,13 +776,17 @@ func (s *Supervisor) pumpStdout(t *Thread, r io.Reader) {
 		// billed for (per-turn usage). Both observe; neither alters the stream.
 		t.meter.Observe(raw)
 		t.usage.Observe(raw)
-		boundary, dedup, isResult := classifyEvent(raw)
+		boundary, dedup, typ := classifyEvent(raw)
 		t.co.add(json.RawMessage(raw), boundary, dedup)
 		// A `result` ends a turn: decrement the in-flight count and complete a
 		// pending in-band interrupt. Done AFTER the result event itself is
 		// buffered so the turn_aborted lifecycle event orders behind it.
-		if isResult {
+		if typ == "result" {
 			s.observeTurnEnd(t)
+		}
+		// A control_response answers a SetModel / SetPermissionMode waiter.
+		if typ == "control_response" {
+			observeControlResponse(t, raw)
 		}
 	}
 	// Drain whatever is still buffered when the stream ends so a trailing
@@ -701,9 +795,10 @@ func (s *Supervisor) pumpStdout(t *Thread, r io.Reader) {
 }
 
 // classifyEvent inspects one stream-json event to decide whether it should
-// force an immediate coalescer flush (a semantic boundary), whether it is a
-// candidate for byte-identical dedup within a batch, and whether it is a
-// `result` (a turn end — the caller tracks those for interrupt/stop safety).
+// force an immediate coalescer flush (a semantic boundary) and whether it is
+// a candidate for byte-identical dedup within a batch, and reports the
+// event's type so the caller can track turn ends and control responses
+// without re-parsing.
 //
 // Boundaries are kept conservative: a `result` (turn end) and any assistant
 // turn carrying a tool_use block (the UI renders a tool card and may gate on
@@ -711,7 +806,7 @@ func (s *Supervisor) pumpStdout(t *Thread, r io.Reader) {
 // Plain assistant text events are dedup candidates because `claude --verbose`
 // can repeat an identical partial snapshot; only exact duplicates are dropped,
 // so no content is ever lost.
-func classifyEvent(raw json.RawMessage) (boundary, dedup, isResult bool) {
+func classifyEvent(raw json.RawMessage) (boundary, dedup bool, typ string) {
 	var head struct {
 		Type    string `json:"type"`
 		Message struct {
@@ -721,20 +816,51 @@ func classifyEvent(raw json.RawMessage) (boundary, dedup, isResult bool) {
 		} `json:"message"`
 	}
 	if json.Unmarshal(raw, &head) != nil {
-		return false, false, false
+		return false, false, ""
 	}
 	switch head.Type {
 	case "result":
-		return true, false, true
+		return true, false, head.Type
 	case "assistant":
 		for _, blk := range head.Message.Content {
 			if blk.Type == "tool_use" {
-				return true, false, false
+				return true, false, head.Type
 			}
 		}
-		return false, true, false
+		return false, true, head.Type
 	}
-	return false, false, false
+	return false, false, head.Type
+}
+
+// observeControlResponse completes the waiter for one control_response. The
+// response's request_id keys the controls map; responses nobody registered
+// for (e.g. an interrupt ack) are ignored.
+func observeControlResponse(t *Thread, raw json.RawMessage) {
+	var head struct {
+		Response struct {
+			RequestID string `json:"request_id"`
+			Subtype   string `json:"subtype"`
+			Error     string `json:"error"`
+		} `json:"response"`
+	}
+	if json.Unmarshal(raw, &head) != nil || head.Response.RequestID == "" {
+		return
+	}
+	t.mu.Lock()
+	ch := t.controls[head.Response.RequestID]
+	delete(t.controls, head.Response.RequestID)
+	t.mu.Unlock()
+	if ch == nil {
+		return
+	}
+	out := controlOutcome{}
+	if head.Response.Subtype == "error" {
+		out.err = head.Response.Error
+		if out.err == "" {
+			out.err = "control request rejected"
+		}
+	}
+	ch <- out
 }
 
 // observeHotCompact pulls assistant text out of one stream-json event into
@@ -871,6 +997,11 @@ func (s *Supervisor) reap(t *Thread) {
 	// Unblock any in-flight Compact waiters: the summary turn isn't coming.
 	if t.hotCompact != nil {
 		t.hotCompact.finish(fmt.Errorf("agent exited before compact completed"))
+	}
+	// Likewise any control-request waiters — their responses aren't coming.
+	for id, ch := range t.controls {
+		delete(t.controls, id)
+		ch <- controlOutcome{err: "agent exited before answering"}
 	}
 	if t.mcpConfig != "" {
 		_ = os.Remove(t.mcpConfig)

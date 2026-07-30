@@ -57,6 +57,7 @@
 #include <QLabel>
 #include <QLayout>
 #include <QListView>
+#include <QListWidget>
 #include <QMouseEvent>
 #include <QPaintEvent>
 #include <QPainter>
@@ -433,8 +434,22 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     m_draftTimer->setSingleShot(true);
     m_draftTimer->setInterval(400);
     connect(m_draftTimer, &QTimer::timeout, this, &AgentPanel::saveDraft);
-    connect(m_input, &QPlainTextEdit::textChanged, this,
-            [this] { m_draftTimer->start(); });
+    connect(m_input, &QPlainTextEdit::textChanged, this, [this] {
+        m_draftTimer->start();
+        updateSlashPopup();
+    });
+
+    // Slash-command autocomplete popup: an overlay list above the composer,
+    // fed by the harness's own command list (see updateSlashPopup). Palette
+    // colours only; it inherits the theme like every other child widget.
+    m_slashPopup = new QListWidget(this);
+    m_slashPopup->setVisible(false);
+    m_slashPopup->setFrameShape(QFrame::StyledPanel);
+    m_slashPopup->setSelectionMode(QAbstractItemView::SingleSelection);
+    m_slashPopup->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    m_slashPopup->setFocusPolicy(Qt::NoFocus); // keys stay in the composer
+    connect(m_slashPopup, &QListWidget::itemClicked, this,
+            [this](QListWidgetItem *) { acceptSlashCompletion(); });
 
     // --- in-conversation find bar (hidden until Ctrl+F) --------------------
     m_findBar = new QFrame(this);
@@ -484,36 +499,22 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     });
 
     m_modeCombo = new QComboBox(this);
-    m_modeCombo->addItem(QStringLiteral("Apply edits automatically"), QStringLiteral("acceptEdits"));
-    m_modeCombo->addItem(QStringLiteral("Ask before each step"), QStringLiteral("default"));
-    m_modeCombo->addItem(QStringLiteral("Work freely"), QStringLiteral("auto"));
-    m_modeCombo->addItem(QStringLiteral("Expert — never ask"), QStringLiteral("bypassPermissions"));
     m_modeCombo->setToolTip(QStringLiteral(
-        "How much the agent checks with you before it acts. Fixed once it starts."));
-    // Sticky: the last choice becomes the default for the next agent — except
-    // for "Unsafe (bypass)", which resets to "Auto" so it's never re-armed
-    // accidentally on the next conversation.
-    {
-        QString saved = KSharedConfig::openConfig()
-                            ->group(QStringLiteral("Agent"))
-                            .readEntry("permissionMode", QStringLiteral("acceptEdits"));
-        if (saved == QLatin1String("bypassPermissions")) {
-            saved = QStringLiteral("auto");
-        }
-        const int savedIdx = m_modeCombo->findData(saved);
-        if (savedIdx >= 0) {
-            m_modeCombo->setCurrentIndex(savedIdx);
-        }
-    }
+        "How much the agent checks with you before it acts. You can change it\n"
+        "while the agent runs; it applies from the next action."));
+    rebuildModeCombo();
     connect(m_modeCombo, &QComboBox::currentIndexChanged, this, [this] {
         const QString mode = m_modeCombo->currentData().toString();
-        // Don't persist the unsafe choice — next agent falls back to Auto.
-        if (mode == QLatin1String("bypassPermissions")) {
-            return;
+        // Sticky per backend: the last choice becomes the default for the next
+        // agent — except the auto-approve-everything choices (claude's
+        // bypassPermissions, kimi's yolo), which are never re-armed
+        // accidentally on the next conversation.
+        if (mode != QLatin1String("bypassPermissions") && mode != QLatin1String("yolo")) {
+            KSharedConfig::openConfig()
+                ->group(QStringLiteral("Agent"))
+                .writeEntry(kimiSelected() ? "kimiMode" : "permissionMode", mode);
         }
-        KSharedConfig::openConfig()
-            ->group(QStringLiteral("Agent"))
-            .writeEntry("permissionMode", mode);
+        maybePushOption(QStringLiteral("permissionMode"), mode);
     });
 
     m_isolationCombo = new QComboBox(this);
@@ -545,31 +546,18 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     });
 
     m_effortCombo = new QComboBox(this);
-    // An empty value passes no --effort flag, leaving Claude Code's own default.
-    m_effortCombo->addItem(QStringLiteral("Default"), QString());
-    m_effortCombo->addItem(QStringLiteral("Low"), QStringLiteral("low"));
-    m_effortCombo->addItem(QStringLiteral("Medium"), QStringLiteral("medium"));
-    m_effortCombo->addItem(QStringLiteral("High"), QStringLiteral("high"));
-    m_effortCombo->addItem(QStringLiteral("Extra-high"), QStringLiteral("xhigh"));
-    m_effortCombo->addItem(QStringLiteral("Maximum"), QStringLiteral("max"));
     m_effortCombo->setToolTip(QStringLiteral(
         "How long the agent thinks before it acts. Higher is more thorough but\n"
         "slower. Default leaves the model's own configured level untouched.\n"
-        "Fixed once it starts."));
-    // Sticky: the last choice becomes the default for the next agent.
-    {
-        const QString saved = KSharedConfig::openConfig()
-                                  ->group(QStringLiteral("Agent"))
-                                  .readEntry("effort", QString());
-        const int savedIdx = m_effortCombo->findData(saved);
-        if (savedIdx >= 0) {
-            m_effortCombo->setCurrentIndex(savedIdx);
-        }
-    }
+        "Fixed at start for Claude Code; adjustable while a Kimi agent runs."));
+    rebuildEffortCombo();
     connect(m_effortCombo, &QComboBox::currentIndexChanged, this, [this] {
+        const QString effort = m_effortCombo->currentData().toString();
+        // Sticky per backend: the last choice becomes the default next time.
         KSharedConfig::openConfig()
             ->group(QStringLiteral("Agent"))
-            .writeEntry("effort", m_effortCombo->currentData().toString());
+            .writeEntry(kimiSelected() ? "kimiThinking" : "effort", effort);
+        maybePushOption(QStringLiteral("effort"), effort);
     });
 
     // Provider selector. Routes this agent's `claude` harness at a third-party
@@ -632,8 +620,15 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
             ->group(QStringLiteral("Agent"))
             .writeEntry("backend", m_backendCombo->currentData().toString());
         rebuildModelCombo();
+        rebuildModeCombo();
+        rebuildEffortCombo();
         refresh();
     });
+    // The mode/effort combos were first built before the backend combo existed
+    // (their ctor order); re-run them now the restored backend is known, so a
+    // sticky "kimi" default shows kimi's own mode/thinking lists.
+    rebuildModeCombo();
+    rebuildEffortCombo();
 
     // Model selector. For Claude direct each item carries a tier token the core
     // resolves to a concrete --model id (its resolveModel is the single source of
@@ -643,22 +638,22 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     // populates it to match the selected provider.
     m_modelCombo = new QComboBox(this);
     m_modelCombo->setToolTip(QStringLiteral(
-        "Model for this agent, fixed once it starts.\n"
+        "Model for this agent. You can switch it while the agent runs; the\n"
+        "new model takes over from the next message.\n"
         "Default leaves the provider's own configured/main model untouched."));
     connect(m_modelCombo, &QComboBox::currentIndexChanged, this, [this] {
         // Only the Claude-direct tier choice is sticky; a provider's model ids
         // must not be persisted as the Claude model token, and neither must the
         // free-text Kimi model (an editable combo).
-        if (m_modelCombo->isEditable()) {
-            return;
+        if (!m_modelCombo->isEditable()
+            && (!m_providerCombo
+                || m_providerCombo->currentData().toString()
+                       == ProviderStore::directId())) {
+            KSharedConfig::openConfig()
+                ->group(QStringLiteral("Agent"))
+                .writeEntry("model", m_modelCombo->currentData().toString());
         }
-        if (m_providerCombo &&
-            m_providerCombo->currentData().toString() != ProviderStore::directId()) {
-            return;
-        }
-        KSharedConfig::openConfig()
-            ->group(QStringLiteral("Agent"))
-            .writeEntry("model", m_modelCombo->currentData().toString());
+        maybePushOption(QStringLiteral("model"), currentModel());
     });
     rebuildModelCombo();
 
@@ -1063,6 +1058,256 @@ void AgentPanel::setComposerText(const QString &text)
     m_input->setFocus();
 }
 
+void AgentPanel::updateSlashPopup()
+{
+    if (!m_slashPopup || !m_input) {
+        return;
+    }
+    const QString text = m_input->toPlainText();
+    // Active while the composer holds exactly one line that starts with "/"
+    // and the command word is still being typed (no space yet).
+    const bool active = text.startsWith(QLatin1Char('/'))
+        && !text.contains(QLatin1Char('\n')) && !text.contains(QLatin1Char(' '))
+        && text.length() <= 64 && !m_slashCommands.isEmpty();
+    if (!active) {
+        hideSlashPopup();
+        return;
+    }
+    const QString prefix = text.mid(1);
+    m_slashPopup->clear();
+    for (const auto &cmd : std::as_const(m_slashCommands)) {
+        if (!cmd.first.startsWith(prefix, Qt::CaseInsensitive)) {
+            continue;
+        }
+        const QString label = cmd.second.isEmpty()
+            ? QStringLiteral("/") + cmd.first
+            : QStringLiteral("/%1 — %2").arg(cmd.first, cmd.second);
+        auto *item = new QListWidgetItem(label, m_slashPopup);
+        item->setData(Qt::UserRole, cmd.first);
+    }
+    if (m_slashPopup->count() == 0) {
+        hideSlashPopup();
+        return;
+    }
+    m_slashPopup->setCurrentRow(0);
+    // Overlay just above the composer, matching its width.
+    const int rowH = qMax(1, m_slashPopup->sizeHintForRow(0));
+    const int visible = qMin(m_slashPopup->count(), 8);
+    const int h = visible * rowH + 2 * m_slashPopup->frameWidth();
+    const QPoint inputTopLeft = m_input->mapTo(this, QPoint(0, 0));
+    m_slashPopup->setGeometry(inputTopLeft.x(), inputTopLeft.y() - h,
+                              m_input->width(), h);
+    m_slashPopup->raise();
+    m_slashPopup->setVisible(true);
+}
+
+void AgentPanel::acceptSlashCompletion()
+{
+    if (!m_slashPopup || !m_slashPopup->isVisible()) {
+        return;
+    }
+    QListWidgetItem *item = m_slashPopup->currentItem();
+    hideSlashPopup();
+    if (!item) {
+        return;
+    }
+    const QString name = item->data(Qt::UserRole).toString();
+    m_input->setPlainText(QStringLiteral("/") + name + QStringLiteral(" "));
+    QTextCursor cur = m_input->textCursor();
+    cur.movePosition(QTextCursor::End);
+    m_input->setTextCursor(cur);
+    m_input->setFocus();
+}
+
+void AgentPanel::hideSlashPopup()
+{
+    if (m_slashPopup) {
+        m_slashPopup->setVisible(false);
+    }
+}
+
+bool AgentPanel::kimiSelected() const
+{
+    // A bound thread's backend is authoritative; before one exists the picker
+    // decides (the combo may hold a sticky "kimi" default).
+    if (!m_threadId.isEmpty()) {
+        return m_backend == QLatin1String("kimi");
+    }
+    return m_backendCombo
+        && m_backendCombo->currentData().toString() == QLatin1String("kimi");
+}
+
+// kimiOptionValues reads a persisted kimi config-option enumeration
+// ("value|name" pairs captured from the init event) back as (value, name).
+static QList<QPair<QString, QString>> kimiOptionValues(const char *key)
+{
+    QList<QPair<QString, QString>> out;
+    const QStringList entries = KSharedConfig::openConfig()
+                                    ->group(QStringLiteral("Agent"))
+                                    .readEntry(key, QStringList());
+    for (const QString &entry : entries) {
+        const QString value = entry.section(QLatin1Char('|'), 0, 0);
+        const QString name = entry.section(QLatin1Char('|'), 1);
+        if (!value.isEmpty()) {
+            out.append({value, name.isEmpty() ? value : name});
+        }
+    }
+    return out;
+}
+
+void AgentPanel::rebuildModeCombo()
+{
+    if (!m_modeCombo) {
+        return;
+    }
+    QSignalBlocker block(m_modeCombo);
+    m_modeCombo->clear();
+    if (kimiSelected()) {
+        // Kimi's own approval modes (default / plan / auto / yolo on 0.30),
+        // discovered from the session handshake. Until a kimi session has
+        // run there is nothing to enumerate — offer only the CLI default.
+        const auto modes = kimiOptionValues("kimiOpt-mode");
+        if (modes.isEmpty()) {
+            m_modeCombo->addItem(QStringLiteral("CLI default"), QString());
+            return;
+        }
+        for (const auto &m : modes) {
+            m_modeCombo->addItem(m.second, m.first);
+        }
+        // Sticky, but never re-arm the auto-approve-everything mode.
+        QString saved = KSharedConfig::openConfig()
+                            ->group(QStringLiteral("Agent"))
+                            .readEntry("kimiMode", QString());
+        if (saved == QLatin1String("yolo")) {
+            saved.clear();
+        }
+        const int idx = m_modeCombo->findData(saved);
+        if (idx >= 0) {
+            m_modeCombo->setCurrentIndex(idx);
+        }
+        return;
+    }
+    m_modeCombo->addItem(QStringLiteral("Apply edits automatically"),
+                         QStringLiteral("acceptEdits"));
+    m_modeCombo->addItem(QStringLiteral("Ask before each step"), QStringLiteral("default"));
+    m_modeCombo->addItem(QStringLiteral("Plan first — read-only until approved"),
+                         QStringLiteral("plan"));
+    m_modeCombo->addItem(QStringLiteral("Work freely"), QStringLiteral("auto"));
+    m_modeCombo->addItem(QStringLiteral("Expert — never ask"),
+                         QStringLiteral("bypassPermissions"));
+    // Sticky, but "Expert — never ask" resets to "Work freely" so it's never
+    // re-armed accidentally on the next conversation.
+    QString saved = KSharedConfig::openConfig()
+                        ->group(QStringLiteral("Agent"))
+                        .readEntry("permissionMode", QStringLiteral("acceptEdits"));
+    if (saved == QLatin1String("bypassPermissions")) {
+        saved = QStringLiteral("auto");
+    }
+    const int idx = m_modeCombo->findData(saved);
+    if (idx >= 0) {
+        m_modeCombo->setCurrentIndex(idx);
+    }
+}
+
+void AgentPanel::rebuildEffortCombo()
+{
+    if (!m_effortCombo) {
+        return;
+    }
+    QSignalBlocker block(m_effortCombo);
+    m_effortCombo->clear();
+    if (kimiSelected()) {
+        // Kimi's "thinking" levels (low / high / max on 0.30), discovered
+        // from the session handshake — its analogue of thinking effort.
+        m_effortCombo->addItem(QStringLiteral("CLI default"), QString());
+        const auto levels = kimiOptionValues("kimiOpt-thinking");
+        for (const auto &l : levels) {
+            m_effortCombo->addItem(l.second, l.first);
+        }
+        const QString saved = KSharedConfig::openConfig()
+                                  ->group(QStringLiteral("Agent"))
+                                  .readEntry("kimiThinking", QString());
+        const int idx = m_effortCombo->findData(saved);
+        if (idx >= 0) {
+            m_effortCombo->setCurrentIndex(idx);
+        }
+        return;
+    }
+    // An empty value passes no --effort flag, leaving Claude Code's own default.
+    m_effortCombo->addItem(QStringLiteral("Default"), QString());
+    m_effortCombo->addItem(QStringLiteral("Low"), QStringLiteral("low"));
+    m_effortCombo->addItem(QStringLiteral("Medium"), QStringLiteral("medium"));
+    m_effortCombo->addItem(QStringLiteral("High"), QStringLiteral("high"));
+    m_effortCombo->addItem(QStringLiteral("Extra-high"), QStringLiteral("xhigh"));
+    m_effortCombo->addItem(QStringLiteral("Maximum"), QStringLiteral("max"));
+    const QString saved = KSharedConfig::openConfig()
+                              ->group(QStringLiteral("Agent"))
+                              .readEntry("effort", QString());
+    const int idx = m_effortCombo->findData(saved);
+    if (idx >= 0) {
+        m_effortCombo->setCurrentIndex(idx);
+    }
+}
+
+void AgentPanel::maybePushOption(const QString &option, const QString &value)
+{
+    // Pre-start and dormant changes apply at the (re)start instead; only a
+    // live thread takes a mid-session change.
+    if (m_threadId.isEmpty() || m_dormant || !m_core || !m_core->isConnected()) {
+        return;
+    }
+    // "Default" (empty) can't be applied to a running session — the CLIs take
+    // only concrete values mid-session. It will apply at the next start.
+    if (value.isEmpty()) {
+        addNote(i18n("The default applies from the next start — the running agent "
+                     "keeps its current setting."),
+                QStringLiteral("dim"));
+        return;
+    }
+    const QString tid = m_threadId;
+    QPointer<AgentPanel> self(this);
+    m_core->call(QStringLiteral("agent.setOption"),
+                 QJsonObject{
+                     {QStringLiteral("threadId"), tid},
+                     {QStringLiteral("option"), option},
+                     {QStringLiteral("value"), value},
+                 },
+                 [self, tid, option, value](const QJsonObject &result,
+                                            const QJsonObject &error) {
+                     if (!self || tid != self->m_threadId) {
+                         return;
+                     }
+                     if (!error.isEmpty()) {
+                         // The picker now shows a value the agent refused —
+                         // say so rather than silently diverging.
+                         self->addNote(
+                             i18n("Could not change the %1: %2",
+                                  option == QLatin1String("model")
+                                      ? i18n("model")
+                                      : option == QLatin1String("effort")
+                                            ? i18n("thinking effort")
+                                            : i18n("approval mode"),
+                                  error.value(QStringLiteral("message"))
+                                      .toString()
+                                      .toHtmlEscaped()),
+                             QStringLiteral("err"));
+                         return;
+                     }
+                     const QString applied =
+                         result.value(QStringLiteral("value")).toString();
+                     self->addNote(
+                         i18n("%1 changed to <b>%2</b> — applies from the next action",
+                              option == QLatin1String("model")
+                                  ? i18n("Model")
+                                  : option == QLatin1String("effort")
+                                        ? i18n("Thinking effort")
+                                        : i18n("Approval mode"),
+                              (applied.isEmpty() ? value : applied).toHtmlEscaped()),
+                         QStringLiteral("sys"));
+                 },
+                 this);
+}
+
 void AgentPanel::rebuildModelCombo()
 {
     if (!m_modelCombo) {
@@ -1244,6 +1489,33 @@ bool AgentPanel::eventFilter(QObject *obj, QEvent *event)
     }
     if (obj == m_input && event->type() == QEvent::KeyPress) {
         auto *key = static_cast<QKeyEvent *>(event);
+        // While the slash popup is up it owns the navigation keys; everything
+        // else falls through so typing keeps filtering the list.
+        if (m_slashPopup && m_slashPopup->isVisible()) {
+            switch (key->key()) {
+            case Qt::Key_Up:
+            case Qt::Key_Down: {
+                const int delta = key->key() == Qt::Key_Down ? 1 : -1;
+                const int count = m_slashPopup->count();
+                if (count > 0) {
+                    int row = m_slashPopup->currentRow() + delta;
+                    row = qBound(0, row, count - 1);
+                    m_slashPopup->setCurrentRow(row);
+                }
+                return true;
+            }
+            case Qt::Key_Return:
+            case Qt::Key_Enter:
+            case Qt::Key_Tab:
+                acceptSlashCompletion();
+                return true;
+            case Qt::Key_Escape:
+                hideSlashPopup();
+                return true;
+            default:
+                break;
+            }
+        }
         // Esc while a turn is in flight interrupts it (keeps the session hot) so
         // you can redirect the agent without reaching for the toolbar button.
         if (key->key() == Qt::Key_Escape && !m_threadId.isEmpty() && !m_dormant
@@ -1642,23 +1914,27 @@ void AgentPanel::refresh()
             actions.first()->setEnabled(running); // "Hot Opus (live thread)"
         }
     }
-    // Permission, isolation, effort, model and desktop access are fixed once a
-    // thread exists (they are baked into the agent's launch). A not-yet-started
-    // Kimi pick further disables the pickers that don't apply to that backend —
-    // including "When to ask": kimi permissions flow over ACP and always ask,
-    // so offering the mode combo would silently ignore the user's choice.
-    // Picker state only matters before a thread exists — a bound thread's
-    // backend is m_backend, and the combo may hold a stale sticky default.
+    // Backend, isolation, provider and desktop access are baked into the
+    // agent's launch — frozen once a thread exists. Model and "when to ask"
+    // stay adjustable WHILE THE AGENT RUNS: the core forwards changes
+    // mid-session (claude: set_model / set_permission_mode control requests;
+    // kimi: session/set_config_option). Thinking effort is likewise live for
+    // kimi (its "thinking" option); Claude Code has no set_effort control
+    // request, so effort stays a start-time choice there. Picker state only
+    // matters before a thread exists — a bound thread's backend is m_backend,
+    // and the combo may hold a stale sticky default.
     const bool pickerKimi = m_threadId.isEmpty() && m_backendCombo
         && m_backendCombo->currentData().toString() == QLatin1String("kimi");
+    const bool kimiSel = threadKimi || pickerKimi;
     m_compactCombo->setEnabled(!threadKimi && !pickerKimi);
     m_compactStrip->setEnabled(!threadKimi && !pickerKimi);
     m_backendCombo->setEnabled(m_threadId.isEmpty());
-    m_modeCombo->setEnabled(m_threadId.isEmpty() && !pickerKimi);
+    m_modeCombo->setEnabled(m_threadId.isEmpty() || running);
     m_isolationCombo->setEnabled(m_threadId.isEmpty());
-    m_effortCombo->setEnabled(m_threadId.isEmpty() && !pickerKimi);
+    m_effortCombo->setEnabled(kimiSel ? (m_threadId.isEmpty() || running)
+                                      : m_threadId.isEmpty());
     m_providerCombo->setEnabled(m_threadId.isEmpty() && !pickerKimi);
-    m_modelCombo->setEnabled(m_threadId.isEmpty());
+    m_modelCombo->setEnabled(m_threadId.isEmpty() || running);
     m_coworkCheck->setEnabled(m_threadId.isEmpty() && !pickerKimi);
 
     // Offer promotion while a thread runs non-isolated in the workspace.
@@ -2224,18 +2500,15 @@ void AgentPanel::onSendClicked()
             {QStringLiteral("workspacePath"), m_workspace},
             {QStringLiteral("prompt"), text},
             {QStringLiteral("backend"), m_backendCombo->currentData().toString()},
-            // Kimi has no permission modes — it always asks over ACP. Send
-            // empty rather than a mode the core would silently drop.
-            {QStringLiteral("permissionMode"),
-             startingKimi ? QString() : m_modeCombo->currentData().toString()},
+            // The mode/effort combos hold per-backend vocabularies (Claude's
+            // permission modes and --effort levels, or kimi's "mode" and
+            // "thinking" config-option values), so both send verbatim.
+            {QStringLiteral("permissionMode"), m_modeCombo->currentData().toString()},
             {QStringLiteral("isolation"), m_isolationCombo->currentData().toString()},
-            // Effort, provider routing and Cowork don't apply to Kimi Code
-            // (the core rejects them); its model is the editable combo's text.
-            {QStringLiteral("effort"),
-             startingKimi ? QString() : m_effortCombo->currentData().toString()},
-            {QStringLiteral("model"),
-             startingKimi ? m_modelCombo->currentText().trimmed()
-                          : m_modelCombo->currentData().toString()},
+            {QStringLiteral("effort"), m_effortCombo->currentData().toString()},
+            {QStringLiteral("model"), currentModel()},
+            // Provider routing and Cowork don't apply to Kimi Code (the core
+            // rejects them).
             {QStringLiteral("coworkEnabled"), !startingKimi && m_coworkCheck->isChecked()},
             {QStringLiteral("attachments"), attachments}};
         if (!providerJson.isEmpty()) {
@@ -2910,6 +3183,30 @@ void AgentPanel::showNextPermission()
         return;
     }
     const QString tool = req.value(QStringLiteral("toolName")).toString();
+    // The plan-mode exit is a decision, not a tool grant: the agent finished
+    // its read-only planning and asks to start making changes. Show the plan
+    // itself instead of a raw tool prompt. (Approving lets the CLI leave plan
+    // mode; denying keeps it planning.)
+    if (tool == QLatin1String("ExitPlanMode")) {
+        QString plan = req.value(QStringLiteral("input"))
+                           .toObject()
+                           .value(QStringLiteral("plan"))
+                           .toString()
+                           .trimmed();
+        if (plan.length() > 1200) {
+            plan = plan.left(1200) + QChar(0x2026);
+        }
+        m_permLabel->setText(
+            i18n("&#128203;&nbsp; The agent finished planning and wants to start "
+                 "making changes.")
+            + (plan.isEmpty()
+                   ? QString()
+                   : QStringLiteral("<br><tt>%1</tt>")
+                         .arg(plan.toHtmlEscaped().replace(QLatin1Char('\n'),
+                                                           QLatin1String("<br>")))));
+        m_permBar->setVisible(true);
+        return;
+    }
     QString summary = agentkate::permSummary(tool, req.value(QStringLiteral("input")).toObject());
     if (summary.length() > 240) {
         summary = summary.left(240) + QChar(0x2026);
@@ -3103,6 +3400,18 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
                 }
                 if (!entries.isEmpty()) {
                     cfg.writeEntry(QStringLiteral("kimiOpt-") + id, entries);
+                }
+            }
+        }
+        // The claude init event lists the session's slash commands (names
+        // only) — the composer's autocomplete feed.
+        const QJsonArray slashCmds = ev.value(QStringLiteral("slash_commands")).toArray();
+        if (!slashCmds.isEmpty()) {
+            m_slashCommands.clear();
+            for (const QJsonValue &v : slashCmds) {
+                const QString name = v.toString();
+                if (!name.isEmpty()) {
+                    m_slashCommands.append({name, QString()});
                 }
             }
         }
@@ -3344,6 +3653,21 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
         refresh();
         // The turn boundary is the moment a queued follow-up can fire.
         drainSendQueue();
+
+    } else if (type == QLatin1String("_commands")) {
+        // The kimi CLI's command list (translated from ACP
+        // available_commands_update) — replaces the autocomplete feed. Not a
+        // feed row; purely composer state.
+        m_slashCommands.clear();
+        const QJsonArray cmds = ev.value(QStringLiteral("commands")).toArray();
+        for (const QJsonValue &v : cmds) {
+            const QJsonObject cmd = v.toObject();
+            const QString name = cmd.value(QStringLiteral("name")).toString();
+            if (!name.isEmpty()) {
+                m_slashCommands.append(
+                    {name, cmd.value(QStringLiteral("description")).toString()});
+            }
+        }
 
     } else if (type == QLatin1String("_stderr")) {
         addNote(ev.value(QStringLiteral("text")).toString().toHtmlEscaped(),

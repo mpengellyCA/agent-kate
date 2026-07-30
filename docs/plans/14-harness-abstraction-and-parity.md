@@ -1,6 +1,6 @@
 # 14 — Harness Abstraction & Feature Parity (agent systems rework)
 
-> **Status: in progress — P1–P2 landed.** Follows the Kimi Code backend branch
+> **Status: in progress — P1–P3 landed.** Follows the Kimi Code backend branch
 > (`kimi-code-backend`, `e0e9594` + review fixes `5a20c66`). Seven phases;
 > land sequentially, one commit per phase, built green (`scripts/build.sh`,
 > `go test ./...` incl. `-race`, `ctest --test-dir build`), smoke-verified
@@ -211,12 +211,34 @@ Facts verified against the real binaries while implementing:
 - claude init event carries `slash_commands`/`tools`/`agents`/`skills` (P3's
   autocomplete feed) — confirmed present on claude 2.1.x.
 
-**P3 — Session control (L).** Verify the CLI's control_request subtypes
-against the installed `claude` (never assume); wire mid-session model /
-effort / permission-mode where supported; plan mode; slash-command
-autocomplete fed by init event + ACP `available_commands_update`; kimi
-approval-mode investigation. Unfreeze the corresponding combos post-start
-where the harness allows.
+**P3 — Session control (L). ✅ LANDED.** Verified against claude 2.1.220 by
+driving `claude -p` stream-json directly:
+- `set_model` ✓ (validates ids with a clean error; the switch is REAL — the
+  next turn ran and billed on the new model, confirmed via modelUsage).
+- `set_permission_mode` ✓ (valid: acceptEdits, auto, bypassPermissions,
+  default, dontAsk, plan).
+- `set_effort` ✗ — "Unsupported control request subtype". Claude effort
+  stays a start-time choice, rejected cleanly by `agent.setOption`.
+- `set_max_thinking_tokens` ✓ exists but has no UI concept here — not wired.
+
+What landed: `agent.setOption {threadId, option, value}` RPC (claude:
+control requests with tracked responses so CLI rejections propagate; kimi:
+session/set_config_option with ids model/thinking/mode), persisted to the
+record so resume replays the latest choice; kimi start/resume now apply
+thinking + mode (record.Effort/PermissionMode hold kimi's own vocabulary
+for kimi threads); model + when-to-ask combos live while the agent runs
+(kimi thinking too), per-backend combo vocabularies with per-backend sticky
+keys (`kimiMode`/`kimiThinking`, yolo never re-armed — same rule as
+bypassPermissions); "Plan first" mode offered for claude; ExitPlanMode
+permission prompt shows the plan itself; slash-command autocomplete in the
+composer fed by the claude init event's `slash_commands` and kimi's
+`available_commands_update` (translated to a synthetic `_commands` event;
+a pre-handshake announcement is stashed and replayed after init).
+Notes for dogfooding: the ExitPlanMode prompt path assumes plan-mode tool
+gating routes through the permission broker like other tools — verify in
+real use; after approving ExitPlanMode the CLI leaves plan mode itself but
+the mode combo keeps showing "Plan first" (we don't guess the CLI's new
+mode). Slash commands are sent as plain user text for both backends.
 
 **P4 — Working-visibility (L).** Background-jobs tray (background shells +
 BashOutput polling), Task-subagent monitor reusing the WorkflowMonitor

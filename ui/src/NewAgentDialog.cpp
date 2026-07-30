@@ -55,35 +55,62 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, QWidget *parent)
     form->addRow(i18n("How clever?"), m_model);
     root->addLayout(form);
 
-    // The model list follows the backend: Claude tiers for Claude Code; for
-    // Kimi Code the CLI's own model list, as discovered from the last kimi
-    // session's handshake (until one has run, only the default is offered —
-    // the panel's Setup menu additionally takes a free-text id).
-    auto rebuildModels = [this] {
+    // The model, when-to-ask and effort lists all follow the backend: Claude's
+    // fixed vocabularies for Claude Code; for Kimi Code the CLI's own lists
+    // (model / mode / thinking) as discovered from the last kimi session's
+    // handshake — until one has run, only the defaults are offered (the
+    // panel's Setup menu additionally takes a free-text model id).
+    auto kimiOptions = [](const char *key) {
+        return KSharedConfig::openConfig()
+            ->group(QStringLiteral("Agent"))
+            .readEntry(key, QStringList());
+    };
+    auto rebuildBackendChoices = [this, kimiOptions] {
         const bool kimi =
             m_backend->currentData().toString() == QLatin1String("kimi");
-        QSignalBlocker block(m_model);
+        QSignalBlocker blockModel(m_model);
+        QSignalBlocker blockPerm(m_permission);
+        QSignalBlocker blockEffort(m_effort);
         m_model->clear();
+        m_permission->clear();
+        m_effort->clear();
         m_model->addItem(i18n("Use my default"), QString());
         if (!kimi) {
             m_model->addItem(i18n("Smartest (Opus)"), QStringLiteral("opus"));
             m_model->addItem(i18n("Balanced (Sonnet)"), QStringLiteral("sonnet"));
             m_model->addItem(i18n("Fastest (Haiku)"), QStringLiteral("haiku"));
+            m_permission->addItem(i18n("Apply edits automatically"),
+                                  QStringLiteral("acceptEdits"));
+            m_permission->addItem(i18n("Ask before each step"), QStringLiteral("default"));
+            m_permission->addItem(i18n("Plan first — read-only until approved"),
+                                  QStringLiteral("plan"));
+            m_permission->addItem(i18n("Work freely"), QStringLiteral("auto"));
+            m_permission->addItem(i18n("Expert — never ask"),
+                                  QStringLiteral("bypassPermissions"));
+            m_effort->addItem(i18n("Default"), QString());
+            m_effort->addItem(i18n("Low"), QStringLiteral("low"));
+            m_effort->addItem(i18n("Medium"), QStringLiteral("medium"));
+            m_effort->addItem(i18n("High"), QStringLiteral("high"));
+            m_effort->addItem(i18n("Extra-high"), QStringLiteral("xhigh"));
+            m_effort->addItem(i18n("Maximum"), QStringLiteral("max"));
             return;
         }
-        const QStringList models = KSharedConfig::openConfig()
-                                       ->group(QStringLiteral("Agent"))
-                                       .readEntry("kimiOpt-model", QStringList());
-        for (const QString &entry : models) {
-            const QString value = entry.section(QLatin1Char('|'), 0, 0);
-            const QString name = entry.section(QLatin1Char('|'), 1);
-            if (!value.isEmpty()) {
-                m_model->addItem(name.isEmpty() ? value : name, value);
+        const auto addFrom = [](QComboBox *combo, const QStringList &entries) {
+            for (const QString &entry : entries) {
+                const QString value = entry.section(QLatin1Char('|'), 0, 0);
+                const QString name = entry.section(QLatin1Char('|'), 1);
+                if (!value.isEmpty()) {
+                    combo->addItem(name.isEmpty() ? value : name, value);
+                }
             }
-        }
+        };
+        addFrom(m_model, kimiOptions("kimiOpt-model"));
+        m_permission->addItem(i18n("CLI default"), QString());
+        addFrom(m_permission, kimiOptions("kimiOpt-mode"));
+        m_effort->addItem(i18n("CLI default"), QString());
+        addFrom(m_effort, kimiOptions("kimiOpt-thinking"));
     };
-    rebuildModels();
-    connect(m_backend, &QComboBox::currentIndexChanged, this, rebuildModels);
+    connect(m_backend, &QComboBox::currentIndexChanged, this, rebuildBackendChoices);
 
     m_sandbox = new QCheckBox(
         i18n("Work in a private copy, so changes don't touch my files until I approve"), this);
@@ -101,22 +128,15 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, QWidget *parent)
     auto *advForm = new QFormLayout(m_advanced);
     advForm->setContentsMargins(0, 0, 0, 0);
     m_permission = new QComboBox(m_advanced);
-    m_permission->addItem(i18n("Apply edits automatically"), QStringLiteral("acceptEdits"));
-    m_permission->addItem(i18n("Ask before each step"), QStringLiteral("default"));
-    m_permission->addItem(i18n("Work freely"), QStringLiteral("auto"));
-    m_permission->addItem(i18n("Expert — never ask"), QStringLiteral("bypassPermissions"));
     advForm->addRow(i18n("When to ask"), m_permission);
     m_effort = new QComboBox(m_advanced);
-    m_effort->addItem(i18n("Default"), QString());
-    m_effort->addItem(i18n("Low"), QStringLiteral("low"));
-    m_effort->addItem(i18n("Medium"), QStringLiteral("medium"));
-    m_effort->addItem(i18n("High"), QStringLiteral("high"));
-    m_effort->addItem(i18n("Extra-high"), QStringLiteral("xhigh"));
-    m_effort->addItem(i18n("Maximum"), QStringLiteral("max"));
     advForm->addRow(i18n("Thinking effort"), m_effort);
     m_advanced->setVisible(false);
     root->addWidget(m_advanced);
     connect(advToggle, &QCheckBox::toggled, m_advanced, &QWidget::setVisible);
+    // All three per-backend combos exist now — populate them for the default
+    // backend selection.
+    rebuildBackendChoices();
 
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
     buttons->button(QDialogButtonBox::Ok)->setText(i18n("Create Agent"));

@@ -24,6 +24,10 @@ import (
 //   - control_request/interrupt is acked with a control_response, and a held
 //     turn's (aborted) result is then emitted — the behaviour a spike against
 //     claude 2.1.185 confirmed;
+//   - control_request set_model / set_permission_mode answer success, except
+//     a value of "bad" which answers the error shape claude 2.1.220 uses for
+//     an unrecognised model / mode; other subtypes answer "Unsupported
+//     control request subtype" (also the real CLI's behaviour);
 //   - EOF on stdin exits 0 — the CLI's clean "input closed" exit.
 func fakeClaudeScript(t *testing.T) string {
 	t.Helper()
@@ -64,13 +68,30 @@ for line in sys.stdin:
                 {"type": "text", "text": "ok"}]}})
             send({"type": "result", "subtype": "success", "is_error": False,
                   "session_id": "sess-fake"})
-    elif t == "control_request" and msg.get("request", {}).get("subtype") == "interrupt":
-        send({"type": "control_response", "response": {
-            "request_id": msg.get("request_id"), "subtype": "success"}})
-        if held:
-            send({"type": "result", "subtype": "error_during_execution",
-                  "is_error": True, "session_id": "sess-fake"})
-            held = False
+    elif t == "control_request":
+        req = msg.get("request", {})
+        sub = req.get("subtype")
+        rid = msg.get("request_id")
+        if sub == "interrupt":
+            send({"type": "control_response", "response": {
+                "request_id": rid, "subtype": "success"}})
+            if held:
+                send({"type": "result", "subtype": "error_during_execution",
+                      "is_error": True, "session_id": "sess-fake"})
+                held = False
+        elif sub in ("set_model", "set_permission_mode"):
+            value = req.get("model") or req.get("mode") or ""
+            if value == "bad":
+                send({"type": "control_response", "response": {
+                    "request_id": rid, "subtype": "error",
+                    "error": "not a recognized value: " + value}})
+            else:
+                send({"type": "control_response", "response": {
+                    "request_id": rid, "subtype": "success"}})
+        else:
+            send({"type": "control_response", "response": {
+                "request_id": rid, "subtype": "error",
+                "error": "Unsupported control request subtype: " + str(sub)}})
 `
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake claude: %v", err)
@@ -289,6 +310,38 @@ func TestInterruptIdle(t *testing.T) {
 		t.Fatal("post-turn interrupt killed the process; it must be a no-op")
 	}
 	sup.StopAll()
+}
+
+// TestSetModelAndPermissionMode covers the mid-session control requests: a
+// success resolves the call, and the CLI's rejection text is returned
+// verbatim so the UI can show it and revert the picker.
+func TestSetModelAndPermissionMode(t *testing.T) {
+	claudeBin := fakeClaudeScript(t)
+	col := &eventCollector{}
+	sup := NewSupervisor(claudeBin, testLogger(), col.add)
+
+	th, err := sup.Start(StartOptions{ID: "t-ctl1", WorkDir: t.TempDir(), Prompt: "hello"})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	col.waitFor(t, "turn result", isResult)
+
+	if err := sup.SetModel(th.ID, "claude-sonnet-4-6"); err != nil {
+		t.Errorf("SetModel: %v", err)
+	}
+	if err := sup.SetPermissionMode(th.ID, "plan"); err != nil {
+		t.Errorf("SetPermissionMode: %v", err)
+	}
+	if err := sup.SetModel(th.ID, "bad"); err == nil {
+		t.Error("SetModel(bad) succeeded; the CLI's rejection should propagate")
+	} else if !strings.Contains(err.Error(), "not a recognized value") {
+		t.Errorf("SetModel(bad) error = %q, want the CLI's text", err)
+	}
+	sup.StopAll()
+
+	if err := sup.SetModel(th.ID, "claude-sonnet-4-6"); err == nil {
+		t.Error("SetModel on a stopped thread succeeded; it should be rejected")
+	}
 }
 
 // TestInterruptMidTurn: the pre-existing in-band interrupt contract still

@@ -34,6 +34,7 @@ class QHBoxLayout;
 class QLabel;
 class QLineEdit;
 class QMenu;
+class QListWidget;
 class QPlainTextEdit;
 class QPushButton;
 class QScrollArea;
@@ -275,6 +276,26 @@ private:
     void updateWorkflowChip();
     // Open the dedicated WorkflowMonitorDialog for the remembered workflow.
     void openWorkflowMonitor();
+    // Whether the panel is on the Kimi backend: the bound thread's backend, or
+    // (before a thread exists) the picker's selection.
+    bool kimiSelected() const;
+    // Slash-command autocomplete (plan 14 P3): typing "/" as the first
+    // character of the composer opens a popup listing the harness's commands
+    // (claude: the init event's slash_commands; kimi: ACP
+    // available_commands_update via the _commands event). Enter/Tab inserts,
+    // Esc dismisses, Up/Down navigate.
+    void updateSlashPopup();
+    void acceptSlashCompletion();
+    void hideSlashPopup();
+    // Repopulate the "when to ask" / thinking-effort combos for the selected
+    // backend (Claude's fixed vocabularies vs kimi's discovered config
+    // options), restoring the per-backend sticky choice.
+    void rebuildModeCombo();
+    void rebuildEffortCombo();
+    // Apply a model / effort / permission-mode change to the RUNNING agent via
+    // agent.setOption (mid-session); a no-op before start or while dormant —
+    // those apply at the next (re)start through the normal launch params.
+    void maybePushOption(const QString &option, const QString &value);
     void addNote(const QString &html, const QString &kind);
     // Append a collapsed thinking card for a reasoning block (both harnesses
     // emit the same thinking-block shape; kimi via the translator).
@@ -367,6 +388,11 @@ private:
     // ACP plan update rewrites this one card in place, so the feed carries the
     // current plan rather than a trail of stale copies.
     int m_checklistKey = -1;
+    // The harness's slash commands (name, description) feeding the composer's
+    // autocomplete; descriptions are empty for claude (the init event lists
+    // names only).
+    QList<QPair<QString, QString>> m_slashCommands;
+    QListWidget *m_slashPopup = nullptr;
 
     // Background-Workflow tracking. A `Workflow` tool_use is recorded by its
     // transcript key (with its input JSON) so the paired tool_result — which

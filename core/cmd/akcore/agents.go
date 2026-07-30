@@ -123,7 +123,12 @@ func startKimiThread(d handlerDeps, threadID string, p agentStartParams) {
 		Prompt:      p.Prompt,
 		Attachments: p.Attachments,
 		Model:       p.Model,
-		MCPServers:  []kimi.MCPServer{coopMCPServer(d.exePath, d.socketPath, threadID, wt.Path)},
+		// The kimi analogues of effort and permission mode: the "thinking"
+		// and "mode" config options (values are kimi's own vocabularies,
+		// picked from the enumerations the handshake reports).
+		Thinking:   p.Effort,
+		Mode:       p.PermissionMode,
+		MCPServers: []kimi.MCPServer{coopMCPServer(d.exePath, d.socketPath, threadID, wt.Path)},
 	})
 	if err != nil {
 		emitLifecycle(d.srv, threadID, "error", err.Error(), &wt)
@@ -135,15 +140,17 @@ func startKimiThread(d handlerDeps, threadID string, p agentStartParams) {
 	// the supervisor emits the init event synchronously inside Start, before
 	// this record exists.)
 	rec := session.Record{
-		ThreadID:  threadID,
-		SessionID: th.SessionID(),
-		Project:   p.WorkspacePath,
-		Worktree:  wt,
-		Backend:   session.BackendKimi,
-		Model:     p.Model,
-		Title:     summarizePrompt(p.Prompt),
-		Created:   time.Now(),
-		Status:    session.StatusRunning,
+		ThreadID:       threadID,
+		SessionID:      th.SessionID(),
+		Project:        p.WorkspacePath,
+		Worktree:       wt,
+		Backend:        session.BackendKimi,
+		Model:          p.Model,
+		Effort:         p.Effort,
+		PermissionMode: p.PermissionMode,
+		Title:          summarizePrompt(p.Prompt),
+		Created:        time.Now(),
+		Status:         session.StatusRunning,
 	}
 	if err := d.sessions.Put(rec); err != nil {
 		d.log.Warn("could not persist thread record", "thread", threadID, "err", err)
@@ -177,6 +184,8 @@ func resumeKimiThread(d handlerDeps, rec session.Record) {
 		SessionID:  rec.SessionID,
 		Resume:     true,
 		Model:      rec.Model,
+		Thinking:   rec.Effort,
+		Mode:       rec.PermissionMode,
 		MCPServers: []kimi.MCPServer{coopMCPServer(d.exePath, d.socketPath, rec.ThreadID, rec.Worktree.Path)},
 	}); err != nil {
 		emitLifecycle(d.srv, rec.ThreadID, "error", err.Error(), &rec.Worktree)

@@ -577,6 +577,79 @@ func registerHandlers(d handlerDeps) {
 		return map[string]any{"ok": true}, nil
 	})
 
+	// agent.setOption changes one session option — model, permissionMode or
+	// effort — on a RUNNING thread, mid-session, and persists it to the record
+	// so a later resume replays the same choice. Backend mapping:
+	//   claude: model → set_model control request; permissionMode →
+	//     set_permission_mode (both verified against claude 2.1.220); effort
+	//     is rejected — the CLI has no set_effort control request.
+	//   kimi: model/effort/permissionMode → the session/set_config_option
+	//     ids "model" / "thinking" / "mode" (kimi's own value vocabularies).
+	// The CLI's own rejection (unknown model id, bad mode) is passed through
+	// verbatim so the UI can show it and revert the picker.
+	d.srv.Handle("agent.setOption", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			ThreadID string `json:"threadId"`
+			Option   string `json:"option"` // "model" | "permissionMode" | "effort"
+			Value    string `json:"value"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		if p.ThreadID == "" || p.Option == "" {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "threadId and option are required")
+		}
+		if !d.agentRunning(p.ThreadID) {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams,
+				"the agent is not running — options apply at the next start instead")
+		}
+		applied := p.Value
+		if d.isKimiThread(p.ThreadID) {
+			configID := map[string]string{
+				"model":          "model",
+				"effort":         "thinking",
+				"permissionMode": "mode",
+			}[p.Option]
+			if configID == "" {
+				return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown option "+p.Option)
+			}
+			if err := d.ksup.SetConfigOption(p.ThreadID, configID, p.Value); err != nil {
+				return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+			}
+		} else {
+			switch p.Option {
+			case "model":
+				applied = resolveModel(p.Value)
+				if err := d.sup.SetModel(p.ThreadID, applied); err != nil {
+					return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+				}
+			case "permissionMode":
+				if err := d.sup.SetPermissionMode(p.ThreadID, p.Value); err != nil {
+					return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+				}
+			case "effort":
+				return nil, ipc.Errorf(ipc.CodeInvalidParams,
+					"Claude Code does not support changing the thinking effort mid-session")
+			default:
+				return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown option "+p.Option)
+			}
+		}
+		// Persist so a resume replays the latest choice, not the start-time one.
+		_ = d.sessions.UpdateQuiet(p.ThreadID, func(r *session.Record) {
+			switch p.Option {
+			case "model":
+				r.Model = applied
+			case "effort":
+				r.Effort = applied
+			case "permissionMode":
+				r.PermissionMode = applied
+			}
+		})
+		d.log.Info("agent option changed", "thread", p.ThreadID,
+			"option", p.Option, "value", applied)
+		return map[string]any{"ok": true, "value": applied}, nil
+	})
+
 	// agent.interrupt cancels the in-flight turn immediately (no further tokens
 	// billed) while keeping the process resident and the session hot: the next
 	// agent.send goes down the same stdin with no resume cost. The supervisor

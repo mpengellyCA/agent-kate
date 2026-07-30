@@ -181,9 +181,7 @@ func TestToolNameMapping(t *testing.T) {
 // Updates with no Claude-shaped counterpart are dropped silently.
 func TestIgnoredUpdates(t *testing.T) {
 	tr := newTranslator("s1", "", nil)
-	for _, kind := range []string{
-		"config_option_update", "available_commands_update",
-	} {
+	for _, kind := range []string{"config_option_update"} {
 		if ev := tr.update(upd(kind, map[string]any{
 			"content": map[string]any{"type": "text", "text": "ignored"},
 		})); len(ev) != 0 {
@@ -194,6 +192,22 @@ func TestIgnoredUpdates(t *testing.T) {
 	if ev := tr.update(upd("plan", map[string]any{"entries": []any{}})); len(ev) != 0 {
 		t.Errorf("empty plan emitted %d events, want 0", len(ev))
 	}
+}
+
+// The CLI's slash-command list ships as the synthetic _commands event that
+// feeds the composer's autocomplete.
+func TestAvailableCommandsBecomeCommandsEvent(t *testing.T) {
+	tr := newTranslator("s1", "", nil)
+	got := tr.update(upd("available_commands_update", map[string]any{
+		"availableCommands": []any{
+			map[string]any{"name": "init", "description": "Create AGENTS.md"},
+			map[string]any{"name": "compact", "description": "Compact the session"},
+		},
+	}))
+	assertEvents(t, got,
+		`{"type":"_commands","commands":[
+		  {"name":"init","description":"Create AGENTS.md"},
+		  {"name":"compact","description":"Compact the session"}]}`)
 }
 
 // Thought deltas accumulate silently and flush as ONE thinking-block assistant
