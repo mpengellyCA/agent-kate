@@ -50,6 +50,12 @@ type Supervisor struct {
 	mu      sync.Mutex
 	threads map[string]*Thread
 
+	// Interrupt-backstop timings: how long an unacknowledged in-band abort may
+	// stay pending before the process group is SIGINTed, and how long after
+	// that before SIGKILL. Overridable in tests; the defaults suit real claude.
+	interruptBackstopDelay time.Duration
+	interruptKillDelay     time.Duration
+
 	// reapWG tracks every in-flight reap() goroutine. StopAll waits on it so
 	// the caller can be sure every thread's "exited" lifecycle event has been
 	// delivered — and thus every cold-exit compaction has been spawned —
@@ -65,10 +71,12 @@ func NewSupervisor(claudeBin string, log *slog.Logger, emit EventFunc) *Supervis
 		claudeBin = "claude"
 	}
 	return &Supervisor{
-		claudeBin: claudeBin,
-		log:       log,
-		emit:      emit,
-		threads:   make(map[string]*Thread),
+		claudeBin:              claudeBin,
+		log:                    log,
+		emit:                   emit,
+		interruptBackstopDelay: 3 * time.Second,
+		interruptKillDelay:     2 * time.Second,
+		threads:                make(map[string]*Thread),
 	}
 }
 
@@ -152,7 +160,16 @@ type Thread struct {
 	pgid        int         // process-group id (== leader pid); signalled by Interrupt
 	interrupted bool        // set by Interrupt so reap() reports a user-interrupt if the process dies
 	aborting    bool        // set by Interrupt while an in-band abort is pending; cleared on the aborted turn's result
-	hotCompact  *hotCompact // when non-nil, the next assistant turn is captured for a summary
+	stopping    bool        // a Stop is in flight; suppresses turn_aborted and rejects new Sends
+	// turnsInFlight counts user messages written whose `result` event has not
+	// arrived yet — the claude counterpart of the kimi supervisor's
+	// activePrompts. Every turn is initiated by our own Send (opening prompt,
+	// follow-ups, Compact's summary prompt), and the CLI ends each with exactly
+	// one result event, so Send increments and the result observer decrements.
+	// Interrupt is a no-op at 0: aborting an idle CLI would arm a backstop no
+	// result can ever disarm, killing a healthy resident process seconds later.
+	turnsInFlight int
+	hotCompact    *hotCompact // when non-nil, the next assistant turn is captured for a summary
 
 	co *coalescer // batches this thread's events before they reach the emit callback
 }
@@ -437,28 +454,59 @@ func (s *Supervisor) Send(threadID, text string, attachments []Attachment) error
 	if !t.alive {
 		return fmt.Errorf("thread %q is not running", threadID)
 	}
+	if t.stopping {
+		return fmt.Errorf("thread %q is stopping", threadID)
+	}
 	if _, err := t.stdin.Write(append(msg, '\n')); err != nil {
 		return fmt.Errorf("write to agent: %w", err)
 	}
+	t.turnsInFlight++
 	return nil
 }
 
-// Stop ends a thread: it closes the input stream and force-kills the process
-// if it does not exit promptly.
+// Stop ends a thread. On an idle thread it closes the input stream — the CLI
+// exits at its next stdin read — with a kill backstop for a process that
+// doesn't. On a busy thread (a turn in flight) closing stdin alone is not
+// graceful: the CLI keeps generating until the turn ends, so the backstop
+// SIGKILLs any turn longer than the grace window mid-write, which can leave
+// the session JSONL truncated. So a busy Stop first aborts the turn in-band
+// (the same interrupt the CLI's Esc uses), waits — bounded — for the aborted
+// turn's result to land, and only then closes stdin. Stop returns immediately
+// in both cases; the graceful sequencing runs on a background goroutine.
 func (s *Supervisor) Stop(threadID string) error {
 	t := s.thread(threadID)
 	if t == nil {
 		return fmt.Errorf("unknown thread %q", threadID)
 	}
 	t.mu.Lock()
-	alive := t.alive
+	if !t.alive {
+		_ = t.stdin.Close()
+		t.mu.Unlock()
+		return nil
+	}
+	if t.stopping {
+		t.mu.Unlock()
+		return nil // a stop is already in flight
+	}
+	t.stopping = true
+	busy := t.turnsInFlight > 0
+	t.mu.Unlock()
+	if busy {
+		safe.Go("agent.gracefulStop", func() { s.abortThenClose(t) })
+	} else {
+		s.closeStdin(t)
+	}
+	return nil
+}
+
+// closeStdin closes the thread's input stream so the CLI exits at its next
+// stdin read, and arms the kill backstop for a process that doesn't. reap()
+// handles the clean exit; the backstop only fires if the process lingers.
+func (s *Supervisor) closeStdin(t *Thread) {
+	t.mu.Lock()
 	proc := t.cmd.Process
 	_ = t.stdin.Close()
 	t.mu.Unlock()
-	if !alive {
-		return nil
-	}
-	// reap() handles the clean exit; this is only a backstop.
 	safe.Go("agent.stopKillBackstop", func() {
 		time.Sleep(5 * time.Second)
 		t.mu.Lock()
@@ -468,14 +516,39 @@ func (s *Supervisor) Stop(threadID string) error {
 			_ = proc.Kill()
 		}
 	})
-	return nil
+}
+
+// abortThenClose is the busy half of Stop: abort the in-flight turn in-band,
+// wait for its result (so the CLI finishes writing the session JSONL), then
+// close stdin. The wait is bounded just past Interrupt's own escalation
+// window: if the abort never lands (a hung tool), the interrupt backstop has
+// already SIGINT/SIGKILLed the process by then and the close is a no-op.
+func (s *Supervisor) abortThenClose(t *Thread) {
+	if err := s.Interrupt(t.ID); err != nil {
+		s.log.Warn("stop: in-band abort failed; closing stdin directly",
+			"thread", t.ID, "err", err)
+		s.closeStdin(t)
+		return
+	}
+	deadline := time.Now().Add(s.interruptBackstopDelay + s.interruptKillDelay + time.Second)
+	for time.Now().Before(deadline) {
+		t.mu.Lock()
+		done := !t.alive || (!t.aborting && t.turnsInFlight == 0)
+		t.mu.Unlock()
+		if done {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	s.closeStdin(t)
 }
 
 // Interrupt halts a thread's in-flight turn *immediately* while keeping the
-// process resident and the session hot. Unlike Stop — the graceful "finish this
-// turn, then quit" path used by StopAll and panel close — this aborts generation
+// process resident and the session hot. Unlike Stop — the "wind the thread
+// down" path used by StopAll and panel close — this aborts generation
 // mid-response so no further tokens are billed, then leaves the CLI running so the
-// next Send goes down the same stdin with no resume cost.
+// next Send goes down the same stdin with no resume cost. A no-op on an idle
+// thread: with no turn in flight there is nothing to abort.
 //
 // Primary path is in-band and does NOT close stdin: it writes Claude Code's
 // stream-json interrupt control_request. A spike against claude 2.1.185 confirmed
@@ -508,6 +581,14 @@ func (s *Supervisor) Interrupt(threadID string) error {
 		t.mu.Unlock()
 		return nil
 	}
+	if t.turnsInFlight == 0 {
+		// Nothing in flight to abort. Sending the frame anyway would arm the
+		// backstop with no result coming to disarm it, and a few seconds later
+		// it would kill a perfectly idle resident process (the same hazard the
+		// kimi supervisor guards against).
+		t.mu.Unlock()
+		return nil
+	}
 	// Mark the abort pending but do NOT set t.interrupted yet: that flag makes
 	// reap() report a user-interrupt, and we only want that if the escalation
 	// backstop has to kill the process. A clean in-band abort keeps the process
@@ -528,7 +609,7 @@ func (s *Supervisor) Interrupt(threadID string) error {
 	// result (a hung tool the CLI can't cancel). If the abort landed cleanly,
 	// pumpStdout has already cleared t.aborting, so we do nothing.
 	safe.Go("agent.interruptBackstop", func() {
-		time.Sleep(3 * time.Second)
+		time.Sleep(s.interruptBackstopDelay)
 		if !s.abortPending(threadID) {
 			return // clean in-band abort — process stays alive
 		}
@@ -539,7 +620,7 @@ func (s *Supervisor) Interrupt(threadID string) error {
 		if pgid > 0 {
 			_ = syscall.Kill(-pgid, syscall.SIGINT)
 		}
-		time.Sleep(2 * time.Second)
+		time.Sleep(s.interruptKillDelay)
 		if !s.Running(threadID) {
 			return
 		}
@@ -565,12 +646,13 @@ func (s *Supervisor) abortPending(threadID string) bool {
 }
 
 // StopAll terminates every running thread (used at core shutdown) and blocks
-// until each thread's reap() has run to completion. Stop() only closes stdin
-// and schedules a 5s backstop kill, so without this join the process could
-// exit before a thread's "exited" lifecycle event fires — which is exactly
-// what spawns the cold-exit compaction. Waiting here guarantees every such
-// compaction has at least been spawned (and registered with its WaitGroup)
-// before the caller moves on to drain them.
+// until each thread's reap() has run to completion. Stop() returns before the
+// process has exited (it only sequences the abort/stdin-close and backstops),
+// so without this join the core could exit before a thread's "exited"
+// lifecycle event fires — which is exactly what spawns the cold-exit
+// compaction. Waiting here guarantees every such compaction has at least been
+// spawned (and registered with its WaitGroup) before the caller moves on to
+// drain them.
 func (s *Supervisor) StopAll() {
 	s.mu.Lock()
 	ids := make([]string, 0, len(s.threads))
@@ -604,13 +686,14 @@ func (s *Supervisor) pumpStdout(t *Thread, r io.Reader) {
 		// billed for (per-turn usage). Both observe; neither alters the stream.
 		t.meter.Observe(raw)
 		t.usage.Observe(raw)
-		boundary, dedup := classifyEvent(raw)
+		boundary, dedup, isResult := classifyEvent(raw)
 		t.co.add(json.RawMessage(raw), boundary, dedup)
-		// A `result` while an in-band abort is pending completes the interrupt:
-		// the process stays resident, so emit `turn_aborted` (not a reap) to let
-		// the UI reset to idle and keep accepting messages on the same stdin. Do
-		// this AFTER the result event itself is buffered so ordering is preserved.
-		s.observeAbort(t, raw)
+		// A `result` ends a turn: decrement the in-flight count and complete a
+		// pending in-band interrupt. Done AFTER the result event itself is
+		// buffered so the turn_aborted lifecycle event orders behind it.
+		if isResult {
+			s.observeTurnEnd(t)
+		}
 	}
 	// Drain whatever is still buffered when the stream ends so a trailing
 	// partial batch is never stranded behind its timer.
@@ -618,8 +701,9 @@ func (s *Supervisor) pumpStdout(t *Thread, r io.Reader) {
 }
 
 // classifyEvent inspects one stream-json event to decide whether it should
-// force an immediate coalescer flush (a semantic boundary) and whether it is a
-// candidate for byte-identical dedup within a batch.
+// force an immediate coalescer flush (a semantic boundary), whether it is a
+// candidate for byte-identical dedup within a batch, and whether it is a
+// `result` (a turn end — the caller tracks those for interrupt/stop safety).
 //
 // Boundaries are kept conservative: a `result` (turn end) and any assistant
 // turn carrying a tool_use block (the UI renders a tool card and may gate on
@@ -627,7 +711,7 @@ func (s *Supervisor) pumpStdout(t *Thread, r io.Reader) {
 // Plain assistant text events are dedup candidates because `claude --verbose`
 // can repeat an identical partial snapshot; only exact duplicates are dropped,
 // so no content is ever lost.
-func classifyEvent(raw json.RawMessage) (boundary, dedup bool) {
+func classifyEvent(raw json.RawMessage) (boundary, dedup, isResult bool) {
 	var head struct {
 		Type    string `json:"type"`
 		Message struct {
@@ -637,20 +721,20 @@ func classifyEvent(raw json.RawMessage) (boundary, dedup bool) {
 		} `json:"message"`
 	}
 	if json.Unmarshal(raw, &head) != nil {
-		return false, false
+		return false, false, false
 	}
 	switch head.Type {
 	case "result":
-		return true, false
+		return true, false, true
 	case "assistant":
 		for _, blk := range head.Message.Content {
 			if blk.Type == "tool_use" {
-				return true, false
+				return true, false, false
 			}
 		}
-		return false, true
+		return false, true, false
 	}
-	return false, false
+	return false, false, false
 }
 
 // observeHotCompact pulls assistant text out of one stream-json event into
@@ -687,33 +771,30 @@ func observeHotCompact(t *Thread, raw json.RawMessage) {
 	}
 }
 
-// observeAbort completes a pending in-band interrupt when the aborted turn's
-// `result` event arrives. The process stays alive, so instead of a reap we emit
-// a `turn_aborted` lifecycle event: the UI resets to idle and the next Send goes
-// down the same stdin with no resume cost. A no-op unless an abort is pending.
-func (s *Supervisor) observeAbort(t *Thread, raw json.RawMessage) {
+// observeTurnEnd handles a `result` event: the turn it ends is no longer in
+// flight, and if an in-band interrupt was pending this result completes it.
+// The process stays alive on a clean abort, so instead of a reap we emit a
+// `turn_aborted` lifecycle event: the UI resets to idle and the next Send goes
+// down the same stdin with no resume cost. During a graceful Stop the
+// lifecycle event is suppressed — the exited event that follows tells the UI
+// everything, and an "interrupted — ready for your next message" note on a
+// thread that is shutting down would mislead.
+func (s *Supervisor) observeTurnEnd(t *Thread) {
 	t.mu.Lock()
-	if !t.aborting {
-		t.mu.Unlock()
-		return
+	if t.turnsInFlight > 0 {
+		t.turnsInFlight--
 	}
-	t.mu.Unlock()
-	var head struct {
-		Type string `json:"type"`
-	}
-	if json.Unmarshal(raw, &head) != nil || head.Type != "result" {
-		return
-	}
-	t.mu.Lock()
-	// Re-check under the lock in case the backstop fired between the two loads.
-	if !t.aborting {
-		t.mu.Unlock()
-		return
-	}
+	aborted := t.aborting
 	t.aborting = false
+	stopping := t.stopping
 	t.mu.Unlock()
+	if !aborted {
+		return
+	}
 	s.log.Info("agent turn aborted in-band; process stays resident", "thread", t.ID)
-	s.emitLifecycle(t, "turn_aborted", "interrupted — session kept, ready for your next message")
+	if !stopping {
+		s.emitLifecycle(t, "turn_aborted", "interrupted — session kept, ready for your next message")
+	}
 }
 
 // Compact sends a one-shot summarisation prompt to a live thread and waits

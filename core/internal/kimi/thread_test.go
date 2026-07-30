@@ -150,6 +150,17 @@ func (c *eventCollector) waitFor(t *testing.T, what string, pred func(ev map[str
 	t.Fatalf("timed out waiting for %s; events so far:\n%s", what, sb.String())
 }
 
+// indexOf returns the position of the first event matching pred, or -1.
+func (c *eventCollector) indexOf(pred func(ev map[string]any) bool) int {
+	for i, raw := range c.snapshot() {
+		var ev map[string]any
+		if json.Unmarshal(raw, &ev) == nil && pred(ev) {
+			return i
+		}
+	}
+	return -1
+}
+
 func isLifecycle(phase string) func(map[string]any) bool {
 	return func(ev map[string]any) bool {
 		return ev["type"] == "_lifecycle" && ev["phase"] == phase
@@ -372,6 +383,55 @@ func TestKimiResume(t *testing.T) {
 			before[0], after[0])
 	}
 	sup.StopAll()
+}
+
+// TestKimiGracefulStopMidTurn is the P1 regression test for the kimi side:
+// Stop on a busy thread must cancel the turn via session/cancel, let the
+// cancelled turn's result land, and only then close stdin — instead of
+// cutting the turn off and relying on the kill backstop. The turn_aborted
+// lifecycle event is suppressed during a stop (the exit note is the one the
+// UI should show), and new Sends are rejected once the stop is in flight.
+func TestKimiGracefulStopMidTurn(t *testing.T) {
+	kimiBin := fakeKimiScript(t)
+	col := &eventCollector{}
+	sup := NewSupervisor(kimiBin, testLogger(), col.add, nil, t.TempDir())
+
+	th, err := sup.Start(StartOptions{ID: "t-kimi6", WorkDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if err := sup.Send(th.ID, "wait-cancel", nil); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	col.waitFor(t, "in-flight tool call", hasToolUse)
+
+	if err := sup.Stop(th.ID); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := sup.Send(th.ID, "one more thing", nil); err == nil {
+		t.Error("send during a stop succeeded; it should be rejected")
+	}
+	col.waitFor(t, "exited lifecycle", isLifecycle("exited"))
+
+	ri := col.indexOf(isResult)
+	ei := col.indexOf(isLifecycle("exited"))
+	if ri < 0 {
+		t.Fatal("no result event for the cancelled turn — stdin was closed without cancelling")
+	}
+	if ri > ei {
+		t.Errorf("result (index %d) arrived after the exit event (index %d)", ri, ei)
+	}
+	var exitEv map[string]any
+	_ = json.Unmarshal(col.snapshot()[ei], &exitEv)
+	if got := exitEv["detail"]; got != "exited cleanly" {
+		t.Errorf("exit detail = %v, want %q", got, "exited cleanly")
+	}
+	if i := col.indexOf(isLifecycle("turn_aborted")); i >= 0 {
+		t.Errorf("turn_aborted emitted during a stop (index %d); it should be suppressed", i)
+	}
+	if sup.Running(th.ID) {
+		t.Error("thread still running after stop + exited lifecycle")
+	}
 }
 
 // TestKimiInterruptIdle: an interrupt with no turn in flight — and an

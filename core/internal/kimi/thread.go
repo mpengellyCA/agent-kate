@@ -75,6 +75,7 @@ type Thread struct {
 	pgid        int  // process-group id (== leader pid); signalled by the interrupt backstop
 	interrupted bool // set when the interrupt backstop had to kill; reap() reports a user-interrupt
 	cancelling  bool // a session/cancel is in flight; the last prompt completion clears it
+	stopping    bool // a Stop is in flight; suppresses turn_aborted and rejects new Sends
 	// activePrompts counts session/prompt requests awaiting their response.
 	// Normally 0 or 1 (ACP allows one turn per session; kimi rejects overlap),
 	// but a rejected overlapping prompt completes independently and must not
@@ -431,13 +432,17 @@ func (s *Supervisor) Send(threadID, text string, attachments []agent.Attachment)
 	}
 	t.mu.Lock()
 	alive := t.alive
+	stopping := t.stopping
 	sid := t.sessionID
-	if alive {
+	if alive && !stopping {
 		t.activePrompts++ // Interrupt has something to cancel from here on
 	}
 	t.mu.Unlock()
 	if !alive {
 		return fmt.Errorf("thread %q is not running", threadID)
+	}
+	if stopping {
+		return fmt.Errorf("thread %q is stopping", threadID)
 	}
 	err := t.client.send("session/prompt", map[string]any{
 		"sessionId": sid,
@@ -471,6 +476,7 @@ func (s *Supervisor) onPromptDone(t *Thread, f acpFrame) {
 		t.cancelling = false
 	}
 	tr := t.tr
+	stopping := t.stopping
 	t.mu.Unlock()
 
 	if f.Error != nil {
@@ -496,7 +502,11 @@ func (s *Supervisor) onPromptDone(t *Thread, f acpFrame) {
 	}
 	_ = json.Unmarshal(f.Result, &res)
 	s.emitEvents(t, tr.endTurn())
-	if res.StopReason == "cancelled" {
+	// During a graceful Stop the turn_aborted lifecycle event is suppressed:
+	// the exited event that follows tells the UI everything, and an
+	// "interrupted — ready for your next message" note on a thread that is
+	// shutting down would mislead.
+	if res.StopReason == "cancelled" && !stopping {
 		s.emitLifecycle(t, "turn_aborted", "interrupted — session kept, ready for your next message")
 	}
 }
@@ -575,22 +585,48 @@ func (s *Supervisor) cancelPending(threadID string) bool {
 	return t.alive && t.cancelling
 }
 
-// Stop ends a thread: it closes the input stream and force-kills the process
-// if it does not exit promptly.
+// Stop ends a thread. On an idle thread it closes the input stream — kimi
+// exits when its stdin ends — with a kill backstop for a process that doesn't.
+// On a busy thread (a prompt in flight) closing stdin alone is not graceful:
+// the turn would be cut off mid-stream. So a busy Stop first cancels the turn
+// via session/cancel (the same interrupt the interactive CLI's Esc maps to),
+// waits — bounded — for the prompt response to land, and only then closes
+// stdin. Stop returns immediately in both cases; the graceful sequencing runs
+// on a background goroutine — the same contract agent.Supervisor.Stop makes.
 func (s *Supervisor) Stop(threadID string) error {
 	t := s.thread(threadID)
 	if t == nil {
 		return fmt.Errorf("unknown thread %q", threadID)
 	}
 	t.mu.Lock()
-	alive := t.alive
+	if !t.alive {
+		_ = t.stdin.Close()
+		t.mu.Unlock()
+		return nil
+	}
+	if t.stopping {
+		t.mu.Unlock()
+		return nil // a stop is already in flight
+	}
+	t.stopping = true
+	busy := t.activePrompts > 0
+	t.mu.Unlock()
+	if busy {
+		safe.Go("kimi.gracefulStop", func() { s.abortThenClose(t) })
+	} else {
+		s.closeStdin(t)
+	}
+	return nil
+}
+
+// closeStdin closes the thread's input stream so kimi exits, and arms the kill
+// backstop for a process that doesn't. reap() handles the clean exit; the
+// backstop only fires if the process lingers.
+func (s *Supervisor) closeStdin(t *Thread) {
+	t.mu.Lock()
 	proc := t.cmd.Process
 	_ = t.stdin.Close()
 	t.mu.Unlock()
-	if !alive {
-		return nil
-	}
-	// reap() handles the clean exit; this is only a backstop.
 	safe.Go("kimi.stopKillBackstop", func() {
 		time.Sleep(5 * time.Second)
 		t.mu.Lock()
@@ -600,7 +636,31 @@ func (s *Supervisor) Stop(threadID string) error {
 			_ = proc.Kill()
 		}
 	})
-	return nil
+}
+
+// abortThenClose is the busy half of Stop: cancel the in-flight turn, wait for
+// its prompt response (ACP's turn boundary), then close stdin. The wait is
+// bounded just past Interrupt's own escalation window: if the cancel never
+// acks (a hung turn), the interrupt backstop has already SIGINT/SIGKILLed the
+// process by then and the close is a no-op.
+func (s *Supervisor) abortThenClose(t *Thread) {
+	if err := s.Interrupt(t.ID); err != nil {
+		s.log.Warn("stop: session/cancel failed; closing stdin directly",
+			"thread", t.ID, "err", err)
+		s.closeStdin(t)
+		return
+	}
+	deadline := time.Now().Add(s.cancelBackstopDelay + s.cancelKillDelay + time.Second)
+	for time.Now().Before(deadline) {
+		t.mu.Lock()
+		done := !t.alive || t.activePrompts == 0
+		t.mu.Unlock()
+		if done {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	s.closeStdin(t)
 }
 
 // StopAll terminates every running thread (used at core shutdown) and blocks

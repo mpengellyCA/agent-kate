@@ -1,6 +1,6 @@
 # 14 — Harness Abstraction & Feature Parity (agent systems rework)
 
-> **Status: planned — not started.** Follows the Kimi Code backend branch
+> **Status: in progress — P1 landed.** Follows the Kimi Code backend branch
 > (`kimi-code-backend`, `e0e9594` + review fixes `5a20c66`). Seven phases;
 > land sequentially, one commit per phase, built green (`scripts/build.sh`,
 > `go test ./...` incl. `-race`, `ctest --test-dir build`), smoke-verified
@@ -151,6 +151,11 @@ timeout is invisible today), background-job elapsed/last-activity in the tray.
 
 - **Claude interrupt** — in-band `control_request:interrupt` + abort
   observer + SIGINT-process-group backstop. Matches the CLI's Esc. ✓
+  (P1 correction: the ✓ held only mid-turn. An *idle* interrupt armed a
+  backstop no result could disarm — the same kill-a-healthy-process hazard
+  `5a20c66` fixed for kimi. P1 added claude-side turn tracking
+  (`turnsInFlight`, the counterpart of kimi's `activePrompts`) and made idle
+  interrupt a no-op.)
 - **Kimi interrupt** — `session/cancel` + backstop; after `5a20c66` a cancel
   racing natural completion or an idle interrupt is a no-op. Matches ACP. ✓
 - **Claude stop mid-turn** — `Stop` closes stdin then **kills after 5 s**, so
@@ -165,8 +170,21 @@ timeout is invisible today), background-job elapsed/last-activity in the tray.
 
 ## Phases
 
-**P1 — Graceful mid-turn stop (S).** Interrupt-then-stop sequencing in both
-supervisors; test with the fake-claude and fake-kimi scripts.
+**P1 — Graceful mid-turn stop (S). ✅ LANDED.** Interrupt-then-stop sequencing
+in both supervisors; tested with the fake-claude and fake-kimi scripts.
+What the implementation added beyond the sketch:
+- Claude-side turn tracking (`Thread.turnsInFlight`; every turn starts with
+  our own Send and ends with exactly one `result`) — needed both to know a
+  Stop is "busy" and to make an idle Interrupt a no-op (see the corrected
+  interrupt note above).
+- A `stopping` flag on both threads: repeated Stops coalesce, Sends during a
+  stop are rejected deterministically ("thread is stopping") instead of
+  racing the stdin close, and the `turn_aborted` lifecycle event is
+  suppressed mid-stop (the exit note is the one the UI should show).
+- The stream-json fake claude lives in `internal/agent/agent_test.go`
+  (init/turns/interrupt), not cmd/akcore — supervisor tests sit with the
+  supervisor, mirroring `internal/kimi/thread_test.go`; cmd/akcore's shell
+  fake still covers the compaction flow.
 
 **P2 — Rendering parity quick wins (M).** Thinking cards (both harnesses —
 translator maps `agent_thought_chunk` to a thinking block), TodoWrite/plan
