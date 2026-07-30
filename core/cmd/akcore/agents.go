@@ -13,21 +13,21 @@ import (
 
 	"agentkate/internal/agent"
 	"agentkate/internal/compact"
+	"agentkate/internal/harness"
 	"agentkate/internal/kimi"
 	"agentkate/internal/safe"
 	"agentkate/internal/session"
 	"agentkate/internal/worktree"
 )
 
-// startAgentThread creates the thread's worktree, writes its MCP config and
-// launches the headless agent. Failures are reported as lifecycle events
-// rather than as an error reply, since the agent.start reply has already been
-// sent by the time this runs.
-func startAgentThread(d handlerDeps, threadID, sessionID string, p agentStartParams) {
-	if p.Backend == session.BackendKimi {
-		startKimiThread(d, threadID, p)
-		return
-	}
+// startThread creates the thread's worktree and launches the agent through
+// its harness. Failures are reported as lifecycle events rather than as an
+// error reply, since the agent.start reply has already been sent by the time
+// this runs. sessionID is pre-minted when the harness's capabilities say so
+// (claude --session-id), empty otherwise — the harness assigns its own during
+// launch and Launch reports it back.
+func startThread(d handlerDeps, h harness.Harness, threadID, sessionID string, p agentStartParams) {
+	caps := h.Capabilities()
 	wt, err := worktree.Create(p.WorkspacePath, threadID, p.Isolation)
 	if err != nil {
 		d.log.Error("worktree create failed", "thread", threadID, "err", err)
@@ -39,49 +39,36 @@ func startAgentThread(d handlerDeps, threadID, sessionID string, p agentStartPar
 	d.gitCache.Register(wt)
 	d.gitCache.Activate(threadID) // an agent is about to run here — watch it live
 
-	mcpConfig, err := writeMCPConfig(d.exePath, d.socketPath, threadID, wt.Path, p.CoworkEnabled)
-	if err != nil {
-		emitLifecycle(d.srv, threadID, "error", "mcp config: "+err.Error(), &wt)
-		return
-	}
-
-	// The UI sends a tier token ("opus"/"sonnet"/"haiku"/"fable"/""); resolve
-	// it to a concrete --model id once here and persist that id, so a later
-	// resume replays the exact same model.
-	model := resolveModel(p.Model)
-
-	if _, err := d.sup.Start(agent.StartOptions{
-		ID:             threadID,
+	launched, err := h.Launch(harness.StartSpec{
+		ThreadID:       threadID,
 		WorkDir:        wt.Path,
 		Prompt:         p.Prompt,
-		MCPConfig:      mcpConfig,
-		PermissionMode: p.PermissionMode,
-		Effort:         p.Effort,
-		Model:          model,
 		Attachments:    p.Attachments,
+		Model:          p.Model,
+		Effort:         p.Effort,
+		PermissionMode: p.PermissionMode,
 		SessionID:      sessionID,
-		CoworkEnabled:  p.CoworkEnabled,
+		Cowork:         p.CoworkEnabled,
 		Provider:       p.Provider,
-	}); err != nil {
-		os.Remove(mcpConfig)
+	})
+	if err != nil {
 		emitLifecycle(d.srv, threadID, "error", err.Error(), &wt)
 		return
 	}
 
 	// Persist the thread so it survives a stop, a crash or an Agent Kate
-	// restart, and can later be resumed on this same Claude Code session.
-	permMode := p.PermissionMode
-	if permMode == "" {
-		permMode = "acceptEdits"
-	}
+	// restart, and can later be resumed on the same session. The record holds
+	// what the harness actually APPLIED (resolved model, defaulted mode, the
+	// session id it assigned), so a later resume replays reality.
 	rec := session.Record{
 		ThreadID:       threadID,
-		SessionID:      sessionID,
+		SessionID:      launched.SessionID,
 		Project:        p.WorkspacePath,
 		Worktree:       wt,
-		PermissionMode: permMode,
-		Effort:         p.Effort,
-		Model:          model,
+		Backend:        caps.ID,
+		PermissionMode: launched.PermissionMode,
+		Effort:         launched.Effort,
+		Model:          launched.Model,
 		Title:          summarizePrompt(p.Prompt),
 		Created:        time.Now(),
 		Status:         session.StatusRunning,
@@ -96,79 +83,18 @@ func startAgentThread(d handlerDeps, threadID, sessionID string, p agentStartPar
 	if wt.Isolated {
 		mode = "in an isolated worktree on " + wt.Branch
 	}
-	d.log.Info("agent thread started", "thread", threadID, "isolated", wt.Isolated, "dir", wt.Path)
+	d.log.Info("agent thread started", "thread", threadID, "harness", caps.ID,
+		"isolated", wt.Isolated, "dir", wt.Path)
 	emitLifecycle(d.srv, threadID, "started", "running "+mode, &wt)
 }
 
-// startKimiThread is the kimi-backend counterpart of startAgentThread: same
-// worktree/registry/record lifecycle, but the process is a `kimi acp` child
-// driven over ACP. No MCP-config tempfile (the Cooperation bridge is passed
-// to session/new as a stdio server) and no model tier resolution (kimi takes
-// its own aliases); the session id is kimi-assigned during the handshake.
-func startKimiThread(d handlerDeps, threadID string, p agentStartParams) {
-	wt, err := worktree.Create(p.WorkspacePath, threadID, p.Isolation)
-	if err != nil {
-		d.log.Error("worktree create failed", "thread", threadID, "err", err)
-		emitLifecycle(d.srv, threadID, "error", "worktree: "+err.Error(), nil)
-		return
-	}
-	wt.Number = d.sessions.NextNumber(p.WorkspacePath)
-	d.threads.put(threadID, wt)
-	d.gitCache.Register(wt)
-	d.gitCache.Activate(threadID) // an agent is about to run here — watch it live
-
-	th, err := d.ksup.Start(kimi.StartOptions{
-		ID:          threadID,
-		WorkDir:     wt.Path,
-		Prompt:      p.Prompt,
-		Attachments: p.Attachments,
-		Model:       p.Model,
-		// The kimi analogues of effort and permission mode: the "thinking"
-		// and "mode" config options (values are kimi's own vocabularies,
-		// picked from the enumerations the handshake reports).
-		Thinking:   p.Effort,
-		Mode:       p.PermissionMode,
-		MCPServers: []kimi.MCPServer{coopMCPServer(d.exePath, d.socketPath, threadID, wt.Path)},
-	})
-	if err != nil {
-		emitLifecycle(d.srv, threadID, "error", err.Error(), &wt)
-		return
-	}
-
-	// Kimi assigns its own session id during the ACP handshake; take it from
-	// the thread directly. (The run loop's session_id capture can't do it:
-	// the supervisor emits the init event synchronously inside Start, before
-	// this record exists.)
-	rec := session.Record{
-		ThreadID:       threadID,
-		SessionID:      th.SessionID(),
-		Project:        p.WorkspacePath,
-		Worktree:       wt,
-		Backend:        session.BackendKimi,
-		Model:          p.Model,
-		Effort:         p.Effort,
-		PermissionMode: p.PermissionMode,
-		Title:          summarizePrompt(p.Prompt),
-		Created:        time.Now(),
-		Status:         session.StatusRunning,
-	}
-	if err := d.sessions.Put(rec); err != nil {
-		d.log.Warn("could not persist thread record", "thread", threadID, "err", err)
-	}
-
-	mode := "directly in the workspace"
-	if wt.Isolated {
-		mode = "in an isolated worktree on " + wt.Branch
-	}
-	d.log.Info("kimi thread started", "thread", threadID, "isolated", wt.Isolated, "dir", wt.Path)
-	emitLifecycle(d.srv, threadID, "started", "running "+mode, &wt)
-}
-
-// resumeKimiThread re-launches a dormant kimi thread on its persisted kimi
-// session, in the same worktree it ran in before. Compaction does not exist
-// for kimi, so resume always re-attaches the original session (ACP
-// session/resume) — never a summary-seeded fresh one.
-func resumeKimiThread(d handlerDeps, rec session.Record) {
+// resumeThread re-launches a dormant thread through its harness, in the same
+// worktree it ran in before. For harnesses with compaction support, a current
+// compacted summary seeds a FRESH session instead of replaying the full
+// transcript — that is where the compaction savings actually land; without
+// one (or without the capability) the original session is re-attached.
+func resumeThread(d handlerDeps, h harness.Harness, rec session.Record, provOverride *agent.Provider) {
+	caps := h.Capabilities()
 	if _, err := os.Stat(rec.Worktree.Path); err != nil {
 		emitLifecycle(d.srv, rec.ThreadID, "error",
 			"worktree no longer exists: "+rec.Worktree.Path, nil)
@@ -178,129 +104,86 @@ func resumeKimiThread(d handlerDeps, rec session.Record) {
 	d.gitCache.Register(rec.Worktree)
 	d.gitCache.Activate(rec.ThreadID) // resuming — this thread is active again, watch it
 
-	if _, err := d.ksup.Start(kimi.StartOptions{
-		ID:         rec.ThreadID,
-		WorkDir:    rec.Worktree.Path,
-		SessionID:  rec.SessionID,
-		Resume:     true,
-		Model:      rec.Model,
-		Thinking:   rec.Effort,
-		Mode:       rec.PermissionMode,
-		MCPServers: []kimi.MCPServer{coopMCPServer(d.exePath, d.socketPath, rec.ThreadID, rec.Worktree.Path)},
-	}); err != nil {
-		emitLifecycle(d.srv, rec.ThreadID, "error", err.Error(), &rec.Worktree)
-		return
-	}
-
-	_ = d.sessions.UpdateQuiet(rec.ThreadID, func(r *session.Record) {
-		r.Status = session.StatusRunning
-	})
-	d.log.Info("kimi thread resumed", "thread", rec.ThreadID, "session", rec.SessionID)
-	emitLifecycle(d.srv, rec.ThreadID, "resumed", "resumed Kimi Code session", &rec.Worktree)
-}
-
-// resumeAgentThread re-launches a dormant thread. If a current compacted
-// summary exists, a fresh Claude Code session is started seeded with that
-// summary instead of replaying the full transcript — that is where the
-// compaction savings actually land. Without a current summary the thread
-// resumes on its original session via --resume as before.
-func resumeAgentThread(d handlerDeps, rec session.Record, provOverride *agent.Provider) {
-	if _, err := os.Stat(rec.Worktree.Path); err != nil {
-		emitLifecycle(d.srv, rec.ThreadID, "error",
-			"worktree no longer exists: "+rec.Worktree.Path, nil)
-		return
-	}
-	d.threads.put(rec.ThreadID, rec.Worktree)
-	d.gitCache.Register(rec.Worktree)
-	d.gitCache.Activate(rec.ThreadID) // resuming — this thread is active again, watch it
-
-	mcpConfig, err := writeMCPConfig(d.exePath, d.socketPath, rec.ThreadID, rec.Worktree.Path, rec.CoworkEnabled)
-	if err != nil {
-		emitLifecycle(d.srv, rec.ThreadID, "error", "mcp config: "+err.Error(), &rec.Worktree)
-		return
-	}
-
-	// Pick a path: seed-from-summary if a current summary is on disk, else
-	// classic --resume. A summary is "current" when it has been refreshed
-	// after the last user/agent turn.
-	sum, _ := d.summaries.Get(rec.ThreadID)
-	current := sum != nil &&
-		(rec.LastTurnAt.IsZero() || !rec.LastTurnAt.After(rec.SummaryUpdatedAt))
-
-	opts := agent.StartOptions{
-		ID:             rec.ThreadID,
+	spec := harness.StartSpec{
+		ThreadID:       rec.ThreadID,
 		WorkDir:        rec.Worktree.Path,
-		MCPConfig:      mcpConfig,
-		PermissionMode: rec.PermissionMode,
-		Effort:         rec.Effort,
 		Model:          rec.Model,
-		CoworkEnabled:  rec.CoworkEnabled,
+		Effort:         rec.Effort,
+		PermissionMode: rec.PermissionMode,
+		Cowork:         rec.CoworkEnabled,
 		Provider:       providerFromRecord(rec),
 	}
 	// A fresh override (the UI re-supplying a KWallet-held token the Record never
 	// stores) takes precedence over the env-var resolution baked into the snapshot.
 	if provOverride.Routed() {
-		opts.Provider = provOverride
+		spec.Provider = provOverride
 	}
-	var sessionIDForRecord string
-	var detail string
-	if current {
+
+	// Seed-from-summary when the harness supports compaction and a current
+	// summary is on disk. A summary is "current" when it has been refreshed
+	// after the last user/agent turn.
+	var sum *compact.Summary
+	seeded := false
+	if caps.Compaction {
+		sum, _ = d.summaries.Get(rec.ThreadID)
+		seeded = sum != nil &&
+			(rec.LastTurnAt.IsZero() || !rec.LastTurnAt.After(rec.SummaryUpdatedAt))
+	}
+	detail := "resumed " + caps.DisplayName + " session"
+	if seeded {
 		// Fresh session seeded with the summary text. The instruction line
 		// at the bottom asks the agent to acknowledge briefly so its first
 		// turn is short — minimising the prefix that gets cached.
-		newID := session.NewID()
-		opts.SessionID = newID
-		opts.Resume = false
-		opts.Prompt = sum.Body +
+		spec.SessionID = session.NewID()
+		spec.Prompt = sum.Body +
 			"\n\n---\n\nThe above is prior context from a session that has " +
 			"been compacted. Acknowledge in one sentence that you have read " +
 			"it, then wait for the user's next instruction."
-		sessionIDForRecord = newID
 		detail = "resumed from compacted summary (new session)"
 	} else {
-		opts.SessionID = rec.SessionID
-		opts.Resume = true
-		sessionIDForRecord = rec.SessionID
-		detail = "resumed Claude Code session"
+		spec.SessionID = rec.SessionID
+		spec.Resume = true
 	}
 
-	if _, err := d.sup.Start(opts); err != nil {
-		os.Remove(mcpConfig)
+	launched, err := h.Launch(spec)
+	if err != nil {
 		emitLifecycle(d.srv, rec.ThreadID, "error", err.Error(), &rec.Worktree)
 		return
 	}
 
 	_ = d.sessions.UpdateQuiet(rec.ThreadID, func(r *session.Record) {
 		r.Status = session.StatusRunning
-		if current {
+		if seeded {
 			// The summary is now baked into the new session; clear our
 			// staleness signals so the next compact cycle starts fresh.
-			r.SessionID = sessionIDForRecord
+			r.SessionID = launched.SessionID
 			r.SummaryUpdatedAt = time.Time{}
 			r.LastTurnAt = time.Time{}
 		}
 	})
-	if current {
+	if seeded {
 		// The previous summary belonged to the old session; drop it so a
 		// missed exit-compact on the new session does not silently reuse
 		// stale content.
 		_ = d.summaries.Remove(rec.ThreadID)
 	}
-	d.log.Info("agent thread resumed",
-		"thread", rec.ThreadID, "session", sessionIDForRecord, "seeded", current)
+	d.log.Info("agent thread resumed", "thread", rec.ThreadID, "harness", caps.ID,
+		"session", launched.SessionID, "seeded", seeded)
 	emitLifecycle(d.srv, rec.ThreadID, "resumed", detail, &rec.Worktree)
 }
 
 // forkAgentThread branches a source thread's conversation into a brand-new
 // thread that can run on a different model or effort while keeping the full
 // context. It creates a fresh isolated worktree from the source worktree's HEAD
-// (committed state only — uncommitted changes are NOT copied), then starts the
-// new thread with `--resume <sourceSessionID> --fork-session`, which replays the
-// source context but mints a new Claude Code session for the fork's own turns.
-// The source thread is never touched. The new session id is captured from the
-// CLI init event by the run loop (see run.go's lastSessionID wiring), so the
-// fork's Record starts with an empty SessionID and is filled in on first event.
-func forkAgentThread(d handlerDeps, src session.Record, newThreadID, model, effort, title string) {
+// (committed state only — uncommitted changes are NOT copied), then launches
+// the new thread with the harness's fork semantics (claude: `--resume
+// <sourceSessionID> --fork-session`), which replays the source context but
+// mints a new session for the fork's own turns. The source thread is never
+// touched. The new session id is captured from the init event by the run loop
+// (see run.go's lastSessionID wiring), so the fork's Record starts with an
+// empty SessionID and is filled in on first event. Callers gate on
+// Capabilities().Fork before reaching here.
+func forkAgentThread(d handlerDeps, h harness.Harness, src session.Record, newThreadID, model, effort, title string) {
 	// Branch the fork's worktree from the source worktree's HEAD so it starts
 	// from exactly the committed state the conversation was continuing from.
 	base, ok := worktree.Head(src.Worktree.Path)
@@ -320,37 +203,32 @@ func forkAgentThread(d handlerDeps, src session.Record, newThreadID, model, effo
 	d.gitCache.Register(wt)
 	d.gitCache.Activate(newThreadID)
 
-	mcpConfig, err := writeMCPConfig(d.exePath, d.socketPath, newThreadID, wt.Path, src.CoworkEnabled)
-	if err != nil {
-		emitLifecycle(d.srv, newThreadID, "error", "mcp config: "+err.Error(), &wt)
-		return
-	}
-
 	// Model/effort default to the source's when the fork didn't override them —
 	// a fork that changes only the effort keeps the source model, and vice versa.
-	resolvedModel := src.Model
+	// (The source record already holds resolved/applied values, which Launch
+	// passes through unchanged.)
+	forkModel := src.Model
 	if strings.TrimSpace(model) != "" {
-		resolvedModel = resolveModel(model)
+		forkModel = model
 	}
-	resolvedEffort := src.Effort
+	forkEffort := src.Effort
 	if strings.TrimSpace(effort) != "" {
-		resolvedEffort = effort
+		forkEffort = effort
 	}
 
-	if _, err := d.sup.Start(agent.StartOptions{
-		ID:             newThreadID,
+	launched, err := h.Launch(harness.StartSpec{
+		ThreadID:       newThreadID,
 		WorkDir:        wt.Path,
-		MCPConfig:      mcpConfig,
+		Model:          forkModel,
+		Effort:         forkEffort,
 		PermissionMode: src.PermissionMode,
-		Effort:         resolvedEffort,
-		Model:          resolvedModel,
 		SessionID:      src.SessionID,
 		Resume:         true,
 		ForkSession:    true,
-		CoworkEnabled:  src.CoworkEnabled,
+		Cowork:         src.CoworkEnabled,
 		Provider:       providerFromRecord(src),
-	}); err != nil {
-		os.Remove(mcpConfig)
+	})
+	if err != nil {
 		emitLifecycle(d.srv, newThreadID, "error", err.Error(), &wt)
 		return
 	}
@@ -361,14 +239,15 @@ func forkAgentThread(d handlerDeps, src session.Record, newThreadID, model, effo
 	}
 	rec := session.Record{
 		ThreadID: newThreadID,
-		// SessionID is intentionally empty: --fork-session mints a new one that
-		// the run loop captures from the init event into this record.
-		SessionID:      "",
+		// Empty for a fork: the harness mints a new session whose id the run
+		// loop captures from the init event into this record.
+		SessionID:      launched.SessionID,
 		Project:        src.Project,
 		Worktree:       wt,
-		PermissionMode: src.PermissionMode,
-		Effort:         resolvedEffort,
-		Model:          resolvedModel,
+		Backend:        h.Capabilities().ID,
+		PermissionMode: launched.PermissionMode,
+		Effort:         launched.Effort,
+		Model:          launched.Model,
 		Title:          forkTitle,
 		Created:        time.Now(),
 		Status:         session.StatusRunning,
@@ -387,18 +266,19 @@ func forkAgentThread(d handlerDeps, src session.Record, newThreadID, model, effo
 
 	d.log.Info("agent thread forked",
 		"from", src.ThreadID, "thread", newThreadID, "branch", wt.Branch,
-		"model", resolvedModel, "effort", resolvedEffort)
+		"model", launched.Model, "effort", launched.Effort)
 	emitLifecycle(d.srv, newThreadID, "started",
 		"forked from #"+strconv.Itoa(src.Worktree.Number)+" on "+wt.Branch, &wt)
 }
 
 // promoteAgentThread upgrades a non-isolated thread to an isolated worktree: it
-// stops the agent, moves the working tree and Claude Code session into a fresh
-// worktree, then resumes the thread there.
-func promoteAgentThread(d handlerDeps, rec session.Record) {
+// stops the agent, moves the working tree and session into a fresh worktree,
+// then resumes the thread there. Callers gate on Capabilities().Promote (the
+// session relocation is claude-specific today).
+func promoteAgentThread(d handlerDeps, h harness.Harness, rec session.Record) {
 	// Stop any live process and wait for it to exit before touching git.
-	_ = d.sup.Stop(rec.ThreadID)
-	for i := 0; i < 60 && d.sup.Running(rec.ThreadID); i++ {
+	_ = h.Stop(rec.ThreadID)
+	for i := 0; i < 60 && h.Running(rec.ThreadID); i++ {
 		time.Sleep(200 * time.Millisecond)
 	}
 
@@ -442,7 +322,7 @@ func promoteAgentThread(d handlerDeps, rec session.Record) {
 
 	// Bring the thread back up, now inside its isolated worktree. The provider
 	// (if any) is rebuilt from the Record; its token re-resolves from the env var.
-	resumeAgentThread(d, rec, nil)
+	resumeThread(d, h, rec, nil)
 }
 
 // runHotCompactIfConfigured runs a Hot-Opus compaction on the live thread
@@ -456,8 +336,8 @@ func runHotCompactIfConfigured(d handlerDeps, threadID string) {
 	if !ok {
 		return
 	}
-	if rec.Backend == session.BackendKimi {
-		return // kimi threads have no compaction support
+	if h, ok := d.harnesses.Get(rec.Backend); !ok || !h.Capabilities().Compaction {
+		return // this thread's harness has no compaction support
 	}
 	if compact.Strategy(rec.CompactStrategy).Resolve() != compact.ExitOpusHot {
 		return
@@ -502,8 +382,8 @@ func runHotCompactIfConfigured(d handlerDeps, threadID string) {
 func runHotCompactsAtShutdown(d handlerDeps, progress shutdownProgressFn) {
 	var targets []session.Record
 	for _, rec := range d.sessions.List("") {
-		if rec.Backend == session.BackendKimi {
-			continue // kimi threads have no compaction support
+		if h, ok := d.harnesses.Get(rec.Backend); !ok || !h.Capabilities().Compaction {
+			continue // this thread's harness has no compaction support
 		}
 		if !d.sup.Running(rec.ThreadID) {
 			continue
@@ -740,9 +620,9 @@ func resolveCompactModel(token string) (modelID string, strategy compact.Strateg
 
 // mcpBridgeArgs is the argv for one `akcore mcp` bridge process: the
 // Cooperation server, or the opt-in Cowork desktop server when cowork is set.
-// backend tags kimi threads so the bridge hides the Claude-only
-// request_permission tool (kimi permissions flow over ACP, not MCP).
-func mcpBridgeArgs(socketPath, threadID, workspace string, cowork bool, backend string) []string {
+// noPermissionTool hides the request_permission tool for harnesses whose
+// permissions don't flow over MCP (kimi asks via ACP instead).
+func mcpBridgeArgs(socketPath, threadID, workspace string, cowork, noPermissionTool bool) []string {
 	args := []string{
 		"mcp",
 		"--socket", socketPath,
@@ -752,19 +632,20 @@ func mcpBridgeArgs(socketPath, threadID, workspace string, cowork bool, backend 
 	if cowork {
 		args = append(args, "--cowork")
 	}
-	if backend != "" {
-		args = append(args, "--backend", backend)
+	if noPermissionTool {
+		args = append(args, "--no-permission-tool")
 	}
 	return args
 }
 
 // coopMCPServer describes the Cooperation MCP bridge as an ACP stdio server
-// for a kimi thread's session/new.
+// for a kimi thread's session/new. The permission tool is hidden: kimi
+// permissions flow over ACP (session/request_permission), not MCP.
 func coopMCPServer(exePath, socketPath, threadID, workspace string) kimi.MCPServer {
 	return kimi.MCPServer{
 		Name:    "cooperation",
 		Command: exePath,
-		Args:    mcpBridgeArgs(socketPath, threadID, workspace, false, session.BackendKimi),
+		Args:    mcpBridgeArgs(socketPath, threadID, workspace, false, true),
 		Env:     []kimi.MCPEnv{},
 	}
 }
@@ -777,14 +658,14 @@ func writeMCPConfig(exePath, socketPath, threadID, workspace string, coworkEnabl
 		"cooperation": map[string]any{
 			"type":    "stdio",
 			"command": exePath,
-			"args":    mcpBridgeArgs(socketPath, threadID, workspace, false, ""),
+			"args":    mcpBridgeArgs(socketPath, threadID, workspace, false, false),
 		},
 	}
 	if coworkEnabled {
 		servers["cowork"] = map[string]any{
 			"type":    "stdio",
 			"command": exePath,
-			"args":    mcpBridgeArgs(socketPath, threadID, workspace, true, ""),
+			"args":    mcpBridgeArgs(socketPath, threadID, workspace, true, false),
 		}
 	}
 	cfg := map[string]any{"mcpServers": servers}

@@ -1787,6 +1787,9 @@ void MainWindow::setupCore()
     // frame on connect, so by the time connected() fires the role is already being
     // established ahead of any UI-only query. Just do the post-connect work here.
     connect(m_core, &CoreClient::connected, this, [this] {
+        // Learn the core's harness capability sets first — every engine
+        // picker and backend-specific affordance derives from them.
+        HarnessRegistry::self()->fetch(m_core);
         pushOpenFilesToCore();
         reloadExtensionServers();
     });

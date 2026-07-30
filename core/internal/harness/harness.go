@@ -1,0 +1,161 @@
+// Package harness defines the contract every agent backend ("harness")
+// fulfils, plus the capability set that drives routing and UI affordances.
+//
+// A harness is one way of running an agent: a CLI binary spoken to over some
+// protocol (Claude Code over stream-json, Kimi Code over ACP, …). The
+// orchestration layer never asks "is this kimi?" — it asks the thread's
+// harness to act, and consults its Capabilities for anything optional. Adding
+// a backend means implementing this interface and registering it (see
+// docs/HARNESSES.md); no string compares should appear outside the adapter.
+package harness
+
+import (
+	"encoding/json"
+
+	"agentkate/internal/agent"
+)
+
+// ModelPicker kinds — how the UI should offer model choice for a harness.
+const (
+	// ModelPickerTiers: a fixed set of tier tokens (opus/sonnet/…) that the
+	// core resolves to concrete model ids at launch.
+	ModelPickerTiers = "tiers"
+	// ModelPickerDiscovered: the CLI enumerates its models per session (the
+	// init event's configOptions); the picker lists those plus free text.
+	ModelPickerDiscovered = "discovered"
+)
+
+// Capabilities declares what one harness supports. The handlers gate optional
+// RPCs on these (one shared "X is not supported by <DisplayName> agents"
+// message), and the UI fetches them via agent.capabilities to drive its
+// affordances — so a wrong flag here shows up as a wrongly-enabled button,
+// never as a scattered conditional.
+type Capabilities struct {
+	ID          string `json:"id"`          // registry key, e.g. "claude", "kimi"
+	DisplayName string `json:"displayName"` // human name, e.g. "Claude Code"
+	// Badge prefixes the roster subtitle ("Kimi · working"); empty for the
+	// default engine so the common case stays unmarked.
+	Badge string `json:"badge"`
+
+	Fork            bool `json:"fork"`            // agent.fork (--fork-session semantics)
+	Compaction      bool `json:"compaction"`      // summaries: setCompactStrategy/compactNow/summaryStatus + exit compaction
+	Promote         bool `json:"promote"`         // agent.promote (move session into an isolated worktree)
+	ProviderRouting bool `json:"providerRouting"` // third-party Anthropic-compatible endpoints
+	Cowork          bool `json:"cowork"`          // the KDE Cowork desktop MCP server
+	EffortLive      bool `json:"effortLive"`      // thinking effort adjustable mid-session
+	UsageReporting  bool `json:"usageReporting"`  // tokens/cost in result events
+	SessionBrowse   bool `json:"sessionBrowse"`   // on-disk session discovery (session.browse)
+	// MintsSessionID: the core pre-mints the session id and passes it to the
+	// CLI (claude --session-id). False = the CLI assigns its own during the
+	// handshake, so agent.start replies with an empty sessionId and the id is
+	// captured from the init event.
+	MintsSessionID bool `json:"mintsSessionId"`
+
+	ModelPicker string `json:"modelPicker"` // ModelPickerTiers | ModelPickerDiscovered
+	// PermissionModes / Efforts: the harness's static vocabularies (values
+	// only; the UI owns the human labels). Empty = the vocabulary is
+	// discovered per session from the CLI's configOptions instead.
+	PermissionModes []string `json:"permissionModes"`
+	Efforts         []string `json:"efforts"`
+}
+
+// StartSpec is the harness-neutral launch request. Adapters translate it into
+// their CLI's own options; fields a harness doesn't support are validated
+// away by the capability gates before Launch is ever called, so an adapter
+// may simply ignore them.
+type StartSpec struct {
+	ThreadID    string
+	WorkDir     string // the worktree (also the MCP bridge's workspace)
+	Prompt      string // opening message; empty on resume
+	Attachments []agent.Attachment
+
+	Model          string // harness vocabulary (tier token or CLI model id)
+	Effort         string // harness vocabulary (claude --effort / kimi thinking)
+	PermissionMode string // harness vocabulary (claude mode / kimi mode)
+
+	SessionID   string // pre-minted (MintsSessionID) or the session to resume
+	Resume      bool   // re-attach SessionID instead of starting fresh
+	ForkSession bool   // with Resume: branch a NEW session off the resumed context
+
+	Cowork   bool            // opt into the Cowork desktop MCP server
+	Provider *agent.Provider // third-party API routing; nil = direct
+}
+
+// Launched reports what a Launch actually applied, for the thread's record —
+// so resume replays reality, not the request. SessionID may be empty when the
+// id is assigned later (a fork's init event mints it).
+type Launched struct {
+	SessionID      string
+	Model          string
+	Effort         string
+	PermissionMode string
+}
+
+// Harness is one agent backend. Implementations wrap a supervisor owning the
+// child processes; all methods must be safe for concurrent use.
+type Harness interface {
+	Capabilities() Capabilities
+
+	// Launch starts (or resumes, or forks — per spec) one agent thread.
+	Launch(spec StartSpec) (Launched, error)
+
+	Send(threadID, text string, atts []agent.Attachment) error
+	Interrupt(threadID string) error
+	Stop(threadID string) error
+	Running(threadID string) bool
+	StopAll()
+
+	// ReadTranscript returns the thread's replayable event history. sessionID
+	// is the record's session id — harnesses whose transcript lives with the
+	// CLI (claude) need it; harnesses that keep their own event log ignore it.
+	ReadTranscript(threadID, sessionID string) ([]json.RawMessage, error)
+
+	// SetOption changes one session option — "model", "effort" or
+	// "permissionMode" — on a RUNNING thread, mid-session. It returns the
+	// value as applied (e.g. a tier resolved to a concrete model id) so the
+	// caller persists reality. An unsupported option returns an error naming
+	// the harness.
+	SetOption(threadID, option, value string) (applied string, err error)
+}
+
+// Registry holds the registered harnesses. It is built once at startup and
+// read-only afterwards, so it needs no locking.
+type Registry struct {
+	defaultID string
+	order     []string
+	m         map[string]Harness
+}
+
+// NewRegistry creates a registry whose Get resolves the empty id to
+// defaultID — persisted records use "" for the default backend.
+func NewRegistry(defaultID string) *Registry {
+	return &Registry{defaultID: defaultID, m: make(map[string]Harness)}
+}
+
+// Register adds a harness under its Capabilities().ID. Registration order is
+// preserved (it is the order pickers list engines in).
+func (r *Registry) Register(h Harness) {
+	id := h.Capabilities().ID
+	if _, dup := r.m[id]; !dup {
+		r.order = append(r.order, id)
+	}
+	r.m[id] = h
+}
+
+// Get returns the harness for id; the empty id resolves to the default.
+func (r *Registry) Get(id string) (Harness, bool) {
+	if id == "" {
+		id = r.defaultID
+	}
+	h, ok := r.m[id]
+	return h, ok
+}
+
+// All returns the harnesses in registration order.
+func (r *Registry) All() []Harness {
+	out := make([]Harness, 0, len(r.order))
+	for _, id := range r.order {
+		out = append(out, r.m[id])
+	}
+	return out
+}

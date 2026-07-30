@@ -1,5 +1,7 @@
 #pragma once
 
+#include "state/HarnessTraits.h"
+
 #include <QHash>
 #include <QJsonArray>
 #include <QJsonObject>
@@ -86,10 +88,13 @@ public:
                             const QString &title, bool isolated,
                             const QString &backend = QString());
 
-    // Pre-pick the agent backend ("claude" | "kimi") before the first start.
-    // No-op once a thread exists (the combo is frozen then) or if the id isn't
-    // an offered choice.
+    // Pre-pick the engine (harness, direct API) before the first start. No-op
+    // once a thread exists (the combo is frozen then) or if the id isn't an
+    // offered choice.
     void preselectBackend(const QString &backend);
+    // Pre-pick the full engine — harness plus optional provider overlay — for
+    // the guided New Agent dialog. No-op once a thread exists.
+    void preselectEngine(const QString &backend, const QString &providerId);
 
     // Pre-pick the start model by its id ("opus", "sonnet", …) before the first
     // start. No-op once a thread exists (the combo is frozen then) or if the id
@@ -117,8 +122,8 @@ public:
     void applyChatSettings();
 
     // Re-read the configured API provider profiles (after the Providers settings
-    // dialog closes) and rebuild the provider picker. No-op once a thread exists,
-    // since the picker is frozen then.
+    // dialog closes) and rebuild the engine picker's provider entries. No-op once
+    // a thread exists, since the picker is frozen then.
     void reloadProviders();
 
     // Attach a set of local file paths as context for the next message. Used
@@ -291,9 +296,18 @@ private:
     void updateWorkflowChip();
     // Open the dedicated WorkflowMonitorDialog for the remembered workflow.
     void openWorkflowMonitor();
-    // Whether the panel is on the Kimi backend: the bound thread's backend, or
-    // (before a thread exists) the picker's selection.
-    bool kimiSelected() const;
+    // The traits driving this panel's affordances: the bound thread's harness,
+    // or (before a thread exists) the engine picker's selection. Every
+    // backend-specific decision binds to these — never to an id compare.
+    HarnessTraits currentTraits() const;
+    // The engine picker's selection, split into its two axes. A bound thread
+    // answers from its own state (m_backend / the started provider).
+    QString selectedHarnessId() const;
+    QString selectedProviderId() const;
+    // Repopulate the engine picker (harnesses × provider overlays), restoring
+    // the sticky choice (with one-time migration from the legacy backend +
+    // provider keys).
+    void rebuildEngineCombo();
     // Slash-command autocomplete (plan 14 P3): typing "/" as the first
     // character of the composer opens a popup listing the harness's commands
     // (claude: the init event's slash_commands; kimi: ACP
@@ -473,10 +487,10 @@ private:
     QComboBox *m_modeCombo = nullptr;
     QComboBox *m_isolationCombo = nullptr;
     QComboBox *m_effortCombo = nullptr;
-    QComboBox *m_providerCombo = nullptr; // third-party API provider (or Claude direct)
-    // Which agent harness runs this thread: Claude Code (default) or Kimi Code.
-    // Fixed once the thread starts, like the other setup combos.
-    QComboBox *m_backendCombo = nullptr;
+    // One "who runs this agent" picker: each entry is a harness, optionally
+    // overlaid with a third-party API provider (data "harness" or
+    // "harness|providerId"). Replaces the former backend + provider combos.
+    QComboBox *m_engineCombo = nullptr;
     QComboBox *m_modelCombo = nullptr;
     // Backend of the bound thread ("" or "claude" = Claude Code, "kimi" = Kimi
     // Code), taken from the agent.start reply or the dormant-thread record.

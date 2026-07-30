@@ -16,7 +16,7 @@ import (
 	"agentkate/internal/cowork"
 	"agentkate/internal/gitstatus"
 	"agentkate/internal/ipc"
-	"agentkate/internal/kimi"
+	"agentkate/internal/harness"
 	"agentkate/internal/permission"
 	"agentkate/internal/safe"
 	"agentkate/internal/search"
@@ -76,9 +76,12 @@ type coopPostNoteParams struct {
 
 // handlerDeps bundles everything registerHandlers needs.
 type handlerDeps struct {
-	srv        *ipc.Server
+	srv *ipc.Server
+	// sup is the Claude supervisor, reachable directly for the capabilities
+	// only it has today (hot compaction via Compact). All per-thread routing
+	// goes through harnesses.
 	sup        *agent.Supervisor
-	ksup       *kimi.Supervisor
+	harnesses  *harness.Registry
 	coop       *coop.State
 	threads    *threadRegistry
 	broker     *permission.Broker
@@ -94,43 +97,58 @@ type handlerDeps struct {
 	log        *slog.Logger
 }
 
-// --- backend routing -------------------------------------------------------
-// Per-thread operations route to the supervisor that owns the thread: the
-// Claude supervisor, or for backend="kimi" threads the kimi supervisor. The
-// live supervisors answer first (a record may not be persisted yet); the
-// session store answers for dormant threads.
+// --- harness routing -------------------------------------------------------
+// Per-thread operations route to the harness that owns the thread. The live
+// harnesses answer first (a record may not be persisted yet); the session
+// store's Backend answers for dormant threads; unknown/empty falls back to
+// the default harness.
 
-func (d handlerDeps) isKimiThread(threadID string) bool {
-	if d.ksup != nil && d.ksup.Running(threadID) {
-		return true
+func (d handlerDeps) harnessFor(threadID string) harness.Harness {
+	for _, h := range d.harnesses.All() {
+		if h.Running(threadID) {
+			return h
+		}
 	}
-	rec, ok := d.sessions.Get(threadID)
-	return ok && rec.Backend == session.BackendKimi
+	if rec, ok := d.sessions.Get(threadID); ok {
+		if h, ok := d.harnesses.Get(rec.Backend); ok {
+			return h
+		}
+	}
+	h, _ := d.harnesses.Get("") // the default harness always exists
+	return h
+}
+
+func (d handlerDeps) capsFor(threadID string) harness.Capabilities {
+	return d.harnessFor(threadID).Capabilities()
 }
 
 func (d handlerDeps) agentRunning(threadID string) bool {
-	return d.sup.Running(threadID) || (d.ksup != nil && d.ksup.Running(threadID))
+	for _, h := range d.harnesses.All() {
+		if h.Running(threadID) {
+			return true
+		}
+	}
+	return false
 }
 
 func (d handlerDeps) agentSend(threadID, text string, atts []agent.Attachment) error {
-	if d.ksup != nil && d.ksup.Running(threadID) {
-		return d.ksup.Send(threadID, text, atts)
-	}
-	return d.sup.Send(threadID, text, atts)
+	return d.harnessFor(threadID).Send(threadID, text, atts)
 }
 
 func (d handlerDeps) agentStop(threadID string) error {
-	if d.ksup != nil && d.ksup.Running(threadID) {
-		return d.ksup.Stop(threadID)
-	}
-	return d.sup.Stop(threadID)
+	return d.harnessFor(threadID).Stop(threadID)
 }
 
 func (d handlerDeps) agentInterrupt(threadID string) error {
-	if d.ksup != nil && d.ksup.Running(threadID) {
-		return d.ksup.Interrupt(threadID)
-	}
-	return d.sup.Interrupt(threadID)
+	return d.harnessFor(threadID).Interrupt(threadID)
+}
+
+// unsupported is THE capability-gate error: every optional feature a harness
+// lacks is rejected with this one message shape, so the wording never drifts
+// per call site.
+func unsupported(feature string, caps harness.Capabilities) error {
+	return ipc.Errorf(ipc.CodeInvalidParams,
+		feature+" is not supported by "+caps.DisplayName+" agents")
 }
 
 // recordAttachments appends a compact, body-free attachment sidecar entry for a
@@ -174,6 +192,19 @@ func registerHandlers(d handlerDeps) {
 	registerCoworkHandlers(d)
 
 	// --- agent threads -----------------------------------------------------
+
+	// agent.capabilities lists the registered harnesses with their capability
+	// sets, in engine-picker order. The UI fetches this once per connection
+	// and derives every backend-specific affordance from it — no harness
+	// knowledge is hardcoded client-side.
+	d.srv.Handle("agent.capabilities", func(_ context.Context, _ json.RawMessage) (any, error) {
+		list := make([]harness.Capabilities, 0, len(d.harnesses.All()))
+		for _, h := range d.harnesses.All() {
+			list = append(list, h.Capabilities())
+		}
+		return map[string]any{"harnesses": list}, nil
+	})
+
 	d.srv.Handle("agent.start", func(_ context.Context, raw json.RawMessage) (any, error) {
 		var p agentStartParams
 		if err := json.Unmarshal(raw, &p); err != nil {
@@ -182,47 +213,37 @@ func registerHandlers(d handlerDeps) {
 		if p.WorkspacePath == "" || p.Prompt == "" {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "workspacePath and prompt are required")
 		}
-		switch p.Backend {
-		case "", "claude":
-			p.Backend = session.BackendClaude
-		case session.BackendKimi:
-		default:
+		h, ok := d.harnesses.Get(p.Backend)
+		if !ok {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown backend "+p.Backend)
 		}
-		// The kimi backend speaks ACP to the kimi CLI directly; provider routing
-		// and the Cowork desktop server are Claude-only, and compaction is
-		// rejected per-thread (agent.setCompactStrategy / agent.compactNow).
-		if p.Backend == session.BackendKimi {
-			if p.Provider.Routed() {
-				return nil, ipc.Errorf(ipc.CodeInvalidParams,
-					"provider routing is not supported for the kimi backend")
-			}
-			if p.CoworkEnabled {
-				return nil, ipc.Errorf(ipc.CodeInvalidParams,
-					"cowork is not supported for the kimi backend")
-			}
+		caps := h.Capabilities()
+		if p.Provider.Routed() && !caps.ProviderRouting {
+			return nil, unsupported("Provider routing", caps)
+		}
+		if p.CoworkEnabled && !caps.Cowork {
+			return nil, unsupported("Cowork", caps)
 		}
 		// Start asynchronously so this reply — which carries the threadId —
-		// always reaches the UI before any streamed event for the thread.
+		// always reaches the UI before any streamed event for the thread. The
+		// session id is pre-minted only for harnesses launched onto an id we
+		// choose; otherwise the CLI assigns its own during the handshake and
+		// the UI captures it from the init event.
 		threadID := agent.NewThreadID()
-		sessionID := session.NewID()
-		safe.Go("agent.startThread", func() { startAgentThread(d, threadID, sessionID, p) })
+		sessionID := ""
+		if caps.MintsSessionID {
+			sessionID = session.NewID()
+		}
+		safe.Go("agent.startThread", func() { startThread(d, h, threadID, sessionID, p) })
 		// The opening prompt's attachments are recorded against the new thread id
 		// (the record is created asynchronously above, but the sidecar is keyed by
 		// thread id and needs no record to exist).
 		recordAttachments(d, threadID, p.Prompt, p.Attachments)
-		// Echo the backend so the UI knows which one actually started; kimi
-		// assigns its own session id, so its sessionId is empty here and is
-		// captured from the init event instead.
-		replyBackend := p.Backend
-		if replyBackend == "" {
-			replyBackend = "claude"
-		}
-		reply := map[string]any{"threadId": threadID, "sessionId": sessionID, "backend": replyBackend}
-		if p.Backend == session.BackendKimi {
-			reply["sessionId"] = ""
-		}
-		return reply, nil
+		return map[string]any{
+			"threadId":  threadID,
+			"sessionId": sessionID,
+			"backend":   caps.ID,
+		}, nil
 	})
 
 	// agent.resume re-launches a dormant thread on its persisted Claude Code
@@ -249,21 +270,15 @@ func registerHandlers(d handlerDeps) {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams,
 				"thread "+p.ThreadID+" is already running")
 		}
-		if rec.SessionID == "" {
-			if rec.Backend == session.BackendKimi {
-				return nil, ipc.Errorf(ipc.CodeInvalidParams,
-					"thread has no Kimi Code session to resume")
-			}
-			return nil, ipc.Errorf(ipc.CodeInvalidParams,
-				"thread has no Claude Code session to resume")
+		h, ok := d.harnesses.Get(rec.Backend)
+		if !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown backend "+rec.Backend)
 		}
-		safe.Go("agent.resumeThread", func() {
-			if rec.Backend == session.BackendKimi {
-				resumeKimiThread(d, rec)
-			} else {
-				resumeAgentThread(d, rec, p.Provider)
-			}
-		})
+		if rec.SessionID == "" {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams,
+				"thread has no "+h.Capabilities().DisplayName+" session to resume")
+		}
+		safe.Go("agent.resumeThread", func() { resumeThread(d, h, rec, p.Provider) })
 		return map[string]any{"threadId": rec.ThreadID, "sessionId": rec.SessionID}, nil
 	})
 
@@ -294,22 +309,9 @@ func registerHandlers(d handlerDeps) {
 		if attachTurns == nil {
 			attachTurns = []session.AttachmentTurn{}
 		}
-		// Kimi threads have no Claude transcript file; their transcript is the
-		// core-side translated-event log the kimi supervisor appends to live.
-		if rec.Backend == session.BackendKimi {
-			events, err := d.ksup.ReadTranscript(p.ThreadID)
-			if err != nil {
-				return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
-			}
-			if events == nil {
-				events = []json.RawMessage{}
-			}
-			return map[string]any{"events": events, "attachments": attachTurns}, nil
-		}
-		if rec.SessionID == "" {
-			return map[string]any{"events": []json.RawMessage{}, "attachments": attachTurns}, nil
-		}
-		events, err := session.ReadTranscript(rec.SessionID)
+		// Each harness serves its own transcript source: claude reads the CLI's
+		// session file (by session id), kimi its core-side translated-event log.
+		events, err := d.harnessFor(p.ThreadID).ReadTranscript(p.ThreadID, rec.SessionID)
 		if err != nil {
 			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
 		}
@@ -338,9 +340,9 @@ func registerHandlers(d handlerDeps) {
 		if !ok {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
 		}
-		if src.Backend == session.BackendKimi {
-			return nil, ipc.Errorf(ipc.CodeInvalidParams,
-				"forking is not supported for kimi threads")
+		h := d.harnessFor(p.ThreadID)
+		if !h.Capabilities().Fork {
+			return nil, unsupported("Forking", h.Capabilities())
 		}
 		if src.SessionID == "" {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams,
@@ -348,7 +350,7 @@ func registerHandlers(d handlerDeps) {
 		}
 		newThreadID := agent.NewThreadID()
 		safe.Go("agent.forkThread", func() {
-			forkAgentThread(d, src, newThreadID, p.Model, p.Effort, p.Title)
+			forkAgentThread(d, h, src, newThreadID, p.Model, p.Effort, p.Title)
 		})
 		return map[string]any{"threadId": newThreadID}, nil
 	})
@@ -366,15 +368,15 @@ func registerHandlers(d handlerDeps) {
 		if !ok {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
 		}
-		if rec.Backend == session.BackendKimi {
-			return nil, ipc.Errorf(ipc.CodeInvalidParams,
-				"promoting is not supported for kimi threads")
+		h := d.harnessFor(p.ThreadID)
+		if !h.Capabilities().Promote {
+			return nil, unsupported("Promoting", h.Capabilities())
 		}
 		if rec.Worktree.Isolated {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams,
 				"this thread already runs in an isolated worktree")
 		}
-		safe.Go("agent.promoteThread", func() { promoteAgentThread(d, rec) })
+		safe.Go("agent.promoteThread", func() { promoteAgentThread(d, h, rec) })
 		return map[string]any{"threadId": rec.ThreadID}, nil
 	})
 
@@ -579,13 +581,10 @@ func registerHandlers(d handlerDeps) {
 
 	// agent.setOption changes one session option — model, permissionMode or
 	// effort — on a RUNNING thread, mid-session, and persists it to the record
-	// so a later resume replays the same choice. Backend mapping:
-	//   claude: model → set_model control request; permissionMode →
-	//     set_permission_mode (both verified against claude 2.1.220); effort
-	//     is rejected — the CLI has no set_effort control request.
-	//   kimi: model/effort/permissionMode → the session/set_config_option
-	//     ids "model" / "thinking" / "mode" (kimi's own value vocabularies).
-	// The CLI's own rejection (unknown model id, bad mode) is passed through
+	// so a later resume replays the same choice. Each harness maps the option
+	// onto its own mechanism (claude: set_model / set_permission_mode control
+	// requests, no mid-session effort; kimi: session/set_config_option). The
+	// CLI's own rejection (unknown model id, bad mode) is passed through
 	// verbatim so the UI can show it and revert the picker.
 	d.srv.Handle("agent.setOption", func(_ context.Context, raw json.RawMessage) (any, error) {
 		var p struct {
@@ -603,36 +602,9 @@ func registerHandlers(d handlerDeps) {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams,
 				"the agent is not running — options apply at the next start instead")
 		}
-		applied := p.Value
-		if d.isKimiThread(p.ThreadID) {
-			configID := map[string]string{
-				"model":          "model",
-				"effort":         "thinking",
-				"permissionMode": "mode",
-			}[p.Option]
-			if configID == "" {
-				return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown option "+p.Option)
-			}
-			if err := d.ksup.SetConfigOption(p.ThreadID, configID, p.Value); err != nil {
-				return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
-			}
-		} else {
-			switch p.Option {
-			case "model":
-				applied = resolveModel(p.Value)
-				if err := d.sup.SetModel(p.ThreadID, applied); err != nil {
-					return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
-				}
-			case "permissionMode":
-				if err := d.sup.SetPermissionMode(p.ThreadID, p.Value); err != nil {
-					return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
-				}
-			case "effort":
-				return nil, ipc.Errorf(ipc.CodeInvalidParams,
-					"Claude Code does not support changing the thinking effort mid-session")
-			default:
-				return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown option "+p.Option)
-			}
+		applied, err := d.harnessFor(p.ThreadID).SetOption(p.ThreadID, p.Option, p.Value)
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
 		// Persist so a resume replays the latest choice, not the start-time one.
 		_ = d.sessions.UpdateQuiet(p.ThreadID, func(r *session.Record) {
@@ -759,7 +731,7 @@ func registerHandlers(d handlerDeps) {
 		recs := d.sessions.List(p.Project)
 		out := make([]map[string]any, 0, len(recs))
 		for _, r := range recs {
-			out = append(out, map[string]any{
+			row := map[string]any{
 				"threadId": r.ThreadID,
 				"project":  r.Project,
 				"title":    r.Title,
@@ -774,7 +746,13 @@ func registerHandlers(d handlerDeps) {
 				"lastTurn": r.LastTurnAt,
 				"model":    r.Model,
 				"tags":     r.Tags,
-			})
+			}
+			// The record's harness capabilities, resolved (a legacy "" backend
+			// reports the default harness), so a consumer never re-derives them.
+			if h, ok := d.harnesses.Get(r.Backend); ok {
+				row["harness"] = h.Capabilities()
+			}
+			out = append(out, row)
 		}
 		return map[string]any{"threads": out}, nil
 	})
@@ -955,9 +933,8 @@ func registerHandlers(d handlerDeps) {
 		if p.Strategy != "" && !s.Valid() {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown strategy "+p.Strategy)
 		}
-		if d.isKimiThread(p.ThreadID) {
-			return nil, ipc.Errorf(ipc.CodeInvalidParams,
-				"compaction is not supported for kimi threads")
+		if caps := d.capsFor(p.ThreadID); !caps.Compaction {
+			return nil, unsupported("Compaction", caps)
 		}
 		if err := d.sessions.Update(p.ThreadID, func(r *session.Record) {
 			r.CompactStrategy = p.Strategy
@@ -980,6 +957,9 @@ func registerHandlers(d handlerDeps) {
 		rec, ok := d.sessions.Get(p.ThreadID)
 		if !ok {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		}
+		if caps := d.capsFor(p.ThreadID); !caps.Compaction {
+			return nil, unsupported("Compaction", caps)
 		}
 		sum, err := d.summaries.Get(p.ThreadID)
 		if err != nil {
@@ -1020,9 +1000,8 @@ func registerHandlers(d handlerDeps) {
 		if !ok {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
 		}
-		if rec.Backend == session.BackendKimi {
-			return nil, ipc.Errorf(ipc.CodeInvalidParams,
-				"compaction is not supported for kimi threads")
+		if caps := d.capsFor(p.ThreadID); !caps.Compaction {
+			return nil, unsupported("Compaction", caps)
 		}
 		if rec.SessionID == "" {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "thread has no Claude Code session yet")

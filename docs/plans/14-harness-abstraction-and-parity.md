@@ -1,7 +1,7 @@
 # 14 — Harness Abstraction & Feature Parity (agent systems rework)
 
-> **Status: in progress — P1–P5 landed (parity complete). Next: P6 registry
-> refactor, then the optional P7 spike.** Follows the Kimi Code backend branch
+> **Status: P1–P6 landed. P7 (antigravity spike) remains, on hold.** Follows
+> the Kimi Code backend branch
 > (`kimi-code-backend`, `e0e9594` + review fixes `5a20c66`). Seven phases;
 > land sequentially, one commit per phase, built green (`scripts/build.sh`,
 > `go test ./...` incl. `-race`, `ctest --test-dir build`), smoke-verified
@@ -298,11 +298,49 @@ Bonus fix: the Agent Activity inspector is now re-pointed when the active
 agent changes (it previously only tracked thread creation, so switching
 between running agents left it on the old thread).
 
-**P6 — Harness registry refactor (L).** The `Harness` interface + capability
-registry + `agent.capabilities` RPC + UI traits + Engine picker; delete every
-`backend == "kimi"` conditional outside the kimi package; write
-`docs/HARNESSES.md` (how to add one). This lands *after* parity work so the
-capability set is discovered from real needs, not invented.
+**P6 — Harness registry refactor (L). ✅ LANDED.** The `Harness` interface +
+capability registry (`core/internal/harness`) with adapters in
+`cmd/akcore/harness_claude.go` / `harness_kimi.go`; `agent.capabilities` RPC;
+UI `HarnessRegistry`/`HarnessTraits` (`ui/src/state/HarnessTraits.*`) with
+built-in fallbacks mirroring the adapters; ONE Engine picker (harness ×
+provider overlay: "Claude Code · Claude Code via Fireworks · … · Kimi Code")
+replacing the backend + provider combos in the panel Setup menu and
+NewAgentDialog; every `backend == "kimi"` conditional outside the kimi
+package/adapter deleted (core AND UI — verified by grep, only comments and
+the traits fallback remain); `docs/HARNESSES.md` written.
+How the sketch met the real code:
+- The interface grew a `Launch(StartSpec) (Launched, error)` shape instead of
+  separate Start/Resume: one launch method serves fresh starts, resumes,
+  summary-seeded restarts AND forks, and `Launched` reports what was actually
+  APPLIED (session id, resolved model, defaulted mode) so records persist
+  reality — that is what let startAgentThread/startKimiThread/
+  resumeAgentThread/resumeKimiThread collapse into startThread/resumeThread,
+  and the seeded-resume branch became generic (gated on caps.Compaction).
+- `SetOption`/`ReadTranscript` joined the interface (P3/P2 features the plan's
+  sketch predated); `Capabilities` gained `Badge`, `EffortLive`,
+  `MintsSessionID` and dropped the sketch's `MidSessionModelSwitch` (both
+  harnesses have it — a capability nobody branches on isn't one).
+- claude's canonical id is "claude" (session.BackendClaude is "" and can't
+  key a registry); `Registry.Get("")` resolves legacy records to the default;
+  new records store explicit ids.
+- The MCP bridge's `--backend kimi` flag became the honest
+  `--no-permission-tool` (the actual semantic).
+- Vocabulary labels stay UI-side (i18n) — the capability set carries VALUES;
+  discovered lists persist under `<id>Opt-<option>` / sticky under
+  `<id>Mode`/`<id>Thinking`, which compose to the exact keys P2/P3 already
+  used for kimi, so no user settings were lost. Engine stickiness is one
+  `engine` key with one-time migration from the legacy backend+provider keys.
+- Per-record capability embedding went into `agent.list` as specified, but
+  the UI restore path uses `session.listThreads` + the registry (keyed by
+  backend id), so the embed is informational.
+- Deferred from the gap list: kimi session browse (kimi 0.30 DOES advertise
+  ACP `sessionCapabilities.list` — a real browse integration is its own
+  feature; capability stays honestly false), and the roster "+ New Agent"
+  model dropdown still lists claude tiers only (its choices predate the
+  registry; harmless for other harnesses — preselect just no-ops).
+During P6 validation the kimi cloud service had an outage (turns stalled even
+with mcpServers:[] driven by hand — nothing of ours); it recovered and
+smoke-kimi PASSED on the refactored core.
 
 **P7 — Antigravity revival spike (S, optional).** Re-evaluate `agy` against
 the registry: if it can hold a session and report tool calls now, port the

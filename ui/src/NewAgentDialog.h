@@ -15,11 +15,12 @@ class QWidget;
 // agent's sticky default" (the data values match AgentPanel's combos).
 struct NewAgentChoices {
     QString task;           // optional first task, pre-filled into the composer
-    QString backend;        // claude | kimi
-    QString modelId;        // "" | opus | sonnet | haiku | fable
+    QString backend;        // harness id from the engine picker (claude, kimi, …)
+    QString providerId;     // optional provider overlay; "" = direct
+    QString modelId;        // tier token / discovered model id; "" = default
     QString isolation;      // auto | isolated | workspace
-    QString permissionMode; // acceptEdits | default | auto | bypassPermissions
-    QString effort;         // "" | low | medium | high | xhigh | max
+    QString permissionMode; // the harness's own mode vocabulary; "" = default
+    QString effort;         // the harness's own effort vocabulary; "" = default
 };
 
 // NewAgentDialog — a friendly front door for starting an agent: describe the
@@ -36,7 +37,7 @@ public:
 
 private:
     QPlainTextEdit *m_task = nullptr;
-    QComboBox *m_backend = nullptr;
+    QComboBox *m_engine = nullptr; // harness + optional provider overlay
     QComboBox *m_model = nullptr;
     QCheckBox *m_sandbox = nullptr;
     QWidget *m_advanced = nullptr;

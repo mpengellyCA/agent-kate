@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: 2026 The Agent Kate developers
 
 #include "NewAgentDialog.h"
+#include "ProviderConfig.h"
+#include "state/HarnessTraits.h"
 
 #include <KConfigGroup>
 #include <KLocalizedString>
@@ -45,57 +47,48 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, QWidget *parent)
     // The two choices most people care about, in plain language.
     auto *form = new QFormLayout;
     form->setLabelAlignment(Qt::AlignLeft);
-    m_backend = new QComboBox(this);
-    m_backend->addItem(i18n("Claude Code"), QStringLiteral("claude"));
-    m_backend->addItem(i18n("Kimi Code"), QStringLiteral("kimi"));
-    m_backend->setToolTip(i18n("Which agent program runs this task. Kimi Code needs the kimi CLI installed."));
-    form->addRow(i18n("Which agent?"), m_backend);
+    m_engine = new QComboBox(this);
+    m_engine->setToolTip(i18n(
+        "Which agent engine runs this task: the agent program, optionally "
+        "routed through a third-party API provider."));
+    for (const HarnessTraits &t : HarnessRegistry::self()->all()) {
+        m_engine->addItem(t.displayName, t.id);
+        if (!t.providerRouting) {
+            continue;
+        }
+        const QList<ProviderProfile> profiles = ProviderStore::load();
+        for (const ProviderProfile &p : profiles) {
+            if (p.routed()) {
+                m_engine->addItem(i18nc("engine entry: harness via provider",
+                                        "%1 via %2", t.displayName, p.name),
+                                  t.id + QLatin1Char('|') + p.id);
+            }
+        }
+    }
+    form->addRow(i18n("Which agent?"), m_engine);
     m_model = new QComboBox(this);
     m_model->setToolTip(i18n("Which model powers this agent. Smarter is more capable; faster is cheaper."));
     form->addRow(i18n("How clever?"), m_model);
     root->addLayout(form);
 
-    // The model, when-to-ask and effort lists all follow the backend: Claude's
-    // fixed vocabularies for Claude Code; for Kimi Code the CLI's own lists
-    // (model / mode / thinking) as discovered from the last kimi session's
-    // handshake — until one has run, only the defaults are offered (the
-    // panel's Setup menu additionally takes a free-text model id).
-    auto kimiOptions = [](const char *key) {
-        return KSharedConfig::openConfig()
-            ->group(QStringLiteral("Agent"))
-            .readEntry(key, QStringList());
-    };
-    auto rebuildBackendChoices = [this, kimiOptions] {
-        const bool kimi =
-            m_backend->currentData().toString() == QLatin1String("kimi");
+    // The model, when-to-ask and effort lists all follow the engine's harness:
+    // its static vocabularies where it has them, else the lists discovered
+    // from its last session's handshake — until one has run, only the
+    // defaults are offered (the panel's Setup menu additionally takes a
+    // free-text model id for discovered-model harnesses).
+    auto rebuildBackendChoices = [this] {
+        const HarnessTraits t = HarnessRegistry::self()->traits(
+            m_engine->currentData().toString().section(QLatin1Char('|'), 0, 0));
         QSignalBlocker blockModel(m_model);
         QSignalBlocker blockPerm(m_permission);
         QSignalBlocker blockEffort(m_effort);
         m_model->clear();
         m_permission->clear();
         m_effort->clear();
-        m_model->addItem(i18n("Use my default"), QString());
-        if (!kimi) {
-            m_model->addItem(i18n("Smartest (Opus)"), QStringLiteral("opus"));
-            m_model->addItem(i18n("Balanced (Sonnet)"), QStringLiteral("sonnet"));
-            m_model->addItem(i18n("Fastest (Haiku)"), QStringLiteral("haiku"));
-            m_permission->addItem(i18n("Apply edits automatically"),
-                                  QStringLiteral("acceptEdits"));
-            m_permission->addItem(i18n("Ask before each step"), QStringLiteral("default"));
-            m_permission->addItem(i18n("Plan first — read-only until approved"),
-                                  QStringLiteral("plan"));
-            m_permission->addItem(i18n("Work freely"), QStringLiteral("auto"));
-            m_permission->addItem(i18n("Expert — never ask"),
-                                  QStringLiteral("bypassPermissions"));
-            m_effort->addItem(i18n("Default"), QString());
-            m_effort->addItem(i18n("Low"), QStringLiteral("low"));
-            m_effort->addItem(i18n("Medium"), QStringLiteral("medium"));
-            m_effort->addItem(i18n("High"), QStringLiteral("high"));
-            m_effort->addItem(i18n("Extra-high"), QStringLiteral("xhigh"));
-            m_effort->addItem(i18n("Maximum"), QStringLiteral("max"));
-            return;
-        }
-        const auto addFrom = [](QComboBox *combo, const QStringList &entries) {
+        const auto addDiscovered = [](QComboBox *combo, const QString &key) {
+            const QStringList entries = KSharedConfig::openConfig()
+                                            ->group(QStringLiteral("Agent"))
+                                            .readEntry(key, QStringList());
             for (const QString &entry : entries) {
                 const QString value = entry.section(QLatin1Char('|'), 0, 0);
                 const QString name = entry.section(QLatin1Char('|'), 1);
@@ -104,13 +97,32 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, QWidget *parent)
                 }
             }
         };
-        addFrom(m_model, kimiOptions("kimiOpt-model"));
-        m_permission->addItem(i18n("CLI default"), QString());
-        addFrom(m_permission, kimiOptions("kimiOpt-mode"));
-        m_effort->addItem(i18n("CLI default"), QString());
-        addFrom(m_effort, kimiOptions("kimiOpt-thinking"));
+        m_model->addItem(i18n("Use my default"), QString());
+        if (t.modelPicker == QLatin1String("tiers")) {
+            m_model->addItem(i18n("Smartest (Opus)"), QStringLiteral("opus"));
+            m_model->addItem(i18n("Balanced (Sonnet)"), QStringLiteral("sonnet"));
+            m_model->addItem(i18n("Fastest (Haiku)"), QStringLiteral("haiku"));
+        } else {
+            addDiscovered(m_model, t.optionKey(QStringLiteral("model")));
+        }
+        if (t.permissionModes.isEmpty()) {
+            m_permission->addItem(i18n("CLI default"), QString());
+            addDiscovered(m_permission, t.optionKey(QStringLiteral("mode")));
+        } else {
+            for (const QString &mode : t.permissionModes) {
+                m_permission->addItem(HarnessRegistry::modeLabel(mode), mode);
+            }
+        }
+        m_effort->addItem(i18n("Default"), QString());
+        if (t.efforts.isEmpty()) {
+            addDiscovered(m_effort, t.optionKey(QStringLiteral("thinking")));
+        } else {
+            for (const QString &effort : t.efforts) {
+                m_effort->addItem(HarnessRegistry::effortLabel(effort), effort);
+            }
+        }
     };
-    connect(m_backend, &QComboBox::currentIndexChanged, this, rebuildBackendChoices);
+    connect(m_engine, &QComboBox::currentIndexChanged, this, rebuildBackendChoices);
 
     m_sandbox = new QCheckBox(
         i18n("Work in a private copy, so changes don't touch my files until I approve"), this);
@@ -153,7 +165,9 @@ NewAgentChoices NewAgentDialog::choices() const
 {
     NewAgentChoices c;
     c.task = m_task->toPlainText().trimmed();
-    c.backend = m_backend->currentData().toString();
+    const QString engine = m_engine->currentData().toString();
+    c.backend = engine.section(QLatin1Char('|'), 0, 0);
+    c.providerId = engine.section(QLatin1Char('|'), 1);
     c.modelId = m_model->currentData().toString();
     c.isolation = m_sandbox->isChecked() ? QStringLiteral("isolated")
                                          : QStringLiteral("workspace");

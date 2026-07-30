@@ -22,9 +22,10 @@ func (b *mcpBridge) advertisedTools() []map[string]any {
 		return coworkToolDefs()
 	}
 	defs := toolDefs()
-	if b.backend == "kimi" {
-		// Kimi permissions flow over ACP (session/request_permission), not MCP
-		// — hide the Claude-only gate so a kimi agent never calls it.
+	if b.noPermissionTool {
+		// This harness's permissions don't flow over MCP (e.g. kimi asks via
+		// ACP session/request_permission) — hide the gate so its agent never
+		// calls it.
 		filtered := make([]map[string]any, 0, len(defs))
 		for _, def := range defs {
 			if def["name"] == "request_permission" {

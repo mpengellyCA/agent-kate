@@ -571,14 +571,14 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     rebuildModeCombo();
     connect(m_modeCombo, &QComboBox::currentIndexChanged, this, [this] {
         const QString mode = m_modeCombo->currentData().toString();
-        // Sticky per backend: the last choice becomes the default for the next
+        // Sticky per harness: the last choice becomes the default for the next
         // agent — except the auto-approve-everything choices (claude's
         // bypassPermissions, kimi's yolo), which are never re-armed
         // accidentally on the next conversation.
         if (mode != QLatin1String("bypassPermissions") && mode != QLatin1String("yolo")) {
             KSharedConfig::openConfig()
                 ->group(QStringLiteral("Agent"))
-                .writeEntry(kimiSelected() ? "kimiMode" : "permissionMode", mode);
+                .writeEntry(currentTraits().stickyModeKey(), mode);
         }
         maybePushOption(QStringLiteral("permissionMode"), mode);
     });
@@ -615,86 +615,55 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     m_effortCombo->setToolTip(QStringLiteral(
         "How long the agent thinks before it acts. Higher is more thorough but\n"
         "slower. Default leaves the model's own configured level untouched.\n"
-        "Fixed at start for Claude Code; adjustable while a Kimi agent runs."));
+        "Some engines can change it while the agent runs; others fix it at start."));
     rebuildEffortCombo();
     connect(m_effortCombo, &QComboBox::currentIndexChanged, this, [this] {
         const QString effort = m_effortCombo->currentData().toString();
-        // Sticky per backend: the last choice becomes the default next time.
+        // Sticky per harness: the last choice becomes the default next time.
         KSharedConfig::openConfig()
             ->group(QStringLiteral("Agent"))
-            .writeEntry(kimiSelected() ? "kimiThinking" : "effort", effort);
+            .writeEntry(currentTraits().stickyEffortKey(), effort);
         maybePushOption(QStringLiteral("effort"), effort);
     });
 
-    // Provider selector. Routes this agent's `claude` harness at a third-party
-    // Anthropic-compatible API (Fireworks, OpenRouter, …) instead of Anthropic's
-    // own. "Claude (direct)" (the default) injects nothing — identical to before.
-    // Fixed once the agent starts, like the other setup combos. Profiles are
-    // managed in Options → Configure API Providers…. The model combo's contents
-    // follow this choice (Claude tiers vs the provider's own model ids).
-    m_providerCombo = new QComboBox(this);
-    m_providerCombo->setToolTip(QStringLiteral(
-        "Which API endpoint this agent talks to, fixed once it starts.\n"
-        "Claude (direct) uses Anthropic. Other entries route the harness at a\n"
-        "third-party Anthropic-compatible API with your stored key.\n"
-        "Manage these in Options ▸ Configure API Providers…"));
-    {
-        const QList<ProviderProfile> profiles = ProviderStore::load();
-        for (const ProviderProfile &p : profiles) {
-            m_providerCombo->addItem(p.name, p.id);
-        }
-        const QString saved = KSharedConfig::openConfig()
-                                  ->group(QStringLiteral("Agent"))
-                                  .readEntry("provider", ProviderStore::directId());
-        const int savedIdx = m_providerCombo->findData(saved);
-        if (savedIdx >= 0) {
-            m_providerCombo->setCurrentIndex(savedIdx);
-        }
-    }
-    connect(m_providerCombo, &QComboBox::currentIndexChanged, this, [this] {
+    // Engine selector: ONE "who runs this agent" picker. Each entry is a
+    // harness (Claude Code, Kimi Code, … — from the core's capability
+    // registry), optionally overlaid with a third-party API provider for
+    // harnesses that support routing ("Claude Code via Fireworks"). Fixed once
+    // the agent starts. The mode/effort/model pickers follow this choice.
+    m_engineCombo = new QComboBox(this);
+    m_engineCombo->setToolTip(QStringLiteral(
+        "Which agent engine runs this thread, fixed once it starts: the agent\n"
+        "program, optionally routed at a third-party Anthropic-compatible API\n"
+        "with your stored key. Manage providers in Options ▸ Configure API\n"
+        "Providers…"));
+    rebuildEngineCombo();
+    connect(m_engineCombo, &QComboBox::currentIndexChanged, this, [this] {
         KSharedConfig::openConfig()
             ->group(QStringLiteral("Agent"))
-            .writeEntry("provider", m_providerCombo->currentData().toString());
-        rebuildModelCombo();
-    });
-
-    // Backend selector: which agent harness runs this thread — Claude Code (the
-    // default, unchanged behaviour) or Kimi Code. Fixed once it starts, like the
-    // other setup combos. Choosing Kimi disables the provider/effort pickers
-    // (unsupported there) and turns the model combo into free text.
-    m_backendCombo = new QComboBox(this);
-    m_backendCombo->addItem(QStringLiteral("Claude Code"), QStringLiteral("claude"));
-    m_backendCombo->addItem(QStringLiteral("Kimi Code"), QStringLiteral("kimi"));
-    m_backendCombo->setToolTip(QStringLiteral(
-        "Which agent program runs this thread, fixed once it starts.\n"
-        "Kimi Code needs the `kimi` CLI installed; provider routing, thinking\n"
-        "effort, when-to-ask, forking and compaction don't apply to Kimi\n"
-        "threads — Kimi always asks before gated actions."));
-    // Sticky: the last choice becomes the default for the next agent. Set before
-    // connecting so restoring "kimi" doesn't fire the handler mid-construction.
-    {
-        const QString saved = KSharedConfig::openConfig()
-                                  ->group(QStringLiteral("Agent"))
-                                  .readEntry("backend", QStringLiteral("claude"));
-        const int savedIdx = m_backendCombo->findData(saved);
-        if (savedIdx >= 0) {
-            m_backendCombo->setCurrentIndex(savedIdx);
-        }
-    }
-    connect(m_backendCombo, &QComboBox::currentIndexChanged, this, [this] {
-        KSharedConfig::openConfig()
-            ->group(QStringLiteral("Agent"))
-            .writeEntry("backend", m_backendCombo->currentData().toString());
+            .writeEntry("engine", m_engineCombo->currentData().toString());
         rebuildModelCombo();
         rebuildModeCombo();
         rebuildEffortCombo();
         refresh();
     });
-    // The mode/effort combos were first built before the backend combo existed
-    // (their ctor order); re-run them now the restored backend is known, so a
-    // sticky "kimi" default shows kimi's own mode/thinking lists.
+    // The mode/effort combos were first built before the engine combo existed
+    // (their ctor order); re-run them now the restored engine is known, so a
+    // sticky non-default harness shows its own mode/thinking lists.
     rebuildModeCombo();
     rebuildEffortCombo();
+    // A late agent.capabilities fetch can revise the engine list (a new
+    // harness, changed traits) — rebuild the pickers while they are still
+    // free; a bound thread's pickers re-evaluate on the next refresh().
+    connect(HarnessRegistry::self(), &HarnessRegistry::changed, this, [this] {
+        if (m_threadId.isEmpty()) {
+            rebuildEngineCombo();
+            rebuildModelCombo();
+            rebuildModeCombo();
+            rebuildEffortCombo();
+        }
+        refresh();
+    });
 
     // Model selector. For Claude direct each item carries a tier token the core
     // resolves to a concrete --model id (its resolveModel is the single source of
@@ -708,13 +677,11 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
         "new model takes over from the next message.\n"
         "Default leaves the provider's own configured/main model untouched."));
     connect(m_modelCombo, &QComboBox::currentIndexChanged, this, [this] {
-        // Only the Claude-direct tier choice is sticky; a provider's model ids
-        // must not be persisted as the Claude model token, and neither must the
-        // free-text Kimi model (an editable combo).
+        // Only the direct tier choice is sticky; a provider's model ids must
+        // not be persisted as the tier token, and neither must a discovered
+        // free-text model (an editable combo).
         if (!m_modelCombo->isEditable()
-            && (!m_providerCombo
-                || m_providerCombo->currentData().toString()
-                       == ProviderStore::directId())) {
+            && selectedProviderId() == ProviderStore::directId()) {
             KSharedConfig::openConfig()
                 ->group(QStringLiteral("Agent"))
                 .writeEntry("model", m_modelCombo->currentData().toString());
@@ -903,11 +870,10 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
         auto *panel = new QWidget(menu);
         auto *form = new QFormLayout(panel);
         form->setContentsMargins(10, 8, 10, 8);
-        form->addRow(QStringLiteral("Agent backend"), m_backendCombo);
+        form->addRow(QStringLiteral("Engine"), m_engineCombo);
         form->addRow(QStringLiteral("When to ask"), m_modeCombo);
         form->addRow(QStringLiteral("Where it works"), m_isolationCombo);
         form->addRow(QStringLiteral("Thinking effort"), m_effortCombo);
-        form->addRow(QStringLiteral("AI provider"), m_providerCombo);
         form->addRow(QStringLiteral("Model"), m_modelCombo);
         form->addRow(QStringLiteral("Desktop access"), m_coworkCheck);
         auto *action = new QWidgetAction(menu);
@@ -1053,7 +1019,7 @@ QString AgentPanel::currentModel() const
     if (!m_modelCombo->isEditable()) {
         return m_modelCombo->currentData().toString();
     }
-    // The Kimi backend's combo is editable: a picked dropdown item shows its
+    // A discovered-models combo is editable: a picked dropdown item shows its
     // display label ("K3 — kimi-code/k3") but must send its data value; text
     // that matches no item is a hand-typed model id, sent verbatim.
     const int idx = m_modelCombo->currentIndex();
@@ -1070,12 +1036,24 @@ QString AgentPanel::currentEffort() const
 
 void AgentPanel::preselectBackend(const QString &backend)
 {
+    preselectEngine(backend, QString());
+}
+
+void AgentPanel::preselectEngine(const QString &backend, const QString &providerId)
+{
     if (backend.isEmpty() || !m_threadId.isEmpty()) {
         return; // combo is frozen once a thread exists
     }
-    const int idx = m_backendCombo->findData(backend);
+    QString data = backend;
+    if (!providerId.isEmpty() && providerId != ProviderStore::directId()) {
+        data += QLatin1Char('|') + providerId;
+    }
+    int idx = m_engineCombo->findData(data);
+    if (idx < 0) {
+        idx = m_engineCombo->findData(backend); // provider gone — bare harness
+    }
     if (idx >= 0) {
-        m_backendCombo->setCurrentIndex(idx);
+        m_engineCombo->setCurrentIndex(idx);
     }
 }
 
@@ -1200,20 +1178,85 @@ void AgentPanel::hideSlashPopup()
     }
 }
 
-bool AgentPanel::kimiSelected() const
+HarnessTraits AgentPanel::currentTraits() const
 {
-    // A bound thread's backend is authoritative; before one exists the picker
-    // decides (the combo may hold a sticky "kimi" default).
-    if (!m_threadId.isEmpty()) {
-        return m_backend == QLatin1String("kimi");
-    }
-    return m_backendCombo
-        && m_backendCombo->currentData().toString() == QLatin1String("kimi");
+    // A bound thread's backend is authoritative; before one exists the engine
+    // picker decides (it may hold a sticky non-default engine).
+    return HarnessRegistry::self()->traits(
+        m_threadId.isEmpty() ? selectedHarnessId() : m_backend);
 }
 
-// kimiOptionValues reads a persisted kimi config-option enumeration
-// ("value|name" pairs captured from the init event) back as (value, name).
-static QList<QPair<QString, QString>> kimiOptionValues(const char *key)
+QString AgentPanel::selectedHarnessId() const
+{
+    if (!m_threadId.isEmpty()) {
+        return m_backend;
+    }
+    return m_engineCombo
+        ? m_engineCombo->currentData().toString().section(QLatin1Char('|'), 0, 0)
+        : QString();
+}
+
+QString AgentPanel::selectedProviderId() const
+{
+    if (!m_threadId.isEmpty()) {
+        return m_startedProviderId;
+    }
+    const QString provider = m_engineCombo
+        ? m_engineCombo->currentData().toString().section(QLatin1Char('|'), 1)
+        : QString();
+    return provider.isEmpty() ? ProviderStore::directId() : provider;
+}
+
+void AgentPanel::rebuildEngineCombo()
+{
+    if (!m_engineCombo) {
+        return;
+    }
+    QSignalBlocker block(m_engineCombo);
+    const QString before = m_engineCombo->currentData().toString();
+    m_engineCombo->clear();
+    for (const HarnessTraits &t : HarnessRegistry::self()->all()) {
+        m_engineCombo->addItem(t.displayName, t.id);
+        if (!t.providerRouting) {
+            continue;
+        }
+        // Provider overlays: the same harness routed at a third-party
+        // Anthropic-compatible API ("Claude Code via Fireworks").
+        const QList<ProviderProfile> profiles = ProviderStore::load();
+        for (const ProviderProfile &p : profiles) {
+            if (!p.routed()) {
+                continue; // the direct entry IS the base harness row
+            }
+            m_engineCombo->addItem(
+                i18nc("engine entry: harness via provider", "%1 via %2",
+                      t.displayName, p.name),
+                t.id + QLatin1Char('|') + p.id);
+        }
+    }
+    // Sticky, with one-time migration from the legacy backend+provider keys.
+    KConfigGroup cfg = KSharedConfig::openConfig()->group(QStringLiteral("Agent"));
+    QString saved = !before.isEmpty() ? before : cfg.readEntry("engine", QString());
+    if (saved.isEmpty()) {
+        const QString backend = cfg.readEntry("backend", QStringLiteral("claude"));
+        const QString provider = cfg.readEntry("provider", ProviderStore::directId());
+        saved = backend;
+        if (backend == QLatin1String("claude") && provider != ProviderStore::directId()) {
+            saved += QLatin1Char('|') + provider;
+        }
+    }
+    int idx = m_engineCombo->findData(saved);
+    if (idx < 0) {
+        // e.g. the sticky provider was deleted — fall back to its harness.
+        idx = m_engineCombo->findData(saved.section(QLatin1Char('|'), 0, 0));
+    }
+    if (idx >= 0) {
+        m_engineCombo->setCurrentIndex(idx);
+    }
+}
+
+// optionValues reads a persisted discovered-option enumeration ("value|name"
+// pairs captured from the init event, key = traits.optionKey) as (value, name).
+static QList<QPair<QString, QString>> optionValues(const QString &key)
 {
     QList<QPair<QString, QString>> out;
     const QStringList entries = KSharedConfig::openConfig()
@@ -1234,48 +1277,35 @@ void AgentPanel::rebuildModeCombo()
     if (!m_modeCombo) {
         return;
     }
+    const HarnessTraits t = currentTraits();
     QSignalBlocker block(m_modeCombo);
     m_modeCombo->clear();
-    if (kimiSelected()) {
-        // Kimi's own approval modes (default / plan / auto / yolo on 0.30),
-        // discovered from the session handshake. Until a kimi session has
-        // run there is nothing to enumerate — offer only the CLI default.
-        const auto modes = kimiOptionValues("kimiOpt-mode");
+    if (t.permissionModes.isEmpty()) {
+        // The harness's modes are discovered per session (configOptions) and
+        // persisted from the init event. Until one has run there is nothing
+        // to enumerate — offer only the CLI default.
+        const auto modes = optionValues(t.optionKey(QStringLiteral("mode")));
         if (modes.isEmpty()) {
-            m_modeCombo->addItem(QStringLiteral("CLI default"), QString());
+            m_modeCombo->addItem(i18n("CLI default"), QString());
             return;
         }
         for (const auto &m : modes) {
             m_modeCombo->addItem(m.second, m.first);
         }
-        // Sticky, but never re-arm the auto-approve-everything mode.
-        QString saved = KSharedConfig::openConfig()
-                            ->group(QStringLiteral("Agent"))
-                            .readEntry("kimiMode", QString());
-        if (saved == QLatin1String("yolo")) {
-            saved.clear();
+    } else {
+        for (const QString &mode : t.permissionModes) {
+            m_modeCombo->addItem(HarnessRegistry::modeLabel(mode), mode);
         }
-        const int idx = m_modeCombo->findData(saved);
-        if (idx >= 0) {
-            m_modeCombo->setCurrentIndex(idx);
-        }
-        return;
     }
-    m_modeCombo->addItem(QStringLiteral("Apply edits automatically"),
-                         QStringLiteral("acceptEdits"));
-    m_modeCombo->addItem(QStringLiteral("Ask before each step"), QStringLiteral("default"));
-    m_modeCombo->addItem(QStringLiteral("Plan first — read-only until approved"),
-                         QStringLiteral("plan"));
-    m_modeCombo->addItem(QStringLiteral("Work freely"), QStringLiteral("auto"));
-    m_modeCombo->addItem(QStringLiteral("Expert — never ask"),
-                         QStringLiteral("bypassPermissions"));
-    // Sticky, but "Expert — never ask" resets to "Work freely" so it's never
-    // re-armed accidentally on the next conversation.
+    // Sticky per harness — but never re-arm an auto-approve-everything mode
+    // ("Expert — never ask" / yolo) on the next conversation.
     QString saved = KSharedConfig::openConfig()
                         ->group(QStringLiteral("Agent"))
-                        .readEntry("permissionMode", QStringLiteral("acceptEdits"));
+                        .readEntry(t.stickyModeKey(), QString());
     if (saved == QLatin1String("bypassPermissions")) {
         saved = QStringLiteral("auto");
+    } else if (saved == QLatin1String("yolo")) {
+        saved.clear();
     }
     const int idx = m_modeCombo->findData(saved);
     if (idx >= 0) {
@@ -1288,35 +1318,25 @@ void AgentPanel::rebuildEffortCombo()
     if (!m_effortCombo) {
         return;
     }
+    const HarnessTraits t = currentTraits();
     QSignalBlocker block(m_effortCombo);
     m_effortCombo->clear();
-    if (kimiSelected()) {
-        // Kimi's "thinking" levels (low / high / max on 0.30), discovered
-        // from the session handshake — its analogue of thinking effort.
-        m_effortCombo->addItem(QStringLiteral("CLI default"), QString());
-        const auto levels = kimiOptionValues("kimiOpt-thinking");
+    // An empty value leaves the CLI's own configured default untouched.
+    m_effortCombo->addItem(i18n("Default"), QString());
+    if (t.efforts.isEmpty()) {
+        // Discovered per session (e.g. kimi's "thinking" low/high/max).
+        const auto levels = optionValues(t.optionKey(QStringLiteral("thinking")));
         for (const auto &l : levels) {
             m_effortCombo->addItem(l.second, l.first);
         }
-        const QString saved = KSharedConfig::openConfig()
-                                  ->group(QStringLiteral("Agent"))
-                                  .readEntry("kimiThinking", QString());
-        const int idx = m_effortCombo->findData(saved);
-        if (idx >= 0) {
-            m_effortCombo->setCurrentIndex(idx);
+    } else {
+        for (const QString &effort : t.efforts) {
+            m_effortCombo->addItem(HarnessRegistry::effortLabel(effort), effort);
         }
-        return;
     }
-    // An empty value passes no --effort flag, leaving Claude Code's own default.
-    m_effortCombo->addItem(QStringLiteral("Default"), QString());
-    m_effortCombo->addItem(QStringLiteral("Low"), QStringLiteral("low"));
-    m_effortCombo->addItem(QStringLiteral("Medium"), QStringLiteral("medium"));
-    m_effortCombo->addItem(QStringLiteral("High"), QStringLiteral("high"));
-    m_effortCombo->addItem(QStringLiteral("Extra-high"), QStringLiteral("xhigh"));
-    m_effortCombo->addItem(QStringLiteral("Maximum"), QStringLiteral("max"));
     const QString saved = KSharedConfig::openConfig()
                               ->group(QStringLiteral("Agent"))
-                              .readEntry("effort", QString());
+                              .readEntry(t.stickyEffortKey(), QString());
     const int idx = m_effortCombo->findData(saved);
     if (idx >= 0) {
         m_effortCombo->setCurrentIndex(idx);
@@ -1385,36 +1405,30 @@ void AgentPanel::maybePushOption(const QString &option, const QString &value)
 void AgentPanel::rebuildModelCombo()
 {
     if (!m_modelCombo) {
-        return; // provider combo may fire before the model combo is built
+        return; // the engine combo may fire before the model combo is built
     }
-    const bool kimi = m_backendCombo
-        && m_backendCombo->currentData().toString() == QLatin1String("kimi");
+    const HarnessTraits t = currentTraits();
 
     QSignalBlocker block(m_modelCombo);
     m_modelCombo->clear();
 
-    if (kimi) {
-        // Kimi takes an optional free-text model id (empty = the CLI's own
-        // configured default). Once a kimi session has run, the CLI's real
+    if (t.modelPicker == QLatin1String("discovered")) {
+        // The harness takes an optional free-text model id (empty = the CLI's
+        // own configured default). Once a session has run, the CLI's real
         // model list (discovered from the handshake and persisted from the
         // init event) fills the dropdown; the combo stays editable so a new
         // id can still be typed before any session existed.
         m_modelCombo->setEditable(true);
         m_modelCombo->lineEdit()->clear();
         m_modelCombo->lineEdit()->setPlaceholderText(
-            i18n("kimi default (e.g. kimi-code/kimi-for-coding)"));
-        const QStringList models = KSharedConfig::openConfig()
-                                       ->group(QStringLiteral("Agent"))
-                                       .readEntry("kimiOpt-model", QStringList());
-        for (const QString &entry : models) {
-            const QString value = entry.section(QLatin1Char('|'), 0, 0);
-            const QString name = entry.section(QLatin1Char('|'), 1);
-            if (!value.isEmpty()) {
-                m_modelCombo->addItem(
-                    name.isEmpty() ? value
-                                   : QStringLiteral("%1 — %2").arg(name, value),
-                    value);
-            }
+            i18n("CLI default — or type a model id"));
+        const auto models = optionValues(t.optionKey(QStringLiteral("model")));
+        for (const auto &m : models) {
+            m_modelCombo->addItem(
+                m.second == m.first
+                    ? m.first
+                    : QStringLiteral("%1 — %2").arg(m.second, m.first),
+                m.first);
         }
         m_modelCombo->setCurrentIndex(-1);
         m_modelCombo->lineEdit()->clear();
@@ -1422,9 +1436,7 @@ void AgentPanel::rebuildModelCombo()
     }
     m_modelCombo->setEditable(false);
 
-    const QString providerId = m_providerCombo
-        ? m_providerCombo->currentData().toString()
-        : ProviderStore::directId();
+    const QString providerId = selectedProviderId();
     if (providerId.isEmpty() || providerId == ProviderStore::directId()) {
         // Claude tiers — the core's resolveModel maps these to concrete ids.
         m_modelCombo->addItem(QStringLiteral("Default model"), QString());
@@ -1460,25 +1472,13 @@ void AgentPanel::rebuildModelCombo()
 
 void AgentPanel::reloadProviders()
 {
-    if (!m_providerCombo || !m_threadId.isEmpty()) {
+    if (!m_engineCombo || !m_threadId.isEmpty()) {
         return; // frozen once a thread exists
     }
-    const QString current = m_providerCombo->currentData().toString();
-    {
-        QSignalBlocker block(m_providerCombo);
-        m_providerCombo->clear();
-        const QList<ProviderProfile> profiles = ProviderStore::load();
-        for (const ProviderProfile &p : profiles) {
-            m_providerCombo->addItem(p.name, p.id);
-        }
-        int idx = m_providerCombo->findData(current);
-        if (idx < 0) {
-            idx = m_providerCombo->findData(ProviderStore::directId());
-        }
-        if (idx >= 0) {
-            m_providerCombo->setCurrentIndex(idx);
-        }
-    }
+    // The provider profiles are part of the engine list; rebuilding it keeps
+    // the current selection (falling back to the bare harness if the selected
+    // provider was deleted).
+    rebuildEngineCombo();
     rebuildModelCombo();
 }
 
@@ -1633,8 +1633,8 @@ void AgentPanel::setDormant(const QString &threadId, const QString &title, bool 
     loadTranscript();
     // Pull the thread's persisted compaction strategy and reflect it in the
     // dropdown — overrides whatever sticky default the panel was showing.
-    // Kimi threads have no compaction support, so there's nothing to pull.
-    if (m_backend != QLatin1String("kimi")) {
+    // Skipped for harnesses without compaction support: nothing to pull.
+    if (currentTraits().compaction) {
         const QString tid = m_threadId;
         m_core->call(QStringLiteral("agent.summaryStatus"),
                      QJsonObject{{QStringLiteral("threadId"), tid}},
@@ -1755,8 +1755,8 @@ void AgentPanel::loadTranscriptFrom(const QString &fromThreadId)
 
 void AgentPanel::pushCompactStrategy()
 {
-    // Kimi threads have no compaction support — the core rejects the call.
-    if (m_backend == QLatin1String("kimi")) {
+    // No compaction support on this harness — the core would reject the call.
+    if (!currentTraits().compaction) {
         return;
     }
     if (m_threadId.isEmpty() || !m_core || !m_core->isConnected()) {
@@ -1773,9 +1773,10 @@ void AgentPanel::pushCompactStrategy()
 
 void AgentPanel::runCompactNow(const QString &model)
 {
-    // Kimi threads have no compaction support — the core rejects the call.
-    if (m_backend == QLatin1String("kimi")) {
-        addNote(QStringLiteral("Compaction is not supported for Kimi Code agents."),
+    const HarnessTraits t = currentTraits();
+    // No compaction support on this harness — the core would reject the call.
+    if (!t.compaction) {
+        addNote(i18n("Compaction is not supported for %1 agents.", t.displayName),
                 QStringLiteral("dim"));
         return;
     }
@@ -1823,9 +1824,7 @@ void AgentPanel::runCompactNow(const QString &model)
 
 void AgentPanel::doResume()
 {
-    addNote(m_backend == QLatin1String("kimi")
-                ? QStringLiteral("resuming the Kimi Code session…")
-                : QStringLiteral("resuming the Claude Code session…"),
+    addNote(i18n("resuming the %1 session…", currentTraits().displayName),
             QStringLiteral("sys"));
     QJsonObject params{{QStringLiteral("threadId"), m_threadId}};
     // Re-attach the provider (with its API token) when this panel started the
@@ -1858,9 +1857,9 @@ void AgentPanel::resume()
     if (!m_dormant || m_threadId.isEmpty()) {
         return;
     }
-    // Kimi threads have no compaction support — resume straight away instead of
-    // checking summary status / offering a pre-resume compact.
-    if (m_backend == QLatin1String("kimi")) {
+    // Harnesses without compaction support resume straight away — there is no
+    // summary status to check or pre-resume compact to offer.
+    if (!currentTraits().compaction) {
         doResume();
         return;
     }
@@ -1957,23 +1956,24 @@ void AgentPanel::refresh()
         m_interruptBtn->setVisible(running && !m_idle);
     }
     m_diffBtn->setEnabled(running);
-    // Forking is Claude-only: a Kimi thread can't be forked (the core rejects
-    // agent.fork), so the button stays disabled for one.
-    const bool threadKimi = m_backend == QLatin1String("kimi");
+    // Every optional affordance binds to the harness's capability set — the
+    // bound thread's traits, or the engine picker's selection before a thread
+    // exists (currentTraits() resolves that).
+    const HarnessTraits traits = currentTraits();
     if (m_forkBtn) {
-        m_forkBtn->setEnabled(!m_threadId.isEmpty() && !threadKimi);
+        m_forkBtn->setEnabled(!m_threadId.isEmpty() && traits.fork);
         m_forkBtn->setToolTip(
-            threadKimi
-                ? QStringLiteral("Forking is not supported for Kimi Code agents.")
-                : QStringLiteral(
+            traits.fork
+                ? QStringLiteral(
                     "Continue this conversation as a new agent on a different model or "
-                    "thinking effort, keeping the full context. The original is untouched."));
+                    "thinking effort, keeping the full context. The original is untouched.")
+                : i18n("Forking is not supported for %1 agents.", traits.displayName));
     }
-    // Compact-now needs a thread on disk (running or dormant). The Hot Opus
-    // menu item is the only one that further needs the thread to be live.
-    // Kimi threads have no compaction support at all.
+    // Compact-now needs a thread on disk (running or dormant) and a harness
+    // with compaction support. The Hot Opus menu item is the only one that
+    // further needs the thread to be live.
     if (m_compactNowBtn) {
-        m_compactNowBtn->setEnabled(!m_threadId.isEmpty() && !threadKimi);
+        m_compactNowBtn->setEnabled(!m_threadId.isEmpty() && traits.compaction);
         if (auto *menu = m_compactNowBtn->menu()) {
             const auto actions = menu->actions();
             if (!actions.isEmpty()) {
@@ -1982,34 +1982,25 @@ void AgentPanel::refresh()
         }
     }
     if (m_compactNowMenu) {
-        m_compactNowMenu->setEnabled(!m_threadId.isEmpty() && !threadKimi);
+        m_compactNowMenu->setEnabled(!m_threadId.isEmpty() && traits.compaction);
         const auto actions = m_compactNowMenu->actions();
         if (!actions.isEmpty()) {
             actions.first()->setEnabled(running); // "Hot Opus (live thread)"
         }
     }
-    // Backend, isolation, provider and desktop access are baked into the
-    // agent's launch — frozen once a thread exists. Model and "when to ask"
-    // stay adjustable WHILE THE AGENT RUNS: the core forwards changes
-    // mid-session (claude: set_model / set_permission_mode control requests;
-    // kimi: session/set_config_option). Thinking effort is likewise live for
-    // kimi (its "thinking" option); Claude Code has no set_effort control
-    // request, so effort stays a start-time choice there. Picker state only
-    // matters before a thread exists — a bound thread's backend is m_backend,
-    // and the combo may hold a stale sticky default.
-    const bool pickerKimi = m_threadId.isEmpty() && m_backendCombo
-        && m_backendCombo->currentData().toString() == QLatin1String("kimi");
-    const bool kimiSel = threadKimi || pickerKimi;
-    m_compactCombo->setEnabled(!threadKimi && !pickerKimi);
-    m_compactStrip->setEnabled(!threadKimi && !pickerKimi);
-    m_backendCombo->setEnabled(m_threadId.isEmpty());
+    // Engine, isolation and desktop access are baked into the agent's launch —
+    // frozen once a thread exists. Model and "when to ask" stay adjustable
+    // WHILE THE AGENT RUNS (the core forwards mid-session changes through the
+    // harness); thinking effort is live only where the harness says so.
+    m_compactCombo->setEnabled(traits.compaction);
+    m_compactStrip->setEnabled(traits.compaction);
+    m_engineCombo->setEnabled(m_threadId.isEmpty());
     m_modeCombo->setEnabled(m_threadId.isEmpty() || running);
     m_isolationCombo->setEnabled(m_threadId.isEmpty());
-    m_effortCombo->setEnabled(kimiSel ? (m_threadId.isEmpty() || running)
-                                      : m_threadId.isEmpty());
-    m_providerCombo->setEnabled(m_threadId.isEmpty() && !pickerKimi);
+    m_effortCombo->setEnabled(traits.effortLive ? (m_threadId.isEmpty() || running)
+                                                : m_threadId.isEmpty());
     m_modelCombo->setEnabled(m_threadId.isEmpty() || running);
-    m_coworkCheck->setEnabled(m_threadId.isEmpty() && !pickerKimi);
+    m_coworkCheck->setEnabled(m_threadId.isEmpty() && traits.cowork);
 
     // Offer promotion while a thread runs non-isolated in the workspace.
     m_promoteBar->setVisible(!m_threadId.isEmpty() && !m_isolated && !m_promoting);
@@ -2057,10 +2048,11 @@ void AgentPanel::refresh()
             st = AgentRoles::AgentStatus::Working;
         }
     }
-    // Badge Kimi Code threads so the roster card shows which backend drives
-    // this agent ("" / "claude" threads stay unmarked — the common case).
-    if (threadKimi) {
-        text.prepend(QStringLiteral("Kimi · "));
+    // Badge non-default engines so the roster card shows which harness drives
+    // this agent (the default engine stays unmarked — the common case). The
+    // badge text is harness data, never a hardcoded name.
+    if (!m_threadId.isEmpty() && !traits.badge.isEmpty()) {
+        text.prepend(traits.badge + QStringLiteral(" · "));
     }
     // Append the running session cost as a quiet suffix once any has accrued.
     // Kept on the same subtitle so the roster card reflects it too.
@@ -2506,16 +2498,13 @@ void AgentPanel::onSendClicked()
     // Resolve the API provider for a fresh start up front, while the composer
     // still holds the message — a missing key aborts cleanly without losing it.
     // (akcore inherits this UI's environment, so if the key can't be resolved
-    // here it cannot be resolved at launch either.)
+    // here it cannot be resolved at launch either.) Only engines with provider
+    // routing carry a provider overlay in the first place.
     QJsonObject providerJson;
     QString startedProviderId;
-    // A Kimi Code start skips provider routing entirely (the core rejects a
-    // provider combined with backend=kimi).
-    const bool startingKimi = m_threadId.isEmpty() && m_backendCombo
-        && m_backendCombo->currentData().toString() == QLatin1String("kimi");
-    if (m_threadId.isEmpty() && m_providerCombo && !startingKimi) {
-        const ProviderProfile prof =
-            ProviderStore::byId(m_providerCombo->currentData().toString());
+    const HarnessTraits startTraits = currentTraits();
+    if (m_threadId.isEmpty() && startTraits.providerRouting) {
+        const ProviderProfile prof = ProviderStore::byId(selectedProviderId());
         if (prof.routed()) {
             providerJson = ProviderStore::toJson(prof);
             if (!providerJson.contains(QStringLiteral("authToken"))) {
@@ -2586,17 +2575,18 @@ void AgentPanel::onSendClicked()
         QJsonObject startParams{
             {QStringLiteral("workspacePath"), m_workspace},
             {QStringLiteral("prompt"), text},
-            {QStringLiteral("backend"), m_backendCombo->currentData().toString()},
-            // The mode/effort combos hold per-backend vocabularies (Claude's
-            // permission modes and --effort levels, or kimi's "mode" and
-            // "thinking" config-option values), so both send verbatim.
+            {QStringLiteral("backend"), selectedHarnessId()},
+            // The mode/effort combos hold per-harness vocabularies (Claude's
+            // permission modes and --effort levels, or a discovered harness's
+            // own config-option values), so both send verbatim.
             {QStringLiteral("permissionMode"), m_modeCombo->currentData().toString()},
             {QStringLiteral("isolation"), m_isolationCombo->currentData().toString()},
             {QStringLiteral("effort"), m_effortCombo->currentData().toString()},
             {QStringLiteral("model"), currentModel()},
-            // Provider routing and Cowork don't apply to Kimi Code (the core
-            // rejects them).
-            {QStringLiteral("coworkEnabled"), !startingKimi && m_coworkCheck->isChecked()},
+            // Cowork applies only where the harness supports it (the checkbox
+            // is disabled otherwise, but the record must never lie).
+            {QStringLiteral("coworkEnabled"),
+             startTraits.cowork && m_coworkCheck->isChecked()},
             {QStringLiteral("attachments"), attachments}};
         if (!providerJson.isEmpty()) {
             startParams.insert(QStringLiteral("provider"), providerJson);
@@ -3711,13 +3701,15 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
         if (subtype != QLatin1String("init")) {
             return;
         }
-        // A kimi init event carries the session's config options (model /
-        // thinking / mode enumerations straight from the CLI). Persist each
-        // as "value|name" pairs so the pickers can offer the real lists on
-        // the next agent instead of free-text fields.
+        // A discovered-options init event carries the session's config options
+        // (model / thinking / mode enumerations straight from the CLI).
+        // Persist each as "value|name" pairs under the harness's option key so
+        // the pickers can offer the real lists on the next agent instead of
+        // free-text fields.
         const QJsonArray configOptions =
             ev.value(QStringLiteral("configOptions")).toArray();
         if (!configOptions.isEmpty()) {
+            const HarnessTraits t = currentTraits();
             KConfigGroup cfg =
                 KSharedConfig::openConfig()->group(QStringLiteral("Agent"));
             for (const QJsonValue &ov : configOptions) {
@@ -3735,7 +3727,7 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
                                    + val.value(QStringLiteral("name")).toString();
                 }
                 if (!entries.isEmpty()) {
-                    cfg.writeEntry(QStringLiteral("kimiOpt-") + id, entries);
+                    cfg.writeEntry(t.optionKey(id), entries);
                 }
             }
         }

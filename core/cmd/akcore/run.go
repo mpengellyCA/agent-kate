@@ -19,6 +19,7 @@ import (
 	"agentkate/internal/coop"
 	"agentkate/internal/cowork"
 	"agentkate/internal/gitstatus"
+	"agentkate/internal/harness"
 	"agentkate/internal/ipc"
 	"agentkate/internal/kde"
 	"agentkate/internal/kimi"
@@ -160,6 +161,12 @@ func runCore() {
 	// --resume targets the latest session rather than the stale start-time id.
 	lastSessionID := map[string]string{}
 
+	// The harness registry is built after the supervisors below (their emit
+	// callback is this relay), but the relay's compaction gate needs it — so
+	// declare it here and assign once construction completes. Events only flow
+	// after handlers are registered, well past that point.
+	var harnesses *harness.Registry
+
 	// The agent supervisors relay every thread event to the UI as a
 	// notification, so the agent panel can render the conversation live. Events
 	// arrive pre-coalesced as an ordered batch; we forward the whole batch in a
@@ -231,12 +238,15 @@ func runCore() {
 				})
 				// Cold-exit compaction runs only on a normal exit; a user
 				// interrupt is meant to be immediate, so we don't spend a turn
-				// summarising it. Kimi threads have no compaction support.
+				// summarising it — and only for harnesses that support
+				// compaction at all.
 				if probe.Phase == "exited" {
-					if rec, ok := sessions.Get(threadID); ok && rec.Backend != session.BackendKimi {
-						strat := compact.Strategy(rec.CompactStrategy).Resolve()
-						if strat.RunsOnExit() && strat != compact.ExitOpusHot {
-							coldCompacts.spawn(log, sessions, summaries, rec, strat)
+					if rec, ok := sessions.Get(threadID); ok && harnesses != nil {
+						if h, ok := harnesses.Get(rec.Backend); ok && h.Capabilities().Compaction {
+							strat := compact.Strategy(rec.CompactStrategy).Resolve()
+							if strat.RunsOnExit() && strat != compact.ExitOpusHot {
+								coldCompacts.spawn(log, sessions, summaries, rec, strat)
+							}
 						}
 					}
 				}
@@ -253,6 +263,14 @@ func runCore() {
 			dec, ok := askHumanPermission(srv, broker, threadID, toolName, input)
 			return ok && dec.Allow
 		}, "")
+
+	// The harness registry: each supervisor wrapped in its adapter, in the
+	// order pickers list engines. "claude" is the default — persisted records
+	// use an empty Backend for it. Adding a backend means registering one
+	// more adapter here (see docs/HARNESSES.md).
+	harnesses = harness.NewRegistry("claude")
+	harnesses.Register(newClaudeHarness(sup, exePath, *socket))
+	harnesses.Register(newKimiHarness(ksup, exePath, *socket))
 
 	// --- KDE Plasma Cowork (opt-in desktop see/control; off by default) --------
 	// The shared D-Bus client and consent authority are constructed eagerly so the
@@ -292,7 +310,7 @@ func runCore() {
 	deps := handlerDeps{
 		srv:        srv,
 		sup:        sup,
-		ksup:       ksup,
+		harnesses:  harnesses,
 		coop:       coopState,
 		threads:    threads,
 		broker:     broker,
@@ -319,7 +337,7 @@ func runCore() {
 		shutdownOnce.Do(func() {
 			running := 0
 			for _, rec := range sessions.List("") {
-				if sup.Running(rec.ThreadID) || ksup.Running(rec.ThreadID) {
+				if deps.agentRunning(rec.ThreadID) {
 					running++
 				}
 			}
@@ -328,8 +346,9 @@ func runCore() {
 			// cache-warm; it emits its own per-agent "compacting" progress.
 			runHotCompactsAtShutdown(deps, progress)
 			progress("stopping", "", 0, running)
-			sup.StopAll()
-			ksup.StopAll()
+			for _, h := range harnesses.All() {
+				h.StopAll()
+			}
 			// Cold-exit compactions were spawned from the exit lifecycle as each
 			// thread reaped; drain them (bounded) before we let the process exit.
 			progress("draining", "", 0, 0)

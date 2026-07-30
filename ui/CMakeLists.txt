@@ -42,6 +42,7 @@ find_package(KF6 6.0 QUIET COMPONENTS Wallet)
 
 add_executable(agentkate
     src/main.cpp
+    src/state/HarnessTraits.cpp
     src/state/Reactive.cpp
     src/theme/ThemeManager.cpp
     src/AppearanceDialog.cpp

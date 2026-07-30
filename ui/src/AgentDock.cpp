@@ -397,7 +397,11 @@ void AgentDock::newAgentInActiveProjectGuided()
     if (!panel) {
         return;
     }
-    // The agent isn't started yet, so the combos are still free to set.
+    // The agent isn't started yet, so the combos are still free to set. The
+    // full engine (harness + optional provider overlay) comes first — it
+    // decides what the other pickers offer.
+    panel->preselectEngine(c.backend, c.providerId);
+    panel->preselectModel(c.modelId);
     panel->preselectIsolation(c.isolation);
     panel->preselectPermission(c.permissionMode);
     panel->preselectEffort(c.effort);
@@ -1048,9 +1052,13 @@ void AgentDock::forkAgent(int agentId)
         emit statusMessage(i18n("Start the agent before forking it"));
         return;
     }
-    // Forking is Claude-only — the core rejects agent.fork for Kimi threads.
-    if (e->panel->backend() == QLatin1String("kimi")) {
-        emit statusMessage(i18n("Forking is not supported for Kimi Code agents"));
+    // Forking is a per-harness capability — the core rejects agent.fork where
+    // unsupported; mirror that here so the dialog never opens pointlessly.
+    const HarnessTraits traits =
+        HarnessRegistry::self()->traits(e->panel->backend());
+    if (!traits.fork) {
+        emit statusMessage(
+            i18n("Forking is not supported for %1 agents", traits.displayName));
         return;
     }
     const QString sourceTitle = m_roster->agentTitle(agentId);
