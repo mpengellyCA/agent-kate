@@ -125,6 +125,20 @@ type StartSpec struct {
 	Cowork   bool            // opt into the Cowork desktop MCP server
 	Provider *agent.Provider // third-party API routing; nil = direct
 
+	// Env overlays the agent process's environment, on top of the core's own
+	// (and after any provider routing). Neutral by design — every adapter
+	// applies it the same way, because "run this thread's CLI with this
+	// variable set" needs no CLI knowledge. It is how per-thread CLI state
+	// isolation is expressed (e.g. KIMI_CODE_HOME pointing a kimi thread at
+	// its own home directory).
+	//
+	// It is deliberately NOT reachable from an agent: launch_agent does not
+	// accept it. A worker's environment decides where its credentials come
+	// from and which endpoint they are sent to, so handing that lever to a
+	// model would route around the permission prompt that guards every other
+	// way of doing the same thing.
+	Env map[string]string
+
 	// SystemPrompt is persona text to run the thread's agent with, on top of
 	// the CLI's own system prompt. Gated by Capabilities.SystemPrompt: a
 	// harness without the channel reports it unapplied rather than emulating

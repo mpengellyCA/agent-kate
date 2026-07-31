@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -81,6 +82,36 @@ var modelSlotEnv = map[string][]string{
 //
 // It returns an error rather than spawning an unauthenticated request when a
 // routed provider has no resolvable credential.
+// ApplyEnvOverlay sets (or replaces) each key of overlay in base, returning the
+// merged environment. Shared by both supervisors so "run this thread with this
+// variable set" behaves identically on every harness — the overlay is applied
+// LAST, after provider routing, so it is one rule rather than an ordering
+// puzzle: what the caller asked for is what the child gets.
+func ApplyEnvOverlay(base []string, overlay map[string]string) []string {
+	if len(overlay) == 0 {
+		return base
+	}
+	out := make([]string, 0, len(base)+len(overlay))
+	for _, kv := range base {
+		key := kv
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			key = kv[:i]
+		}
+		if _, replaced := overlay[key]; !replaced {
+			out = append(out, kv)
+		}
+	}
+	keys := make([]string, 0, len(overlay))
+	for k := range overlay {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys) // deterministic order, so a test can assert the env
+	for _, k := range keys {
+		out = append(out, k+"="+overlay[k])
+	}
+	return out
+}
+
 func buildEnv(base []string, p *Provider) ([]string, error) {
 	if !p.Routed() {
 		return base, nil

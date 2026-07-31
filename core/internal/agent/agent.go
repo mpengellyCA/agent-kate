@@ -114,6 +114,10 @@ type StartOptions struct {
 	Provider       *Provider    // optional third-party API routing; nil/empty BaseURL = Claude direct
 	SystemPrompt   string       // claude --append-system-prompt; empty = none
 	AgentsJSON     string       // claude --agents payload, pre-rendered by the adapter; empty = none
+	// Env overlays the child's environment (applied AFTER provider routing, so
+	// a caller cannot silently redirect a routed thread's endpoint by ordering).
+	// See harness.StartSpec.Env for why this never comes from an agent.
+	Env map[string]string
 }
 
 // buildStartArgs assembles the `claude` argv for one thread. Split out of
@@ -395,7 +399,8 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 	if err != nil {
 		return nil, err
 	}
-	cmd.Env = env
+	// The caller's per-thread overlay goes on last (e.g. a CLI-state home dir).
+	cmd.Env = ApplyEnvOverlay(env, opts.Env)
 	// Put the agent in its own process group so Interrupt() can signal the whole
 	// group (claude + any tools / MCP subprocesses it spawns) rather than
 	// orphaning children. The group id equals the leader's pid.

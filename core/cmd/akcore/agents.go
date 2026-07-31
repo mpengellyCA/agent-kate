@@ -97,6 +97,7 @@ func launchThread(d handlerDeps, h harness.Harness, threadID, sessionID string,
 		Provider:       p.Provider,
 		SystemPrompt:   p.SystemPrompt,
 		Agents:         p.Agents,
+		Env:            p.Env,
 	})
 	if err != nil {
 		emitLifecycle(d, threadID, "error", err.Error(), &wt)
@@ -133,6 +134,7 @@ func launchThread(d handlerDeps, h harness.Harness, threadID, sessionID string,
 		CoworkEnabled:  p.CoworkEnabled,
 		SystemPrompt:   recPrompt,
 		Agents:         recAgents,
+		Env:            p.Env,
 	}
 	applyProviderToRecord(&rec, p.Provider)
 	if err := d.sessions.Put(rec); err != nil {
@@ -180,6 +182,9 @@ func resumeThread(d handlerDeps, h harness.Harness, rec session.Record, provOver
 		// written before P3 carry none and resume exactly as they did before.
 		SystemPrompt: rec.SystemPrompt,
 		Agents:       rec.Agents,
+		// Without this a resumed thread would run against a different CLI home
+		// than it was launched with — and its session lives in the old one.
+		Env: rec.Env,
 	}
 	// A fresh override (the UI re-supplying a KWallet-held token the Record never
 	// stores) takes precedence over the env-var resolution baked into the snapshot.
@@ -302,9 +307,11 @@ func forkAgentThread(d handlerDeps, h harness.Harness, src session.Record, newTh
 		Cowork:         src.CoworkEnabled,
 		Provider:       providerFromRecord(src),
 		// A fork continues the source's conversation, so it continues the
-		// source's persona too — the record holds what was applied there.
+		// source's persona too — the record holds what was applied there — and
+		// its environment, which is where the source's CLI state lives.
 		SystemPrompt: src.SystemPrompt,
 		Agents:       src.Agents,
+		Env:          src.Env,
 	})
 	if err != nil {
 		emitLifecycle(d, newThreadID, "error", err.Error(), &wt)
@@ -339,6 +346,7 @@ func forkAgentThread(d handlerDeps, h harness.Harness, src session.Record, newTh
 		Tags:            append([]string(nil), src.Tags...),
 		SystemPrompt:    forkPrompt,
 		Agents:          forkAgents,
+		Env:             src.Env,
 	}
 	applyProviderToRecord(&rec, providerFromRecord(src))
 	if err := d.sessions.Put(rec); err != nil {

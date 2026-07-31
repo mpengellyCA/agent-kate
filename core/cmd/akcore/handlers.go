@@ -63,6 +63,10 @@ type agentStartParams struct {
 	// than emulating it.
 	SystemPrompt string                 `json:"systemPrompt,omitempty"`
 	Agents       []harness.AgentProfile `json:"agents,omitempty"`
+	// Env overlays this thread's process environment (plan 16 P6). Reachable
+	// from agent.start — a UI/human path — and deliberately NOT from
+	// launch_agent: see harness.StartSpec.Env.
+	Env map[string]string `json:"env,omitempty"`
 }
 
 type agentSendParams struct {

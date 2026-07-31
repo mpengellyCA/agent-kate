@@ -68,6 +68,18 @@ that, so resume replays reality. `SetOption` maps
 `model|effort|permissionMode` onto your CLI's mid-session mechanism, or
 returns an error naming the harness.
 
+`StartSpec.Env` is a per-thread environment overlay every adapter applies the
+same way (`agent.ApplyEnvOverlay`, after provider routing). It exists because
+some CLIs have no flags worth shaping — `kimi acp` has none at all — and their
+only per-thread lever is the environment: `KIMI_CODE_HOME` relocates a kimi
+thread's entire home (sessions, config **and credentials**, verified on 0.30.0),
+so pointing one at an empty directory also un-authenticates it. That is why the
+overlay ships as a lever with no default policy. It is persisted on the record
+and replayed on resume/fork/promote — a relaunch without it would look for the
+session in a different home — and it is deliberately unreachable from
+`launch_agent`: a worker's environment decides where its credentials come from
+and which endpoint they go to.
+
 `Compact(ctx, spec)` runs one context compaction and returns the summary body.
 Both mechanisms live in your adapter, distinguished by `spec.Hot`: hot sends
 `spec.Prompt` into the LIVE thread and returns its reply (no re-cache, needs a

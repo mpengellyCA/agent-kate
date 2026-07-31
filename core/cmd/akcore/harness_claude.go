@@ -197,6 +197,7 @@ func (h *claudeHarness) Launch(spec harness.StartSpec) (harness.Launched, error)
 		Provider:       spec.Provider,
 		SystemPrompt:   systemPrompt,
 		AgentsJSON:     agentsJSON,
+		Env:            spec.Env,
 	}); err != nil {
 		os.Remove(mcpConfig)
 		return harness.Launched{}, err

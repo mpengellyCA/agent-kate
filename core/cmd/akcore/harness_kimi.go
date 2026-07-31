@@ -82,6 +82,7 @@ func (h *kimiHarness) Launch(spec harness.StartSpec) (harness.Launched, error) {
 		Model:       spec.Model,
 		Thinking:    spec.Effort,
 		Mode:        spec.PermissionMode,
+		Env:         spec.Env,
 		MCPServers: []kimi.MCPServer{
 			coopMCPServer(h.exePath, h.socketPath, spec.ThreadID, spec.WorkDir),
 		},

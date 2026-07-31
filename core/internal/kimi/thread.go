@@ -59,6 +59,12 @@ type StartOptions struct {
 	Thinking    string             // kimi thinking level (config option "thinking"); "" = CLI default
 	Mode        string             // kimi approval mode (config option "mode"); "" = CLI default
 	MCPServers  []MCPServer        // forwarded to session/new (the Cooperation bridge)
+	// Env overlays the child's environment. `kimi acp` takes no harness-shaping
+	// flags at all (plan 15's probe), so environment is the ONLY per-thread
+	// lever this CLI has — KIMI_CODE_HOME, for one, moves a thread's whole
+	// kimi state (sessions, config, agents) somewhere of the caller's
+	// choosing. See harness.StartSpec.Env for why no agent can set it.
+	Env map[string]string
 }
 
 // Thread is one running `kimi acp` process. Its outward surface mirrors
@@ -260,6 +266,9 @@ func ReadTranscript(eventDir, threadID string) ([]json.RawMessage, error) {
 func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 	cmd := exec.Command(s.kimiBin, "acp")
 	cmd.Dir = opts.WorkDir
+	// kimi used to spawn with the core's environment verbatim; a per-thread
+	// overlay is the only way to shape an `acp` child (plan 16 P6).
+	cmd.Env = agent.ApplyEnvOverlay(os.Environ(), opts.Env)
 	// Own process group, like the Claude threads, so the interrupt backstop
 	// can signal kimi plus anything it spawned.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

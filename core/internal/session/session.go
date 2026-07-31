@@ -87,6 +87,15 @@ type Record struct {
 	SystemPrompt string                 `json:"systemPrompt,omitempty"`
 	Agents       []harness.AgentProfile `json:"agents,omitempty"`
 
+	// Env is the per-thread process-environment overlay this thread was
+	// launched with (plan 16 P6). Persisted as REQUESTED, not as applied:
+	// unlike the persona channels there is nothing to negotiate — the spawn
+	// either sets a variable or it does not. It has to survive, because it is
+	// what points a CLI at its per-thread state (KIMI_CODE_HOME): a resume
+	// without it would look for the session in a different home. Absent on
+	// records written before P6, which then resume exactly as they did before.
+	Env map[string]string `json:"env,omitempty"`
+
 	// CoworkEnabled opts this thread into the KDE Plasma Cowork MCP server
 	// (desktop see/control). Off by default; only the UI may flip it
 	// (cowork.setEnabled). See docs/plans/08-kde-cowork/.
