@@ -13,7 +13,7 @@ class QLineEdit;
 // source agent's" — the fork only overrides what the user actually changed.
 struct ForkChoices {
     QString name;    // fork's roster title
-    QString modelId; // "" | opus | sonnet | haiku | fable
+    QString modelId; // "" = keep source's; else a live model value/alias
     QString effort;  // "" | low | medium | high | xhigh | max
 };
 
@@ -27,9 +27,11 @@ class ForkAgentDialog : public QDialog
 public:
     // sourceTitle names the agent being forked (used for the heading and the
     // default fork name). sourceModel/sourceEffort prefill the pickers with the
-    // source's current settings ("" = the agent's default).
+    // source's current settings ("" = the agent's default). backend/providerId
+    // select which engine's live model + effort vocabularies the pickers offer.
     ForkAgentDialog(const QString &sourceTitle, const QString &sourceModel,
-                    const QString &sourceEffort, QWidget *parent = nullptr);
+                    const QString &sourceEffort, const QString &backend,
+                    const QString &providerId, QWidget *parent = nullptr);
 
     ForkChoices choices() const;
 

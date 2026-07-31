@@ -83,7 +83,7 @@ func NewSupervisor(claudeBin string, log *slog.Logger, emit EventFunc) *Supervis
 // Attachment is a file the human attached to a message: an image (sent as an
 // image content block) or a text file (embedded inline as text).
 type Attachment struct {
-	Kind      string `json:"kind"`      // "image" or "text"
+	Kind      string `json:"kind"` // "image" or "text"
 	Name      string `json:"name"`
 	MediaType string `json:"mediaType"` // images, e.g. "image/png"
 	Text      string `json:"text"`      // text files: the file content
@@ -157,10 +157,10 @@ type Thread struct {
 	meter       *toolMeter  // measures tool_result sizes for token-cost telemetry
 	usage       *usageMeter // measures per-turn LLM token usage and billed cost
 	alive       bool
-	pgid        int         // process-group id (== leader pid); signalled by Interrupt
-	interrupted bool        // set by Interrupt so reap() reports a user-interrupt if the process dies
-	aborting    bool        // set by Interrupt while an in-band abort is pending; cleared on the aborted turn's result
-	stopping    bool        // a Stop is in flight; suppresses turn_aborted and rejects new Sends
+	pgid        int  // process-group id (== leader pid); signalled by Interrupt
+	interrupted bool // set by Interrupt so reap() reports a user-interrupt if the process dies
+	aborting    bool // set by Interrupt while an in-band abort is pending; cleared on the aborted turn's result
+	stopping    bool // a Stop is in flight; suppresses turn_aborted and rejects new Sends
 	// turnsInFlight counts user messages written whose `result` event has not
 	// arrived yet — the claude counterpart of the kimi supervisor's
 	// activePrompts. Every turn is initiated by our own Send (opening prompt,
@@ -674,6 +674,103 @@ func (s *Supervisor) SetModel(threadID, model string) error {
 // acceptEdits, auto, bypassPermissions, default, dontAsk, plan).
 func (s *Supervisor) SetPermissionMode(threadID, mode string) error {
 	return s.sendControl(threadID, "set_permission_mode", map[string]any{"mode": mode})
+}
+
+// ClaudeModel is one entry of the CLI's live model vocabulary as reported by
+// `claude -p /model`. Value is the token passed to `--model` (an alias like
+// "opus" that resolves to the newest model, a "[1m]" variant, or a full id);
+// Name is a display label.
+type ClaudeModel struct {
+	Value string
+	Name  string
+}
+
+// DiscoverModels runs `claude -p /model` — a local slash command that prints
+// the live model vocabulary without starting a turn (no tokens billed) and
+// works under OAuth (no API key needed). It returns the parsed alias list, or
+// an empty slice on any failure so callers leave a prior cache intact.
+func (s *Supervisor) DiscoverModels(ctx context.Context) ([]ClaudeModel, error) {
+	cmd := exec.CommandContext(ctx, s.claudeBin, "-p", "/model")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		// Best-effort: an unauthenticated or missing CLI yields nothing to
+		// cache, not a hard error that would blank the picker.
+		return nil, nil
+	}
+	return parseClaudeModelList(string(out)), nil
+}
+
+// parseClaudeModelList extracts the alias vocabulary from `claude -p /model`
+// output, e.g.:
+//
+//	Current model: Opus 5 (1M context) (default)
+//	Usage: /model <name>. Available: sonnet, opus, haiku, fable, best,
+//	  sonnet[1m], opus[1m], fable[1m], opusplan, default, or a full model ID.
+func parseClaudeModelList(out string) []ClaudeModel {
+	const marker = "Available:"
+	i := strings.Index(out, marker)
+	if i < 0 {
+		return nil
+	}
+	list := out[i+len(marker):]
+	if dot := strings.IndexByte(list, '.'); dot >= 0 {
+		list = list[:dot] // the sentence ends at the first period after the list
+	}
+	current := parseCurrentModel(out)
+	var models []ClaudeModel
+	seen := map[string]bool{}
+	for _, tok := range strings.Split(list, ",") {
+		v := strings.TrimSpace(tok)
+		// Drop the trailing "or a full model ID" prose, whether comma-separated
+		// or glued onto the last alias.
+		if low := strings.ToLower(v); strings.HasPrefix(low, "or a full model") {
+			continue
+		} else if idx := strings.Index(low, "or a full model"); idx >= 0 {
+			v = strings.TrimSpace(v[:idx])
+		}
+		if v == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		name := prettyModelAlias(v)
+		if strings.EqualFold(v, "default") && current != "" {
+			name = "Default (" + current + ")"
+		}
+		models = append(models, ClaudeModel{Value: v, Name: name})
+	}
+	return models
+}
+
+// parseCurrentModel pulls the short name from a "Current model: <name> (…)" line.
+func parseCurrentModel(out string) string {
+	const marker = "Current model:"
+	i := strings.Index(out, marker)
+	if i < 0 {
+		return ""
+	}
+	line := out[i+len(marker):]
+	if nl := strings.IndexByte(line, '\n'); nl >= 0 {
+		line = line[:nl]
+	}
+	if p := strings.IndexByte(line, '('); p >= 0 {
+		line = line[:p] // drop "(1M context)" / "(default)" annotations
+	}
+	return strings.TrimSpace(line)
+}
+
+// prettyModelAlias turns "opus" → "Opus" and "opus[1m]" → "Opus (1M)".
+func prettyModelAlias(v string) string {
+	base, oneM := v, false
+	if strings.HasSuffix(strings.ToLower(v), "[1m]") {
+		base, oneM = v[:len(v)-4], true
+	}
+	if base != "" {
+		base = strings.ToUpper(base[:1]) + base[1:]
+	}
+	if oneM {
+		base += " (1M)"
+	}
+	return base
 }
 
 // controlTimeout bounds how long a control request may wait for its response.

@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2026 The Agent Kate developers
 
 #include "HarnessTraits.h"
+#include "../ProviderConfig.h"
 #include "../ipc/CoreClient.h"
 
 #include <KConfigGroup>
@@ -28,6 +29,13 @@ QString HarnessTraits::optionKey(const QString &optionId) const
     return id + QStringLiteral("Opt-") + optionId;
 }
 
+QString HarnessTraits::modelCacheKey(const QString &providerId) const
+{
+    const QString provider =
+        providerId.isEmpty() ? QStringLiteral("direct") : providerId;
+    return id + QLatin1Char('@') + provider + QStringLiteral("Opt-model");
+}
+
 namespace {
 // Built-in fallbacks mirroring the core adapters (cmd/akcore/harness_*.go),
 // served until agent.capabilities answers. Keeping them in lockstep is what
@@ -41,7 +49,9 @@ HarnessTraits claudeDefaults()
     t.providerRouting = t.cowork = true;
     t.usageReporting = t.sessionBrowse = true;
     t.transcriptPreview = true; // claude keeps the on-disk session store
-    t.modelPicker = QStringLiteral("tiers");
+    // Models are discovered live (`claude -p /model`, or a routed provider's
+    // /v1/models); mode/effort stay static vocabularies below.
+    t.modelPicker = QStringLiteral("discovered");
     t.permissionModes = {QStringLiteral("acceptEdits"), QStringLiteral("default"),
                          QStringLiteral("plan"), QStringLiteral("auto"),
                          QStringLiteral("bypassPermissions")};
@@ -91,6 +101,50 @@ HarnessTraits fromJson(const QJsonObject &o)
         t.efforts << v.toString();
     }
     return t;
+}
+
+// recommendedFrom picks the short "recommended" group out of a full catalogue
+// (entries are "value|name"). For Claude direct the live aliases already map to
+// the newest model per family, so the families themselves are the recommendation.
+// For a routed provider the operator's configured slot models are the picks.
+QStringList recommendedFrom(const QString &harnessId, const QString &providerId,
+                            const QStringList &entries)
+{
+    QMap<QString, QString> byValue; // value -> "value|name"
+    for (const QString &e : entries) {
+        const int bar = e.indexOf(QLatin1Char('|'));
+        byValue.insert(bar >= 0 ? e.left(bar) : e, e);
+    }
+    const bool isDirect =
+        providerId.isEmpty() || providerId == ProviderStore::directId();
+    QStringList out;
+    if (isDirect) {
+        // Claude's family aliases (opus/sonnet/haiku/fable/best) each resolve to
+        // the newest model; other direct engines (kimi) expose no families, so
+        // the full list is the picker and the recommended group stays empty.
+        if (harnessId == QLatin1String("claude")) {
+            for (const QString &alias :
+                 {QStringLiteral("opus"), QStringLiteral("sonnet"), QStringLiteral("haiku"),
+                  QStringLiteral("fable"), QStringLiteral("best")}) {
+                const auto it = byValue.constFind(alias);
+                if (it != byValue.constEnd()) {
+                    out << *it;
+                }
+            }
+        }
+        return out;
+    }
+    const ProviderProfile p = ProviderStore::byId(providerId);
+    for (const QString &slot : ProviderStore::modelSlots()) {
+        const QString id = p.models.value(slot);
+        if (id.isEmpty()) {
+            continue;
+        }
+        const auto it = byValue.constFind(id);
+        out << (it != byValue.constEnd() ? *it : id + QLatin1Char('|') + id);
+    }
+    out.removeDuplicates();
+    return out;
 }
 } // namespace
 
@@ -220,6 +274,96 @@ void HarnessRegistry::applyDiscoveredOptions(const QString &harnessId,
     // roster "+ New Agent" menu and any open pickers rebuild from the fresh
     // cache instead of only picking it up on the next app start.
     emit changed();
+}
+
+void HarnessRegistry::discoverModels(CoreClient *core, const QString &harnessId,
+                                     const QString &providerId, const QJsonObject &provider)
+{
+    if (!core || !core->isConnected()) {
+        return;
+    }
+    const QString flight = harnessId + QLatin1Char('@') + providerId;
+    if (m_discoveringModels.contains(flight)) {
+        return;
+    }
+    m_discoveringModels.insert(flight);
+    const QString cacheKey = traits(harnessId).modelCacheKey(providerId);
+    QJsonObject params{{QStringLiteral("backend"), harnessId}};
+    if (!provider.isEmpty()) {
+        params.insert(QStringLiteral("provider"), provider);
+    }
+    core->call(
+        QStringLiteral("agent.discoverModels"), params,
+        [this, flight, cacheKey](const QJsonObject &result, const QJsonObject &error) {
+            m_discoveringModels.remove(flight);
+            if (!error.isEmpty()) {
+                return; // best-effort — keep the last cache
+            }
+            const QJsonArray models = result.value(QStringLiteral("models")).toArray();
+            if (models.isEmpty()) {
+                return; // never blank a populated picker (throttled/offline/no key)
+            }
+            QStringList entries;
+            for (const QJsonValue &mv : models) {
+                const QJsonObject m = mv.toObject();
+                const QString value = m.value(QStringLiteral("value")).toString();
+                if (value.isEmpty()) {
+                    continue;
+                }
+                QString name = m.value(QStringLiteral("name")).toString();
+                entries << value + QLatin1Char('|') + (name.isEmpty() ? value : name);
+            }
+            if (entries.isEmpty()) {
+                return;
+            }
+            KSharedConfig::openConfig()
+                ->group(QStringLiteral("Agent"))
+                .writeEntry(cacheKey, entries);
+            emit changed();
+        },
+        this);
+}
+
+void HarnessRegistry::discoverAll(CoreClient *core)
+{
+    if (!core || !core->isConnected()) {
+        return;
+    }
+    const QList<ProviderProfile> providers = ProviderStore::load();
+    for (const HarnessTraits &t : all()) {
+        // Non-model discovered vocabularies (kimi thinking/mode, and kimi's own
+        // model list via configOptions). No-op for static vocabularies.
+        ensureDiscovered(core, t.id);
+        // Direct model list — Claude answers via `claude -p /model`; harnesses
+        // without HTTP/exec model discovery return an empty list and write nothing.
+        discoverModels(core, t.id, ProviderStore::directId(), QJsonObject{});
+        if (!t.providerRouting) {
+            continue;
+        }
+        for (const ProviderProfile &p : providers) {
+            if (!p.routed()) {
+                continue;
+            }
+            discoverModels(core, t.id, p.id, ProviderStore::toJson(p));
+        }
+    }
+}
+
+HarnessRegistry::ModelChoices
+HarnessRegistry::modelChoices(const QString &harnessId, const QString &providerId) const
+{
+    const HarnessTraits t = traits(harnessId);
+    KConfigGroup cfg = KSharedConfig::openConfig()->group(QStringLiteral("Agent"));
+    QStringList entries = cfg.readEntry(t.modelCacheKey(providerId), QStringList());
+    if (entries.isEmpty()) {
+        // Legacy per-harness cache (kimi, or a Claude cache written before the
+        // per-provider split) so nothing regresses before the first probe lands.
+        entries = cfg.readEntry(t.optionKey(QStringLiteral("model")), QStringList());
+    }
+    ModelChoices out;
+    out.all = entries;
+    out.recommended = recommendedFrom(harnessId, providerId, entries);
+    return out;
 }
 
 HarnessTraits HarnessRegistry::traits(const QString &id) const

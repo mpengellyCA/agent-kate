@@ -78,6 +78,11 @@ public:
     // adoption or dormant restore).
     QString backend() const { return m_backend; }
 
+    // The provider id this agent runs on (ProviderStore::directId() for
+    // Claude-direct). Used to prefill the Fork dialog's live model list from the
+    // source agent's provider catalogue.
+    QString providerId() const { return selectedProviderId(); }
+
     // Bind this fresh panel to a thread the core has ALREADY started (a fork):
     // adopt the running thread id and go live. The fork's own session id is
     // minted asynchronously (--fork-session), so the inherited conversation is

@@ -50,4 +50,19 @@ QString resumeStrategyModel(const QString &strategy);
 // or "" if the user cancelled (in which case the caller should resume on the
 // full transcript and pay the re-cache cost knowingly).
 QString askRecoveryModel(QWidget *parent);
+
+// modelAvailable reports whether a saved model value is still offered for a
+// (harnessId, providerId). Returns true when the model is empty (the provider's
+// own default), when nothing has been discovered yet (an empty catalogue must
+// not trigger a false "unavailable"), or when the value matches a discovered
+// entry; false only when a non-empty catalogue genuinely lacks it.
+bool modelAvailable(const QString &harnessId, const QString &providerId,
+                    const QString &model);
+
+// askReplacementModel pops a modal telling the user a chat's saved model is no
+// longer offered by its provider and lets them pick a replacement from the live
+// catalogue for (harnessId, providerId). Returns the chosen model value, or ""
+// if the user cancelled. oldModel is shown for context.
+QString askReplacementModel(QWidget *parent, const QString &harnessId,
+                            const QString &providerId, const QString &oldModel);
 } // namespace agentkate

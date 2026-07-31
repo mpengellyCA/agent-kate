@@ -33,8 +33,10 @@ func TestHarnessCapabilities(t *testing.T) {
 	if claude.EffortLive {
 		t.Error("claude EffortLive = true; the CLI has no mid-session effort")
 	}
-	if claude.ModelPicker != harness.ModelPickerTiers {
-		t.Errorf("claude ModelPicker = %q, want tiers", claude.ModelPicker)
+	// Claude's models are discovered live (`claude -p /model` for direct, the
+	// provider's /v1/models for routed) — no longer a fixed tier vocabulary.
+	if claude.ModelPicker != harness.ModelPickerDiscovered {
+		t.Errorf("claude ModelPicker = %q, want discovered", claude.ModelPicker)
 	}
 	if len(claude.PermissionModes) == 0 || len(claude.Efforts) == 0 {
 		t.Error("claude static mode/effort vocabularies must be non-empty")

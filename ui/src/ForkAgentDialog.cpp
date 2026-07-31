@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2026 The Agent Kate developers
 
 #include "ForkAgentDialog.h"
+#include "state/HarnessTraits.h"
 
 #include <KLocalizedString>
 
@@ -14,9 +15,11 @@
 #include <QVBoxLayout>
 
 ForkAgentDialog::ForkAgentDialog(const QString &sourceTitle, const QString &sourceModel,
-                                 const QString &sourceEffort, QWidget *parent)
+                                 const QString &sourceEffort, const QString &backend,
+                                 const QString &providerId, QWidget *parent)
     : QDialog(parent)
 {
+    const HarnessTraits traits = HarnessRegistry::self()->traits(backend);
     setWindowTitle(i18nc("@title:window", "Fork Agent"));
 
     auto *root = new QVBoxLayout(this);
@@ -43,10 +46,25 @@ ForkAgentDialog::ForkAgentDialog(const QString &sourceTitle, const QString &sour
 
     m_model = new QComboBox(this);
     m_model->addItem(i18n("Keep the same"), QString());
-    m_model->addItem(i18n("Smartest (Opus)"), QStringLiteral("opus"));
-    m_model->addItem(i18n("Balanced (Sonnet)"), QStringLiteral("sonnet"));
-    m_model->addItem(i18n("Fastest (Haiku)"), QStringLiteral("haiku"));
-    m_model->addItem(i18n("Fable"), QStringLiteral("fable"));
+    // Live catalogue for the source agent's engine/provider: recommended group,
+    // then the full list. No hardcoded model names.
+    {
+        const auto choices = HarnessRegistry::self()->modelChoices(backend, providerId);
+        const auto addEntries = [this](const QStringList &entries) {
+            for (const QString &entry : entries) {
+                const QString value = entry.section(QLatin1Char('|'), 0, 0);
+                const QString name = entry.section(QLatin1Char('|'), 1);
+                if (!value.isEmpty() && m_model->findData(value) < 0) {
+                    m_model->addItem(name.isEmpty() ? value : name, value);
+                }
+            }
+        };
+        addEntries(choices.recommended);
+        if (!choices.recommended.isEmpty() && !choices.all.isEmpty()) {
+            m_model->insertSeparator(m_model->count());
+        }
+        addEntries(choices.all);
+    }
     m_model->setToolTip(i18n("Which model the forked conversation continues on."));
     // Prefill from the source agent so a fork that changes only the effort keeps
     // the model, and vice versa.
@@ -57,11 +75,9 @@ ForkAgentDialog::ForkAgentDialog(const QString &sourceTitle, const QString &sour
 
     m_effort = new QComboBox(this);
     m_effort->addItem(i18n("Keep the same"), QString());
-    m_effort->addItem(i18n("Low"), QStringLiteral("low"));
-    m_effort->addItem(i18n("Medium"), QStringLiteral("medium"));
-    m_effort->addItem(i18n("High"), QStringLiteral("high"));
-    m_effort->addItem(i18n("Extra-high"), QStringLiteral("xhigh"));
-    m_effort->addItem(i18n("Maximum"), QStringLiteral("max"));
+    for (const QString &effort : traits.efforts) {
+        m_effort->addItem(HarnessRegistry::effortLabel(effort), effort);
+    }
     m_effort->setToolTip(i18n("How hard the forked conversation thinks."));
     if (const int idx = m_effort->findData(sourceEffort); idx >= 0) {
         m_effort->setCurrentIndex(idx);

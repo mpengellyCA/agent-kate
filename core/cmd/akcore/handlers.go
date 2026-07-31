@@ -38,6 +38,13 @@ type agentEventParams struct {
 	Events   []json.RawMessage `json:"events"`
 }
 
+// modelDiscoverer is implemented by harnesses that can enumerate a live model
+// catalogue (optionally routed through a provider). agent.discoverModels
+// type-asserts to it, so harnesses without model discovery need no stub.
+type modelDiscoverer interface {
+	DiscoverModels(*agent.Provider) ([]harness.DiscoveredOptionValue, error)
+}
+
 type agentStartParams struct {
 	WorkspacePath  string             `json:"workspacePath"`
 	Prompt         string             `json:"prompt"`
@@ -231,6 +238,37 @@ func registerHandlers(d handlerDeps) {
 		return map[string]any{"configOptions": opts}, nil
 	})
 
+	// agent.discoverModels enumerates a harness's live model catalogue, optionally
+	// routed through a provider (whose non-secret metadata + transient authToken
+	// the UI supplies, exactly as for agent.start). Claude direct answers from
+	// `claude -p /model`; a routed provider from its /v1/models. It is best-effort:
+	// harnesses that don't implement discovery, or a probe that fails, return an
+	// empty list so the UI keeps its last cached catalogue.
+	d.srv.Handle("agent.discoverModels", func(_ context.Context, raw json.RawMessage) (any, error) {
+		var p struct {
+			Backend  string          `json:"backend"`
+			Provider *agent.Provider `json:"provider"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		h, ok := d.harnesses.Get(p.Backend)
+		if !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown backend "+p.Backend)
+		}
+		models := []harness.DiscoveredOptionValue{}
+		if md, ok := h.(modelDiscoverer); ok {
+			found, err := md.DiscoverModels(p.Provider)
+			if err != nil {
+				return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+			}
+			if found != nil {
+				models = found
+			}
+		}
+		return map[string]any{"models": models}, nil
+	})
+
 	d.srv.Handle("agent.start", func(_ context.Context, raw json.RawMessage) (any, error) {
 		var p agentStartParams
 		if err := json.Unmarshal(raw, &p); err != nil {
@@ -277,6 +315,11 @@ func registerHandlers(d handlerDeps) {
 	d.srv.Handle("agent.resume", func(_ context.Context, raw json.RawMessage) (any, error) {
 		var p struct {
 			ThreadID string `json:"threadId"`
+			// Optional: replace the persisted model on resume — the UI sends this
+			// when the record's model is no longer offered and the user picked a
+			// live replacement, so the chat continues instead of failing on a
+			// retired id.
+			Model string `json:"model,omitempty"`
 			// Optional: re-supply the provider (with its API token) on resume.
 			// Needed when the key lives in KWallet — the Record never persists it.
 			Provider *agent.Provider `json:"provider,omitempty"`
@@ -287,6 +330,10 @@ func registerHandlers(d handlerDeps) {
 		rec, ok := d.sessions.Get(p.ThreadID)
 		if !ok {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		}
+		if m := strings.TrimSpace(p.Model); m != "" && m != rec.Model {
+			rec.Model = m                                                                // resume the local copy on the new model…
+			_ = d.sessions.Update(rec.ThreadID, func(r *session.Record) { r.Model = m }) // …and persist it
 		}
 		// A double resume (say, a double-clicked Resume button) would spawn a
 		// second process on the same thread id and corrupt the supervisor's

@@ -1790,6 +1790,10 @@ void MainWindow::setupCore()
         // Learn the core's harness capability sets first — every engine
         // picker and backend-specific affordance derives from them.
         HarnessRegistry::self()->fetch(m_core);
+        // Then refresh every engine/provider's live model catalogue in the
+        // background; pickers rebuild from the cache on changed(), and a
+        // failed/offline probe leaves the last good list intact.
+        HarnessRegistry::self()->discoverAll(m_core);
         pushOpenFilesToCore();
         reloadExtensionServers();
     });

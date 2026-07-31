@@ -107,12 +107,27 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, CoreClient *core,
             }
         };
         m_model->addItem(i18n("Use my default"), QString());
-        if (t.modelPicker == QLatin1String("tiers")) {
-            m_model->addItem(i18n("Smartest (Opus)"), QStringLiteral("opus"));
-            m_model->addItem(i18n("Balanced (Sonnet)"), QStringLiteral("sonnet"));
-            m_model->addItem(i18n("Fastest (Haiku)"), QStringLiteral("haiku"));
-        } else {
-            addDiscovered(m_model, t.optionKey(QStringLiteral("model")));
+        // Live model catalogue for this engine/provider: a short recommended
+        // group, then the full list. Both come from the cache the startup probe
+        // fills (no hardcoded model names).
+        {
+            const QString data = m_engine->currentData().toString();
+            const auto choices = HarnessRegistry::self()->modelChoices(
+                data.section(QLatin1Char('|'), 0, 0), data.section(QLatin1Char('|'), 1, 1));
+            const auto addEntries = [this](const QStringList &entries) {
+                for (const QString &entry : entries) {
+                    const QString value = entry.section(QLatin1Char('|'), 0, 0);
+                    const QString name = entry.section(QLatin1Char('|'), 1);
+                    if (!value.isEmpty() && m_model->findData(value) < 0) {
+                        m_model->addItem(name.isEmpty() ? value : name, value);
+                    }
+                }
+            };
+            addEntries(choices.recommended);
+            if (!choices.recommended.isEmpty() && !choices.all.isEmpty()) {
+                m_model->insertSeparator(m_model->count());
+            }
+            addEntries(choices.all);
         }
         if (t.permissionModes.isEmpty()) {
             m_permission->addItem(i18n("CLI default"), QString());

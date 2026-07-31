@@ -1399,6 +1399,16 @@ void AgentPanel::maybePushOption(const QString &option, const QString &value)
                                       .toString()
                                       .toHtmlEscaped()),
                              QStringLiteral("err"));
+                         // A rejected model is usually a retired/unknown id —
+                         // offer a live replacement and apply it if chosen.
+                         if (option == QLatin1String("model")) {
+                             const QString repl = agentkate::askReplacementModel(
+                                 self, self->m_backend, self->providerId(), value);
+                             if (!repl.isEmpty() && repl != value) {
+                                 self->preselectModel(repl);
+                                 self->maybePushOption(QStringLiteral("model"), repl);
+                             }
+                         }
                          return;
                      }
                      const QString applied =
@@ -1426,66 +1436,40 @@ void AgentPanel::rebuildModelCombo()
     QSignalBlocker block(m_modelCombo);
     m_modelCombo->clear();
 
-    if (t.modelPicker == QLatin1String("discovered")) {
-        // The harness takes an optional free-text model id (empty = the CLI's
-        // own configured default). Once a session has run, the CLI's real
-        // model list (discovered from the handshake and persisted from the
-        // init event) fills the dropdown; the combo stays editable so a new
-        // id can still be typed before any session existed.
-        m_modelCombo->setEditable(true);
-        // Never let Qt's default InsertAtBottom append the hand-typed id as a
-        // dataless dropdown item: currentModel() would then read its empty
-        // itemData and silently send model:"" instead of the typed id.
-        m_modelCombo->setInsertPolicy(QComboBox::NoInsert);
-        m_modelCombo->lineEdit()->clear();
-        m_modelCombo->lineEdit()->setPlaceholderText(
-            i18n("CLI default — or type a model id"));
-        const auto models = optionValues(t.optionKey(QStringLiteral("model")));
-        for (const auto &m : models) {
+    // Every engine discovers its models live now (Claude via `claude -p /model`
+    // or a routed provider's /v1/models; Kimi via its handshake). The combo stays
+    // editable so a full model id can be typed even before a catalogue is cached;
+    // an empty value = the CLI's / provider's own default.
+    m_modelCombo->setEditable(true);
+    // Never let Qt's default InsertAtBottom append the hand-typed id as a
+    // dataless dropdown item: currentModel() would then read its empty itemData
+    // and silently send model:"" instead of the typed id.
+    m_modelCombo->setInsertPolicy(QComboBox::NoInsert);
+    m_modelCombo->lineEdit()->setPlaceholderText(i18n("Default — or type a model id"));
+
+    const auto choices =
+        HarnessRegistry::self()->modelChoices(t.id, selectedProviderId());
+    const auto addEntries = [this](const QStringList &entries) {
+        for (const QString &entry : entries) {
+            const QString value = entry.section(QLatin1Char('|'), 0, 0);
+            const QString name = entry.section(QLatin1Char('|'), 1);
+            if (value.isEmpty() || m_modelCombo->findData(value) >= 0) {
+                continue;
+            }
             m_modelCombo->addItem(
-                m.second == m.first
-                    ? m.first
-                    : QStringLiteral("%1 — %2").arg(m.second, m.first),
-                m.first);
+                (name.isEmpty() || name == value)
+                    ? value
+                    : QStringLiteral("%1 — %2").arg(name, value),
+                value);
         }
-        m_modelCombo->setCurrentIndex(-1);
-        m_modelCombo->lineEdit()->clear();
-        return;
+    };
+    addEntries(choices.recommended);
+    if (!choices.recommended.isEmpty() && !choices.all.isEmpty()) {
+        m_modelCombo->insertSeparator(m_modelCombo->count());
     }
-    m_modelCombo->setEditable(false);
-
-    const QString providerId = selectedProviderId();
-    if (providerId.isEmpty() || providerId == ProviderStore::directId()) {
-        // Claude tiers — the core's resolveModel maps these to concrete ids.
-        m_modelCombo->addItem(QStringLiteral("Default model"), QString());
-        m_modelCombo->addItem(QStringLiteral("Opus"), QStringLiteral("opus"));
-        m_modelCombo->addItem(QStringLiteral("Sonnet"), QStringLiteral("sonnet"));
-        m_modelCombo->addItem(QStringLiteral("Haiku"), QStringLiteral("haiku"));
-        m_modelCombo->addItem(QStringLiteral("Fable"), QStringLiteral("fable"));
-        const QString saved = KSharedConfig::openConfig()
-                                  ->group(QStringLiteral("Agent"))
-                                  .readEntry("model", QString());
-        const int idx = m_modelCombo->findData(saved);
-        if (idx >= 0) {
-            m_modelCombo->setCurrentIndex(idx);
-        }
-        return;
-    }
-
-    // Provider mode: list the provider's own model ids, sent verbatim as --model.
-    // "Provider default" (empty) passes no --model, letting the provider's main
-    // model (ANTHROPIC_MODEL) take effect.
-    const ProviderProfile p = ProviderStore::byId(providerId);
-    m_modelCombo->addItem(QStringLiteral("Provider default"), QString());
-    QStringList added;
-    for (const QString &slot : ProviderStore::modelSlots()) {
-        const QString model = p.models.value(slot).trimmed();
-        if (model.isEmpty() || added.contains(model)) {
-            continue;
-        }
-        added << model;
-        m_modelCombo->addItem(model, model);
-    }
+    addEntries(choices.all);
+    m_modelCombo->setCurrentIndex(-1);
+    m_modelCombo->lineEdit()->clear();
 }
 
 void AgentPanel::reloadProviders()
@@ -1845,6 +1829,23 @@ void AgentPanel::doResume()
     addNote(i18n("resuming the %1 session…", currentTraits().displayName),
             QStringLiteral("sys"));
     QJsonObject params{{QStringLiteral("threadId"), m_threadId}};
+    // If this chat's saved model is no longer in the provider's live catalogue,
+    // ask for a replacement before resuming rather than failing on a retired id.
+    // Send the choice so the core resumes on (and persists) the new model.
+    const QString savedModel = currentModel();
+    if (!agentkate::modelAvailable(m_backend, providerId(), savedModel)) {
+        const QString repl =
+            agentkate::askReplacementModel(this, m_backend, providerId(), savedModel);
+        if (repl.isEmpty()) {
+            addNote(i18n("Resume cancelled — this chat's model is no longer available."),
+                    QStringLiteral("dim"));
+            return;
+        }
+        preselectModel(repl);
+        params.insert(QStringLiteral("model"), repl);
+        addNote(i18n("Model updated to <b>%1</b> for this chat.", repl.toHtmlEscaped()),
+                QStringLiteral("sys"));
+    }
     // Re-attach the provider (with its API token) when this panel started the
     // thread on one this session — the core never persists the token, so a
     // KWallet-held key would otherwise be unavailable on resume. When the panel
@@ -2593,6 +2594,22 @@ void AgentPanel::onSendClicked()
         }
         emit titleChanged(title);
 
+        // If a stale model id is selected (e.g. a resumed pick, or a hand-typed
+        // id no longer offered), ask for a live replacement before starting
+        // rather than failing on the CLI.
+        QString startModel = currentModel();
+        if (!agentkate::modelAvailable(selectedHarnessId(), startedProviderId, startModel)) {
+            const QString repl = agentkate::askReplacementModel(
+                this, selectedHarnessId(), startedProviderId, startModel);
+            if (repl.isEmpty()) {
+                addNote(i18n("Start cancelled — the chosen model is no longer available."),
+                        QStringLiteral("dim"));
+                return;
+            }
+            startModel = repl;
+            preselectModel(repl);
+        }
+
         QJsonObject startParams{
             {QStringLiteral("workspacePath"), m_workspace},
             {QStringLiteral("prompt"), text},
@@ -2603,7 +2620,7 @@ void AgentPanel::onSendClicked()
             {QStringLiteral("permissionMode"), m_modeCombo->currentData().toString()},
             {QStringLiteral("isolation"), m_isolationCombo->currentData().toString()},
             {QStringLiteral("effort"), m_effortCombo->currentData().toString()},
-            {QStringLiteral("model"), currentModel()},
+            {QStringLiteral("model"), startModel},
             // Cowork applies only where the harness supports it (the checkbox
             // is disabled otherwise, but the record must never lie).
             {QStringLiteral("coworkEnabled"),

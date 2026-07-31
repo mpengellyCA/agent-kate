@@ -539,26 +539,16 @@ func summarizePrompt(prompt string) string {
 	return s
 }
 
-// resolveModel maps a UI-facing tier token ("opus", "sonnet", "haiku",
-// "fable") to the concrete claude --model id we spawn or compact with. It is
-// the single source of truth for the tier→id map, shared by the agent-spawn
-// path (startAgentThread) and the compaction path (resolveCompactModel) so the
-// two never disagree about what "opus" means. An empty or unrecognised token
-// is returned trimmed and unchanged: "" leaves Claude Code on its configured
-// default, and an already-full id (e.g. "claude-opus-4-8") passes through.
+// resolveModel normalises a UI-facing model token before we hand it to
+// `claude --model`. Aliases (opus/sonnet/haiku/fable/best/opusplan and their
+// [1m] variants) are passed straight through: the CLI owns the alias→latest
+// map, so "opus" resolves to the newest Opus rather than a version we froze
+// here. Pinning aliases to concrete ids was the bug that kept "opus" on an old
+// release. A full id (e.g. "claude-opus-5") and "" (the CLI default) also pass
+// through unchanged. Routed providers never send aliases — their pickers carry
+// concrete ids discovered from the provider's /v1/models.
 func resolveModel(tier string) string {
-	switch strings.ToLower(strings.TrimSpace(tier)) {
-	case "opus":
-		return "claude-opus-4-8"
-	case "sonnet":
-		return "claude-sonnet-4-6"
-	case "haiku":
-		return "claude-haiku-4-5-20251001"
-	case "fable":
-		return "claude-fable-5"
-	default:
-		return strings.TrimSpace(tier)
-	}
+	return strings.TrimSpace(tier)
 }
 
 // applyProviderToRecord copies a provider's NON-SECRET fields onto a session

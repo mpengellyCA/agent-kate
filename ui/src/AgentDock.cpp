@@ -8,6 +8,7 @@
 #include "AutoOrganizeDialog.h"
 #include "TagEditorDialog.h"
 #include "ipc/CoreClient.h"
+#include "ProviderConfig.h"
 #include "state/HarnessTraits.h"
 
 #include <QDir>
@@ -663,31 +664,26 @@ void AgentDock::seedEngineChoices()
     QList<EngineChoice> choices;
     for (const HarnessTraits &t : HarnessRegistry::self()->all()) {
         choices.append({QString(), QString(), t.displayName, true}); // section
-        if (t.modelPicker == QLatin1String("tiers")) {
-            // Tier tokens — ids must match AgentPanel's model combo.
-            choices.append({t.id, QString(), i18n("Default model"), false});
-            choices.append({t.id, QStringLiteral("opus"), i18n("Opus"), false});
-            choices.append({t.id, QStringLiteral("sonnet"), i18n("Sonnet"), false});
-            choices.append({t.id, QStringLiteral("haiku"), i18n("Haiku"), false});
-            choices.append({t.id, QStringLiteral("fable"), i18n("Fable"), false});
-            continue;
-        }
-        // Discovered-model engine: the CLI's own default, plus any models a
-        // past probe or session has cached (empty until one runs — the full
-        // "New Agent…" dialog and the panel Setup menu offer the probe path).
+        // The engine's own default model, then its live catalogue (Claude-direct
+        // here — the roster quick menu has no provider selection): the recommended
+        // group first, then the full list. Empty until the first probe lands.
         choices.append(
             {t.id, QString(), i18n("%1 (default model)", t.displayName), false});
-        const QStringList models =
-            KSharedConfig::openConfig()
-                ->group(QStringLiteral("Agent"))
-                .readEntry(t.optionKey(QStringLiteral("model")), QStringList());
-        for (const QString &entry : models) {
-            const QString value = entry.section(QLatin1Char('|'), 0, 0);
-            const QString name = entry.section(QLatin1Char('|'), 1);
-            if (!value.isEmpty()) {
-                choices.append({t.id, value, name.isEmpty() ? value : name, false});
+        const auto models =
+            HarnessRegistry::self()->modelChoices(t.id, ProviderStore::directId());
+        QSet<QString> seen;
+        const auto append = [&](const QStringList &entries) {
+            for (const QString &entry : entries) {
+                const QString value = entry.section(QLatin1Char('|'), 0, 0);
+                const QString name = entry.section(QLatin1Char('|'), 1);
+                if (!value.isEmpty() && !seen.contains(value)) {
+                    seen.insert(value);
+                    choices.append({t.id, value, name.isEmpty() ? value : name, false});
+                }
             }
-        }
+        };
+        append(models.recommended);
+        append(models.all);
     }
     m_roster->setEngineChoices(choices);
 }
@@ -1097,7 +1093,8 @@ void AgentDock::forkAgent(int agentId)
     }
     const QString sourceTitle = m_roster->agentTitle(agentId);
     ForkAgentDialog dlg(sourceTitle, e->panel->currentModel(),
-                        e->panel->currentEffort(), m_dialogParent);
+                        e->panel->currentEffort(), e->panel->backend(),
+                        e->panel->providerId(), m_dialogParent);
     if (dlg.exec() != QDialog::Accepted) {
         return;
     }

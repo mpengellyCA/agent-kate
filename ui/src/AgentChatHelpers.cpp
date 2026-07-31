@@ -3,7 +3,9 @@
 
 #include "AgentChatHelpers.h"
 #include "MarkdownUtil.h"
+#include "state/HarnessTraits.h"
 
+#include <QComboBox>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QFont>
@@ -175,6 +177,69 @@ QString askRecoveryModel(QWidget *parent)
 
     if (dlg.exec() == QDialog::Accepted) {
         return choice;
+    }
+    return QString();
+}
+
+bool modelAvailable(const QString &harnessId, const QString &providerId,
+                    const QString &model)
+{
+    if (model.isEmpty()) {
+        return true; // "" = the provider's / CLI's own default, always valid
+    }
+    const auto choices = HarnessRegistry::self()->modelChoices(harnessId, providerId);
+    if (choices.all.isEmpty() && choices.recommended.isEmpty()) {
+        return true; // nothing discovered yet — never nag from an empty catalogue
+    }
+    for (const QStringList &list : {choices.recommended, choices.all}) {
+        for (const QString &entry : list) {
+            if (entry.section(QLatin1Char('|'), 0, 0) == model) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+QString askReplacementModel(QWidget *parent, const QString &harnessId,
+                            const QString &providerId, const QString &oldModel)
+{
+    QDialog dlg(parent);
+    dlg.setWindowTitle(QObject::tr("Model no longer available"));
+
+    auto *layout = new QVBoxLayout(&dlg);
+    auto *msg = new QLabel(QObject::tr(
+        "The model \"%1\" this chat used is no longer offered by its provider. "
+        "Choose a replacement to continue on:")
+                               .arg(oldModel.isEmpty() ? QObject::tr("(default)") : oldModel));
+    msg->setWordWrap(true);
+    layout->addWidget(msg);
+
+    auto *combo = new QComboBox(&dlg);
+    const auto choices = HarnessRegistry::self()->modelChoices(harnessId, providerId);
+    const auto addEntries = [combo](const QStringList &entries) {
+        for (const QString &entry : entries) {
+            const QString value = entry.section(QLatin1Char('|'), 0, 0);
+            const QString name = entry.section(QLatin1Char('|'), 1);
+            if (!value.isEmpty() && combo->findData(value) < 0) {
+                combo->addItem(name.isEmpty() ? value : name, value);
+            }
+        }
+    };
+    addEntries(choices.recommended);
+    if (!choices.recommended.isEmpty() && !choices.all.isEmpty()) {
+        combo->insertSeparator(combo->count());
+    }
+    addEntries(choices.all);
+    layout->addWidget(combo);
+
+    auto *bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    QObject::connect(bb, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    QObject::connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    layout->addWidget(bb);
+
+    if (dlg.exec() == QDialog::Accepted && combo->currentIndex() >= 0) {
+        return combo->currentData().toString();
     }
     return QString();
 }

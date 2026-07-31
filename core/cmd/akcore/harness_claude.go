@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -8,6 +9,7 @@ import (
 
 	"agentkate/internal/agent"
 	"agentkate/internal/harness"
+	"agentkate/internal/modelcatalog"
 	"agentkate/internal/session"
 )
 
@@ -45,7 +47,10 @@ func (h *claudeHarness) Capabilities() harness.Capabilities {
 		SessionBrowse:     true,
 		TranscriptPreview: true, // claude keeps the on-disk session store
 		MintsSessionID:    true,
-		ModelPicker:       harness.ModelPickerTiers,
+		// Models are discovered live (`claude -p /model` for direct, the
+		// provider's /v1/models for routed); the picker lists those plus free
+		// text. Permission modes and effort remain static vocabularies below.
+		ModelPicker: harness.ModelPickerDiscovered,
 		PermissionModes: []string{
 			"acceptEdits", "default", "plan", "auto", "bypassPermissions",
 		},
@@ -112,10 +117,46 @@ func (h *claudeHarness) ReadTranscript(threadID, sessionID string) ([]json.RawMe
 	return session.ReadTranscript(sessionID)
 }
 
-// DiscoverOptions: Claude's vocabulary is static (tier tokens plus the fixed
-// mode/effort lists in Capabilities) — there is nothing to probe.
+// DiscoverOptions: Claude's mode/effort vocabularies are static (see
+// Capabilities); its models are discovered separately via DiscoverModels, so
+// there is nothing to probe here.
 func (h *claudeHarness) DiscoverOptions() ([]harness.DiscoveredOption, error) {
 	return nil, nil
+}
+
+// DiscoverModels enumerates the live model vocabulary. For a routed provider it
+// GETs that provider's /v1/models; for Claude direct it runs `claude -p /model`.
+// Both are best-effort: any failure returns an empty list (never an error that
+// would blank a cached picker), so the UI keeps its last good catalogue.
+func (h *claudeHarness) DiscoverModels(p *agent.Provider) ([]harness.DiscoveredOptionValue, error) {
+	if p.Routed() {
+		key := p.AuthToken
+		if key == "" && p.EnvVar != "" {
+			key = os.Getenv(p.EnvVar)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+		defer cancel()
+		models, err := modelcatalog.Fetch(ctx, p.BaseURL, key)
+		if err != nil {
+			return nil, nil
+		}
+		out := make([]harness.DiscoveredOptionValue, 0, len(models))
+		for _, m := range models {
+			out = append(out, harness.DiscoveredOptionValue{Value: m.ID, Name: m.Name})
+		}
+		return out, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	models, err := h.sup.DiscoverModels(ctx)
+	if err != nil {
+		return nil, nil
+	}
+	out := make([]harness.DiscoveredOptionValue, 0, len(models))
+	for _, m := range models {
+		out = append(out, harness.DiscoveredOptionValue{Value: m.Value, Name: m.Name})
+	}
+	return out, nil
 }
 
 // BrowseSessions wraps the on-disk transcript discovery in the neutral browse

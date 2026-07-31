@@ -12,6 +12,7 @@
 
 class CoreClient;
 class QJsonArray;
+class QJsonObject;
 
 // HarnessTraits mirrors one harness's capability set from the core's
 // agent.capabilities RPC (core/internal/harness). Every backend-specific
@@ -46,6 +47,11 @@ struct HarnessTraits {
     QString stickyModeKey() const;
     QString stickyEffortKey() const;
     QString optionKey(const QString &optionId) const; // discovered enumerations
+    // Per-provider model-catalogue key ([Agent] group). Catalogues are
+    // provider-scoped — Fireworks and OpenRouter are both the "claude" harness
+    // but expose different models — so the model list can't share the
+    // per-harness optionKey(). An empty providerId is the direct sentinel.
+    QString modelCacheKey(const QString &providerId) const;
 };
 
 // HarnessRegistry holds the traits for every harness the core registered,
@@ -70,6 +76,24 @@ public:
     // rebuild. A failed probe leaves today's placeholders (and is retried on
     // the next call) — it never blocks an agent start.
     void ensureDiscovered(CoreClient *core, const QString &harnessId);
+
+    // A model catalogue split into a short "recommended" group and the full
+    // live list, both as "value|name" entries (the picker format).
+    struct ModelChoices {
+        QStringList recommended;
+        QStringList all;
+    };
+
+    // Query every engine/provider's live model catalogue at connect and cache
+    // it. For each engine this probes the discovered-option vocabularies (kimi
+    // thinking/mode) and the Claude-direct model list; for provider-routing
+    // engines it also queries each configured provider's /v1/models. Fully
+    // non-blocking — a failed or empty probe leaves the last cache intact.
+    void discoverAll(CoreClient *core);
+
+    // Cached model choices for a harness + provider (providerId empty = direct),
+    // recommended group first. Empty lists when nothing has been discovered yet.
+    ModelChoices modelChoices(const QString &harnessId, const QString &providerId) const;
     // Persist a configOptions array (the init-event / agent.discoverOptions
     // shape) to the harness's per-option KConfig keys — the single writer for
     // the discovered "value|name" enumerations.
@@ -99,7 +123,13 @@ Q_SIGNALS:
 private:
     HarnessRegistry();
 
+    // Probe one harness/provider's model catalogue via agent.discoverModels and
+    // cache it under modelCacheKey; a non-empty result emits changed().
+    void discoverModels(CoreClient *core, const QString &harnessId,
+                        const QString &providerId, const QJsonObject &provider);
+
     QHash<QString, HarnessTraits> m_traits;
     QStringList m_order;
-    QSet<QString> m_discovering; // harness ids with a probe in flight
+    QSet<QString> m_discovering;      // harness ids with a discoverOptions probe in flight
+    QSet<QString> m_discoveringModels; // "harness@provider" keys with a models probe in flight
 };
