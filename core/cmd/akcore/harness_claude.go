@@ -304,6 +304,40 @@ func (h *claudeHarness) BrowseSessions() ([]harness.BrowsableSession, error) {
 	return out, nil
 }
 
+// Compact runs a compaction pass on this thread. Both mechanisms live here
+// rather than in the handlers (plan 16 P6): the hot one is an in-session turn
+// the supervisor brackets, and the cold one is a fresh `claude --print
+// --resume` — a Claude-shaped subprocess that has no business in a
+// harness-neutral caller. Callers just ask the thread's harness.
+func (h *claudeHarness) Compact(ctx context.Context, spec harness.CompactSpec) (string, error) {
+	if spec.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, spec.Timeout)
+		defer cancel()
+	}
+	if spec.Hot {
+		// The live thread answers the compact prompt itself: no re-cache, but
+		// the process has to be there.
+		if !h.sup.Running(spec.ThreadID) {
+			return "", fmt.Errorf(
+				"hot compaction requires a running thread; resume it first")
+		}
+		return h.sup.Compact(ctx, spec.ThreadID, spec.Prompt)
+	}
+	if spec.SessionID == "" {
+		return "", fmt.Errorf("compact: no session id to resume")
+	}
+	if spec.Model == "" {
+		return "", fmt.Errorf("compact: cold compaction requires a model")
+	}
+	return h.sup.CompactCold(ctx, agent.ColdCompactOptions{
+		WorkDir:   spec.WorkDir,
+		SessionID: spec.SessionID,
+		Model:     spec.Model,
+		Prompt:    spec.Prompt,
+	})
+}
+
 func (h *claudeHarness) SetOption(threadID, option, value string) (string, error) {
 	switch option {
 	case "model":

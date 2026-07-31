@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -41,13 +40,12 @@ func modeTestCore(t *testing.T, sessions *session.Store, h harness.Harness) (*ip
 	if err != nil {
 		t.Fatalf("modes.NewStore: %v", err)
 	}
-	sup := agent.NewSupervisor("", log, func(string, []json.RawMessage) {})
 	harnesses := harness.NewRegistry(h.Capabilities().ID)
 	harnesses.Register(h)
 	gitCache := gitstatus.NewCache(log)
 	t.Cleanup(func() { _ = gitCache.Close() })
 	d := handlerDeps{
-		srv: srv, sup: sup, harnesses: harnesses,
+		srv: srv, harnesses: harnesses,
 		turns: agent.NewTurnTracker(), orchGrants: newOrchGrants(),
 		threads: newThreadRegistry(), gitCache: gitCache,
 		sessions: sessions, modes: store, log: log,

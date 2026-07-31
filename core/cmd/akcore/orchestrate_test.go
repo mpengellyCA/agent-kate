@@ -56,11 +56,11 @@ func TestInSubtree(t *testing.T) {
 		caller, target string
 		want           bool
 	}{
-		{"t-ctrl", "t-ctrl", true},  // self
-		{"t-ctrl", "t-w1", true},    // direct worker
-		{"t-ctrl", "t-w2", true},    // transitive worker
-		{"t-w1", "t-w2", true},      // sub-controller owns its own worker
-		{"t-w1", "t-ctrl", false},   // a worker does NOT own its controller
+		{"t-ctrl", "t-ctrl", true}, // self
+		{"t-ctrl", "t-w1", true},   // direct worker
+		{"t-ctrl", "t-w2", true},   // transitive worker
+		{"t-w1", "t-w2", true},     // sub-controller owns its own worker
+		{"t-w1", "t-ctrl", false},  // a worker does NOT own its controller
 		{"t-ctrl", "t-other", false},
 		{"t-ctrl", "t-missing", false},
 	} {
@@ -150,6 +150,12 @@ func (f *fakeHarness) DiscoverOptions() ([]harness.DiscoveredOption, error) {
 	return nil, nil
 }
 func (f *fakeHarness) BrowseSessions() ([]harness.BrowsableSession, error) { return nil, nil }
+
+// Compact stands in for a harness with no compaction support — the honest
+// default, and the one the shared gate wording is written for.
+func (f *fakeHarness) Compact(context.Context, harness.CompactSpec) (string, error) {
+	return "", harness.Unsupported("Compaction", f.Capabilities())
+}
 
 // serveIPC starts srv on sock and blocks until the socket exists.
 func serveIPC(t *testing.T, srv *ipc.Server, sock string) {
@@ -247,7 +253,7 @@ func orchTestCore(t *testing.T, sessions *session.Store, turns *agent.TurnTracke
 	gitCache := gitstatus.NewCache(log)
 	t.Cleanup(func() { _ = gitCache.Close() })
 	d := handlerDeps{
-		srv: srv, sup: sup, harnesses: harnesses,
+		srv: srv, harnesses: harnesses,
 		turns: turns, orchGrants: newOrchGrants(),
 		threads: newThreadRegistry(), gitCache: gitCache,
 		sessions: sessions, log: log,
@@ -444,7 +450,7 @@ func TestDiscardGoesThroughGate(t *testing.T) {
 	harnesses := harness.NewRegistry("claude")
 	harnesses.Register(newClaudeHarness(sup, "", ""))
 	d := handlerDeps{
-		srv: srv, sup: sup, harnesses: harnesses,
+		srv: srv, harnesses: harnesses,
 		turns: agent.NewTurnTracker(), orchGrants: newOrchGrants(),
 		coop: coop.NewState(), threads: newThreadRegistry(),
 		broker: broker, sessions: sessions, log: log,

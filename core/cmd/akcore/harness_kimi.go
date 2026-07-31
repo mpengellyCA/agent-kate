@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -166,6 +167,15 @@ func (h *kimiHarness) BrowseSessions() ([]harness.BrowsableSession, error) {
 		})
 	}
 	return out, nil
+}
+
+// Compact is the honest gate: ACP has no in-session compaction turn we can
+// bracket, and there is no `kimi --resume --print` equivalent to run a cold
+// pass with. Capabilities().Compaction is false, so the RPC layer rejects the
+// request before it reaches here; this is the backstop for any caller that
+// forgets to check.
+func (h *kimiHarness) Compact(context.Context, harness.CompactSpec) (string, error) {
+	return "", harness.Unsupported("Compaction", h.Capabilities())
 }
 
 func (h *kimiHarness) SetOption(threadID, option, value string) (string, error) {

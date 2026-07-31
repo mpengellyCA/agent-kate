@@ -99,10 +99,11 @@ type coopPostNoteParams struct {
 // handlerDeps bundles everything registerHandlers needs.
 type handlerDeps struct {
 	srv *ipc.Server
-	// sup is the Claude supervisor, reachable directly for the capabilities
-	// only it has today (hot compaction via Compact). All per-thread routing
-	// goes through harnesses.
-	sup        *agent.Supervisor
+	// Every per-thread action routes through harnesses — there is deliberately
+	// no direct supervisor handle here. The last one (the Claude supervisor,
+	// kept for hot compaction) went away with plan 16 P6: compaction is a
+	// Harness method now, and the running/stop checks that used it silently
+	// reported a live kimi thread as not running.
 	harnesses  *harness.Registry
 	turns      *agent.TurnTracker // backend-agnostic idle/busy mirror (agent.wait)
 	orchGrants *orchGrants        // one-shot human approvals for cross-subtree agent control
@@ -714,7 +715,7 @@ func registerHandlers(d handlerDeps) {
 			}
 		}
 		// Hot-compaction must run against the live session, before termination.
-		// It is a no-op for a dormant thread (guards on d.sup.Running internally).
+		// It is a no-op for a dormant thread (it checks agentRunning first).
 		runHotCompactIfConfigured(d, p.ThreadID)
 		// Stop the process and wait for it to exit so its cooperation locks and
 		// git watch are torn down by the reap/lifecycle path before we archive.
@@ -1195,8 +1196,9 @@ func registerHandlers(d handlerDeps) {
 		token := strings.ToLower(strings.TrimSpace(p.Model))
 		if token == "hot" || token == "opus_hot" || token == "hot_opus" {
 			// Hot path: send the compact prompt into the live thread and use
-			// its assistant reply as the summary. Requires a running thread.
-			if !d.sup.Running(p.ThreadID) {
+			// its assistant reply as the summary. Requires a running thread —
+			// the harness enforces that, since only it knows.
+			if !d.agentRunning(p.ThreadID) {
 				return nil, ipc.Errorf(ipc.CodeInvalidParams,
 					"Hot Opus compaction requires a running thread; resume it first")
 			}
@@ -1206,7 +1208,11 @@ func registerHandlers(d handlerDeps) {
 			// thread busy until the summary's result lands (same bracketing
 			// as runHotCompactIfConfigured).
 			d.turns.TurnQueued(p.ThreadID)
-			text, herr := d.sup.Compact(hctx, p.ThreadID, compact.CompactPrompt)
+			text, herr := d.harnessFor(p.ThreadID).Compact(hctx, harness.CompactSpec{
+				ThreadID: p.ThreadID,
+				Prompt:   compact.CompactPrompt,
+				Hot:      true,
+			})
 			if herr != nil {
 				return nil, ipc.Errorf(ipc.CodeInternalError, herr.Error())
 			}
@@ -1230,15 +1236,24 @@ func registerHandlers(d handlerDeps) {
 				}
 				sum = compact.Programmatic(p.ThreadID, rec.SessionID, events)
 			} else {
-				var err error
-				sum, err = compact.RunLLM(ctx, p.ThreadID, strategy, compact.LLMOptions{
-					WorkDir:   rec.Worktree.Path,
+				body, err := d.harnessFor(p.ThreadID).Compact(ctx, harness.CompactSpec{
+					ThreadID:  p.ThreadID,
 					SessionID: rec.SessionID,
+					WorkDir:   rec.Worktree.Path,
 					Model:     modelID,
+					Prompt:    compact.CompactPrompt,
 					Timeout:   5 * time.Minute,
 				})
 				if err != nil {
 					return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+				}
+				sum = compact.Summary{
+					ThreadID:  p.ThreadID,
+					SessionID: rec.SessionID,
+					Strategy:  strategy,
+					Stripped:  rec.CompactStrip,
+					Created:   time.Now().UTC(),
+					Body:      body,
 				}
 			}
 		}
@@ -1829,7 +1844,7 @@ func registerHandlers(d handlerDeps) {
 		if !ok {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
 		}
-		if d.sup.Running(p.ThreadID) {
+		if d.agentRunning(p.ThreadID) {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams,
 				"cannot discard changes while the agent is running — stop it first")
 		}
@@ -1860,7 +1875,7 @@ func registerHandlers(d handlerDeps) {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams,
 				"this thread runs directly in the workspace and has no worktree to remove")
 		}
-		if d.sup.Running(p.ThreadID) {
+		if d.agentRunning(p.ThreadID) {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams,
 				"cannot remove the worktree while the agent is running — stop it first")
 		}
@@ -2351,7 +2366,7 @@ func registerHandlers(d handlerDeps) {
 		// 2. RE-RUN the analysis NOW, server-side. The snapshot may be stale or
 		//    absent (orphaned); AnalyzeCandidate handles a nil snapshot.
 		snap, _ := d.gitCache.SnapshotFor(p.ThreadID)
-		running := d.sup.Running(p.ThreadID)
+		running := d.agentRunning(p.ThreadID)
 		title := ""
 		if recOK {
 			title = rec.Title
@@ -2372,7 +2387,7 @@ func registerHandlers(d handlerDeps) {
 
 		// 5. Defensive stop — even though "running" is a blocker, guard against
 		//    a process that started between analysis and now.
-		_ = d.sup.Stop(p.ThreadID)
+		_ = d.agentStop(p.ThreadID)
 
 		// 6. Archive the record BEFORE touching git, so a failed Remove leaves
 		//    the record (and transcript) intact and recoverable.
@@ -2512,7 +2527,7 @@ func analyzeCleanupCandidates(d handlerDeps, project string) []gitstatus.Cleanup
 				Number:   snap.Number,
 			}
 		}
-		running := d.sup.Running(snap.ThreadID)
+		running := d.agentRunning(snap.ThreadID)
 		title, last := "", time.Time{}
 		if rec, ok := d.sessions.Get(snap.ThreadID); ok {
 			title, last = rec.Title, rec.Updated
@@ -2529,7 +2544,7 @@ func analyzeCleanupCandidates(d handlerDeps, project string) []gitstatus.Cleanup
 		if seen[rec.ThreadID] {
 			continue
 		}
-		running := d.sup.Running(rec.ThreadID)
+		running := d.agentRunning(rec.ThreadID)
 		cands = append(cands,
 			gitstatus.AnalyzeCandidate(rec.Worktree, nil, running, rec.Title, rec.Updated))
 	}

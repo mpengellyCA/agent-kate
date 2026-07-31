@@ -10,6 +10,7 @@ import (
 
 	"agentkate/internal/agent"
 	"agentkate/internal/compact"
+	"agentkate/internal/harness"
 	"agentkate/internal/session"
 	"agentkate/internal/worktree"
 )
@@ -19,7 +20,8 @@ import (
 //
 //   - As an agent thread (no --resume in argv): block reading stdin and exit
 //     cleanly once it's closed — i.e. when the supervisor Stops the thread.
-//   - As a cold compactor (--resume in argv, the shape RunLLM uses): sleep
+//   - As a cold compactor (--resume in argv, the shape the claude harness's
+//     cold Compact spawns): sleep
 //     briefly to model real compaction latency, print a summary body, exit 0.
 //
 // The deliberate sleep on the compaction path lets the test prove that the
@@ -82,8 +84,10 @@ func TestColdExitCompactionCompletesOnShutdown(t *testing.T) {
 	}
 
 	// Wire the cold-exit path exactly as runCore does, but with the fake claude
-	// injected so RunLLM spawns the stub instead of a real model.
-	coldCompacts := &exitCompactTracker{ctx: t.Context(), claudeBin: claudeBin}
+	// injected so the harness's cold Compact spawns the stub instead of a real
+	// model. The tracker routes through the registry now (plan 16 P6), so the
+	// binary reaches it via the supervisor the claude harness wraps.
+	coldCompacts := &exitCompactTracker{ctx: t.Context()}
 	sup := agent.NewSupervisor(claudeBin, log, func(tid string, events []json.RawMessage) {
 		for _, event := range events {
 			var probe struct {
@@ -103,6 +107,10 @@ func TestColdExitCompactionCompletesOnShutdown(t *testing.T) {
 			}
 		}
 	})
+
+	harnesses := harness.NewRegistry("claude")
+	harnesses.Register(newClaudeHarness(sup, "", ""))
+	coldCompacts.harnesses = harnesses
 
 	if _, err := sup.Start(agent.StartOptions{
 		ID:        threadID,

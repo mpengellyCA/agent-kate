@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 
@@ -10,19 +11,22 @@ import (
 // fakeHarness is a do-nothing Harness carrying only an id.
 type fakeHarness struct{ id string }
 
-func (f fakeHarness) Capabilities() Capabilities              { return Capabilities{ID: f.id} }
-func (f fakeHarness) Launch(StartSpec) (Launched, error)      { return Launched{}, nil }
+func (f fakeHarness) Capabilities() Capabilities                    { return Capabilities{ID: f.id} }
+func (f fakeHarness) Launch(StartSpec) (Launched, error)            { return Launched{}, nil }
 func (f fakeHarness) Send(string, string, []agent.Attachment) error { return nil }
-func (f fakeHarness) Interrupt(string) error                  { return nil }
-func (f fakeHarness) Stop(string) error                       { return nil }
-func (f fakeHarness) Running(string) bool                     { return false }
-func (f fakeHarness) StopAll()                                {}
+func (f fakeHarness) Interrupt(string) error                        { return nil }
+func (f fakeHarness) Stop(string) error                             { return nil }
+func (f fakeHarness) Running(string) bool                           { return false }
+func (f fakeHarness) StopAll()                                      {}
 func (f fakeHarness) ReadTranscript(string, string) ([]json.RawMessage, error) {
 	return nil, nil
 }
 func (f fakeHarness) SetOption(string, string, string) (string, error) { return "", nil }
 func (f fakeHarness) DiscoverOptions() ([]DiscoveredOption, error)     { return nil, nil }
 func (f fakeHarness) BrowseSessions() ([]BrowsableSession, error)      { return nil, nil }
+func (f fakeHarness) Compact(context.Context, CompactSpec) (string, error) {
+	return "", Unsupported("Compaction", f.Capabilities())
+}
 
 func TestRegistryLookupAndOrder(t *testing.T) {
 	r := NewRegistry("claude")

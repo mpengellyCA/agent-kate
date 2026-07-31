@@ -287,6 +287,10 @@ func runCore() {
 	harnesses = harness.NewRegistry("claude")
 	harnesses.Register(newClaudeHarness(sup, exePath, *socket))
 	harnesses.Register(newKimiHarness(ksup, exePath, *socket))
+	// The cold-exit tracker is created above (the relay closes over it) but can
+	// only route through the registry once it exists — a compaction can't fire
+	// before a thread has run, which is well after this point.
+	coldCompacts.harnesses = harnesses
 
 	// --- KDE Plasma Cowork (opt-in desktop see/control; off by default) --------
 	// The shared D-Bus client and consent authority are constructed eagerly so the
@@ -325,7 +329,6 @@ func runCore() {
 
 	deps := handlerDeps{
 		srv:        srv,
-		sup:        sup,
 		harnesses:  harnesses,
 		turns:      turns,
 		orchGrants: newOrchGrants(),

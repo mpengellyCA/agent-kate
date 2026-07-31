@@ -423,7 +423,7 @@ func runHotCompactIfConfigured(d handlerDeps, threadID string) {
 	if compact.Strategy(rec.CompactStrategy).Resolve() != compact.ExitOpusHot {
 		return
 	}
-	if !d.sup.Running(threadID) {
+	if !d.agentRunning(threadID) {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -434,7 +434,11 @@ func runHotCompactIfConfigured(d handlerDeps, threadID string) {
 	if d.turns != nil {
 		d.turns.TurnQueued(threadID)
 	}
-	text, err := d.sup.Compact(ctx, threadID, compact.CompactPrompt)
+	text, err := d.harnessFor(threadID).Compact(ctx, harness.CompactSpec{
+		ThreadID: threadID,
+		Prompt:   compact.CompactPrompt,
+		Hot:      true,
+	})
 	if err != nil {
 		d.log.Warn("hot-opus compact failed", "thread", threadID, "err", err)
 		return
@@ -472,7 +476,7 @@ func runHotCompactsAtShutdown(d handlerDeps, progress shutdownProgressFn) {
 		if h, ok := d.harnesses.Get(rec.Backend); !ok || !h.Capabilities().Compaction {
 			continue // this thread's harness has no compaction support
 		}
-		if !d.sup.Running(rec.ThreadID) {
+		if !d.agentRunning(rec.ThreadID) {
 			continue
 		}
 		if compact.Strategy(rec.CompactStrategy).Resolve() != compact.ExitOpusHot {
@@ -524,9 +528,13 @@ const exitCompactCap = 15 * time.Second
 // path can drain them before the process exits. ctx is shared by every spawned
 // compaction; cancelling it (at the shutdown deadline) kills stragglers.
 type exitCompactTracker struct {
-	wg        sync.WaitGroup
-	ctx       context.Context
-	claudeBin string // injectable for tests; "" resolves to "claude" via PATH
+	wg  sync.WaitGroup
+	ctx context.Context
+	// harnesses resolves each record's own backend, so a cold compaction runs
+	// through the thread's harness instead of assuming a claude subprocess
+	// (plan 16 P6). A record whose harness has no Compaction capability never
+	// reaches here — the exit hook checks first — but Compact refuses anyway.
+	harnesses *harness.Registry
 }
 
 // spawn launches a cold-exit compaction for rec as a tracked background
@@ -534,10 +542,14 @@ type exitCompactTracker struct {
 // WaitGroup before it starts, so a later drain() reliably blocks on it.
 func (e *exitCompactTracker) spawn(log *slog.Logger, sessions *session.Store,
 	summaries *compact.Store, rec session.Record, strategy compact.Strategy) {
+	h, ok := e.harnesses.Get(rec.Backend)
+	if !ok || !h.Capabilities().Compaction {
+		return // nothing to run: this thread's engine cannot compact
+	}
 	e.wg.Add(1)
 	safe.Go("shutdown.exitCompact", func() {
 		defer e.wg.Done()
-		runExitCompact(e.ctx, e.claudeBin, log, sessions, summaries, rec, strategy)
+		runExitCompact(e.ctx, h, log, sessions, summaries, rec, strategy)
 	})
 }
 
@@ -577,24 +589,34 @@ func waitWithDeadline(wg *sync.WaitGroup, d time.Duration) bool {
 // logged but do not block anything — the next resume will either find a usable
 // summary or trigger the recovery dialog in the UI. ctx is the shutdown-scoped
 // context: its cancellation (at the shutdown deadline) aborts a straggling
-// claude rather than orphaning it. An empty claudeBin resolves to "claude".
-func runExitCompact(ctx context.Context, claudeBin string, log *slog.Logger,
+// straggler rather than orphaning it. The pass runs through the thread's own
+// harness, which owns the mechanism.
+func runExitCompact(ctx context.Context, h harness.Harness, log *slog.Logger,
 	sessions *session.Store, summaries *compact.Store,
 	rec session.Record, strategy compact.Strategy) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 
-	sum, err := compact.RunLLM(ctx, rec.ThreadID, strategy, compact.LLMOptions{
-		ClaudeBin: claudeBin,
-		WorkDir:   rec.Worktree.Path,
+	body, err := h.Compact(ctx, harness.CompactSpec{
+		ThreadID:  rec.ThreadID,
 		SessionID: rec.SessionID,
+		WorkDir:   rec.Worktree.Path,
 		Model:     strategy.Model(),
+		Prompt:    compact.CompactPrompt,
 		Timeout:   5 * time.Minute,
 	})
 	if err != nil {
 		log.Warn("exit compaction failed",
 			"thread", rec.ThreadID, "strategy", strategy, "err", err)
 		return
+	}
+	sum := compact.Summary{
+		ThreadID:  rec.ThreadID,
+		SessionID: rec.SessionID,
+		Strategy:  strategy,
+		Stripped:  rec.CompactStrip,
+		Created:   time.Now().UTC(),
+		Body:      body,
 	}
 	if err := summaries.Put(sum); err != nil {
 		log.Warn("could not store summary", "thread", rec.ThreadID, "err", err)

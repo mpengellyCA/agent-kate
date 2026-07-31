@@ -68,6 +68,14 @@ that, so resume replays reality. `SetOption` maps
 `model|effort|permissionMode` onto your CLI's mid-session mechanism, or
 returns an error naming the harness.
 
+`Compact(ctx, spec)` runs one context compaction and returns the summary body.
+Both mechanisms live in your adapter, distinguished by `spec.Hot`: hot sends
+`spec.Prompt` into the LIVE thread and returns its reply (no re-cache, needs a
+running process); cold runs a fresh pass over `spec.SessionID` from
+`spec.WorkDir` on `spec.Model`. If your CLI has neither, declare
+`Compaction: false` and return `harness.Unsupported("Compaction", …)` — the
+same wording the RPC gate uses, which a test pins.
+
 Declare `Capabilities()` honestly — every flag gates real behavior:
 
 | Field | Gates |
@@ -170,3 +178,8 @@ under KConfig `[Agent] <id>Opt-<option>`; sticky picks under `<id>Mode` /
   API behind the same binary (env injection, `internal/agent/provider.go`).
   If your CLI exposes an Anthropic-compatible endpoint, that's a provider
   profile, not a new harness.
+- There is no direct supervisor handle in `handlerDeps` — every per-thread
+  action goes through the registry (`d.harnessFor`, `d.agentRunning`,
+  `d.agentStop`). The last exception (the Claude supervisor, kept for hot
+  compaction) went away in plan 16 P6, and it had been silently reporting a
+  live *kimi* thread as not running to the destructive git guards.

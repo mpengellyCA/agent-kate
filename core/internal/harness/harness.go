@@ -10,7 +10,10 @@
 package harness
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
+	"time"
 
 	"agentkate/internal/agent"
 )
@@ -197,6 +200,27 @@ type Launched struct {
 	Agents []AppliedAgent
 }
 
+// CompactSpec is one context-compaction pass, harness-neutrally. Two shapes,
+// distinguished by Hot:
+//
+//   - Hot: send Prompt into the LIVE thread and take the assistant's reply as
+//     the summary. No re-cache cost, but it needs a running process.
+//   - Cold: a fresh, separate pass over SessionID from WorkDir on Model. Works
+//     on a dormant thread and pays a full prefix re-cache.
+//
+// Only ever called on harnesses whose Capabilities().Compaction is true; the
+// rest return the shared not-supported error, so no caller needs to know which
+// CLI can do this.
+type CompactSpec struct {
+	ThreadID  string
+	SessionID string // the session a cold pass resumes; empty for hot
+	WorkDir   string // cwd for a cold pass
+	Model     string // cold-pass model; empty leaves the CLI's default
+	Prompt    string // the compaction instruction
+	Hot       bool
+	Timeout   time.Duration // 0 = the caller's context deadline only
+}
+
 // Harness is one agent backend. Implementations wrap a supervisor owning the
 // child processes; all methods must be safe for concurrent use.
 type Harness interface {
@@ -232,6 +256,19 @@ type Harness interface {
 	// BrowseSessions returns this harness's discoverable past sessions. Only
 	// called for harnesses whose Capabilities().SessionBrowse is true.
 	BrowseSessions() ([]BrowsableSession, error)
+
+	// Compact runs one compaction pass and returns the summary body. Gated by
+	// Capabilities().Compaction: a harness without it returns
+	// Unsupported("Compaction", …) rather than emulating a summary, because a
+	// summary the model never wrote is worse than none.
+	Compact(ctx context.Context, spec CompactSpec) (string, error)
+}
+
+// Unsupported is the shared "this harness cannot do that" error, so a
+// capability gate reads identically wherever it is enforced (the RPC layer
+// wraps the same wording in an IPC error).
+func Unsupported(feature string, caps Capabilities) error {
+	return fmt.Errorf("%s is not supported by %s agents", feature, caps.DisplayName)
 }
 
 // Registry holds the registered harnesses. It is built once at startup and
