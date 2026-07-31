@@ -70,6 +70,12 @@ type Capabilities struct {
 	// False means the CLI's subagent vocabulary is fixed; Launch reports every
 	// requested StartSpec.AgentProfile as unapplied.
 	CustomSubagents bool `json:"customSubagents"`
+	// The launch-option sweep (plan 16 P6). Each gates one StartSpec list; a
+	// false flag means the UI does not offer the option and Launch reports a
+	// request for it as unapplied rather than dropping it.
+	FallbackModels  bool `json:"fallbackModels"`  // ordered model fallbacks
+	DisallowedTools bool `json:"disallowedTools"` // per-session tool deny-list
+	AddDirs         bool `json:"addDirs"`         // extra reachable directories
 
 	ModelPicker string `json:"modelPicker"` // ModelPickerTiers | ModelPickerDiscovered
 	// PermissionModes / Efforts: the harness's static vocabularies (values
@@ -148,6 +154,19 @@ type StartSpec struct {
 	// to. Gated by Capabilities.CustomSubagents; reported per profile in
 	// Launched.Agents, since a harness may express some fields and not others.
 	Agents []AgentProfile
+
+	// The launch-option sweep (plan 16 P6), each capability-gated and each
+	// reported in Launched.UnappliedOptions when the harness has no equivalent:
+	//
+	//   FallbackModels  models to fall back to when the first is overloaded or
+	//                   unavailable, in order (claude --fallback-model).
+	//   DisallowedTools tool names the thread may not use at all
+	//                   (claude --disallowedTools). Deny beats allow.
+	//   AddDirs         extra directories the thread's tools may reach, beyond
+	//                   its worktree (claude --add-dir).
+	FallbackModels  []string
+	DisallowedTools []string
+	AddDirs         []string
 }
 
 // AgentProfile is one custom subagent definition, harness-neutrally. Adapters
@@ -212,6 +231,17 @@ type Launched struct {
 	// Agents carries one entry per requested StartSpec.AgentProfile, in the
 	// same order, so a caller can name exactly which profile lost what.
 	Agents []AppliedAgent
+	// UnappliedOptions names launch options the harness could not express, one
+	// entry each with a reason. It is for the list-valued options (the P6
+	// sweep), where there is no single "applied value" to diff against — the
+	// adapter has to say so explicitly or the request would simply vanish.
+	UnappliedOptions []UnappliedOption
+}
+
+// UnappliedOption is one requested launch option a harness could not apply.
+type UnappliedOption struct {
+	Option string // the neutral option name, e.g. "addDirs"
+	Reason string // human-readable; reaches the launching agent verbatim
 }
 
 // CompactSpec is one context-compaction pass, harness-neutrally. Two shapes,

@@ -40,6 +40,13 @@ struct HarnessTraits {
     // the persona belongs in the opening message.
     bool systemPrompt = false;
     bool customSubagents = false;
+    // The launch-option sweep (plan 16 P6). Each gates one advanced field in
+    // the New Agent dialog — an engine that cannot express the option is not
+    // offered it, which is why the core never has to report these as
+    // downgrades on a UI-driven start.
+    bool fallbackModels = false;  // ordered model fallbacks
+    bool disallowedTools = false; // per-session tool deny-list
+    bool addDirs = false;         // extra reachable directories
 
     QString modelPicker = QStringLiteral("tiers"); // "tiers" | "discovered"
     // Static vocabularies (wire values; the UI owns the human labels). Empty =

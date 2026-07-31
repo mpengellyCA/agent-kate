@@ -98,6 +98,10 @@ func launchThread(d handlerDeps, h harness.Harness, threadID, sessionID string,
 		SystemPrompt:   p.SystemPrompt,
 		Agents:         p.Agents,
 		Env:            p.Env,
+
+		FallbackModels:  p.FallbackModels,
+		DisallowedTools: p.DisallowedTools,
+		AddDirs:         p.AddDirs,
 	})
 	if err != nil {
 		emitLifecycle(d, threadID, "error", err.Error(), &wt)
@@ -135,6 +139,10 @@ func launchThread(d handlerDeps, h harness.Harness, threadID, sessionID string,
 		SystemPrompt:   recPrompt,
 		Agents:         recAgents,
 		Env:            p.Env,
+
+		FallbackModels:  p.FallbackModels,
+		DisallowedTools: p.DisallowedTools,
+		AddDirs:         p.AddDirs,
 	}
 	applyProviderToRecord(&rec, p.Provider)
 	if err := d.sessions.Put(rec); err != nil {
@@ -185,6 +193,11 @@ func resumeThread(d handlerDeps, h harness.Harness, rec session.Record, provOver
 		// Without this a resumed thread would run against a different CLI home
 		// than it was launched with — and its session lives in the old one.
 		Env: rec.Env,
+		// Same reasoning for the sweep: a resume that forgot the deny-list
+		// would hand the thread back a tool the human took away.
+		FallbackModels:  rec.FallbackModels,
+		DisallowedTools: rec.DisallowedTools,
+		AddDirs:         rec.AddDirs,
 	}
 	// A fresh override (the UI re-supplying a KWallet-held token the Record never
 	// stores) takes precedence over the env-var resolution baked into the snapshot.
@@ -312,6 +325,10 @@ func forkAgentThread(d handlerDeps, h harness.Harness, src session.Record, newTh
 		SystemPrompt: src.SystemPrompt,
 		Agents:       src.Agents,
 		Env:          src.Env,
+
+		FallbackModels:  src.FallbackModels,
+		DisallowedTools: src.DisallowedTools,
+		AddDirs:         src.AddDirs,
 	})
 	if err != nil {
 		emitLifecycle(d, newThreadID, "error", err.Error(), &wt)
@@ -347,6 +364,9 @@ func forkAgentThread(d handlerDeps, h harness.Harness, src session.Record, newTh
 		SystemPrompt:    forkPrompt,
 		Agents:          forkAgents,
 		Env:             src.Env,
+		FallbackModels:  src.FallbackModels,
+		DisallowedTools: src.DisallowedTools,
+		AddDirs:         src.AddDirs,
 	}
 	applyProviderToRecord(&rec, providerFromRecord(src))
 	if err := d.sessions.Put(rec); err != nil {

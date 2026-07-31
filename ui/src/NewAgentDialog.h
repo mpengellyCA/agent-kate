@@ -5,11 +5,14 @@
 
 #include <QDialog>
 #include <QString>
+#include <QStringList>
 
 class QPlainTextEdit;
 class QComboBox;
 class QCheckBox;
 class QLabel;
+class QLineEdit;
+class QFormLayout;
 class QWidget;
 class CoreClient;
 
@@ -27,6 +30,11 @@ struct NewAgentChoices {
     QString isolation;      // auto | isolated | workspace
     QString permissionMode; // the harness's own mode vocabulary; "" = default
     QString effort;         // the harness's own effort vocabulary; "" = default
+    // The launch-option sweep (plan 16 P6), each offered only when the chosen
+    // engine declares the capability. Empty lists mean "not requested".
+    QStringList fallbackModels;  // models to fall back to, in order
+    QStringList disallowedTools; // tool names this agent may not use
+    QStringList addDirs;         // extra directories its tools may reach
 };
 
 // NewAgentDialog — a friendly front door for starting an agent: describe the
@@ -58,4 +66,10 @@ private:
     QWidget *m_advanced = nullptr;
     QComboBox *m_permission = nullptr;
     QComboBox *m_effort = nullptr;
+    // Sweep fields + their form rows, so a row can be hidden entirely for an
+    // engine that cannot express it (offering it would be a lie).
+    QLineEdit *m_fallbackModels = nullptr;
+    QLineEdit *m_disallowedTools = nullptr;
+    QLineEdit *m_addDirs = nullptr;
+    QFormLayout *m_advancedForm = nullptr;
 };

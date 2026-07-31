@@ -15,6 +15,7 @@
 #include <QDialogButtonBox>
 #include <QFormLayout>
 #include <QLabel>
+#include <QLineEdit>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QSignalBlocker>
@@ -178,6 +179,12 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, CoreClient *core,
         restore(m_model, prevModel);
         restore(m_permission, prevPerm);
         restore(m_effort, prevEffort);
+        // Only offer the sweep options this engine can actually apply.
+        if (m_advancedForm) {
+            m_advancedForm->setRowVisible(m_fallbackModels, t.fallbackModels);
+            m_advancedForm->setRowVisible(m_disallowedTools, t.disallowedTools);
+            m_advancedForm->setRowVisible(m_addDirs, t.addDirs);
+        }
     };
     // Selecting a discovered-model engine (e.g. Kimi) with no cached option
     // lists probes the CLI once so the lists fill before the agent starts; the
@@ -208,12 +215,33 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, CoreClient *core,
     root->addWidget(advToggle);
 
     m_advanced = new QWidget(this);
-    auto *advForm = new QFormLayout(m_advanced);
+    m_advancedForm = new QFormLayout(m_advanced);
+    QFormLayout *advForm = m_advancedForm;
     advForm->setContentsMargins(0, 0, 0, 0);
     m_permission = new QComboBox(m_advanced);
     advForm->addRow(i18n("When to ask"), m_permission);
     m_effort = new QComboBox(m_advanced);
     advForm->addRow(i18n("Thinking effort"), m_effort);
+    // The launch-option sweep (plan 16 P6). Each row is hidden for an engine
+    // that cannot express it: offering a field the launch would silently drop
+    // is exactly the downgrade the applied-truth rule exists to prevent.
+    m_fallbackModels = new QLineEdit(m_advanced);
+    m_fallbackModels->setPlaceholderText(i18n("e.g. sonnet, haiku"));
+    m_fallbackModels->setToolTip(
+        i18n("Models to fall back to, in order, if the chosen one is overloaded "
+             "or unavailable."));
+    advForm->addRow(i18n("Fall back to"), m_fallbackModels);
+    m_disallowedTools = new QLineEdit(m_advanced);
+    m_disallowedTools->setPlaceholderText(i18n("e.g. WebFetch, Bash(git push:*)"));
+    m_disallowedTools->setToolTip(
+        i18n("Tools this agent may never use. A denial always beats an allowance."));
+    advForm->addRow(i18n("Never use"), m_disallowedTools);
+    m_addDirs = new QLineEdit(m_advanced);
+    m_addDirs->setPlaceholderText(i18n("e.g. /home/you/reference-docs"));
+    m_addDirs->setToolTip(
+        i18n("Extra directories this agent's tools may read, beyond its own "
+             "working copy. Comma-separated."));
+    advForm->addRow(i18n("Also allow access to"), m_addDirs);
     m_advanced->setVisible(false);
     root->addWidget(m_advanced);
     connect(advToggle, &QCheckBox::toggled, m_advanced, &QWidget::setVisible);
@@ -283,5 +311,24 @@ NewAgentChoices NewAgentDialog::choices() const
                                          : QStringLiteral("workspace");
     c.permissionMode = m_permission->currentData().toString();
     c.effort = m_effort->currentData().toString();
+    // A hidden row is an option this engine cannot express — read nothing from
+    // it, so a value typed before switching engines cannot leak into the launch.
+    const auto listFrom = [](const QLineEdit *edit) {
+        QStringList out;
+        if (!edit || !edit->isVisibleTo(edit->window())) {
+            return out;
+        }
+        const QStringList parts = edit->text().split(QLatin1Char(','), Qt::SkipEmptyParts);
+        for (const QString &p : parts) {
+            const QString trimmed = p.trimmed();
+            if (!trimmed.isEmpty()) {
+                out << trimmed;
+            }
+        }
+        return out;
+    };
+    c.fallbackModels = listFrom(m_fallbackModels);
+    c.disallowedTools = listFrom(m_disallowedTools);
+    c.addDirs = listFrom(m_addDirs);
     return c;
 }

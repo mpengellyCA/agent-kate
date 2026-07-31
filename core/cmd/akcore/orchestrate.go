@@ -191,6 +191,18 @@ func unappliedPersona(systemPrompt string, profiles []harness.AgentProfile,
 	return out
 }
 
+// unappliedSweepReport renders the harness's own UnappliedOptions (the plan 16
+// P6 list-valued launch options) into the same reason-carrying shape. The
+// adapter owns the wording, because only it knows why its CLI cannot express
+// the option.
+func unappliedSweepReport(launched harness.Launched) []map[string]string {
+	var out []map[string]string
+	for _, u := range launched.UnappliedOptions {
+		out = append(out, map[string]string{"option": u.Option, "reason": u.Reason})
+	}
+	return out
+}
+
 // profileLabel names a profile in applied-truth output, standing in for the
 // nameless (which no harness can register anyway).
 func profileLabel(name string) string {
@@ -335,6 +347,7 @@ func registerOrchestrationHandlers(d handlerDeps) {
 		}, launched)
 		unapplied = append(unapplied,
 			unappliedPersona(p.SystemPrompt, p.Agents, launched, caps)...)
+		unapplied = append(unapplied, unappliedSweepReport(launched)...)
 		var appliedAgents []string
 		for _, a := range launched.Agents {
 			if a.Applied {

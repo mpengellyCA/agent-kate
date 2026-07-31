@@ -71,6 +71,42 @@ func (h *kimiHarness) Capabilities() harness.Capabilities {
 const kimiNoCustomSubagents = "Kimi Code agents cannot be given custom subagent " +
 	"profiles over ACP (its subagent set is fixed: coder, explore, plan)"
 
+// The plan 16 P6 sweep, per option, probed against kimi 0.30.0: `kimi acp`
+// takes no harness-shaping flags at all, and ACP's session/new carries a
+// single `cwd` plus `mcpServers` — no model-fallback chain, no tool deny-list,
+// no additional roots. The documented per-agent `disallowedTools` frontmatter
+// belongs to an agent FILE, and P3 proved those files are unreachable over ACP
+// (v2 engine only), so there is nowhere honest to put it.
+const (
+	kimiNoFallbackModels = "Kimi Code has no model-fallback chain over ACP; " +
+		"the session runs on one model"
+	kimiNoDisallowedTools = "Kimi Code has no per-session tool deny-list over ACP " +
+		"(its agent-file frontmatter is read only by the v2 engine, which ACP never runs)"
+	kimiNoAddDirs = "Kimi Code sessions reach one working directory over ACP; " +
+		"extra roots are not expressible"
+)
+
+// unappliedSweep reports every list-valued sweep option the caller asked for,
+// since kimi can express none of them. A request that vanished silently would
+// be worse than one that is refused with a reason.
+func unappliedSweep(spec harness.StartSpec) []harness.UnappliedOption {
+	var out []harness.UnappliedOption
+	for _, o := range []struct {
+		name   string
+		want   []string
+		reason string
+	}{
+		{"fallbackModels", spec.FallbackModels, kimiNoFallbackModels},
+		{"disallowedTools", spec.DisallowedTools, kimiNoDisallowedTools},
+		{"addDirs", spec.AddDirs, kimiNoAddDirs},
+	} {
+		if len(o.want) > 0 {
+			out = append(out, harness.UnappliedOption{Option: o.name, Reason: o.reason})
+		}
+	}
+	return out
+}
+
 func (h *kimiHarness) Launch(spec harness.StartSpec) (harness.Launched, error) {
 	th, err := h.ksup.Start(kimi.StartOptions{
 		ID:          spec.ThreadID,
@@ -102,6 +138,7 @@ func (h *kimiHarness) Launch(spec harness.StartSpec) (harness.Launched, error) {
 		PermissionMode:      th.Mode(),
 		SystemPromptApplied: false,
 		Agents:              harness.UnappliedAgents(spec.Agents, kimiNoCustomSubagents),
+		UnappliedOptions:    unappliedSweep(spec),
 	}, nil
 }
 

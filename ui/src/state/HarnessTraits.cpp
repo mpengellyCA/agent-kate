@@ -51,6 +51,8 @@ HarnessTraits claudeDefaults()
     t.transcriptPreview = true; // claude keeps the on-disk session store
     // --append-system-prompt and --agents, both verified in print mode.
     t.systemPrompt = t.customSubagents = true;
+    // --fallback-model / --disallowedTools / --add-dir, verified on 2.1.220.
+    t.fallbackModels = t.disallowedTools = t.addDirs = true;
     // Models are discovered live (`claude -p /model`, or a routed provider's
     // /v1/models); mode/effort stay static vocabularies below.
     t.modelPicker = QStringLiteral("discovered");
@@ -74,6 +76,8 @@ HarnessTraits kimiDefaults()
     // not a previewable/forgettable on-disk store. systemPrompt and
     // customSubagents stay false too: `kimi acp` takes no system-prompt channel
     // and resolves subagents from a compiled-in set (see harness_kimi.go).
+    // The P6 sweep is off for the same reason: `kimi acp` takes no
+    // harness-shaping flags, and ACP session/new carries one cwd.
     t.modelPicker = QStringLiteral("discovered");
     return t;
 }
@@ -95,6 +99,9 @@ HarnessTraits fromJson(const QJsonObject &o)
     t.transcriptPreview = o.value(QStringLiteral("transcriptPreview")).toBool();
     t.systemPrompt = o.value(QStringLiteral("systemPrompt")).toBool();
     t.customSubagents = o.value(QStringLiteral("customSubagents")).toBool();
+    t.fallbackModels = o.value(QStringLiteral("fallbackModels")).toBool();
+    t.disallowedTools = o.value(QStringLiteral("disallowedTools")).toBool();
+    t.addDirs = o.value(QStringLiteral("addDirs")).toBool();
     t.modelPicker = o.value(QStringLiteral("modelPicker")).toString();
     t.permissionModes.clear();
     const QJsonArray modes = o.value(QStringLiteral("permissionModes")).toArray();

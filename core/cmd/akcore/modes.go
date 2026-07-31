@@ -212,6 +212,7 @@ func registerModeHandlers(d handlerDeps) {
 		}, launched)
 		unapplied = append(unapplied,
 			unappliedPersona(systemPrompt, nil, launched, caps)...)
+		unapplied = append(unapplied, unappliedSweepReport(launched)...)
 		return map[string]any{
 			"threadId":  threadID,
 			"sessionId": launched.SessionID,

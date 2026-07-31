@@ -105,3 +105,53 @@ func TestBuildStartArgsSessionAndCowork(t *testing.T) {
 		t.Error("a fresh thread must not --resume")
 	}
 }
+
+// TestBuildStartArgsSweepFlags pins the plan 16 P6 launch-option sweep, all
+// three verified present on claude 2.1.220. --fallback-model takes ONE
+// comma-separated value; --disallowedTools and --add-dir are variadic
+// (`<tools...>`, `<directories...>`), so each value is passed as its own flag
+// occurrence — a variadic flag greedily eats whatever argv follows it, which a
+// live probe confirmed by watching `--add-dir /tmp "prompt"` swallow the
+// prompt.
+func TestBuildStartArgsSweepFlags(t *testing.T) {
+	args := buildStartArgs(StartOptions{
+		WorkDir:         "/ws",
+		FallbackModels:  []string{"sonnet", "haiku"},
+		DisallowedTools: []string{"Bash(git push:*)", "WebFetch", "  "},
+		AddDirs:         []string{"/ref/docs", "/ref/schemas", ""},
+	})
+
+	if v, ok := flagValue(args, "--fallback-model"); !ok || v != "sonnet,haiku" {
+		t.Errorf("--fallback-model = %q (present=%v), want the comma-joined list", v, ok)
+	}
+	// Each list value is its own occurrence, and blanks are dropped rather than
+	// passed as an empty argument the CLI would have to interpret.
+	var tools, dirs []string
+	for i, a := range args {
+		if i+1 >= len(args) {
+			continue
+		}
+		switch a {
+		case "--disallowedTools":
+			tools = append(tools, args[i+1])
+		case "--add-dir":
+			dirs = append(dirs, args[i+1])
+		}
+	}
+	if len(tools) != 2 || tools[0] != "Bash(git push:*)" || tools[1] != "WebFetch" {
+		t.Errorf("--disallowedTools occurrences = %q", tools)
+	}
+	if len(dirs) != 2 || dirs[0] != "/ref/docs" || dirs[1] != "/ref/schemas" {
+		t.Errorf("--add-dir occurrences = %q", dirs)
+	}
+}
+
+// TestBuildStartArgsSweepOmitted: nothing requested, nothing in the argv.
+func TestBuildStartArgsSweepOmitted(t *testing.T) {
+	args := buildStartArgs(StartOptions{WorkDir: "/ws"})
+	for _, flag := range []string{"--fallback-model", "--disallowedTools", "--add-dir"} {
+		if _, ok := flagValue(args, flag); ok {
+			t.Errorf("%s present without a request", flag)
+		}
+	}
+}

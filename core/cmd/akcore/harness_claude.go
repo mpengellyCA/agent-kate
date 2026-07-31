@@ -33,11 +33,17 @@ func (h *claudeHarness) Capabilities() harness.Capabilities {
 		// The canonical id. Persisted records historically use "" for the
 		// default backend (session.BackendClaude); the registry resolves ""
 		// here, and records written from now on carry the explicit id.
-		ID:              "claude",
-		DisplayName:     "Claude Code",
-		Badge:           "", // the default engine stays unmarked in the roster
-		Fork:            true,
-		Compaction:      true,
+		ID:          "claude",
+		DisplayName: "Claude Code",
+		Badge:       "", // the default engine stays unmarked in the roster
+		Fork:        true,
+		Compaction:  true,
+		// Verified present on claude 2.1.220: --fallback-model (one
+		// comma-separated value), --disallowedTools and --add-dir (both
+		// variadic).
+		FallbackModels:  true,
+		DisallowedTools: true,
+		AddDirs:         true,
 		Promote:         true,
 		ProviderRouting: true,
 		Cowork:          true,
@@ -198,6 +204,11 @@ func (h *claudeHarness) Launch(spec harness.StartSpec) (harness.Launched, error)
 		SystemPrompt:   systemPrompt,
 		AgentsJSON:     agentsJSON,
 		Env:            spec.Env,
+		// The P6 sweep: claude 2.1.220 has all three, so nothing here is ever
+		// reported unapplied.
+		FallbackModels:  spec.FallbackModels,
+		DisallowedTools: spec.DisallowedTools,
+		AddDirs:         spec.AddDirs,
 	}); err != nil {
 		os.Remove(mcpConfig)
 		return harness.Launched{}, err

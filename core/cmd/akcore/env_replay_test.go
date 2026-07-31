@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"agentkate/internal/agent"
+	"agentkate/internal/harness"
 	"agentkate/internal/session"
 	"agentkate/internal/worktree"
 )
@@ -143,5 +144,71 @@ func TestLaunchWorkerIgnoresEnv(t *testing.T) {
 	}
 	if got := fake.spec().Env; len(got) != 0 {
 		t.Fatalf("an agent set its worker's environment: %+v", got)
+	}
+}
+
+// The P6 sweep persists and replays for the same reason the env overlay does —
+// a resume that forgot DisallowedTools would hand the thread back a tool the
+// human took away.
+func TestSweepOptionsPersistAndReplay(t *testing.T) {
+	sessions := testSessions(t)
+	d, fake := personaDeps(t, sessions)
+	proj := t.TempDir()
+
+	if _, _, err := launchThread(d, fake, "t-sweep", "s-sweep", agentStartParams{
+		WorkspacePath:   proj,
+		Prompt:          "go",
+		FallbackModels:  []string{"sonnet", "haiku"},
+		DisallowedTools: []string{"Bash"},
+		AddDirs:         []string{"/ref"},
+	}, launchMeta{}); err != nil {
+		t.Fatalf("launchThread: %v", err)
+	}
+	spec := fake.spec()
+	if len(spec.FallbackModels) != 2 || len(spec.DisallowedTools) != 1 || len(spec.AddDirs) != 1 {
+		t.Fatalf("launch did not pass the sweep: %+v", spec)
+	}
+	rec, ok := sessions.Get("t-sweep")
+	if !ok {
+		t.Fatal("no record")
+	}
+	if len(rec.FallbackModels) != 2 || len(rec.DisallowedTools) != 1 || len(rec.AddDirs) != 1 {
+		t.Fatalf("record did not persist the sweep: %+v", rec)
+	}
+
+	rec.Status = session.StatusDormant
+	resumeThread(d, fake, rec, nil)
+	spec = fake.spec()
+	if len(spec.DisallowedTools) != 1 || spec.DisallowedTools[0] != "Bash" {
+		t.Errorf("resume dropped the deny-list: %+v", spec.DisallowedTools)
+	}
+	if len(spec.AddDirs) != 1 || len(spec.FallbackModels) != 2 {
+		t.Errorf("resume dropped part of the sweep: %+v", spec)
+	}
+}
+
+// A harness that cannot express these options must SAY so per option — the
+// kimi adapter's reasons, rendered into the same shape launch_agent reports.
+func TestKimiReportsTheSweepUnapplied(t *testing.T) {
+	h := newKimiHarness(nil, "", "")
+	got := unappliedSweep(harness.StartSpec{
+		FallbackModels:  []string{"x"},
+		DisallowedTools: []string{"Bash"},
+		AddDirs:         []string{"/ref"},
+	})
+	if len(got) != 3 {
+		t.Fatalf("reported %d unapplied options, want all 3: %+v", len(got), got)
+	}
+	for _, u := range got {
+		if u.Reason == "" {
+			t.Errorf("option %q reported with no reason", u.Option)
+		}
+	}
+	// Nothing requested, nothing reported.
+	if n := len(unappliedSweep(harness.StartSpec{})); n != 0 {
+		t.Errorf("reported %d unapplied options for an empty request", n)
+	}
+	if caps := h.Capabilities(); caps.FallbackModels || caps.DisallowedTools || caps.AddDirs {
+		t.Error("kimi claims a sweep capability it does not have")
 	}
 }

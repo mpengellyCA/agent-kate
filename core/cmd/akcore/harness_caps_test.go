@@ -29,6 +29,12 @@ func TestHarnessCapabilities(t *testing.T) {
 		// subagents whose tools and model are both honored.
 		"SystemPrompt":    claude.SystemPrompt,
 		"CustomSubagents": claude.CustomSubagents,
+		// The plan 16 P6 sweep, all three verified present on claude 2.1.220:
+		// --fallback-model (one comma-separated value), --disallowedTools and
+		// --add-dir (both variadic).
+		"FallbackModels":  claude.FallbackModels,
+		"DisallowedTools": claude.DisallowedTools,
+		"AddDirs":         claude.AddDirs,
 	} {
 		if !got {
 			t.Errorf("claude capability %s = false, want true", name)
@@ -67,6 +73,13 @@ func TestHarnessCapabilities(t *testing.T) {
 		// Probed live on kimi 0.30.0; see harness_kimi.go.
 		"SystemPrompt":    kimi.SystemPrompt,
 		"CustomSubagents": kimi.CustomSubagents,
+		// `kimi acp` takes no harness-shaping flags, and ACP session/new
+		// carries one cwd plus mcpServers — no fallback chain, no tool
+		// deny-list, no extra roots. The documented per-agent disallowedTools
+		// frontmatter lives in an agent FILE, which ACP never reads.
+		"FallbackModels":  kimi.FallbackModels,
+		"DisallowedTools": kimi.DisallowedTools,
+		"AddDirs":         kimi.AddDirs,
 	} {
 		if got {
 			t.Errorf("kimi capability %s = true, want false (honestly gated, not emulated)", name)

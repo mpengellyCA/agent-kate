@@ -1104,6 +1104,18 @@ void AgentPanel::preselectPermission(const QString &mode)
     }
 }
 
+void AgentPanel::preselectLaunchOptions(const QStringList &fallbackModels,
+                                        const QStringList &disallowedTools,
+                                        const QStringList &addDirs)
+{
+    if (!m_threadId.isEmpty()) {
+        return; // the CLI is already running; these are launch-time only
+    }
+    m_fallbackModels = fallbackModels;
+    m_disallowedTools = disallowedTools;
+    m_addDirs = addDirs;
+}
+
 void AgentPanel::preselectEffort(const QString &effort)
 {
     if (!m_threadId.isEmpty()) {
@@ -2649,6 +2661,22 @@ void AgentPanel::onSendClicked()
         if (!providerJson.isEmpty()) {
             startParams.insert(QStringLiteral("provider"), providerJson);
         }
+        // The P6 launch options, sent only when the human asked for them (the
+        // New Agent dialog offers each field only where the engine can apply
+        // it, so an empty list here means "not requested", never "dropped").
+        const auto insertList = [&startParams](const char *key, const QStringList &list) {
+            if (list.isEmpty()) {
+                return;
+            }
+            QJsonArray arr;
+            for (const QString &v : list) {
+                arr.append(v);
+            }
+            startParams.insert(QLatin1String(key), arr);
+        };
+        insertList("fallbackModels", m_fallbackModels);
+        insertList("disallowedTools", m_disallowedTools);
+        insertList("addDirs", m_addDirs);
         m_startedProviderId = startedProviderId;
         m_core->call(QStringLiteral("agent.start"), startParams,
                      [this](const QJsonObject &result, const QJsonObject &error) {

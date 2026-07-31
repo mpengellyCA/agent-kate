@@ -118,6 +118,13 @@ public:
     void preselectIsolation(const QString &isolation); // "auto" | "isolated" | "workspace"
     void preselectPermission(const QString &mode);     // permission-mode data value
     void preselectEffort(const QString &effort);       // "" | low | medium | high | xhigh | max
+    // Pre-set the plan 16 P6 launch options for the first start (fallback
+    // models, a tool deny-list, extra reachable directories). They ride on
+    // agent.start only — mid-session the CLI has already been launched — and
+    // are only ever collected for an engine that declares the capability.
+    void preselectLaunchOptions(const QStringList &fallbackModels,
+                                const QStringList &disallowedTools,
+                                const QStringList &addDirs);
     // Pre-fill the composer with a first task (the user still presses Start/Send).
     void setComposerText(const QString &text);
 
@@ -513,6 +520,10 @@ private:
     // can re-attach a KWallet-held API token the core never persists. Empty for
     // Claude direct.
     QString m_startedProviderId;
+    // The P6 launch options this panel starts with, set before the first start.
+    QStringList m_fallbackModels;
+    QStringList m_disallowedTools;
+    QStringList m_addDirs;
     QCheckBox *m_coworkCheck = nullptr; // start this agent with the Cowork desktop tools wired in
     // Compaction strategy + strip flag — controls how the thread's transcript
     // is condensed to keep resume cost down. Both are sticky to last used.

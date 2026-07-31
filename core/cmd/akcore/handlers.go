@@ -67,6 +67,11 @@ type agentStartParams struct {
 	// from agent.start — a UI/human path — and deliberately NOT from
 	// launch_agent: see harness.StartSpec.Env.
 	Env map[string]string `json:"env,omitempty"`
+	// The P6 launch-option sweep, each capability-gated per harness and
+	// reported as applied-truth when a harness cannot express it.
+	FallbackModels  []string `json:"fallbackModels,omitempty"`
+	DisallowedTools []string `json:"disallowedTools,omitempty"`
+	AddDirs         []string `json:"addDirs,omitempty"`
 }
 
 type agentSendParams struct {

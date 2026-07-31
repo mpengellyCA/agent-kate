@@ -96,6 +96,15 @@ type Record struct {
 	// records written before P6, which then resume exactly as they did before.
 	Env map[string]string `json:"env,omitempty"`
 
+	// The P6 launch-option sweep, persisted AS REQUESTED (there is no
+	// negotiated value to record — a harness either expressed the list or
+	// reported it unapplied, and a resume re-runs that same translation). They
+	// must survive: a resume that forgot DisallowedTools would hand the thread
+	// back a tool the human took away.
+	FallbackModels  []string `json:"fallbackModels,omitempty"`
+	DisallowedTools []string `json:"disallowedTools,omitempty"`
+	AddDirs         []string `json:"addDirs,omitempty"`
+
 	// CoworkEnabled opts this thread into the KDE Plasma Cowork MCP server
 	// (desktop see/control). Off by default; only the UI may flip it
 	// (cowork.setEnabled). See docs/plans/08-kde-cowork/.

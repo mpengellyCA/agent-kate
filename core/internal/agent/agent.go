@@ -118,6 +118,10 @@ type StartOptions struct {
 	// a caller cannot silently redirect a routed thread's endpoint by ordering).
 	// See harness.StartSpec.Env for why this never comes from an agent.
 	Env map[string]string
+	// The plan 16 P6 sweep, straight through from StartSpec.
+	FallbackModels  []string // claude --fallback-model (comma-joined)
+	DisallowedTools []string // claude --disallowedTools
+	AddDirs         []string // claude --add-dir
 }
 
 // buildStartArgs assembles the `claude` argv for one thread. Split out of
@@ -165,6 +169,26 @@ func buildStartArgs(opts StartOptions) []string {
 	// vocabulary, including which fields the binary honors).
 	if opts.AgentsJSON != "" {
 		args = append(args, "--agents", opts.AgentsJSON)
+	}
+	// The launch-option sweep (plan 16 P6), all verified present on claude
+	// 2.1.220. --fallback-model takes ONE comma-separated value; the other two
+	// are variadic (`<tools...>`, `<directories...>`), which is why each value
+	// is passed as its own flag occurrence: a variadic flag greedily eats the
+	// argv that follows it. (Our prompt travels over stdin as stream-json, not
+	// as a trailing positional, so nothing downstream is at risk either way —
+	// but one value per occurrence keeps that true if that ever changes.)
+	if len(opts.FallbackModels) > 0 {
+		args = append(args, "--fallback-model", strings.Join(opts.FallbackModels, ","))
+	}
+	for _, tool := range opts.DisallowedTools {
+		if strings.TrimSpace(tool) != "" {
+			args = append(args, "--disallowedTools", tool)
+		}
+	}
+	for _, dir := range opts.AddDirs {
+		if strings.TrimSpace(dir) != "" {
+			args = append(args, "--add-dir", dir)
+		}
 	}
 	// A fresh thread is pinned to a session id we choose, so it can be resumed
 	// later; a resumed thread replays that same Claude Code session.

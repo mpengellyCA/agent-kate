@@ -444,6 +444,9 @@ void AgentDock::newAgentInActiveProjectGuided()
     panel->preselectIsolation(c.isolation);
     panel->preselectPermission(c.permissionMode);
     panel->preselectEffort(c.effort);
+    // The P6 sweep rides on the first start; the dialog only offered the
+    // options this engine declares, so nothing here can be silently dropped.
+    panel->preselectLaunchOptions(c.fallbackModels, c.disallowedTools, c.addDirs);
     panel->setComposerText(c.task);
 }
 
