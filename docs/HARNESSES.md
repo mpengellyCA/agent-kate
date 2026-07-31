@@ -154,6 +154,13 @@ under KConfig `[Agent] <id>Opt-<option>`; sticky picks under `<id>Mode` /
 
 ## Sharp edges
 
+- A new harness joins the **ensembles** (`internal/modes`) automatically: an
+  ensemble names engines by registry id and models in that engine's own
+  vocabulary, both passed through untouched. The one thing the ensemble layer
+  reads from a harness is `Capabilities().PermissionModes` — its LAST entry is
+  offered to controllers as the "run this worker unattended" mode, so order
+  yours from most supervised to least. A harness whose modes are discovered per
+  session (empty list) simply gets no such hint, never a guessed one.
 - `session.Record.Backend` is `""` on records written before the registry
   existed; `Registry.Get("")` resolves it to the default harness. New records
   carry explicit ids.

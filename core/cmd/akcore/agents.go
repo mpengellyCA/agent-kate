@@ -31,11 +31,14 @@ func startThread(d handlerDeps, h harness.Harness, threadID, sessionID string, p
 }
 
 // launchMeta carries the orchestration extras of a worker launch (plan 16):
-// the launching thread's id (persisted as the worker's ParentThreadID) and an
-// optional roster title. Zero value = an ordinary human-launched thread.
+// the launching thread's id (persisted as the worker's ParentThreadID), an
+// optional roster title, and an explicit Role for a thread that is born into
+// one (mode.apply's controller — it is a controller before it has launched
+// anybody). Zero value = an ordinary human-launched thread.
 type launchMeta struct {
 	ParentThreadID string
 	Title          string
+	Role           string
 }
 
 // appliedPersona narrows a persona request down to what the harness CONFIRMED
@@ -108,8 +111,8 @@ func launchThread(d handlerDeps, h harness.Harness, threadID, sessionID string,
 	if strings.TrimSpace(title) == "" {
 		title = p.Prompt
 	}
-	role := ""
-	if meta.ParentThreadID != "" {
+	role := meta.Role
+	if role == "" && meta.ParentThreadID != "" {
 		role = session.RoleWorker
 	}
 	recPrompt, recAgents := appliedPersona(p.SystemPrompt, p.Agents, launched)

@@ -102,6 +102,23 @@ other:
 | `close_agent` | polite stop + archive (reversible) |
 | `discard_agent` | destructive removal of a thread and its worktree |
 
+## Ensembles
+
+An **ensemble** is a user-editable recipe: one controller agent, a roster of
+worker roles it may launch, and a master prompt that briefs it. They live in
+`modes.json` (`$XDG_DATA_HOME/agentkate/`) behind `mode.list/get/save/delete/apply`;
+built-ins ship in code and merge on load, a user entry of the same name shadows
+one, and deleting a built-in records a suppression so it stays gone.
+
+`mode.apply` creates **exactly one thread** — the controller, marked
+`Role: "controller"` — with the rendered master prompt as its opening message
+(identical text on every harness) and, where the harness has the persona channel,
+also as its system prompt so the orchestration rules survive a long run. Workers
+are never pre-spawned: the controller launches the roles it needs through
+`launch_agent`, using the roster's exact arguments, and they arrive in the roster
+as ordinary agents. The core does no scheduling — the controller *is* the
+scheduler.
+
 ## Repository layout
 
 ```

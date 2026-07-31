@@ -1671,16 +1671,7 @@ void AgentPanel::adoptRunningThread(const QString &threadId, const QString &sour
                                     const QString &title, bool isolated,
                                     const QString &backend)
 {
-    m_threadId = threadId;
-    Q_EMIT threadIdChanged(m_threadId);
-    m_dormant = false;
-    m_idle = true; // the fork is live and waiting for its first turn/follow-up
-    m_isolated = isolated;
-    m_backend = backend;
-    // A fork bills its own fresh session — start the cost meter from zero.
-    m_sessionCostUsd = 0.0;
-    m_sessionInTokens = 0;
-    m_sessionOutTokens = 0;
+    bindStartedThread(threadId, isolated, backend);
     // Replay the inherited conversation from the source agent (the fork's own
     // session id is minted asynchronously, so its transcript file isn't ready yet).
     loadTranscriptFrom(sourceThreadId);
@@ -1689,6 +1680,35 @@ void AgentPanel::adoptRunningThread(const QString &threadId, const QString &sour
             QStringLiteral("sys"));
     emit dormantChanged(false);
     refresh();
+}
+
+void AgentPanel::adoptStartedThread(const QString &threadId, const QString &note,
+                                    bool isolated, const QString &backend)
+{
+    bindStartedThread(threadId, isolated, backend);
+    // No transcript to replay: this thread was born with its opening message,
+    // which streams in live like any other first turn.
+    if (!note.isEmpty()) {
+        addNote(note.toHtmlEscaped(), QStringLiteral("sys"));
+    }
+    emit dormantChanged(false);
+    refresh();
+}
+
+// bindStartedThread is the shared state flip behind both adoptions: take over a
+// thread the core has already started, live, with its own fresh cost meter.
+void AgentPanel::bindStartedThread(const QString &threadId, bool isolated,
+                                   const QString &backend)
+{
+    m_threadId = threadId;
+    Q_EMIT threadIdChanged(m_threadId);
+    m_dormant = false;
+    m_idle = true; // live, waiting for its first turn to stream in
+    m_isolated = isolated;
+    m_backend = backend;
+    m_sessionCostUsd = 0.0;
+    m_sessionInTokens = 0;
+    m_sessionOutTokens = 0;
 }
 
 void AgentPanel::loadTranscript()

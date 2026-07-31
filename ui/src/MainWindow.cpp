@@ -29,6 +29,7 @@
 #include "git/GutterController.h"
 #include "git/LogViewer.h"
 #include "ipc/CoreClient.h"
+#include "state/EnsembleCatalog.h"
 
 #include <KTextEditor/Cursor>
 #include <KTextEditor/Document>
@@ -1808,6 +1809,10 @@ void MainWindow::setupCore()
         // Learn the core's harness capability sets first — every engine
         // picker and backend-specific affordance derives from them.
         HarnessRegistry::self()->fetch(m_core);
+        // The ensemble catalogue drives the New Agent dialog and the roster's
+        // quick menu; an older core simply answers with an error and the UI
+        // offers no ensembles.
+        EnsembleCatalog::self()->fetch(m_core);
         // Then refresh every engine/provider's live model catalogue in the
         // background; pickers rebuild from the cache on changed(), and a
         // failed/offline probe leaves the last good list intact.

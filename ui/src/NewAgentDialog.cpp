@@ -3,6 +3,7 @@
 
 #include "NewAgentDialog.h"
 #include "ProviderConfig.h"
+#include "state/EnsembleCatalog.h"
 #include "state/HarnessTraits.h"
 
 #include <KConfigGroup>
@@ -49,6 +50,24 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, CoreClient *core,
     // The two choices most people care about, in plain language.
     auto *form = new QFormLayout;
     form->setLabelAlignment(Qt::AlignLeft);
+    // Ensembles first: picking one replaces every choice below it (the recipe
+    // owns the controller's engine, model and options), so it belongs at the
+    // top where it reads as "one agent, or a crew".
+    m_ensemble = new QComboBox(this);
+    m_ensemble->addItem(i18n("A single agent"), QString());
+    for (const Ensemble &e : EnsembleCatalog::self()->list()) {
+        m_ensemble->addItem(i18n("Ensemble: %1", e.name), e.name);
+        if (!e.description.isEmpty()) {
+            m_ensemble->setItemData(m_ensemble->count() - 1, e.description, Qt::ToolTipRole);
+        }
+    }
+    form->addRow(i18n("Work as"), m_ensemble);
+    // With no ensembles to choose from (an older core, or every built-in
+    // deleted) the row would be a picker with one option — hide it rather than
+    // ask a question that has no alternatives.
+    if (m_ensemble->count() < 2) {
+        form->setRowVisible(m_ensemble, false);
+    }
     m_engine = new QComboBox(this);
     m_engine->setToolTip(i18n(
         "Which agent engine runs this task: the agent program, optionally "
@@ -72,6 +91,11 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, CoreClient *core,
     m_model->setToolTip(i18n("Which model powers this agent. Smarter is more capable; faster is cheaper."));
     form->addRow(i18n("How clever?"), m_model);
     root->addLayout(form);
+
+    m_ensembleHint = new QLabel(this);
+    m_ensembleHint->setWordWrap(true);
+    m_ensembleHint->setVisible(false);
+    root->addWidget(m_ensembleHint);
 
     // The model, when-to-ask and effort lists all follow the engine's harness:
     // its static vocabularies where it has them, else the lists discovered
@@ -197,6 +221,9 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, CoreClient *core,
     // backend selection, and probe that engine's option lists if discovered.
     probeEngine();
     rebuildBackendChoices();
+    connect(m_ensemble, &QComboBox::currentIndexChanged, this,
+            &NewAgentDialog::applyEnsembleMode);
+    applyEnsembleMode();
 
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
     buttons->button(QDialogButtonBox::Ok)->setText(i18n("Create Agent"));
@@ -209,10 +236,45 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, CoreClient *core,
     resize(460, 420);
 }
 
+// applyEnsembleMode greys out the single-agent pickers when an ensemble is
+// selected. The ensemble defines its controller (and the roles it may launch),
+// so leaving the engine/model/advanced rows live would show choices the launch
+// silently ignores — the ensemble's recipe wins either way, so say so.
+void NewAgentDialog::applyEnsembleMode()
+{
+    const QString name = m_ensemble->currentData().toString();
+    const bool crew = !name.isEmpty();
+    m_engine->setEnabled(!crew);
+    m_model->setEnabled(!crew);
+    m_sandbox->setEnabled(!crew);
+    m_advanced->setEnabled(!crew);
+    m_ensembleHint->setVisible(crew);
+    if (!crew) {
+        return;
+    }
+    const Ensemble e = EnsembleCatalog::self()->get(name);
+    QStringList roles;
+    for (const EnsembleMember &w : e.workers) {
+        roles << (w.model.isEmpty() ? w.role : i18nc("worker role and its model",
+                                                     "%1 (%2)", w.role, w.model));
+    }
+    const QString controller = e.controller.model.isEmpty()
+        ? HarnessRegistry::self()->traits(e.controller.backend).displayName
+        : e.controller.model;
+    m_ensembleHint->setText(
+        roles.isEmpty()
+            ? i18n("Starts one controller agent on %1. It defines no worker roles, so it "
+                   "chooses any helpers itself.", controller)
+            : i18n("Starts one controller agent on %1, which may launch these workers as "
+                   "the job needs them: %2.", controller, roles.join(i18nc(
+                       "list separator", ", "))));
+}
+
 NewAgentChoices NewAgentDialog::choices() const
 {
     NewAgentChoices c;
     c.task = m_task->toPlainText().trimmed();
+    c.ensemble = m_ensemble->currentData().toString();
     const QString engine = m_engine->currentData().toString();
     c.backend = engine.section(QLatin1Char('|'), 0, 0);
     c.providerId = engine.section(QLatin1Char('|'), 1);

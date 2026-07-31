@@ -12,10 +12,15 @@ and a custom subagent profile), which Claude supports and Kimi does not — so
 the same call must come back APPLIED in one direction and NOT APPLIED, named,
 in the other.
 
+A third leg covers ensembles (plan 16 P4): the mode.* catalogue round-trip, and
+a mode.apply whose controller orchestrates from its rendered master prompt
+alone — nothing in the human's task names a tool, a backend or a model.
+
 A passing run proves the launch_agent/wait_agent bridge tools, the synchronous
 agent.launchWorker path, the agent.wait turn tracker, the ParentThreadID/Role
-linkage in agent.list, the core-broadcast `mcp.activity` feed (plan 16 P2) and
-the persona applied-truth (plan 16 P3) — for both harnesses in both roles.
+linkage in agent.list, the core-broadcast `mcp.activity` feed (plan 16 P2), the
+persona applied-truth (plan 16 P3) and the ensemble apply path (plan 16 P4) —
+for both harnesses in both roles.
 
 Requires: a built ./build/akcore and authenticated `claude` + `kimi` CLIs.
 Run unbuffered for live output:  python3 -u scripts/smoke-orchestrate.py
@@ -245,6 +250,135 @@ def run_direction(bus, name, controller_backend, controller_extra, prompt,
     return checks
 
 
+def run_ensemble(bus, workspace):
+    """Apply an ensemble and let its briefing alone drive the orchestration.
+
+    This is plan 16 P4's end-to-end claim: mode.apply starts ONE thread (the
+    controller), already briefed with the rendered master prompt, and that
+    prompt is what teaches it to launch a worker with the roster's exact
+    arguments. Nothing here tells the controller which tool to call or which
+    backend/model to use — if the roster or the tool names in the master prompt
+    were wrong, the run fails.
+    """
+    log("\n=== ensembles: mode.save -> mode.apply -> the controller orchestrates ===")
+    checks = {}
+
+    listing = bus.call("mode.list", {})
+    catalogue = listing.get("modes", [])
+    checks["mode.list serves the built-in ensembles"] = \
+        bool(catalogue) and all(m.get("builtIn") for m in catalogue)
+    checks["mode.list serves the default master prompt"] = \
+        "{{worker_roster}}" in listing.get("defaultMasterPrompt", "")
+
+    # Both roles pinned to haiku: this exercises the machinery, not the model.
+    haiku = "claude-haiku-4-5-20251001"
+    ensemble = {
+        "name": "Smoke Ensemble",
+        "description": "orchestration smoke",
+        "controller": {"backend": "claude", "model": haiku, "isolation": "workspace"},
+        "workers": [{"role": "ponger", "backend": "claude", "model": haiku,
+                     "isolation": "workspace",
+                     "notes": "Replies with one word. Give it the exact words to say."}],
+    }
+    bus.call("mode.save", {"mode": ensemble})
+    saved = [m for m in bus.call("mode.list", {}).get("modes", [])
+             if m.get("name") == "Smoke Ensemble"]
+    checks["mode.save round-trips into the catalogue"] = \
+        bool(saved) and not saved[0].get("builtIn") \
+        and saved[0].get("workers", [{}])[0].get("role") == "ponger"
+
+    task = ('Launch exactly one "ponger" worker, using the backend, model and '
+            'isolation its roster row gives, and set its prompt to: "Reply with '
+            'exactly the single word ENSEMBLEPONG and nothing else. Do not use any '
+            'tools." Wait for that worker, then reply with a single line: '
+            'WORKER SAID: <the worker\'s reply text>. Do not post notes, do not '
+            'claim files, and do not call any other tools.')
+    applied = bus.call("mode.apply",
+                       {"name": "Smoke Ensemble", "workDir": workspace, "task": task},
+                       deadline_secs=90)
+    controller_id = applied.get("threadId", "")
+    log(f"controller thread: {controller_id} backend={applied.get('backend')!r}")
+    checks["mode.apply started a controller thread"] = bool(controller_id)
+    checks["mode.apply reported the ensemble name"] = applied.get("ensemble") == "Smoke Ensemble"
+    # Claude has the persona channel, so the briefing is ALSO pinned as a system
+    # prompt — and that has to be reported, not assumed.
+    checks["mode.apply pinned the briefing as a system prompt (claude)"] = \
+        applied.get("systemPromptApplied") is True
+    checks["mode.apply reported nothing unapplied"] = not applied.get("unapplied")
+
+    state = {"done": False, "magic": False, "launched": False}
+    acts = []
+
+    def on_notify(msg):
+        if msg.get("method") == "mcp.activity":
+            p = msg["params"]
+            acts.append(p)
+            log(f"  ++ mcp.activity {p.get('tool')} thread={p.get('threadId')} "
+                f"ok={p.get('ok')} args={p.get('argsSummary')!r}")
+            return
+        if msg.get("method") == "permission.requested":
+            p = msg["params"]
+            log(f"  >> permission requested: {p.get('toolName')} — auto-approving")
+            bus.call_async("permission.respond",
+                           {"requestId": p["requestId"], "allow": True})
+            return
+        if msg.get("method") != "agent.event":
+            return
+        params = msg["params"]
+        prefix = "[ctrl]" if params.get("threadId") == controller_id else "[wrkr]"
+        for ev in events_of(params):
+            summarize(prefix, ev)
+            if params.get("threadId") != controller_id:
+                continue
+            if ev.get("type") == "user":
+                for block in ev.get("message", {}).get("content", []):
+                    if block.get("type") == "tool_result":
+                        c = block.get("content")
+                        txt = c if isinstance(c, str) else " ".join(
+                            x.get("text", "") for x in c if isinstance(x, dict))
+                        if "Launched worker" in txt:
+                            state["launched"] = True
+            if ev.get("type") == "assistant":
+                for block in ev.get("message", {}).get("content", []):
+                    if block.get("type") == "text" and "ENSEMBLEPONG" in block.get("text", ""):
+                        state["magic"] = True
+            if ev.get("type") == "result":
+                if "ENSEMBLEPONG" in str(ev.get("result", "")):
+                    state["magic"] = True
+                state["done"] = True
+
+    bus.pump(on_notify, lambda: state["done"], time.time() + DEADLINE_SECS)
+
+    checks["the briefing alone made the controller launch a worker"] = state["launched"]
+    checks["controller relayed the worker's reply (ENSEMBLEPONG)"] = state["magic"]
+    checks["mcp.activity: launch_agent from the controller"] = any(
+        a.get("tool") == "launch_agent" and a.get("threadId") == controller_id
+        and a.get("ok") for a in acts)
+
+    threads = bus.call("agent.list", {"project": ""}).get("threads", [])
+    controller = next((t for t in threads if t.get("threadId") == controller_id), None)
+    worker = next((t for t in threads if t.get("parentThreadId") == controller_id), None)
+    checks["the applied controller is role 'controller'"] = \
+        bool(controller) and controller.get("role") == "controller"
+    checks["its worker is a real thread, parented to it"] = \
+        bool(worker) and worker.get("role") == "worker"
+    checks["mode.apply pre-spawned no workers of its own"] = \
+        len([t for t in threads if t.get("parentThreadId") == controller_id]) <= 1
+
+    for t in (worker, controller):
+        if t:
+            bus.call_async("agent.stop", {"threadId": t["threadId"]})
+    time.sleep(2)
+
+    # Deleting a user ensemble removes it; the built-ins are untouched.
+    bus.call("mode.delete", {"name": "Smoke Ensemble"})
+    after = bus.call("mode.list", {}).get("modes", [])
+    checks["mode.delete removes the user ensemble"] = \
+        not any(m.get("name") == "Smoke Ensemble" for m in after)
+    checks["mode.delete left the built-ins alone"] = len(after) == len(catalogue)
+    return checks
+
+
 def main():
     if not os.path.exists(AKCORE):
         sys.exit("build akcore first: scripts/build.sh")
@@ -323,6 +457,11 @@ def main():
                 bus, "B", "kimi", {"workspacePath": workspace},
                 prompt_b, "claude", "CLAUDEPONG", persona_applied=True).items():
             all_checks[f"B: {k}"] = v
+
+        # C: ensembles (P4) — the catalogue, and an applied controller that
+        # orchestrates from its briefing alone.
+        for k, v in run_ensemble(bus, workspace).items():
+            all_checks[f"C: {k}"] = v
     finally:
         core.terminate()
         try:

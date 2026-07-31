@@ -30,7 +30,7 @@ const (
 
 // Orchestration roles for Record.Role (empty = ordinary human-launched thread).
 const (
-	RoleController = "controller" // has launched workers via the Cooperation bridge
+	RoleController = "controller" // launches workers via the Cooperation bridge (or was born one: mode.apply)
 	RoleWorker     = "worker"     // launched by another thread (ParentThreadID)
 )
 

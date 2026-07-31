@@ -687,9 +687,96 @@ static-true for Claude, false/absent for Kimi unless noted):
     stay empty), `appliedPersona` narrowing, an `agent.launchWorker` record
     round-trip, the on-disk session shape, and the argv-limit boundaries
     (at the limit passes, one byte over refuses).
-- **P4 — Ensembles (Feature 3)**. `core/internal/modes`, `mode.*` RPCs, built-in
-  ensembles, master-prompt template, `NewAgentDialog`/quick-menu picker,
-  ensemble editor dialog.
+- **P4 — Ensembles (Feature 3). ✅ LANDED.** `core/internal/modes` (built-ins
+  merged with the user's `modes.json`, user-wins + suppression), the five
+  `mode.*` RPCs, the master-prompt template, the New Agent dialog's ensemble
+  picker, the roster quick menu's Ensembles section, and the ensemble editor.
+  `scripts/smoke-orchestrate.py` gained a third leg (C) that applies an
+  ensemble and lets its rendered briefing — nothing else — drive a real
+  cross-thread launch; 43/43 checks green.
+
+  **Probed before writing the built-ins** (the plan's model strings were
+  partly wrong, and a shipped ensemble naming a model no CLI knows is a
+  silent failure at first use):
+  - `claude -p /model` on 2.1.220 →
+    `sonnet, opus, haiku, fable, best, sonnet[1m], opus[1m], fable[1m],
+    opusplan, default, or a full model ID`. So `fable`/`opus`/`sonnet` are
+    real vocabulary, and `resolveModel` is now a pass-through (the tier→id map
+    died with live model discovery) — the CLI resolves the alias itself.
+  - kimi 0.30.0's ACP config-option enumeration (a live `DiscoverOptions`
+    probe, no tokens spent) → models `kimi-code/kimi-for-coding` ("K2.7
+    Coding"), `kimi-code/kimi-for-coding-highspeed`, `kimi-code/k3`,
+    `kimi-code/k3-256k`; thinking `low|high|max`; modes
+    `default|plan|auto|yolo`. The plan's `kimi/kimi-for-coding` was missing
+    the `kimi-code/` prefix and would not have launched — the shipped
+    "Opus Controls Kimi Coders" uses the real id, and
+    `TestBuiltInsCarryRealVocabulary` now fails if a built-in ever drifts off
+    a probed id.
+
+  Where the sketch met the real code:
+  - **The controller is born a controller.** P1 derived `Role` from
+    "has a parent" (`worker`) / "has launched someone" (`controller`), but a
+    mode.apply controller has neither at birth. `launchMeta` gained an explicit
+    `Role`, so the roster nesting P5 builds on is correct from the first event
+    rather than after the first `launch_agent`.
+  - **The master prompt goes through BOTH channels where they exist.** The
+    opening message is the harness-neutral path (byte-identical text on kimi
+    and claude), and where `Capabilities().SystemPrompt` is true the same
+    rendered text is ALSO pinned as the system prompt — the orchestration
+    rules then survive the opening message ageing out of a long run. That is
+    reported, not assumed: `mode.apply` returns `systemPromptApplied` plus the
+    same `unapplied` list `launch_agent` uses, and the UI prints the losses in
+    the controller's first system line.
+  - **The one thing the ensemble layer reads from a harness is its permission
+    vocabulary**, positionally: `PermissionModes`'s LAST entry is offered to
+    the controller as the "run this worker unattended" mode. That keeps the
+    permission guidance in each engine's own spelling with no `backend == "…"`
+    compare, and a discovered-vocabulary harness (kimi) contributes no hint
+    rather than a guessed one (`TestNoPermissionHintWithoutVocabulary`).
+    Documented in HARNESSES.md's sharp edges, since it constrains how a new
+    adapter orders its list.
+  - **Engine ids in the built-ins are data, not gates.** `"claude"` / `"kimi"`
+    appear in `builtin.go` the same way they would in a user's saved ensemble:
+    as registry keys, resolved through `Registry.Get` and failing loudly when
+    absent (`TestModeApplyValidation`). No behaviour branches on them.
+  - **`mode.apply` takes an optional `task`** (appended under a "## The task"
+    heading), which the plan did not have. Without it an applied ensemble opens
+    with a briefing and no job, so the controller's first act is to ask what to
+    do — one wasted turn on every launch. The New Agent dialog's task box feeds
+    it.
+  - **Validation stops at what apply needs**: a name, and a role name per
+    worker. Model ids and permission modes are deliberately NOT checked
+    against a list — that vocabulary belongs to the harness and changes with
+    every CLI release, so a stale allow-list would reject models that started
+    working today (`TestValidateRejectsUnusableEnsembles` pins both halves).
+  - **UI: a bug the editor would have shipped.** An editable model combo
+    reports a stale `currentIndex` when its edit text was set to an id the
+    local catalogue has never seen — so saving an ensemble written on another
+    machine would have silently cleared its model. `EnsembleDialog::modelIdFor`
+    is the fix and is public+static purely so `ui/tests/EnsembleDialogTest`
+    can pin it (mutation-checked: reading the index alone fails the test).
+    Switching a row's engine now also clears its model, since a model id
+    belongs to exactly one engine's vocabulary.
+  - `EnsembleCatalog` (`ui/src/state/`) mirrors `mode.list` for all three
+    surfaces, in the shape of the existing `HarnessRegistry` singleton; an
+    older core answers with an error and the UI simply offers no ensembles
+    (the New Agent dialog hides the row entirely rather than showing a picker
+    with one option).
+  - `AgentPanel::adoptRunningThread` was fork-specific (it replays the source
+    transcript and prints "forked from …"). Split into a shared
+    `bindStartedThread` plus a new `adoptStartedThread` for a thread with no
+    inherited conversation — the ensemble controller.
+  - **The master prompt's tool names are right on both engines**, which was not
+    obvious: the smoke's kimi controller emits `tool_use:
+    mcp__cooperation__launch_agent` — the same name the claude controller does,
+    because the kimi translator normalises it — so one harness-neutral prompt
+    naming `mcp__cooperation__*` is correct for every engine.
+  - Not gated any further than `agent.start` is: an agent bridge could in
+    principle call `mode.apply` over the bus, exactly as it could call
+    `agent.start`. That is the pre-existing localhost/same-uid model
+    (`docs/security-model.md` §1), not a new surface — the cross-subtree
+    approval gate exists for *controlling other threads*, which mode.apply
+    does not do.
 - **P5 — Cross-thread UI (4c)**. All-threads inspector timeline, roster
   controller/worker nesting, cooperation activity feed.
 - **P6 — Parity & feature sweep (Features 5 + 6)**. Compaction behind the

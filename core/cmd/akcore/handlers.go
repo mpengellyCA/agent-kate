@@ -18,6 +18,7 @@ import (
 	"agentkate/internal/gitstatus"
 	"agentkate/internal/harness"
 	"agentkate/internal/ipc"
+	"agentkate/internal/modes"
 	"agentkate/internal/permission"
 	"agentkate/internal/safe"
 	"agentkate/internal/search"
@@ -112,6 +113,7 @@ type handlerDeps struct {
 	sessions   *session.Store
 	attachSide *session.AttachmentStore // per-thread attachment metadata sidecars
 	summaries  *compact.Store
+	modes      *modes.Store // user-editable ensembles (plan 16 P4)
 	skills     *skills.Catalog
 	gitCache   *gitstatus.Cache
 	cowork     *cowork.Service // nil if KDE/consent init failed; handlers guard
@@ -226,6 +228,10 @@ func registerHandlers(d handlerDeps) {
 
 	// Bridge identity + the `mcp.activity` feed the UI watches (plan 16 P2).
 	registerMCPActivity(d)
+
+	// Ensembles: the user-editable controller/worker recipes and the one-thread
+	// apply that briefs a controller (plan 16 P4).
+	registerModeHandlers(d)
 
 	// --- agent threads -----------------------------------------------------
 

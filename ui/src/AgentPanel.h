@@ -93,6 +93,13 @@ public:
                             const QString &title, bool isolated,
                             const QString &backend = QString());
 
+    // Bind this fresh panel to a thread the core has already started that has
+    // NO prior conversation to inherit — an ensemble controller (mode.apply
+    // launched it with its briefing as the opening message). Same live
+    // adoption, minus the transcript replay; note is shown as a system line.
+    void adoptStartedThread(const QString &threadId, const QString &note, bool isolated,
+                            const QString &backend = QString());
+
     // Pre-pick the engine (harness, direct API) before the first start. No-op
     // once a thread exists (the combo is frozen then) or if the id isn't an
     // offered choice.
@@ -241,6 +248,8 @@ private:
     // uses this panel's own thread; a fork passes its source thread so the
     // inherited conversation appears before the fork's own session id exists.
     void loadTranscriptFrom(const QString &fromThreadId);
+    // Shared state flip behind both adoptions of an already-started thread.
+    void bindStartedThread(const QString &threadId, bool isolated, const QString &backend);
     // Send the current compact-combo + strip values to the core for this
     // thread. No-op when no thread exists yet — the choice is then sticky
     // local-only until a thread is created.

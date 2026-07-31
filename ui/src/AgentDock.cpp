@@ -3,12 +3,14 @@
 #include "AgentPanel.h"
 #include "AgentRoster.h"
 #include "NewAgentDialog.h"
+#include "EnsembleDialog.h"
 #include "ForkAgentDialog.h"
 #include "shell/PanelStack.h"
 #include "AutoOrganizeDialog.h"
 #include "TagEditorDialog.h"
 #include "ipc/CoreClient.h"
 #include "ProviderConfig.h"
+#include "state/EnsembleCatalog.h"
 #include "state/HarnessTraits.h"
 
 #include <QDir>
@@ -67,11 +69,26 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
     connect(m_roster, &AgentRoster::forkRequested, this, &AgentDock::forkAgent);
     connect(m_roster, &AgentRoster::projectFocused, this, &AgentDock::projectFocused);
 
-    // Seed the "+ New Agent" quick menu from the harness registry, and keep it
-    // current as capabilities land or an option probe fills in a discovered
-    // engine's models.
+    connect(m_roster, &AgentRoster::applyEnsembleRequested, this,
+            [this](const QString &project, const QString &ensemble) {
+                QString p = project;
+                if (p.isEmpty() && !m_projects.isEmpty()) {
+                    p = m_projects.constLast();
+                }
+                if (!p.isEmpty()) {
+                    applyEnsemble(p, ensemble);
+                }
+            });
+    connect(m_roster, &AgentRoster::manageEnsemblesRequested, this,
+            &AgentDock::openEnsembleEditor);
+
+    // Seed the "+ New Agent" quick menu from the harness registry and the
+    // ensemble catalogue, and keep it current as capabilities land, an option
+    // probe fills in a discovered engine's models, or an ensemble is saved.
     seedEngineChoices();
     connect(HarnessRegistry::self(), &HarnessRegistry::changed, this,
+            &AgentDock::seedEngineChoices);
+    connect(EnsembleCatalog::self(), &EnsembleCatalog::changed, this,
             &AgentDock::seedEngineChoices);
     connect(m_roster, &AgentRoster::agentActivated, this, [this](int id) {
         if (Entry *e = entryById(id)) {
@@ -394,6 +411,13 @@ void AgentDock::newAgentInActiveProjectGuided()
         return;
     }
     const NewAgentChoices c = dlg.choices();
+    if (!c.ensemble.isEmpty()) {
+        // An ensemble is applied core-side: it starts its controller with the
+        // rendered master prompt as the opening message, so there is no panel
+        // to pre-fill — we adopt the thread the core just started.
+        applyEnsemble(project, c.ensemble, c.task);
+        return;
+    }
     AgentPanel *panel = addAgent(project, c.modelId, c.backend);
     if (!panel) {
         return;
@@ -407,6 +431,90 @@ void AgentDock::newAgentInActiveProjectGuided()
     panel->preselectPermission(c.permissionMode);
     panel->preselectEffort(c.effort);
     panel->setComposerText(c.task);
+}
+
+// applyEnsemble starts a controller/worker ensemble: the core creates ONE
+// thread (the controller) already briefed with the ensemble's master prompt,
+// and we adopt it into a roster panel. The workers do not exist yet — the
+// controller launches the roles it needs through the orchestration tools, and
+// they arrive in the roster as ordinary agents (plan 16 P4).
+void AgentDock::applyEnsemble(const QString &projectPath, const QString &ensemble,
+                              const QString &task)
+{
+    if (projectPath.isEmpty() || ensemble.isEmpty() || !m_core) {
+        return;
+    }
+    ensureProject(projectPath);
+    QJsonObject params{{QStringLiteral("name"), ensemble},
+                       {QStringLiteral("workDir"), projectPath}};
+    if (!task.isEmpty()) {
+        params.insert(QStringLiteral("task"), task);
+    }
+    // Guard the async reply: the dock (or its window) may be gone by the time
+    // the core answers — a known SIGSEGV class in this codebase.
+    QPointer<AgentDock> self(this);
+    m_core->call(
+        QStringLiteral("mode.apply"), params,
+        [self, projectPath, ensemble](const QJsonObject &result, const QJsonObject &error) {
+            if (!self) {
+                return;
+            }
+            if (!error.isEmpty()) {
+                emit self->statusMessage(i18n("Could not start the ensemble: %1",
+                    error.value(QStringLiteral("message")).toString()));
+                return;
+            }
+            const QString threadId = result.value(QStringLiteral("threadId")).toString();
+            if (threadId.isEmpty()) {
+                emit self->statusMessage(i18n("Could not start the ensemble: no thread was created"));
+                return;
+            }
+            const int id = ++self->m_counter;
+            auto *panel = new AgentPanel(self->m_core, self->m_stack);
+            panel->setWorkspace(projectPath);
+            self->m_stack->addWidget(panel);
+            self->m_agents.append(Entry{id, projectPath, panel});
+            self->m_roster->addAgent(projectPath, id, ensemble);
+            self->m_roster->setAgentTitlePinned(id, ensemble);
+            self->wireAgentPanel(id, panel);
+            // Report what the harness actually applied, exactly as launch_agent
+            // does — an ensemble asking for a model or persona channel the
+            // engine cannot honour must say so, not pretend it ran as written.
+            QString note = i18n("controller of the “%1” ensemble — it launches its "
+                                "workers itself as the job needs them.", ensemble);
+            const QJsonArray unapplied = result.value(QStringLiteral("unapplied")).toArray();
+            QStringList losses;
+            for (const QJsonValue &v : unapplied) {
+                const QJsonObject u = v.toObject();
+                const QString option = u.value(QStringLiteral("option")).toString();
+                const QString reason = u.value(QStringLiteral("reason")).toString();
+                const QString applied = u.value(QStringLiteral("applied")).toString();
+                losses << (reason.isEmpty()
+                               ? i18nc("requested option and what was applied instead",
+                                       "%1 → %2", option, applied)
+                               : i18nc("requested option and why it was not applied",
+                                       "%1 (%2)", option, reason));
+            }
+            if (!losses.isEmpty()) {
+                note += QLatin1Char(' ')
+                    + i18n("Not applied as requested: %1.",
+                           losses.join(i18nc("list separator", ", ")));
+            }
+            panel->adoptStartedThread(
+                threadId, note,
+                result.value(QStringLiteral("isolated")).toBool(),
+                result.value(QStringLiteral("backend")).toString());
+            self->m_roster->setCurrentAgent(id);
+            emit self->statusMessage(i18n("Started the “%1” ensemble", ensemble));
+        },
+        this);
+}
+
+void AgentDock::openEnsembleEditor()
+{
+    auto *dlg = new EnsembleDialog(m_core, m_dialogParent);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    dlg->open();
 }
 
 void AgentDock::renameActiveAgent()
@@ -662,6 +770,15 @@ void AgentDock::pushActiveWorktree(const QString &worktreePath)
 void AgentDock::seedEngineChoices()
 {
     QList<EngineChoice> choices;
+    // Ensembles first: a crew is a bigger decision than which model a lone
+    // agent runs, and the section stays present (with just its manage row) so
+    // the feature is discoverable before any ensemble exists.
+    choices.append({QString(), QString(), i18n("Ensembles"), true});
+    for (const Ensemble &e : EnsembleCatalog::self()->list()) {
+        choices.append({QString(), QString(), e.name, false, e.name});
+    }
+    choices.append(
+        {QString(), QString(), i18n("Manage ensembles…"), false, QString(), true});
     for (const HarnessTraits &t : HarnessRegistry::self()->all()) {
         choices.append({QString(), QString(), t.displayName, true}); // section
         // The engine's own default model, then its live catalogue (Claude-direct

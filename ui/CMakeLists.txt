@@ -43,11 +43,13 @@ find_package(KF6 6.0 QUIET COMPONENTS Wallet)
 add_executable(agentkate
     src/main.cpp
     src/state/HarnessTraits.cpp
+    src/state/EnsembleCatalog.cpp
     src/state/Reactive.cpp
     src/theme/ThemeManager.cpp
     src/AppearanceDialog.cpp
     src/CommandPalette.cpp
     src/NewAgentDialog.cpp
+    src/EnsembleDialog.cpp
     src/ForkAgentDialog.cpp
     src/MainWindow.cpp
     src/EditorArea.cpp
@@ -254,6 +256,18 @@ if(Qt6Test_FOUND)
     target_link_libraries(MarkdownUtilTest PRIVATE Qt6::Gui Qt6::Test)
     add_test(NAME MarkdownUtilTest COMMAND MarkdownUtilTest)
     set_tests_properties(MarkdownUtilTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    # Plan 16 P4: the ensemble round-trip and the editable model combo, the two
+    # places the editor could silently write an ensemble that is wrong.
+    add_executable(EnsembleDialogTest tests/EnsembleDialogTest.cpp
+        src/EnsembleDialog.cpp src/state/EnsembleCatalog.cpp
+        src/state/HarnessTraits.cpp src/ProviderConfig.cpp src/ipc/CoreClient.cpp)
+    target_include_directories(EnsembleDialogTest PRIVATE src)
+    target_link_libraries(EnsembleDialogTest PRIVATE Qt6::Widgets Qt6::Test
+        Qt6::Network KF6::ConfigCore KF6::I18n KF6::WidgetsAddons)
+    add_test(NAME EnsembleDialogTest COMMAND EnsembleDialogTest)
+    set_tests_properties(EnsembleDialogTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
     # Plan 17: the editor session keys + restore filter. The regression these

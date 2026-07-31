@@ -9,6 +9,7 @@
 class QPlainTextEdit;
 class QComboBox;
 class QCheckBox;
+class QLabel;
 class QWidget;
 class CoreClient;
 
@@ -16,6 +17,10 @@ class CoreClient;
 // agent's sticky default" (the data values match AgentPanel's combos).
 struct NewAgentChoices {
     QString task;           // optional first task, pre-filled into the composer
+    // ensemble names a controller/worker recipe (plan 16 P4) instead of a single
+    // agent. When set, every field below except task is the ensemble's business:
+    // the caller applies it core-side (mode.apply) rather than creating a panel.
+    QString ensemble;
     QString backend;        // harness id from the engine picker (claude, kimi, …)
     QString providerId;     // optional provider overlay; "" = direct
     QString modelId;        // tier token / discovered model id; "" = default
@@ -38,8 +43,15 @@ public:
     NewAgentChoices choices() const;
 
 private:
+    // Enable/disable the single-agent pickers: an ensemble brings its own
+    // controller engine, model and options, so leaving them live would offer
+    // choices the launch ignores.
+    void applyEnsembleMode();
+
     CoreClient *m_core = nullptr; // for the lazy discovered-option probe
     QPlainTextEdit *m_task = nullptr;
+    QComboBox *m_ensemble = nullptr; // "Single agent" or one ensemble
+    QLabel *m_ensembleHint = nullptr;
     QComboBox *m_engine = nullptr; // harness + optional provider overlay
     QComboBox *m_model = nullptr;
     QCheckBox *m_sandbox = nullptr;

@@ -68,6 +68,13 @@ public:
     bool activeAgentHasWorktree() const; // git lifecycle ops are meaningful
 
     void newAgentInActiveProject();
+    // Apply an ensemble (plan 16 P4): the core starts its controller, already
+    // briefed, and the dock adopts that thread into a roster panel. task is the
+    // human's first instruction, appended to the controller's briefing.
+    void applyEnsemble(const QString &projectPath, const QString &ensemble,
+                       const QString &task = QString());
+    // Open the ensemble editor (roster quick menu / Agent menu).
+    void openEnsembleEditor();
     // Open the guided New Agent dialog, then create the agent with the chosen
     // model / sandbox / options and pre-fill the first task into its composer.
     void newAgentInActiveProjectGuided();

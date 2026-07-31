@@ -362,8 +362,16 @@ void AgentRoster::setEngineChoices(const QList<EngineChoice> &choices)
         QAction *act = menu->addAction(c.label);
         const QString backend = c.backend;
         const QString model = c.model;
-        connect(act, &QAction::triggered, this, [this, backend, model] {
-            emit newAgentWithEngineRequested(selectedProject(), backend, model);
+        const QString ensemble = c.ensemble;
+        const bool manage = c.manage;
+        connect(act, &QAction::triggered, this, [this, backend, model, ensemble, manage] {
+            if (manage) {
+                emit manageEnsemblesRequested();
+            } else if (!ensemble.isEmpty()) {
+                emit applyEnsembleRequested(selectedProject(), ensemble);
+            } else {
+                emit newAgentWithEngineRequested(selectedProject(), backend, model);
+            }
         });
     }
     m_newButton->setMenu(menu);

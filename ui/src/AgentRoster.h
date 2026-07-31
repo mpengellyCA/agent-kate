@@ -21,11 +21,16 @@ struct EngineChoice {
     QString model;       // tier token / discovered model id; "" = engine default
     QString label;       // menu text
     bool header = false; // a non-clickable engine section title
+    // ensemble names a controller/worker recipe to apply instead of starting a
+    // single agent (plan 16 P4). When set, backend/model are unused — the
+    // ensemble owns them — and the row emits applyEnsembleRequested.
+    QString ensemble;
+    bool manage = false; // the "Manage ensembles…" row, which opens the editor
 
     bool operator==(const EngineChoice &o) const
     {
         return backend == o.backend && model == o.model && label == o.label
-            && header == o.header;
+            && header == o.header && ensemble == o.ensemble && manage == o.manage;
     }
 };
 
@@ -97,6 +102,11 @@ Q_SIGNALS:
     // forwards both into the panel before the first start.
     void newAgentWithEngineRequested(const QString &projectPath,
                                      const QString &backend, const QString &model);
+    // An ensemble row was picked: apply the named recipe in this project
+    // (one controller agent, briefed) instead of starting a bare agent.
+    void applyEnsembleRequested(const QString &projectPath, const QString &ensemble);
+    // The quick menu's "Manage ensembles…" row.
+    void manageEnsemblesRequested();
     void closeProjectRequested(const QString &projectPath);
     void closeOtherProjectsRequested(const QString &keepProjectPath);
     void openTerminalRequested(const QString &projectPath);

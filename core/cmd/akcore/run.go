@@ -23,6 +23,7 @@ import (
 	"agentkate/internal/ipc"
 	"agentkate/internal/kde"
 	"agentkate/internal/kimi"
+	"agentkate/internal/modes"
 	"agentkate/internal/permission"
 	"agentkate/internal/safe"
 	"agentkate/internal/session"
@@ -135,6 +136,15 @@ func runCore() {
 	if err != nil {
 		log.Error("cannot open the summary store", "err", err)
 		os.Exit(1)
+	}
+
+	// Ensembles are user data, but an unreadable file must not stop the core:
+	// the built-in catalogue alone is a working arena, so a corrupt modes.json
+	// degrades to "your saved ensembles are missing", not "Agent Kate is down".
+	ensembles, err := modes.NewStore(modes.DefaultPath())
+	if err != nil {
+		log.Warn("cannot open the ensemble store; built-in ensembles only", "err", err)
+		ensembles, _ = modes.NewStore(filepath.Join(os.TempDir(), "agentkate-modes-fallback.json"))
 	}
 
 	// Cold-exit compactions are spawned from the thread-exit lifecycle event,
@@ -326,6 +336,7 @@ func runCore() {
 		sessions:   sessions,
 		attachSide: attachSide,
 		summaries:  summaries,
+		modes:      ensembles,
 		skills:     skillCatalog,
 		gitCache:   gitCache,
 		cowork:     coworkSvc,
