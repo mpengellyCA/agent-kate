@@ -137,11 +137,16 @@ type StartSpec struct {
 // translate it into their CLI's own vocabulary and report, per profile, what
 // they could express (Launched.Agents).
 type AgentProfile struct {
-	Name        string   `json:"name"`
-	Description string   `json:"description"`
-	Prompt      string   `json:"prompt"`          // body / system prompt
-	Tools       []string `json:"tools,omitempty"` // allowlist; empty = all
-	Model       string   `json:"model,omitempty"` // harness-specific id or ""
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Prompt      string `json:"prompt"` // body / system prompt
+	// Tools is an allow-list of tool names; empty = every tool the thread has.
+	// Names pass through UNVALIDATED, matching the CLIs' own permissiveness:
+	// neither harness rejects an unknown tool name, it simply grants nothing
+	// for it. Validating here would mean maintaining a tool catalogue per
+	// harness that goes stale with every CLI release.
+	Tools []string `json:"tools,omitempty"`
+	Model string   `json:"model,omitempty"` // harness-specific id or ""
 }
 
 // AppliedAgent is the applied-truth for one requested AgentProfile: whether
@@ -182,6 +187,11 @@ type Launched struct {
 	// actually reached the CLI. False with no request simply means none was
 	// asked for — callers compare it against what they sent.
 	SystemPromptApplied bool
+	// SystemPromptUnapplied is why it did not, when the adapter knows
+	// something more specific than "this harness has no such channel" (an
+	// oversize prompt, say). Empty leaves the caller on the shared
+	// capability wording.
+	SystemPromptUnapplied string
 	// Agents carries one entry per requested StartSpec.AgentProfile, in the
 	// same order, so a caller can name exactly which profile lost what.
 	Agents []AppliedAgent

@@ -646,6 +646,47 @@ static-true for Claude, false/absent for Kimi unless noted):
     handshake, no `session/set_config_option`), i.e. a second kimi harness,
     not a P3 flag. Left for a future plan if the v2 engine ever reaches ACP.
   - No UI beyond the two fallback traits, as scoped — P4 gates on them.
+
+  **P3 remediation** (post-landing review of 0a4c311):
+  - **The persona was silently lost on every relaunch.** `session.Record`
+    stored nothing about it, so `resumeThread` and `forkAgentThread` (and
+    promote, which ends in `resumeThread`) rebuilt the launch without it — the
+    human stopped one agent and resumed a different one, and P4's ensembles
+    would have inherited that. The record now carries `SystemPrompt` +
+    `Agents` (both `omitempty`, so pre-P3 records are untouched and resume
+    exactly as before), and all three paths re-pass them. What is stored is
+    what `Launched` **confirmed applied**, never the request
+    (`appliedPersona`, agents.go): a kimi thread applied nothing, so it
+    persists nothing and keeps reporting nothing on every later resume. A
+    profile applied with per-field losses is stored as requested, so the
+    resume re-runs the identical translation and lands in the identical place.
+  - **Argv size guard.** Each persona flag is ONE argv element, capped by the
+    kernel at `MAX_ARG_STRLEN` (128 KiB on Linux); an oversize system prompt
+    or `--agents` payload would have failed the spawn with an opaque `E2BIG`
+    that looks nothing like "your prompt is too long". The claude adapter now
+    measures both before the spawn and drops an oversize one with a reason
+    naming the limit. Since the `--agents` flag carries every profile at once,
+    an oversize payload refuses ALL of them — reported per profile.
+  - `Launched` gained `SystemPromptUnapplied`, so an adapter that knows *why*
+    (oversize, not missing) is not overwritten by the shared capability
+    wording. Same fix for the per-profile fallback, which claimed "not
+    supported by Claude Code agents" for a verdict with no reason attached —
+    now "not applied; the harness gave no reason".
+  - One emptiness rule for the system prompt: `strings.TrimSpace` in the
+    adapter, `buildStartArgs` and `unappliedPersona` alike (an empty
+    `--append-system-prompt` still reads as a custom prompt to the CLI).
+  - `AgentProfile.Tools` documents that tool names pass through unvalidated,
+    matching both CLIs (neither rejects an unknown name; it simply grants
+    nothing). Validating would mean a per-harness tool catalogue that goes
+    stale every CLI release.
+  - `docs/security-model.md` §1 notes that persona text travels as argv and is
+    persisted in cleartext — same-uid readable, so it is instructions, not a
+    secrets channel (credentials stay env-only, §3).
+  - New tests: resume/fork/promote replay (a real `resumeThread` and
+    `forkAgentThread` over a fake harness, plus the pre-P3 record that must
+    stay empty), `appliedPersona` narrowing, an `agent.launchWorker` record
+    round-trip, the on-disk session shape, and the argv-limit boundaries
+    (at the limit passes, one byte over refuses).
 - **P4 — Ensembles (Feature 3)**. `core/internal/modes`, `mode.*` RPCs, built-in
   ensembles, master-prompt template, `NewAgentDialog`/quick-menu picker,
   ensemble editor dialog.

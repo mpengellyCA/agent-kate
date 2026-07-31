@@ -57,6 +57,13 @@ func TestBuildStartArgsPersonaOmitted(t *testing.T) {
 			t.Errorf("%s present with nothing requested: %q", flag, args)
 		}
 	}
+	// Blank counts as absent, the same rule the adapter and the applied-truth
+	// report use — an empty --append-system-prompt still reads as a custom
+	// prompt to the CLI.
+	blank := buildStartArgs(StartOptions{WorkDir: "/ws", SystemPrompt: "  \n\t "})
+	if _, ok := flagValue(blank, "--append-system-prompt"); ok {
+		t.Errorf("blank system prompt produced a flag: %q", blank)
+	}
 	// The unrelated flags still land, so the split-out builder stayed faithful.
 	if v, _ := flagValue(args, "--model"); v != "haiku" {
 		t.Errorf("--model = %q", v)

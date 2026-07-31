@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"agentkate/internal/harness"
 	"agentkate/internal/worktree"
 )
 
@@ -75,6 +76,16 @@ type Record struct {
 	// human-launched thread). Both empty outside orchestration.
 	ParentThreadID string `json:"parentThreadId,omitempty"`
 	Role           string `json:"role,omitempty"`
+
+	// Persona (plan 16 P3), stored as APPLIED at launch — never as requested.
+	// A resume, promote or fork re-passes exactly what the harness confirmed
+	// it took, so replay stays reality: a harness that applied nothing (kimi)
+	// persists nothing and keeps reporting nothing. A profile the harness took
+	// with per-field losses is stored as requested, so the resume re-runs the
+	// identical translation and lands in the identical place. Both absent on
+	// records written before P3, which then resume exactly as they did before.
+	SystemPrompt string                 `json:"systemPrompt,omitempty"`
+	Agents       []harness.AgentProfile `json:"agents,omitempty"`
 
 	// CoworkEnabled opts this thread into the KDE Plasma Cowork MCP server
 	// (desktop see/control). Off by default; only the UI may flip it

@@ -79,6 +79,36 @@ type claudeAgentEntry struct {
 	Model       string   `json:"model,omitempty"`
 }
 
+// maxArgBytes is the kernel's cap on ONE argv element (Linux MAX_ARG_STRLEN =
+// 32 pages = 128 KiB including the trailing NUL). Both persona flags are a
+// single element each, and exceeding it fails the whole exec with an opaque
+// E2BIG — a launch failure that would look nothing like "your prompt is too
+// long". Each element is therefore measured on its own before the spawn, and
+// an oversize one is dropped with a reason instead.
+const maxArgBytes = 128*1024 - 1
+
+// tooLongForArgv is the reason an oversize persona element reports.
+func tooLongForArgv(what string, n int) string {
+	return fmt.Sprintf("%s is %d bytes, over the %d-byte limit on a single "+
+		"command-line argument (Linux MAX_ARG_STRLEN); it was not passed to "+
+		"the CLI, which would have failed to start", what, n, maxArgBytes)
+}
+
+// personaSystemPrompt normalises a requested system prompt into what is
+// actually passed on the command line, plus the reason when it is not. Empty
+// or blank text is no request at all (an empty --append-system-prompt would
+// still read as a custom prompt to the CLI); oversize text is dropped with a
+// reason rather than left to fail the spawn with an opaque E2BIG.
+func personaSystemPrompt(requested string) (pass, whyNot string) {
+	if strings.TrimSpace(requested) == "" {
+		return "", ""
+	}
+	if len(requested) > maxArgBytes {
+		return "", tooLongForArgv("the system prompt", len(requested))
+	}
+	return requested, ""
+}
+
 // buildAgentsJSON renders the profiles claude can actually register into the
 // --agents payload, and reports per-profile applied-truth for the rest. The
 // binary validates nothing (a malformed payload or an incomplete entry is
@@ -119,16 +149,25 @@ func buildAgentsJSON(profiles []harness.AgentProfile) (string, []harness.Applied
 		return "", applied
 	}
 	payload, err := json.Marshal(entries)
-	if err != nil {
-		// Unreachable for these field types, but a payload claude would ignore
-		// must never be reported as applied.
+	// refuseAll turns an all-or-nothing payload failure into per-profile
+	// truth: the flag carries every profile at once, so if it cannot be
+	// passed, none of them were.
+	refuseAll := func(reason string) (string, []harness.AppliedAgent) {
 		for i := range applied {
 			if applied[i].Applied {
 				applied[i].Applied = false
-				applied[i].Unapplied = []string{"the profile could not be encoded: " + err.Error()}
+				applied[i].Unapplied = []string{reason}
 			}
 		}
 		return "", applied
+	}
+	if err != nil {
+		// Unreachable for these field types, but a payload claude would ignore
+		// must never be reported as applied.
+		return refuseAll("the profile could not be encoded: " + err.Error())
+	}
+	if len(payload) > maxArgBytes {
+		return refuseAll(tooLongForArgv("the combined subagent definitions JSON", len(payload)))
 	}
 	return string(payload), applied
 }
@@ -141,6 +180,7 @@ func (h *claudeHarness) Launch(spec harness.StartSpec) (harness.Launched, error)
 	}
 	model := resolveModel(spec.Model)
 	agentsJSON, appliedAgents := buildAgentsJSON(spec.Agents)
+	systemPrompt, systemPromptWhyNot := personaSystemPrompt(spec.SystemPrompt)
 	if _, err := h.sup.Start(agent.StartOptions{
 		ID:             spec.ThreadID,
 		WorkDir:        spec.WorkDir,
@@ -155,7 +195,7 @@ func (h *claudeHarness) Launch(spec harness.StartSpec) (harness.Launched, error)
 		ForkSession:    spec.ForkSession,
 		CoworkEnabled:  spec.Cowork,
 		Provider:       spec.Provider,
-		SystemPrompt:   spec.SystemPrompt,
+		SystemPrompt:   systemPrompt,
 		AgentsJSON:     agentsJSON,
 	}); err != nil {
 		os.Remove(mcpConfig)
@@ -177,9 +217,10 @@ func (h *claudeHarness) Launch(spec harness.StartSpec) (harness.Launched, error)
 		Effort:         spec.Effort,
 		PermissionMode: mode,
 		// --append-system-prompt is unconditional once the CLI has started, so
-		// the request IS the applied truth here.
-		SystemPromptApplied: spec.SystemPrompt != "",
-		Agents:              appliedAgents,
+		// whatever survived the checks above IS the applied truth here.
+		SystemPromptApplied:   systemPrompt != "",
+		SystemPromptUnapplied: systemPromptWhyNot,
+		Agents:                appliedAgents,
 	}, nil
 }
 

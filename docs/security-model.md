@@ -82,6 +82,18 @@ noticing — it is not authentication, and any same-uid process (including an
 agent's own tools talking to the socket directly) could assert another thread's
 id. Grants live in memory only and last for the current core run.
 
+### Persona text travels on the command line
+
+A thread's persona — plan 16's `system_prompt` and custom subagent profiles —
+reaches the `claude` CLI as argv (`--append-system-prompt`, `--agents`;
+`core/internal/agent/agent.go`, `buildStartArgs`), so it is readable from
+`/proc/<pid>/cmdline` by any process at your uid, and it is persisted in
+cleartext in `threads.json` so a resume can replay it. That is the same tier as
+everything else here — same-uid processes are not isolated (§0) — and it is
+called out only so nobody mistakes a persona for a confidential channel: it is
+instructions to an agent, not a place for secrets. API credentials are
+deliberately handled the other way (env, never argv, never persisted — §3).
+
 ---
 
 ## 2. The Cowork keystone — per-connection identity

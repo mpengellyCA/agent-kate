@@ -149,10 +149,16 @@ func unappliedPersona(systemPrompt string, profiles []harness.AgentProfile,
 	launched harness.Launched, caps harness.Capabilities) []map[string]string {
 	var out []map[string]string
 	if strings.TrimSpace(systemPrompt) != "" && !launched.SystemPromptApplied {
+		// The adapter's own reason wins when it has one (an oversize prompt is
+		// not a missing capability); otherwise the channel is simply absent.
+		reason := launched.SystemPromptUnapplied
+		if reason == "" {
+			reason = unsupportedDetail("a custom system prompt", caps) +
+				"; put the persona in the worker's opening prompt instead"
+		}
 		out = append(out, map[string]string{
 			"option": "system_prompt",
-			"reason": unsupportedDetail("a custom system prompt", caps) +
-				"; put the persona in the worker's opening prompt instead",
+			"reason": reason,
 		})
 	}
 	for _, a := range launched.Agents {
@@ -161,7 +167,10 @@ func unappliedPersona(systemPrompt string, profiles []harness.AgentProfile,
 		}
 		reason := strings.Join(a.Unapplied, "; ")
 		if reason == "" {
-			reason = unsupportedDetail("this subagent profile", caps)
+			// A verdict with no explanation. Guessing "unsupported" would be
+			// wrong for a harness that HAS the capability and lost the profile
+			// for some other reason, so say only what is known.
+			reason = "not applied; the harness gave no reason"
 		}
 		out = append(out, map[string]string{
 			"option": "agents[" + profileLabel(a.Name) + "]",

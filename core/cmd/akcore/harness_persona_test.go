@@ -106,6 +106,88 @@ func TestBuildAgentsJSONRefusesSilentDrops(t *testing.T) {
 	}
 }
 
+// TestPersonaArgvLimits covers the guard against an opaque E2BIG: each persona
+// flag is ONE argv element, capped by the kernel at MAX_ARG_STRLEN, so an
+// oversize one is dropped with a reason naming the limit instead of failing
+// the whole spawn. Blank text is treated as no request, the same rule
+// buildStartArgs and unappliedPersona use.
+func TestPersonaArgvLimits(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		in             string
+		wantPass       bool
+		wantReasonPart string
+	}{
+		{"ordinary", "You are the scout.", true, ""},
+		{"empty", "", false, ""},
+		{"blank", "   \n\t ", false, ""},
+		{"at the limit", strings.Repeat("x", maxArgBytes), true, ""},
+		{"over the limit", strings.Repeat("x", maxArgBytes+1), false, "MAX_ARG_STRLEN"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pass, whyNot := personaSystemPrompt(tc.in)
+			if (pass != "") != tc.wantPass {
+				t.Errorf("passed %d bytes, want passed=%v", len(pass), tc.wantPass)
+			}
+			if tc.wantReasonPart == "" {
+				if whyNot != "" {
+					t.Errorf("unexpected reason %q", whyNot)
+				}
+			} else if !strings.Contains(whyNot, tc.wantReasonPart) ||
+				!strings.Contains(whyNot, "131071") {
+				t.Errorf("reason = %q, want it to name the limit", whyNot)
+			}
+		})
+	}
+
+	// The agents payload is the other single element: too big means NONE of
+	// the profiles registered, so every one of them says so.
+	huge := harness.AgentProfile{
+		Name: "big", Description: "d", Prompt: strings.Repeat("p", maxArgBytes),
+	}
+	small := harness.AgentProfile{Name: "small", Description: "d", Prompt: "p"}
+	payload, applied := buildAgentsJSON([]harness.AgentProfile{huge, small})
+	if payload != "" {
+		t.Errorf("oversize payload passed anyway (%d bytes)", len(payload))
+	}
+	if len(applied) != 2 {
+		t.Fatalf("applied = %+v", applied)
+	}
+	for _, a := range applied {
+		if a.Applied || len(a.Unapplied) != 1 ||
+			!strings.Contains(a.Unapplied[0], "MAX_ARG_STRLEN") {
+			t.Errorf("%s = %+v, want refused with the size reason", a.Name, a)
+		}
+	}
+}
+
+// TestUnappliedPersonaUsesAdapterReason: an adapter that knows WHY (an
+// oversize prompt) must not have its answer replaced by the generic
+// "unsupported" wording — that would be a lie about a harness that has the
+// capability.
+func TestUnappliedPersonaUsesAdapterReason(t *testing.T) {
+	caps := newClaudeHarness(nil, "", "").Capabilities()
+	got := unappliedPersona("a very long persona", nil, harness.Launched{
+		SystemPromptUnapplied: tooLongForArgv("the system prompt", 200000),
+	}, caps)
+	if len(got) != 1 || !strings.Contains(got[0]["reason"], "MAX_ARG_STRLEN") {
+		t.Fatalf("unapplied = %v, want the adapter's own reason", got)
+	}
+	if strings.Contains(got[0]["reason"], "not supported") {
+		t.Errorf("adapter reason overwritten with the capability wording: %v", got[0])
+	}
+
+	// A verdict with no explanation says only what is known — claiming
+	// "not supported by Claude Code" would be wrong for a harness that has
+	// the capability.
+	got = unappliedPersona("", []harness.AgentProfile{{Name: "x"}}, harness.Launched{
+		Agents: []harness.AppliedAgent{{Name: "x"}},
+	}, caps)
+	if len(got) != 1 || got[0]["reason"] != "not applied; the harness gave no reason" {
+		t.Fatalf("fallback reason = %v", got)
+	}
+}
+
 // TestKimiPersonaUnapplied pins the honest gate: `kimi acp` has no
 // system-prompt channel and resolves subagents from a compiled-in set, so both
 // capabilities are false and Launch reports every requested profile as not

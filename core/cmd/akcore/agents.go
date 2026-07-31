@@ -38,6 +38,30 @@ type launchMeta struct {
 	Title          string
 }
 
+// appliedPersona narrows a persona request down to what the harness CONFIRMED
+// it applied, for the thread's record. Persisting the REQUEST instead would
+// make every later resume replay a persona the agent never actually had —
+// applied-truth has to survive the restart, not just the launch reply.
+//
+// Launched.Agents is one entry per requested profile, in request order (the
+// harness contract), so the pairing is by index; a profile an adapter reported
+// nothing about is simply not persisted, which is the honest reading of "we
+// do not know it landed" (unappliedPersona names it at launch time).
+func appliedPersona(systemPrompt string, requested []harness.AgentProfile,
+	launched harness.Launched) (string, []harness.AgentProfile) {
+	applied := ""
+	if launched.SystemPromptApplied {
+		applied = systemPrompt
+	}
+	var profiles []harness.AgentProfile
+	for i, p := range requested {
+		if i < len(launched.Agents) && launched.Agents[i].Applied {
+			profiles = append(profiles, p)
+		}
+	}
+	return applied, profiles
+}
+
 // launchThread is the shared start path behind agent.start (async, results
 // ignored — failures surface as lifecycle events) and agent.launchWorker
 // (synchronous — the bridge reports applied-truth back to the launching
@@ -88,6 +112,7 @@ func launchThread(d handlerDeps, h harness.Harness, threadID, sessionID string,
 	if meta.ParentThreadID != "" {
 		role = session.RoleWorker
 	}
+	recPrompt, recAgents := appliedPersona(p.SystemPrompt, p.Agents, launched)
 	rec := session.Record{
 		ThreadID:       threadID,
 		SessionID:      launched.SessionID,
@@ -103,6 +128,8 @@ func launchThread(d handlerDeps, h harness.Harness, threadID, sessionID string,
 		Created:        time.Now(),
 		Status:         session.StatusRunning,
 		CoworkEnabled:  p.CoworkEnabled,
+		SystemPrompt:   recPrompt,
+		Agents:         recAgents,
 	}
 	applyProviderToRecord(&rec, p.Provider)
 	if err := d.sessions.Put(rec); err != nil {
@@ -143,6 +170,13 @@ func resumeThread(d handlerDeps, h harness.Harness, rec session.Record, provOver
 		PermissionMode: rec.PermissionMode,
 		Cowork:         rec.CoworkEnabled,
 		Provider:       providerFromRecord(rec),
+		// The persona is a launch-time flag on both paths below: a plain
+		// --resume re-spawns the CLI, and a summary-seeded resume is a brand
+		// new session. Re-passing what the record says was APPLIED keeps the
+		// agent the same agent across a stop, a promote or a restart. Records
+		// written before P3 carry none and resume exactly as they did before.
+		SystemPrompt: rec.SystemPrompt,
+		Agents:       rec.Agents,
 	}
 	// A fresh override (the UI re-supplying a KWallet-held token the Record never
 	// stores) takes precedence over the env-var resolution baked into the snapshot.
@@ -264,11 +298,16 @@ func forkAgentThread(d handlerDeps, h harness.Harness, src session.Record, newTh
 		ForkSession:    true,
 		Cowork:         src.CoworkEnabled,
 		Provider:       providerFromRecord(src),
+		// A fork continues the source's conversation, so it continues the
+		// source's persona too — the record holds what was applied there.
+		SystemPrompt: src.SystemPrompt,
+		Agents:       src.Agents,
 	})
 	if err != nil {
 		emitLifecycle(d, newThreadID, "error", err.Error(), &wt)
 		return
 	}
+	forkPrompt, forkAgents := appliedPersona(src.SystemPrompt, src.Agents, launched)
 
 	forkTitle := strings.TrimSpace(title)
 	if forkTitle == "" {
@@ -295,6 +334,8 @@ func forkAgentThread(d handlerDeps, h harness.Harness, src session.Record, newTh
 		CompactStrategy: src.CompactStrategy,
 		CompactStrip:    src.CompactStrip,
 		Tags:            append([]string(nil), src.Tags...),
+		SystemPrompt:    forkPrompt,
+		Agents:          forkAgents,
 	}
 	applyProviderToRecord(&rec, providerFromRecord(src))
 	if err := d.sessions.Put(rec); err != nil {

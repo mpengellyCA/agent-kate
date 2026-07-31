@@ -153,7 +153,7 @@ func buildStartArgs(opts StartOptions) []string {
 	// Persona text rides ALONGSIDE Claude Code's own system prompt (verified
 	// in print mode against claude 2.1.220); --system-prompt would replace it,
 	// hiding the tool and skill injections, so it is deliberately not used.
-	if opts.SystemPrompt != "" {
+	if strings.TrimSpace(opts.SystemPrompt) != "" {
 		args = append(args, "--append-system-prompt", opts.SystemPrompt)
 	}
 	// Custom subagent definitions for this session, already rendered into the
