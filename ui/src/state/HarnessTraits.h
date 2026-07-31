@@ -47,6 +47,9 @@ struct HarnessTraits {
     bool fallbackModels = false;  // ordered model fallbacks
     bool disallowedTools = false; // per-session tool deny-list
     bool addDirs = false;         // extra reachable directories
+    // subagentTranscripts: the engine writes a per-subagent conversation file
+    // the UI can tail (the panel's "Helpers" menu).
+    bool subagentTranscripts = false;
 
     QString modelPicker = QStringLiteral("tiers"); // "tiers" | "discovered"
     // Static vocabularies (wire values; the UI owns the human labels). Empty =

@@ -111,6 +111,78 @@ void renderBlocks(const QJsonValue &content, const QString &role, QString &html,
     }
 }
 
+// kimiBlocks translates one line of a kimi subagent's wire log into the same
+// Claude-shaped content blocks renderBlocks already speaks (plan 16 P6).
+//
+// The two CLIs write different files for the same thing. Claude's
+// subagents/agent-<id>.jsonl is the transcript shape — {"message":{role,
+// content:[…]}} — while kimi's <session-dir>/agents/<id>/wire.jsonl is its
+// engine's own wire protocol. Probed on 0.30.0, the parts that carry
+// conversation are:
+//
+//   context.append_message   {"message":{role,content:[…]}}  ← already the shape
+//   context.append_loop_event with event.type:
+//       content.part  {"part":{"type":"text"|"think","text"/"think":…}}
+//       tool.call     {name, args}
+//       tool.result   {result:{output}}
+//
+// Everything else (metadata, config.update, llm.request, usage.record,
+// step.begin/end, tools snapshots) is engine bookkeeping with nothing to show.
+QJsonArray kimiBlocks(const QJsonObject &o, QString &role)
+{
+    const QString type = o.value(QStringLiteral("type")).toString();
+    if (type == QLatin1String("context.append_message")) {
+        return {}; // handled by the caller: it is already the transcript shape
+    }
+    if (type != QLatin1String("context.append_loop_event")) {
+        return {};
+    }
+    const QJsonObject ev = o.value(QStringLiteral("event")).toObject();
+    const QString evType = ev.value(QStringLiteral("type")).toString();
+    QJsonArray blocks;
+    if (evType == QLatin1String("content.part")) {
+        const QJsonObject part = ev.value(QStringLiteral("part")).toObject();
+        const QString partType = part.value(QStringLiteral("type")).toString();
+        // Thinking is rendered as ordinary agent text, prefixed, rather than
+        // dropped: in a subagent's log the reasoning is often the only thing
+        // between two tool calls.
+        const QString text = partType == QLatin1String("think")
+            ? part.value(QStringLiteral("think")).toString()
+            : part.value(QStringLiteral("text")).toString();
+        if (text.isEmpty()) {
+            return {};
+        }
+        role = QStringLiteral("assistant");
+        blocks.append(QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("text")},
+            {QStringLiteral("text"), partType == QLatin1String("think")
+                                         ? QStringLiteral("*(thinking)* ") + text
+                                         : text}});
+        return blocks;
+    }
+    if (evType == QLatin1String("tool.call")) {
+        role = QStringLiteral("assistant");
+        blocks.append(QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("tool_use")},
+            {QStringLiteral("name"), ev.value(QStringLiteral("name"))},
+            {QStringLiteral("input"), ev.value(QStringLiteral("args"))}});
+        return blocks;
+    }
+    if (evType == QLatin1String("tool.result")) {
+        const QJsonObject result = ev.value(QStringLiteral("result")).toObject();
+        const QJsonValue output = result.value(QStringLiteral("output"));
+        if (output.isNull() || output.isUndefined()) {
+            return {};
+        }
+        role = QStringLiteral("user");
+        blocks.append(QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("tool_result")},
+            {QStringLiteral("content"), output}});
+        return blocks;
+    }
+    return {};
+}
+
 // Render one JSONL line into a chat HTML fragment (empty for lines that carry no
 // renderable message).
 QString renderLine(const QByteArray &line, const AkColors &c)
@@ -120,12 +192,21 @@ QString renderLine(const QByteArray &line, const AkColors &c)
     }
     const QJsonObject o = QJsonDocument::fromJson(line).object();
     const QJsonObject msg = o.value(QStringLiteral("message")).toObject();
-    if (msg.isEmpty()) {
+    if (!msg.isEmpty()) {
+        // Claude's transcript lines, and kimi's context.append_message — the
+        // same shape, so one branch serves both.
+        QString html;
+        renderBlocks(msg.value(QStringLiteral("content")),
+                     msg.value(QStringLiteral("role")).toString(), html, c);
+        return html;
+    }
+    QString role;
+    const QJsonArray blocks = kimiBlocks(o, role);
+    if (blocks.isEmpty()) {
         return QString();
     }
     QString html;
-    renderBlocks(msg.value(QStringLiteral("content")),
-                 msg.value(QStringLiteral("role")).toString(), html, c);
+    renderBlocks(blocks, role, html, c);
     return html;
 }
 

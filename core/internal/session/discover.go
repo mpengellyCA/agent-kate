@@ -177,3 +177,21 @@ func tidyTitle(s string) string {
 	}
 	return s
 }
+
+// SubagentDir returns the directory Claude Code writes a session's per-subagent
+// transcripts into (<project>/<session>/subagents), or "" when the session has
+// none. Verified against claude 2.1.220: each delegation lands in that
+// directory as agent-<id>.jsonl, in the same shape as the main transcript.
+func SubagentDir(sessionID string) string {
+	if sessionID == "" {
+		return ""
+	}
+	matches, _ := filepath.Glob(
+		filepath.Join(claudeHome(), "projects", "*", sessionID, "subagents"))
+	for _, m := range matches {
+		if st, err := os.Stat(m); err == nil && st.IsDir() {
+			return m
+		}
+	}
+	return ""
+}

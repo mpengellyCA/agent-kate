@@ -243,6 +243,9 @@ func registerHandlers(d handlerDeps) {
 	// apply that briefs a controller (plan 16 P4).
 	registerModeHandlers(d)
 
+	// Per-subagent transcripts, discovered by the thread's own harness (P6).
+	registerSubagentHandlers(d)
+
 	// --- agent threads -----------------------------------------------------
 
 	// agent.capabilities lists the registered harnesses with their capability

@@ -945,6 +945,24 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     // with the existing enable/disable wiring. Hide it from the toolbar.
     m_compactNowBtn->hide();
 
+    // "Helpers ▾" — the conversations this agent's subagents had, which live in
+    // their own files rather than in this transcript (plan 16 P6). The button
+    // only appears for an engine that writes them, and its menu is rebuilt on
+    // open from the core, since subagents appear as the agent delegates.
+    m_subagentsBtn = new QToolButton(this);
+    m_subagentsBtn->setText(QStringLiteral("Helpers"));
+    m_subagentsBtn->setIcon(QIcon::fromTheme(QStringLiteral("system-users")));
+    m_subagentsBtn->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    m_subagentsBtn->setPopupMode(QToolButton::InstantPopup);
+    m_subagentsBtn->setCursor(Qt::PointingHandCursor);
+    m_subagentsBtn->setToolTip(QStringLiteral(
+        "Open the conversation one of this agent's own helper agents had.\n"
+        "They run in their own context, so their work is not in this transcript."));
+    auto *subagentMenu = new QMenu(this);
+    m_subagentsBtn->setMenu(subagentMenu);
+    connect(subagentMenu, &QMenu::aboutToShow, this,
+            [this, subagentMenu] { refreshSubagentMenu(subagentMenu); });
+
     // FlowLayout so the toolbar's buttons wrap onto a second row when the panel
     // is dragged narrow instead of clipping. No stretch — a flow layout has none.
     auto *buttons = new FlowLayout(0, 6, 6);
@@ -952,6 +970,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     buttons->addWidget(compactionBtn);
     buttons->addWidget(m_attachBtn);
     buttons->addWidget(m_diffBtn);
+    buttons->addWidget(m_subagentsBtn);
     buttons->addWidget(m_forkBtn);
     // "Stop & close" sits with the setup/config group — it's the deliberate,
     // less-frequent end-this-agent action. Interrupt is the prominent in-flight
@@ -1102,6 +1121,62 @@ void AgentPanel::preselectPermission(const QString &mode)
     if (idx >= 0) {
         m_modeCombo->setCurrentIndex(idx);
     }
+}
+
+// refreshSubagentMenu rebuilds the Helpers menu from the core each time it is
+// opened: subagents appear as the agent delegates, so a menu built once would
+// be stale by the time it is used.
+void AgentPanel::refreshSubagentMenu(QMenu *menu)
+{
+    menu->clear();
+    if (m_threadId.isEmpty() || !m_core || !m_core->isConnected()) {
+        menu->addAction(i18n("(start the agent first)"))->setEnabled(false);
+        return;
+    }
+    QAction *loading = menu->addAction(i18n("Looking…"));
+    loading->setEnabled(false);
+    QPointer<AgentPanel> self(this);
+    QPointer<QMenu> liveMenu(menu);
+    m_core->call(
+        QStringLiteral("agent.subagentTranscripts"),
+        QJsonObject{{QStringLiteral("threadId"), m_threadId}},
+        [self, liveMenu](const QJsonObject &result, const QJsonObject &error) {
+            if (!self || !liveMenu) {
+                return;
+            }
+            liveMenu->clear();
+            if (!error.isEmpty()) {
+                liveMenu->addAction(error.value(QStringLiteral("message")).toString())
+                    ->setEnabled(false);
+                return;
+            }
+            const QJsonArray list = result.value(QStringLiteral("transcripts")).toArray();
+            if (list.isEmpty()) {
+                liveMenu->addAction(i18n("This agent has not used any helpers yet"))
+                    ->setEnabled(false);
+                return;
+            }
+            for (const QJsonValue &v : list) {
+                const QJsonObject o = v.toObject();
+                const QString id = o.value(QStringLiteral("id")).toString();
+                const QString label = o.value(QStringLiteral("label")).toString();
+                const QString path = o.value(QStringLiteral("path")).toString();
+                const QString text =
+                    label.isEmpty() ? id
+                                    : i18nc("subagent menu entry: profile and id",
+                                            "%1 (%2)", label, id);
+                QAction *act = liveMenu->addAction(text);
+                connect(act, &QAction::triggered, self, [self, path, text] {
+                    if (!self) {
+                        return;
+                    }
+                    auto *dlg = new SubAgentTranscriptDialog(path, text, self);
+                    dlg->setAttribute(Qt::WA_DeleteOnClose);
+                    dlg->show();
+                });
+            }
+        },
+        this);
 }
 
 void AgentPanel::preselectLaunchOptions(const QStringList &fallbackModels,
@@ -2011,6 +2086,13 @@ void AgentPanel::refresh()
     // bound thread's traits, or the engine picker's selection before a thread
     // exists (currentTraits() resolves that).
     const HarnessTraits traits = currentTraits();
+    if (m_subagentsBtn) {
+        // Hidden rather than disabled for an engine that writes no subagent
+        // files: a greyed button would suggest the conversations exist and are
+        // merely out of reach.
+        m_subagentsBtn->setVisible(traits.subagentTranscripts);
+        m_subagentsBtn->setEnabled(!m_threadId.isEmpty());
+    }
     if (m_forkBtn) {
         m_forkBtn->setEnabled(!m_threadId.isEmpty() && traits.fork);
         m_forkBtn->setToolTip(

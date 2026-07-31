@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"time"
 
 	"agentkate/internal/agent"
@@ -38,7 +39,10 @@ func (h *kimiHarness) Capabilities() harness.Capabilities {
 		// session/list works via a one-shot probe (verified kimi 0.30), so
 		// past kimi sessions show up in the "Resume a Session…" browser.
 		SessionBrowse: true,
-		ModelPicker:   harness.ModelPickerDiscovered,
+		// One wire log per subagent under <session-dir>/agents/<id>/, probed
+		// on 0.30.0 — the viewer translates its event shapes.
+		SubagentTranscripts: true,
+		ModelPicker:         harness.ModelPickerDiscovered,
 		// SystemPrompt / CustomSubagents stay false — see below for what was
 		// probed. PermissionModes/Efforts empty: the vocabularies come from
 		// the session handshake's configOptions ("mode", "thinking").
@@ -205,6 +209,23 @@ func (h *kimiHarness) BrowseSessions() ([]harness.BrowsableSession, error) {
 		})
 	}
 	return out, nil
+}
+
+// SubagentTranscripts lists this thread's per-subagent wire logs. kimi keeps
+// one directory per subagent under the session dir — <session>/agents/<id>/
+// wire.jsonl, ids "main" (the thread itself) plus agent-0, agent-1, … —
+// carrying its own wire protocol rather than a Claude-shaped transcript; the
+// viewer translates. Verified on kimi 0.30.0 against real session dirs.
+func (h *kimiHarness) SubagentTranscripts(_, sessionID string) ([]harness.SubagentTranscript, error) {
+	dir := kimi.SessionDir(sessionID)
+	if dir == "" {
+		return nil, nil
+	}
+	list := scanSubagentDir(filepath.Join(dir, "agents"), true)
+	for i := range list {
+		list[i].Label = kimiSubagentLabel(list[i].Path)
+	}
+	return list, nil
 }
 
 // Compact is the honest gate: ACP has no in-session compaction turn we can

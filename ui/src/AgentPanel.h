@@ -122,6 +122,9 @@ public:
     // models, a tool deny-list, extra reachable directories). They ride on
     // agent.start only — mid-session the CLI has already been launched — and
     // are only ever collected for an engine that declares the capability.
+    // Rebuild the "Helpers" menu (this thread's subagent transcripts) from the
+    // core; called each time the menu opens, since subagents appear over time.
+    void refreshSubagentMenu(QMenu *menu);
     void preselectLaunchOptions(const QStringList &fallbackModels,
                                 const QStringList &disallowedTools,
                                 const QStringList &addDirs);
@@ -524,6 +527,7 @@ private:
     QStringList m_fallbackModels;
     QStringList m_disallowedTools;
     QStringList m_addDirs;
+    QToolButton *m_subagentsBtn = nullptr; // "Helpers ▾" — subagent transcripts
     QCheckBox *m_coworkCheck = nullptr; // start this agent with the Cowork desktop tools wired in
     // Compaction strategy + strip flag — controls how the thread's transcript
     // is condensed to keep resume cost down. Both are sticky to last used.

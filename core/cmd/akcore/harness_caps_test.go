@@ -35,6 +35,8 @@ func TestHarnessCapabilities(t *testing.T) {
 		"FallbackModels":  claude.FallbackModels,
 		"DisallowedTools": claude.DisallowedTools,
 		"AddDirs":         claude.AddDirs,
+		// subagents/agent-<id>.jsonl beside the session transcript.
+		"SubagentTranscripts": claude.SubagentTranscripts,
 	} {
 		if !got {
 			t.Errorf("claude capability %s = false, want true", name)
@@ -90,6 +92,11 @@ func TestHarnessCapabilities(t *testing.T) {
 	}
 	if !kimi.SessionBrowse {
 		t.Error("kimi SessionBrowse = false; session/list works via a one-shot probe")
+	}
+	// Unlike the persona channels, this one IS reachable: kimi writes a wire
+	// log per subagent under <session-dir>/agents/<id>/ (probed on 0.30.0).
+	if !kimi.SubagentTranscripts {
+		t.Error("kimi SubagentTranscripts = false; the per-subagent wire logs exist")
 	}
 	if kimi.ModelPicker != harness.ModelPickerDiscovered {
 		t.Errorf("kimi ModelPicker = %q, want discovered", kimi.ModelPicker)

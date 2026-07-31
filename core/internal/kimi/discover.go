@@ -171,3 +171,35 @@ func (s *Supervisor) ListSessions(cwd string) ([]SessionInfo, error) {
 	}
 	return out, nil
 }
+
+// SessionDir locates a kimi session's on-disk directory, or "" if there is
+// none. kimi stores sessions under <home>/sessions/wd_<slug>_<hash>/session_<id>,
+// where the wd_* segment encodes the working directory — so the session id
+// alone needs a glob rather than a computable path. <home> is $KIMI_CODE_HOME
+// when set (the per-thread isolation lever, plan 16 P6), else ~/.kimi-code.
+func SessionDir(sessionID string) string {
+	if sessionID == "" {
+		return ""
+	}
+	home := os.Getenv("KIMI_CODE_HOME")
+	if home == "" {
+		userHome, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		home = filepath.Join(userHome, ".kimi-code")
+	}
+	// Session directories are named "session_<id>"; a caller may pass either
+	// spelling, so normalise to the on-disk one.
+	name := sessionID
+	if !strings.HasPrefix(name, "session_") {
+		name = "session_" + name
+	}
+	matches, _ := filepath.Glob(filepath.Join(home, "sessions", "*", name))
+	for _, m := range matches {
+		if st, err := os.Stat(m); err == nil && st.IsDir() {
+			return m
+		}
+	}
+	return ""
+}

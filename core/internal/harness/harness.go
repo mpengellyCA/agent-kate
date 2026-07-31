@@ -76,6 +76,10 @@ type Capabilities struct {
 	FallbackModels  bool `json:"fallbackModels"`  // ordered model fallbacks
 	DisallowedTools bool `json:"disallowedTools"` // per-session tool deny-list
 	AddDirs         bool `json:"addDirs"`         // extra reachable directories
+	// SubagentTranscripts: the CLI writes a per-subagent conversation file the
+	// UI can tail (agent.subagentTranscripts). False = a thread's delegations
+	// are only visible in its own transcript.
+	SubagentTranscripts bool `json:"subagentTranscripts"`
 
 	ModelPicker string `json:"modelPicker"` // ModelPickerTiers | ModelPickerDiscovered
 	// PermissionModes / Efforts: the harness's static vocabularies (values
@@ -355,4 +359,16 @@ func (r *Registry) All() []Harness {
 		out = append(out, r.m[id])
 	}
 	return out
+}
+
+// SubagentTranscript points at one subagent's on-disk conversation for a
+// thread — the file the UI live-tails in the subagent transcript viewer.
+// Layouts differ per CLI (claude keeps
+// <project>/<session>/subagents/agent-<id>.jsonl, kimi keeps
+// <session-dir>/agents/<id>/wire.jsonl), which is exactly why discovery
+// belongs to the adapter and the neutral shape is just "id, label, path".
+type SubagentTranscript struct {
+	ID    string `json:"id"`    // the CLI's own subagent id
+	Label string `json:"label"` // profile/type name when the file records one
+	Path  string `json:"path"`  // absolute path to the JSONL file
 }

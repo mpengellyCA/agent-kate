@@ -53,6 +53,7 @@ HarnessTraits claudeDefaults()
     t.systemPrompt = t.customSubagents = true;
     // --fallback-model / --disallowedTools / --add-dir, verified on 2.1.220.
     t.fallbackModels = t.disallowedTools = t.addDirs = true;
+    t.subagentTranscripts = true; // subagents/agent-<id>.jsonl beside the session
     // Models are discovered live (`claude -p /model`, or a routed provider's
     // /v1/models); mode/effort stay static vocabularies below.
     t.modelPicker = QStringLiteral("discovered");
@@ -72,6 +73,8 @@ HarnessTraits kimiDefaults()
     t.badge = QStringLiteral("Kimi");
     t.effortLive = true;
     t.sessionBrowse = true; // session/list via a one-shot probe (mirrors the Go adapter)
+    // One wire log per subagent under <session-dir>/agents/<id>/ (probed on 0.30.0).
+    t.subagentTranscripts = true;
     // transcriptPreview stays false: kimi's transcript is the core's event log,
     // not a previewable/forgettable on-disk store. systemPrompt and
     // customSubagents stay false too: `kimi acp` takes no system-prompt channel
@@ -102,6 +105,7 @@ HarnessTraits fromJson(const QJsonObject &o)
     t.fallbackModels = o.value(QStringLiteral("fallbackModels")).toBool();
     t.disallowedTools = o.value(QStringLiteral("disallowedTools")).toBool();
     t.addDirs = o.value(QStringLiteral("addDirs")).toBool();
+    t.subagentTranscripts = o.value(QStringLiteral("subagentTranscripts")).toBool();
     t.modelPicker = o.value(QStringLiteral("modelPicker")).toString();
     t.permissionModes.clear();
     const QJsonArray modes = o.value(QStringLiteral("permissionModes")).toArray();

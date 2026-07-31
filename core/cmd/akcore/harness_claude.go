@@ -54,6 +54,8 @@ func (h *claudeHarness) Capabilities() harness.Capabilities {
 		SessionBrowse:     true,
 		TranscriptPreview: true, // claude keeps the on-disk session store
 		MintsSessionID:    true,
+		// subagents/agent-<id>.jsonl beside the session transcript.
+		SubagentTranscripts: true,
 		// Both verified against claude 2.1.220 in print mode:
 		// --append-system-prompt reaches the model (a probe persona changed the
 		// reply), and --agents registers custom subagents whose tools AND model
@@ -314,6 +316,17 @@ func (h *claudeHarness) BrowseSessions() ([]harness.BrowsableSession, error) {
 		})
 	}
 	return out, nil
+}
+
+// SubagentTranscripts lists this thread's per-subagent transcripts. Claude
+// keeps them beside the session as subagents/agent-<id>.jsonl, in the same
+// shape as the main transcript.
+func (h *claudeHarness) SubagentTranscripts(_, sessionID string) ([]harness.SubagentTranscript, error) {
+	dir := session.SubagentDir(sessionID)
+	if dir == "" {
+		return nil, nil
+	}
+	return scanSubagentDir(dir, false), nil
 }
 
 // Compact runs a compaction pass on this thread. Both mechanisms live here

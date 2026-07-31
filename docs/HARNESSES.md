@@ -104,6 +104,7 @@ Declare `Capabilities()` honestly — every flag gates real behavior:
 | `SystemPrompt` | whether `StartSpec.SystemPrompt` reaches the CLI (persona alongside its own prompt) |
 | `CustomSubagents` | whether `StartSpec.Agents` reaches the CLI (caller-defined subagent profiles) |
 | `FallbackModels` / `DisallowedTools` / `AddDirs` | the list-valued launch options; each gates one advanced field in the New Agent dialog, and a false flag means `Launch` reports the request in `Launched.UnappliedOptions` instead of dropping it |
+| `SubagentTranscripts` | the panel's "Helpers" menu (`agent.subagentTranscripts`); implement the optional `subagentTranscriber` interface to point at your CLI's per-subagent files |
 
 **Do not emulate what the CLI lacks.** A missing capability is honestly gated
 with one shared message ("X is not supported by <DisplayName> agents"), never
