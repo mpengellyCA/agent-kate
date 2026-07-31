@@ -53,6 +53,10 @@ headless, which keeps the harness scriptable.
     translates ACP session updates into the same Claude-shaped stream-json
     events, so the UI renderer is backend-agnostic. Permissions, interrupts,
     follow-ups, and session resume all map onto ACP methods.
+  Every per-thread action — send, stop, compaction, subagent-transcript
+  discovery — goes through the harness registry, never a supervisor handle: the
+  orchestration layer asks the thread's own backend and consults its
+  `Capabilities` for anything optional.
 - **Worktree manager** — one `git worktree` + branch per agent thread, for true
   parallel isolation.
 - **Workspace manager** — multiple projects open at once; each is a workspace with
