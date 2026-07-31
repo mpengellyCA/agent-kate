@@ -506,6 +506,43 @@ static-true for Claude, false/absent for Kimi unless noted):
     reached nobody and `TestAuthorizeAgentTarget` hung for the full 8-minute
     permission timeout. It now does one request/reply round trip before
     returning. Reproduced once under load, green over repeated runs since.
+
+  **P2 remediation** (post-landing review of b63f3e3):
+  - **The UI leaked what the core redacted.** `request_permission` rows had no
+    `permSummary` branch, so they fell through to the compact-JSON dump — and
+    that input is the *gated tool's raw arguments*, the most secret-bearing
+    payload in the catalogue. The row now names the gated tool only (both
+    `tool_name` and `toolName`, the spellings the bridge accepts) and never
+    falls through, even with no name present. Core-side redaction is only half
+    a boundary if the transcript prints the same payload two rows above.
+  - **Role is now one-way in both directions.** `MarkUI` set role `"ui"`
+    unconditionally, so a bridge could call `handshake`, pass `RequireUI`
+    (answering its own grant prompts) and join the UI-only `mcp.activity`
+    feed — the exact inversion `BindBridge` refuses. It now returns with a
+    warning for a bridge connection, handing back the primary-UI slot if it
+    had optimistically claimed it (`s.mu` and `idMu` are never held together,
+    since `NotifyUI` reads roles under `s.mu`).
+  - **A panicking handler answered nobody.** `safe.Go` contains the panic at
+    the goroutine boundary, but the unwind skipped both the reply enqueue and
+    the activity hook: the calling bridge blocked until its own timeout and
+    the feed silently lost the most interesting event there is. Handlers now
+    run inside `callHandler`, whose recover turns a panic into an ordinary
+    `CodeInternalError` response, so the normal enqueue + activity path runs.
+  - `bridge.identify` logs a warning when the thread id is unknown to the
+    session store — deliberately NOT a rejection, since a bridge can identify
+    before its thread's record is persisted.
+  - The feed's `error` is now documented as being INSIDE the redaction
+    boundary (it is a handler's error string verbatim), with
+    `TestBridgeErrorsCarryNoSecrets` driving the reachable error paths with a
+    marker in every secret-bearing field.
+  - Cowork digest parity: `desktop_scroll`, `desktop_drag`,
+    `desktop_move_pointer_relative`, `desktop_screenshot` and
+    `desktop_set_pointer_profile` had no UI digest and fell through to raw
+    JSON while their siblings read as sentences.
+  - Test gaps closed: the bridge connection is now drained and asserted to
+    receive its response and NOTHING else (the `NotifyUI` exclusion, proven
+    from the excluded side), `bridge.identify` from a UI connection is
+    refused, and the panic path is pinned end to end.
 - **P3 — Persona channel + custom subagents (Feature 2)**. `StartSpec`
   extensions, claude `--append-system-prompt`/`--agents`, kimi agent-file
   writer, capability flags, applied-truth reporting.

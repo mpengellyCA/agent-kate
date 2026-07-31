@@ -17,6 +17,7 @@
 #include <QLabel>
 #include <QObject>
 #include <QPushButton>
+#include <QStringList>
 #include <QTextDocument>
 #include <QVBoxLayout>
 
@@ -98,6 +99,19 @@ QString mcpSummary(const QString &verb, const QJsonObject &input)
     if (verb == QLatin1String("whoami")) {
         return QObject::tr("this thread's identity");
     }
+    if (verb == QLatin1String("request_permission")) {
+        // The gate's own input is the RAW ARGUMENTS of the tool being gated —
+        // a Bash command line, an API call's body. Name the gated tool and
+        // nothing else, exactly as the core's mcp.activity digest does. Never
+        // fall through to the generic JSON dump from here: with both name keys
+        // absent that would print the input verbatim.
+        const QString gated = str("tool_name");
+        if (!gated.isEmpty()) {
+            return gated;
+        }
+        const QString altGated = str("toolName"); // the bridge accepts both spellings
+        return altGated.isEmpty() ? QObject::tr("a gated tool") : altGated;
+    }
     // --- Cowork desktop --------------------------------------------------
     if (verb == QLatin1String("desktop_activate_element")
         || verb == QLatin1String("desktop_click_element")
@@ -123,6 +137,48 @@ QString mcpSummary(const QString &verb, const QJsonObject &input)
         || verb == QLatin1String("desktop_play_input")) {
         return QObject::tr("%n event(s)", nullptr,
                            input.value(QStringLiteral("events")).toArray().size());
+    }
+    // Deltas and endpoints, same shapes the core's feed digests.
+    const auto num = [&input](const char *key) {
+        return input.value(QLatin1String(key)).toInt();
+    };
+    const auto delta = [](int v) {
+        return v >= 0 ? QStringLiteral("+%1").arg(v) : QString::number(v);
+    };
+    if (verb == QLatin1String("desktop_scroll")
+        || verb == QLatin1String("desktop_move_pointer_relative")) {
+        return delta(num("dx")) + QLatin1Char(',') + delta(num("dy"));
+    }
+    if (verb == QLatin1String("desktop_drag")) {
+        return QStringLiteral("%1,%2 → %3,%4")
+            .arg(num("fromX")).arg(num("fromY")).arg(num("toX")).arg(num("toY"));
+    }
+    if (verb == QLatin1String("desktop_screenshot")) {
+        const QString win = input.value(QStringLiteral("target"))
+                                .toObject()
+                                .value(QStringLiteral("windowId"))
+                                .toString();
+        if (!win.isEmpty()) {
+            return win;
+        }
+        return input.value(QStringLiteral("interactive")).toBool()
+                   ? QObject::tr("a window the user picks")
+                   : QObject::tr("the active screen");
+    }
+    if (verb == QLatin1String("desktop_set_pointer_profile")) {
+        QStringList parts;
+        if (input.contains(QStringLiteral("speed"))) {
+            parts << QObject::tr("speed %1").arg(input.value(QStringLiteral("speed")).toDouble());
+        }
+        if (input.contains(QStringLiteral("accuracy"))) {
+            parts << QObject::tr("accuracy %1")
+                         .arg(input.value(QStringLiteral("accuracy")).toDouble());
+        }
+        if (input.contains(QStringLiteral("settleMs"))) {
+            parts << QObject::tr("settle %1 ms").arg(num("settleMs"));
+        }
+        return parts.isEmpty() ? QObject::tr("pointer motion defaults")
+                               : parts.join(QStringLiteral(", "));
     }
     return QString();
 }

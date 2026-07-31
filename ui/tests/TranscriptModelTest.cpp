@@ -410,6 +410,26 @@ void TranscriptModelTest::mcpToolsSummarizeTheirArguments()
                          QJsonObject{{QStringLiteral("all_workspaces"), true}}),
              QStringLiteral("every workspace"));
 
+    // The permission gate carries the RAW ARGUMENTS of the tool it is gating —
+    // the most secret-bearing payload in the catalogue. The row must name the
+    // gated tool and nothing else, in either arg spelling the bridge accepts,
+    // and must never fall through to the generic JSON dump.
+    const QJsonObject gateInput{
+        {QStringLiteral("command"), QStringLiteral("deploy --token=hunter2")}};
+    for (const QString &key : {QStringLiteral("tool_name"), QStringLiteral("toolName")}) {
+        const QString s = permSummary(coop("request_permission"),
+                                      QJsonObject{{key, QStringLiteral("Bash")},
+                                                  {QStringLiteral("input"), gateInput}});
+        QCOMPARE(s, QStringLiteral("Bash"));
+        QVERIFY2(!s.contains(QStringLiteral("hunter2")),
+                 "the gated tool's input must never reach the transcript row");
+    }
+    // Even with no tool name at all, the input is not dumped.
+    const QString unnamed =
+        permSummary(coop("request_permission"), QJsonObject{{QStringLiteral("input"), gateInput}});
+    QVERIFY2(!unnamed.contains(QStringLiteral("hunter2")) && !unnamed.isEmpty(),
+             qPrintable(QStringLiteral("nameless gate leaked: %1").arg(unnamed)));
+
     // Cowork: the element, never the text being typed into it.
     const QString typed =
         permSummary(QStringLiteral("mcp__cowork__desktop_set_text"),
@@ -419,6 +439,32 @@ void TranscriptModelTest::mcpToolsSummarizeTheirArguments()
     QCOMPARE(permSummary(QStringLiteral("mcp__cowork__desktop_click"),
                          QJsonObject{{QStringLiteral("x"), 100}, {QStringLiteral("y"), 250}}),
              QStringLiteral("100, 250"));
+    // Every Cowork verb has a digest — none may fall through to raw JSON.
+    QCOMPARE(permSummary(QStringLiteral("mcp__cowork__desktop_scroll"),
+                         QJsonObject{{QStringLiteral("dx"), 0}, {QStringLiteral("dy"), -3}}),
+             QStringLiteral("+0,-3"));
+    QCOMPARE(permSummary(QStringLiteral("mcp__cowork__desktop_move_pointer_relative"),
+                         QJsonObject{{QStringLiteral("dx"), 12}, {QStringLiteral("dy"), 0}}),
+             QStringLiteral("+12,+0"));
+    QCOMPARE(permSummary(QStringLiteral("mcp__cowork__desktop_drag"),
+                         QJsonObject{{QStringLiteral("fromX"), 1}, {QStringLiteral("fromY"), 2},
+                                     {QStringLiteral("toX"), 3}, {QStringLiteral("toY"), 4}}),
+             QStringLiteral("1,2 → 3,4"));
+    QCOMPARE(permSummary(QStringLiteral("mcp__cowork__desktop_screenshot"), QJsonObject{}),
+             QStringLiteral("the active screen"));
+    QCOMPARE(permSummary(QStringLiteral("mcp__cowork__desktop_screenshot"),
+                         QJsonObject{{QStringLiteral("target"),
+                                      QJsonObject{{QStringLiteral("kind"), QStringLiteral("window")},
+                                                  {QStringLiteral("windowId"), QStringLiteral("w-9")}}}}),
+             QStringLiteral("w-9"));
+    for (const char *verb : {"desktop_set_pointer_profile", "desktop_screenshot",
+                             "desktop_scroll", "desktop_drag",
+                             "desktop_move_pointer_relative"}) {
+        const QString s = permSummary(QStringLiteral("mcp__cowork__") + QLatin1String(verb),
+                                      QJsonObject{});
+        QVERIFY2(!s.isEmpty() && !s.startsWith(QLatin1Char('{')),
+                 qPrintable(QStringLiteral("%1 -> %2").arg(QLatin1String(verb), s)));
+    }
 
     // A third-party MCP server keeps today's behaviour (the generic fallback).
     QCOMPARE(permSummary(QStringLiteral("mcp__other__do_thing"),

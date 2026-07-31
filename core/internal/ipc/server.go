@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"os"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -202,6 +204,26 @@ func (s *Server) serveConn(ctx context.Context, netConn net.Conn) {
 	})
 }
 
+// callHandler runs one handler with its own recover, so a panicking handler
+// becomes an ordinary error response instead of a silent hang. safe.Go already
+// keeps a panic from killing the process, but it unwinds the whole dispatch
+// goroutine — past the reply enqueue and past the activity hook — leaving the
+// caller (an agent's MCP bridge) blocked until its own timeout and the
+// mcp.activity feed missing the most interesting event of all.
+func callHandler(ctx context.Context, log *slog.Logger, h Handler,
+	method string, params json.RawMessage) (result any, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error("rpc handler panic recovered", "method", method,
+				"panic", r, "stack", string(debug.Stack()))
+			result = nil
+			err = Errorf(CodeInternalError,
+				fmt.Sprintf("handler for %s panicked: %v", method, r))
+		}
+	}()
+	return h(ctx, params)
+}
+
 func (s *Server) dispatch(ctx context.Context, c *conn, raw []byte) {
 	var f Frame
 	if err := json.Unmarshal(raw, &f); err != nil {
@@ -237,7 +259,7 @@ func (s *Server) dispatch(ctx context.Context, c *conn, raw []byte) {
 	case !ok:
 		resp.Error = Errorf(CodeMethodNotFound, "method not found: "+f.Method)
 	default:
-		result, err := h(ctx, f.Params)
+		result, err := callHandler(ctx, s.log, h, f.Method, f.Params)
 		if err != nil {
 			var rpcErr *RPCError
 			if errors.As(err, &rpcErr) {
@@ -503,12 +525,21 @@ func (r *ConnRef) IsPrimaryUI() bool { return r.c.getPrimary() }
 
 // MarkUI tags this connection as the UI. The first UI to call becomes primary
 // (runs portal sessions). Called from the existing `handshake` handler.
+//
+// A connection that already identified as an agent bridge is REFUSED — the
+// mirror of BindBridge's refusal of a UI connection. Without it a bridge could
+// re-identify by calling `handshake`, and thereby pass RequireUI (answering its
+// own grant prompts) and receive the UI-only mcp.activity feed for every other
+// agent in the arena. Role is one-way per connection in both directions.
 func (s *Server) MarkUI(ctx context.Context) {
 	ref := ConnFromContext(ctx)
 	if ref == nil {
 		return
 	}
 	c := ref.c
+	// Claim the primary slot first: s.mu and idMu are never held together
+	// (NotifyUI reads roles under s.mu), so the bridge check happens under idMu
+	// alone and hands the slot back if it refuses.
 	s.mu.Lock()
 	primary := false
 	if s.primaryConn == nil {
@@ -516,7 +547,22 @@ func (s *Server) MarkUI(ctx context.Context) {
 		primary = true
 	}
 	s.mu.Unlock()
+
 	c.idMu.Lock()
+	if c.role == "bridge" {
+		boundTo := c.connTID
+		c.idMu.Unlock()
+		if primary {
+			s.mu.Lock()
+			if s.primaryConn == c {
+				s.primaryConn = nil
+			}
+			s.mu.Unlock()
+		}
+		s.log.Warn("refusing to mark an agent bridge connection as the UI",
+			"thread", boundTo)
+		return
+	}
 	c.role = "ui"
 	c.isPrimary = primary
 	c.idMu.Unlock()

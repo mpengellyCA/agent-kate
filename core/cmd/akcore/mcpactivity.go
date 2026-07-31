@@ -199,6 +199,12 @@ func mcpArgsSummary(tool string, raw json.RawMessage) string {
 }
 
 // mcpActivityParams builds one `mcp.activity` notification payload.
+//
+// `error` is a handler's own error string, and it is INSIDE the same redaction
+// boundary as argsSummary: no handler a bridge can reach may echo a
+// secret-bearing argument (a prompt or message body, a gated tool's input,
+// text destined for a field) into the error it returns.
+// TestBridgeErrorsCarryNoSecrets guards that for the reachable handlers.
 func mcpActivityParams(threadID, method string, params json.RawMessage,
 	dur time.Duration, errText string) map[string]any {
 	tool := mcpToolFor(method)
@@ -235,6 +241,17 @@ func registerMCPActivity(d handlerDeps) {
 		}
 		if ok, reason := d.srv.BindBridge(ctx, p.ThreadID); !ok {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, reason)
+		}
+		// Observability only — deliberately NOT a rejection. A bridge can
+		// identify before its thread's record is persisted (the spawn and the
+		// record write race at startup), so refusing an unknown id would break
+		// legitimate launches. A warning is enough to notice a bridge binding
+		// an id the core has never heard of.
+		if d.sessions != nil {
+			if _, known := d.sessions.Get(p.ThreadID); !known {
+				d.log.Warn("mcp bridge identified as an unknown thread",
+					"thread", p.ThreadID)
+			}
 		}
 		return map[string]any{"ok": true}, nil
 	})

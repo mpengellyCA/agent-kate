@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -15,7 +16,9 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"agentkate/internal/agent"
 	"agentkate/internal/ipc"
+	"agentkate/internal/session"
 )
 
 // bridgeCallSites extracts every RPC method the MCP bridges call, straight from
@@ -161,24 +164,31 @@ func TestMCPArgsSummaryCaps(t *testing.T) {
 	}
 }
 
-// uiProbe is a raw connection that identifies as the UI (so it receives
-// UI-only notifications) and records every mcp.activity the core broadcasts.
-type uiProbe struct {
-	conn net.Conn
-	acts chan map[string]any
+// rawProbe is a raw socket connection that records everything the core sends
+// it, split into notifications and replies. Raw rather than an ipc.Client
+// because the client discards notifications — and whether a notification
+// reaches a given connection is exactly what these tests are about.
+type rawProbe struct {
+	conn    net.Conn
+	acts    chan map[string]any // mcp.activity payloads
+	notes   chan string         // every OTHER notification's method
+	replies chan ipc.Frame
 }
 
-func newUIProbe(t *testing.T, sock string) *uiProbe {
+func newRawProbe(t *testing.T, sock string) *rawProbe {
 	t.Helper()
 	conn, err := net.Dial("unix", sock)
 	if err != nil {
-		t.Fatalf("ui dial: %v", err)
+		t.Fatalf("probe dial: %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	p := &uiProbe{conn: conn, acts: make(chan map[string]any, 16)}
-	ready := make(chan struct{})
+	p := &rawProbe{
+		conn:    conn,
+		acts:    make(chan map[string]any, 16),
+		notes:   make(chan string, 16),
+		replies: make(chan ipc.Frame, 16),
+	}
 	go func() {
-		handshaked := false
 		sc := bufio.NewScanner(conn)
 		sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 		for sc.Scan() {
@@ -186,36 +196,57 @@ func newUIProbe(t *testing.T, sock string) *uiProbe {
 			if json.Unmarshal(sc.Bytes(), &f) != nil {
 				continue
 			}
-			if f.Method == "mcp.activity" {
+			switch {
+			case f.Method == "mcp.activity":
 				var m map[string]any
 				_ = json.Unmarshal(f.Params, &m)
 				p.acts <- m
-				continue
-			}
-			if f.Method == "" && !handshaked {
-				handshaked = true
-				close(ready)
+			case f.Method != "":
+				p.notes <- f.Method
+			default:
+				p.replies <- f
 			}
 		}
 	}()
-	p.send(t, `{"jsonrpc":"2.0","id":1,"method":"handshake","params":{}}`)
+	return p
+}
+
+// call sends a request and returns its reply frame.
+func (p *rawProbe) call(t *testing.T, id int, method, params string) ipc.Frame {
+	t.Helper()
+	frame := fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":%q,"params":%s}`,
+		id, method, params)
+	if _, err := p.conn.Write([]byte(frame + "\n")); err != nil {
+		t.Fatalf("probe write: %v", err)
+	}
 	select {
-	case <-ready:
-	case <-time.After(2 * time.Second):
-		t.Fatal("handshake never answered")
+	case f := <-p.replies:
+		return f
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s never answered", method)
+		return ipc.Frame{}
+	}
+}
+
+// asUI identifies this connection as the UI, so it receives UI-only feeds.
+func (p *rawProbe) asUI(t *testing.T) *rawProbe {
+	t.Helper()
+	p.call(t, 1, "handshake", "{}")
+	return p
+}
+
+// asBridge identifies this connection as thread's agent bridge.
+func (p *rawProbe) asBridge(t *testing.T, threadID string) *rawProbe {
+	t.Helper()
+	if f := p.call(t, 1, "bridge.identify",
+		fmt.Sprintf(`{"threadId":%q}`, threadID)); f.Error != nil {
+		t.Fatalf("bridge.identify: %v", f.Error)
 	}
 	return p
 }
 
-func (p *uiProbe) send(t *testing.T, frame string) {
-	t.Helper()
-	if _, err := p.conn.Write([]byte(frame + "\n")); err != nil {
-		t.Fatalf("ui write: %v", err)
-	}
-}
-
 // next returns the next activity, or fails if none arrives.
-func (p *uiProbe) next(t *testing.T) map[string]any {
+func (p *rawProbe) next(t *testing.T) map[string]any {
 	t.Helper()
 	select {
 	case m := <-p.acts:
@@ -227,7 +258,7 @@ func (p *uiProbe) next(t *testing.T) map[string]any {
 }
 
 // quiet fails if any activity arrives in the settle window.
-func (p *uiProbe) quiet(t *testing.T, why string) {
+func (p *rawProbe) quiet(t *testing.T, why string) {
 	t.Helper()
 	select {
 	case m := <-p.acts:
@@ -254,10 +285,13 @@ func TestBridgeDispatchEmitsActivity(t *testing.T) {
 	srv.Handle("coop.claimFile", func(_ context.Context, _ json.RawMessage) (any, error) {
 		return nil, ipc.Errorf(ipc.CodeInvalidParams, "already claimed by t-other")
 	})
+	srv.Handle("coop.readNotes", func(_ context.Context, _ json.RawMessage) (any, error) {
+		panic("the board exploded")
+	})
 	registerMCPActivity(handlerDeps{srv: srv, log: log})
 	serveIPC(t, srv, sock)
 
-	ui := newUIProbe(t, sock)
+	ui := newRawProbe(t, sock).asUI(t)
 
 	bridge, err := ipc.Dial(sock)
 	if err != nil {
@@ -312,8 +346,146 @@ func TestBridgeDispatchEmitsActivity(t *testing.T) {
 		t.Errorf("error = %q", errText)
 	}
 
+	// A panicking handler still answers and is still reported: without the
+	// dispatch recover the goroutine unwinds past both the reply and the feed,
+	// so the bridge hangs to its timeout and the most interesting event of all
+	// goes unrecorded.
+	if err := bridge.Call("coop.readNotes", map[string]any{}, nil); err == nil ||
+		!strings.Contains(err.Error(), "panicked") {
+		t.Fatalf("panicking handler: err = %v, want a panic error response", err)
+	}
+	act = ui.next(t)
+	if act["tool"] != "read_notes" {
+		t.Fatalf("activity = %v", act)
+	}
+	if ok, _ := act["ok"].(bool); ok {
+		t.Errorf("panicking call reported ok")
+	}
+	if errText, _ := act["error"].(string); !strings.Contains(errText, "panicked") {
+		t.Errorf("error = %q, want the panic", errText)
+	}
+
 	// The same call from the UI is not MCP traffic and is never broadcast.
-	ui.send(t, `{"jsonrpc":"2.0","id":2,"method":"coop.postNote",`+
-		`"params":{"author":"human","text":"from the UI"}}`)
+	ui.call(t, 2, "coop.postNote", `{"author":"human","text":"from the UI"}`)
 	ui.quiet(t, "UI-role traffic")
+
+	// The feed is UI-only in the other direction too: a bridge gets its
+	// response and nothing else — never another agent's activity.
+	spy := newRawProbe(t, sock).asBridge(t, "t-spy")
+	spy.quiet(t, "bridge.identify on the spy")
+	if f := spy.call(t, 2, "coop.postNote", `{"author":"t-spy","text":"mine"}`); f.Error != nil {
+		t.Fatalf("spy postNote: %v", f.Error)
+	}
+	spy.quiet(t, "bridge received its own activity")
+	select {
+	case m := <-spy.notes:
+		t.Errorf("bridge received notification %q", m)
+	case <-time.After(250 * time.Millisecond):
+	}
+	// ... and the UI did see that bridge's call.
+	if act = ui.next(t); act["threadId"] != "t-spy" {
+		t.Errorf("UI missed the spy bridge's activity: %v", act)
+	}
+
+	// A UI connection may not claim a bridge identity.
+	if f := ui.call(t, 3, "bridge.identify", `{"threadId":"t-agent"}`); f.Error == nil {
+		t.Error("bridge.identify from a UI connection was accepted")
+	}
+	// An empty thread id is refused outright.
+	if f := newRawProbe(t, sock).call(t, 1, "bridge.identify", `{}`); f.Error == nil {
+		t.Error("bridge.identify accepted an empty threadId")
+	}
+}
+
+// TestBridgeCannotBecomeUI pins the role's one-way-ness. A bridge that calls
+// `handshake` must stay a bridge: otherwise it would pass RequireUI (answering
+// its own grant prompts) and start receiving every other agent's mcp.activity.
+func TestBridgeCannotBecomeUI(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	sock := filepath.Join(t.TempDir(), "roles.sock")
+	srv := ipc.NewServer(sock, log)
+	roles := make(chan string, 4)
+	srv.Handle("handshake", func(ctx context.Context, _ json.RawMessage) (any, error) {
+		srv.MarkUI(ctx)
+		ref := ipc.ConnFromContext(ctx)
+		roles <- ref.Role()
+		return map[string]any{"name": "akcore", "isUI": srv.RequireUI(ctx)}, nil
+	})
+	srv.Handle("coop.postNote", func(_ context.Context, _ json.RawMessage) (any, error) {
+		return map[string]any{"id": 1}, nil
+	})
+	registerMCPActivity(handlerDeps{srv: srv, log: log})
+	serveIPC(t, srv, sock)
+
+	ui := newRawProbe(t, sock).asUI(t)
+	if role := <-roles; role != "ui" {
+		t.Fatalf("real UI role = %q", role)
+	}
+
+	bridge := newRawProbe(t, sock).asBridge(t, "t-agent")
+	f := bridge.call(t, 2, "handshake", "{}")
+	if role := <-roles; role != "bridge" {
+		t.Errorf("role after a bridge's handshake = %q, want it to stay bridge", role)
+	}
+	var res struct {
+		IsUI bool `json:"isUI"`
+	}
+	if f.Error == nil {
+		_ = json.Unmarshal(f.Result, &res)
+	}
+	if res.IsUI {
+		t.Error("a bridge passed RequireUI after calling handshake")
+	}
+
+	// It also does not join the UI-only feed: its own call is broadcast to the
+	// real UI and to nobody else.
+	if f := bridge.call(t, 3, "coop.postNote", `{"author":"t-agent","text":"hi"}`); f.Error != nil {
+		t.Fatalf("postNote: %v", f.Error)
+	}
+	bridge.quiet(t, "bridge that tried to become the UI")
+	if act := ui.next(t); act["threadId"] != "t-agent" || act["tool"] != "post_note" {
+		t.Errorf("UI activity = %v", act)
+	}
+}
+
+// TestBridgeErrorsCarryNoSecrets guards the other half of the redaction
+// boundary: an mcp.activity's `error` is the handler's error string verbatim,
+// so no handler a bridge can reach may echo a secret-bearing argument into it.
+func TestBridgeErrorsCarryNoSecrets(t *testing.T) {
+	const secret = "S3CRET-PAYLOAD-MARKER"
+	sessions := testSessions(t)
+	if err := sessions.Put(session.Record{
+		ThreadID: "t-parent", Project: t.TempDir(), Created: time.Now(),
+	}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	client := orchTestCore(t, sessions, agent.NewTurnTracker())
+
+	// Every fixture puts the marker in a secret-bearing field and forces the
+	// handler down an error path.
+	for name, call := range map[string]struct {
+		method string
+		params map[string]any
+	}{
+		"launch: unknown parent": {"agent.launchWorker", map[string]any{
+			"parentThreadId": "t-ghost", "prompt": secret, "title": secret}},
+		"launch: unknown backend": {"agent.launchWorker", map[string]any{
+			"parentThreadId": "t-parent", "prompt": secret, "backend": "codex"}},
+		"launch: bad isolation": {"agent.launchWorker", map[string]any{
+			"parentThreadId": "t-parent", "prompt": secret, "isolation": secret}},
+		"launch: empty prompt": {"agent.launchWorker", map[string]any{
+			"parentThreadId": "t-parent", "prompt": "", "title": secret}},
+		"wait: unknown thread": {"agent.wait", map[string]any{
+			"threadId": "t-ghost", "text": secret}},
+	} {
+		err := client.Call(call.method, call.params, nil)
+		if err == nil {
+			t.Errorf("%s: expected an error path, got success", name)
+			continue
+		}
+		if strings.Contains(err.Error(), secret) {
+			t.Errorf("%s: handler error echoed a secret-bearing argument: %q",
+				name, err.Error())
+		}
+	}
 }
