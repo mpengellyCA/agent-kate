@@ -51,6 +51,7 @@ add_executable(agentkate
     src/ForkAgentDialog.cpp
     src/MainWindow.cpp
     src/EditorArea.cpp
+    src/EditorSession.cpp
     src/DiffView.cpp
     src/ImageView.cpp
     src/KPartView.cpp
@@ -253,6 +254,15 @@ if(Qt6Test_FOUND)
     target_link_libraries(MarkdownUtilTest PRIVATE Qt6::Gui Qt6::Test)
     add_test(NAME MarkdownUtilTest COMMAND MarkdownUtilTest)
     set_tests_properties(MarkdownUtilTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    # Plan 17: the editor session keys + restore filter. The regression these
+    # guard (a fresh run reopening another project's files) was user-visible.
+    add_executable(EditorSessionTest tests/EditorSessionTest.cpp src/EditorSession.cpp)
+    target_include_directories(EditorSessionTest PRIVATE src)
+    target_link_libraries(EditorSessionTest PRIVATE Qt6::Core Qt6::Test KF6::ConfigCore)
+    add_test(NAME EditorSessionTest COMMAND EditorSessionTest)
+    set_tests_properties(EditorSessionTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
     # The wrapping FlowLayout — verify it reflows to more rows as width shrinks

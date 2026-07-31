@@ -4,6 +4,7 @@
 #include "AppearanceDialog.h"
 #include "CommandPalette.h"
 #include "EditorArea.h"
+#include "EditorSession.h"
 #include "ExtensionsDialog.h"
 #include "OutlinePanel.h"
 #include "ProblemsPanel.h"
@@ -426,6 +427,13 @@ void MainWindow::setupUi()
     // re-point the thread-keyed panels when it lands — otherwise "Enable Cowork for
     // this agent" stays greyed out and Git Log keeps the stale thread.
     connect(m_agent, &AgentDock::activeThreadChanged, this, [this](const QString &threadId) {
+        // The shown agent's tab group was keyed on a pending (per-run) id while
+        // it had no thread; re-key it and follow it, so tabs opened during the
+        // session start stay with the agent instead of being stranded.
+        if (adoptPendingEditorGroup(m_activeAgentId, m_activeProject, threadId)
+            && m_editor) {
+            m_editor->setActiveGroup(groupKey());
+        }
         if (m_coworkPanel) {
             m_coworkPanel->setActiveThread(threadId, QString());
         }
@@ -504,6 +512,16 @@ void MainWindow::setupUi()
                 }
             });
     connect(m_editor, &EditorArea::openFilesChanged, this, &MainWindow::pushOpenFilesToCore);
+    // Tab opened/closed: refresh the persisted session too. Debounced, because
+    // persistence used to run only in closeEvent — so a crash replayed the tabs
+    // of whatever the previous run happened to leave behind.
+    m_sessionPersistTimer = new QTimer(this);
+    m_sessionPersistTimer->setSingleShot(true);
+    m_sessionPersistTimer->setInterval(1000);
+    connect(m_sessionPersistTimer, &QTimer::timeout, this,
+            &MainWindow::persistEditorSession);
+    connect(m_editor, &EditorArea::openFilesChanged, this,
+            &MainWindow::schedulePersistEditorSession);
     connect(m_editor, &EditorArea::revealInTreeRequested, this,
             [this](const QString &path) {
                 if (m_tree) {
@@ -1844,18 +1862,39 @@ void MainWindow::onAgentActivated(int agentId, const QString &projectPath,
             m_agent && !m_agent->worktreePathForAgent(agentId).isEmpty());
     }
     setWindowTitle(i18n("Agent Kate — %1", QDir(projectPath).dirName()));
+    // An agent whose session started while a different agent was shown never
+    // got the activeThreadChanged re-key; catch it here, before its group key
+    // is resolved, so its tabs come back with it.
+    adoptPendingEditorGroup(agentId, projectPath, m_agent ? m_agent->currentThreadId()
+                                                          : QString());
     m_editor->setActiveGroup(groupKey());
-    // Reopen the tabs the human had for this project last run (once per run).
-    restoreEditorSession(projectPath);
+    // Reopen the tabs the human had for this agent last run (once per run),
+    // filtered to this agent's own roots.
+    restoreEditorSession(projectPath, worktreePath);
+    // Snapshot the tabs of the agent we just left; a crash after the switch
+    // would otherwise lose them.
+    schedulePersistEditorSession();
     updateAgentActions();
 }
 
+// groupKey names the editor tab group for the active agent. Every form is
+// derived from stable identity — the project path, plus the agent's CORE thread
+// id in tabs-by-agent mode. It deliberately never uses m_activeAgentId except
+// for a still-thread-less agent, whose pending key is confined to this run
+// (see EditorSession.h for the cross-project leak this replaced).
 QString MainWindow::groupKey() const
 {
-    if (m_tabsByAgent) {
-        return QStringLiteral("agent-%1").arg(m_activeAgentId);
+    if (m_activeProject.isEmpty()) {
+        return {};
     }
-    return m_activeProject;
+    if (!m_tabsByAgent) {
+        return EditorSession::projectKey(m_activeProject);
+    }
+    const QString threadId = m_agent ? m_agent->currentThreadId() : QString();
+    if (threadId.isEmpty()) {
+        return EditorSession::pendingKey(m_activeProject, m_activeAgentId);
+    }
+    return EditorSession::agentKey(m_activeProject, threadId);
 }
 
 void MainWindow::setTabsByAgent(bool byAgent)
@@ -1932,10 +1971,10 @@ void MainWindow::onSaveAll()
 }
 
 // persistEditorSession records every editor group's open tabs so the next run
-// can reopen them. Each group is keyed by its own group key (a project path, or
-// "agent-N" when tabs are grouped by agent) — the same key restoreEditorSession
-// reads back — so the working set for *all* open projects survives a quit, not
-// just the active one.
+// can reopen them, under the same key restoreEditorSession reads back — so the
+// working set for *all* open projects survives a quit, not just the active one.
+// Thread-less (pending) groups are skipped: their key means nothing next run.
+// The sweep afterwards retires legacy groups and ones that can never replay.
 void MainWindow::persistEditorSession()
 {
     if (m_restoringSession || !m_editor) {
@@ -1946,56 +1985,81 @@ void MainWindow::persistEditorSession()
                                 .group(QStringLiteral("Sessions"));
     const QStringList keys = m_editor->groupKeys();
     for (const QString &key : keys) {
-        if (key.isEmpty()) {
+        if (!EditorSession::isPersistable(key)) {
             continue;
         }
-        KConfigGroup grp = sessions.group(key);
-        grp.writeEntry("openFiles", m_editor->openFilePathsForGroup(key));
-        grp.writeEntry("active", m_editor->currentPathForGroup(key));
+        EditorSession::write(sessions, key, m_editor->openFilePathsForGroup(key),
+                             m_editor->currentPathForGroup(key));
     }
+    EditorSession::sweep(sessions);
+    // Reach disk now: this also runs on the debounced path, whose whole point is
+    // that a crash costs at most the last second of tab changes.
+    sessions.sync();
+}
+
+// adoptPendingEditorGroup moves a fresh agent's tabs from its per-run pending
+// key to the stable, persistable one once its core thread id exists. Returns
+// whether a group actually moved.
+bool MainWindow::adoptPendingEditorGroup(int agentId, const QString &projectPath,
+                                         const QString &threadId)
+{
+    if (!m_tabsByAgent || !m_editor || threadId.isEmpty() || projectPath.isEmpty()) {
+        return false;
+    }
+    const QString pending = EditorSession::pendingKey(projectPath, agentId);
+    const QString stable = EditorSession::agentKey(projectPath, threadId);
+    if (pending.isEmpty() || stable.isEmpty()
+        || !m_editor->renameGroup(pending, stable)) {
+        return false;
+    }
+    // The tabs are only worth remembering now that they have a stable key.
+    schedulePersistEditorSession();
+    return true;
+}
+
+void MainWindow::schedulePersistEditorSession()
+{
+    if (m_restoringSession || !m_sessionPersistTimer) {
+        return;
+    }
+    m_sessionPersistTimer->start();
 }
 
 // restoreEditorSession replays the current group's saved tabs once per app run.
-// Skips files that no longer exist, caps the count to keep startup snappy, and
-// guards re-entrant persistence while replaying. Keyed by the active group key
-// (project path or "agent-N"), matching how persistEditorSession wrote it.
-void MainWindow::restoreEditorSession(const QString &projectPath)
+// Beyond "does it still exist", every path must live under the agent's own
+// roots — the project, or its worktree when that is outside the project — so a
+// stale or hand-edited group can never reopen another project's files.
+void MainWindow::restoreEditorSession(const QString &projectPath,
+                                      const QString &worktreePath)
 {
-    Q_UNUSED(projectPath);
     const QString key = groupKey();
-    if (key.isEmpty() || m_restoredSessions.contains(key)) {
+    if (key.isEmpty() || projectPath.isEmpty() || m_restoredSessions.contains(key)) {
         return;
     }
     m_restoredSessions.insert(key);
 
-    const KConfigGroup grp = KSharedConfig::openConfig()
-                                 ->group(QStringLiteral("Editor"))
-                                 .group(QStringLiteral("Sessions"))
-                                 .group(key);
-    const QStringList files = grp.readEntry("openFiles", QStringList());
-    if (files.isEmpty()) {
+    // Isolated worktrees normally live at <project>/.agentkate/worktrees/<id>,
+    // already inside the project root; the explicit root covers a relocated one.
+    QStringList roots{projectPath};
+    if (!worktreePath.isEmpty()) {
+        roots << worktreePath;
+    }
+    const KConfigGroup sessions = KSharedConfig::openConfig()
+                                      ->group(QStringLiteral("Editor"))
+                                      .group(QStringLiteral("Sessions"));
+    const EditorSession::Session session = EditorSession::read(sessions, key, roots);
+    if (session.files.isEmpty()) {
         return;
     }
-    const QString active = grp.readEntry("active", QString());
-
-    // Cap restored tabs so a session with many heavy viewers (PDFs) doesn't
-    // stall startup; the rest stay one click away in the tree.
-    constexpr int kMaxRestore = 20;
 
     m_restoringSession = true;
-    int opened = 0;
-    for (const QString &path : files) {
-        if (opened >= kMaxRestore) {
-            break;
-        }
-        if (QFileInfo::exists(path)) {
-            m_editor->openFile(key, path);
-            ++opened;
-        }
+    for (const QString &path : session.files) {
+        m_editor->openFile(key, path);
     }
-    // Re-activate the previously-focused file if it was restored.
-    if (!active.isEmpty() && QFileInfo::exists(active)) {
-        m_editor->openFile(key, active);
+    // Re-activate the previously-focused file (read() only reports one that
+    // survived filtering).
+    if (!session.active.isEmpty()) {
+        m_editor->openFile(key, session.active);
     }
     m_restoringSession = false;
 }

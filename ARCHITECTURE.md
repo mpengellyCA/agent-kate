@@ -33,6 +33,11 @@ and handles input, and delegates every subprocess and protocol concern to the co
   highlighting for 300+ languages with no language server.
 - LSP results from the core are rendered into the editor: completion via
   `KTextEditor::CodeCompletionModel`, diagnostics via the mark/message interfaces.
+- Editor tabs are grouped per project — or per agent, keyed by its **core thread
+  id** — and persisted to `agentkaterc`. `ui/src/EditorSession.h` owns the key
+  derivation and the restore filter: a saved path only reopens under the group it
+  was saved in *and* under that agent's project/worktree root, so a session can
+  never replay another project's files (plan 17).
 
 ### `akcore` — Go
 

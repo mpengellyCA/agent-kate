@@ -1,5 +1,11 @@
 # 17 — Editor Session Scoping (cross-project file leak on startup)
 
+## Status: ✅ LANDED
+
+Implemented as sketched, with one structural deviation and one scope call. See
+"How the sketch met the real code" at the bottom for the full retrospective,
+the live A/B dogfood evidence, and the probed KConfig facts.
+
 ## Goal
 
 Fix the user-reported defect: **on startup, Agent Kate reopens files that were open
@@ -166,3 +172,104 @@ safe even against stale/foreign groups that were never cleaned up, and fixes B5.
   (Go) work, no wire-protocol changes.
 
 Size: **S–M**.
+
+---
+
+## How the sketch met the real code
+
+### What shipped
+
+| Step | Landed as |
+| --- | --- |
+| 1 — stable thread id | No `AgentDock` change was needed: `AgentDock::currentThreadId()` (`AgentDock.h:47`) already returns the shown panel's **core** thread id, and the roster switches the stack *before* it emits `agentActivated` (`AgentDock.cpp:78-88`), so the id is correct by the time `MainWindow::onAgentActivated` runs. |
+| 2 — scoped keys | New unit `ui/src/EditorSession.{h,cpp}` owns key derivation; `MainWindow::groupKey()` is now three lines of policy over it. |
+| 3 — containment filter | `EditorSession::read()` filters against the agent's roots; `restoreEditorSession(projectPath, worktreePath)` passes them and the `Q_UNUSED` is gone. |
+| 4 — housekeeping | `EditorSession::write()` stamps `version=2` + the owning `project`; `EditorSession::sweep()` deletes legacy/unversioned, empty, and vanished-project groups. |
+| 5 — tests | `ui/tests/EditorSessionTest.cpp`, 10 cases, registered in `ui/CMakeLists.txt`. |
+| 6 — dogfood | Done as a live A/B against a copy of the real `agentkaterc` — see below. |
+
+### Deviation: the rules live in their own unit, not in `MainWindow`
+
+The plan put the logic in `MainWindow`, but `ui/tests/` builds each test from a
+small list of real sources and `MainWindow.cpp` transitively pulls in the whole
+app — it cannot be linked into a test. Since step 5 asked for coverage of
+exactly these rules, they moved into `EditorSession`, a free-function namespace
+in the shape of the existing `RecentProjects`. `MainWindow` keeps only the
+wiring; `EditorSession` takes the `KConfigGroup` as a parameter, so the tests
+drive the real read/write/sweep path against a throwaway config file.
+
+### Deviation: pending keys + a group rename (defect the sketch didn't cover)
+
+A freshly created agent has **no thread id** until its session starts, so there
+is no stable key to put its tabs under. Keying it on the counter would reopen
+the leak. So a thread-less agent gets a `pending:<project>:<agentId>` key that
+`isPersistable()` rejects — it can never reach the config — and
+`MainWindow::adoptPendingEditorGroup()` re-keys the group to
+`agent:<project>:<threadId>` the moment the id lands, via the new
+`EditorArea::renameGroup()`.
+
+That hook is called from **both** `activeThreadChanged` and `onAgentActivated`.
+Only the first was obvious; the second is required because
+`activeThreadChanged` fires for the *shown* agent only, so an agent whose
+session started while another agent was on screen would otherwise come back to
+an empty tab group with its tabs stranded under a key nothing reads — an in-run
+tab loss the sketch would have shipped.
+
+### Scope call: `[Agent][LastActive]` keys were left alone
+
+The plan floated reusing the normalizer for the `[Agent][LastActive]` groups
+(which really do exist both with and without trailing slashes). Not done: those
+keys are the *same strings* the UI sends to the core as `project`, and
+`session.listThreads` matches them **exactly** (`core/internal/session/session.go:320`).
+Normalizing the project path at the `AgentDock::addProject` source would orphan
+every thread recorded under a trailing-slash path. Normalizing only the editor
+key (as done here) is safe because that key is UI-local. Splitting the LastActive
+keys needs a core-side path-normalization migration and is out of scope for a
+UI-only bug fix.
+
+### Probed facts
+
+- **KConfig group names tolerate more than expected.** With `sanitize()` stubbed
+  to the identity function, `groupNamesSurviveKConfig` still passed for a group
+  named after a path containing `[`, `]`, `=` and spaces — KConfig escapes group
+  headers itself. The percent-encoding was kept anyway: it makes the key format
+  independent of KConfig's escaping rules, and it encodes `:` so the
+  `agent:<project>:<threadId>` split stays unambiguous for a project path that
+  contains a colon (covered by `projectForKeyRoundTrips`).
+- **The bug reproduces exactly as documented**, and the fix kills it — live A/B
+  below.
+
+### Dogfood evidence (step 6), live A/B on the real rc file
+
+Both runs: the *real* `~/.config/agentkaterc` copied into an isolated
+`XDG_CONFIG_HOME` (`tabsByAgent=true`, `[Editor][Sessions][agent-1]` holding four
+BDC-Kia files), app launched offscreen into `AgentKate/ARCHITECTURE.md`, then the
+core asked `coop.listOpenFiles` — i.e. the files the UI actually had open.
+
+```
+pre-fix build (HEAD, stashed diff):
+  /home/mike/Dev/AgentKate/ARCHITECTURE.md
+  /home/mike/Dev/BDC-Kia/.claude/settings.local.json   ← the reported bug
+  /home/mike/Dev/BDC-Kia/.mcp.json                     ←
+  /home/mike/Dev/BDC-Kia/README.md                     ←
+  /home/mike/Dev/BDC-Kia/config.json                   ←
+
+fixed build:
+  /home/mike/Dev/AgentKate/ARCHITECTURE.md             ← only this
+```
+
+After the fixed run the isolated rc held **0** of the 33 legacy
+`[Editor][Sessions][agent-N]` groups (swept), and no BDC-Kia path anywhere under
+`[Editor]`. As predicted in "Risks / notes", the first run after the fix restores
+nothing — the one-time cost of retiring the legacy corpus.
+
+### Verification
+
+- `ctest --test-dir build` — 5/5 pass, including the new `EditorSessionTest`.
+- Mutation-checked, so the guards are not decorative: dropping the containment
+  filter fails `filtersForeignProjectFiles`; dropping the schema-version check
+  fails `ignoresLegacyAgentGroups`.
+- `go build ./... && go vet ./... && go test ./...` green (untouched by this
+  diff — it contains no `core/` changes), plus `scripts/smoke-agent.py` PASSED as
+  a binary sanity check. The rest of the smoke suite drives core/harness paths
+  this diff does not reach and was deferred to the plan 16 phases.

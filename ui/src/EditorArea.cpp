@@ -261,6 +261,24 @@ void EditorArea::setActiveGroup(const QString &groupKey)
     emitCurrentFile();
 }
 
+bool EditorArea::renameGroup(const QString &from, const QString &to)
+{
+    if (from.isEmpty() || to.isEmpty() || from == to) {
+        return false;
+    }
+    const auto it = m_groups.constFind(from);
+    if (it == m_groups.constEnd() || m_groups.contains(to)) {
+        return false;
+    }
+    QTabWidget *tabs = it.value();
+    m_groups.remove(from);
+    m_groups.insert(to, tabs);
+    if (m_activeGroup == from) {
+        m_activeGroup = to;
+    }
+    return true;
+}
+
 void EditorArea::updateVisible()
 {
     QTabWidget *tabs = activeTabs();

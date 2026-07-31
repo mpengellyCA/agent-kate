@@ -28,6 +28,11 @@ public:
     ~EditorArea() override;
 
     void setActiveGroup(const QString &groupKey);
+    // Re-key an existing group, keeping its tabs. Used when a fresh agent's core
+    // thread id arrives and its per-run "pending" key is replaced by the stable
+    // one (see EditorSession.h). No-op if `from` has no group or `to` already
+    // has one; returns whether the rename happened.
+    bool renameGroup(const QString &from, const QString &to);
     void openFile(const QString &groupKey, const QString &path, int line = -1,
                   int column = 0);
     void openDiff(const QString &groupKey, const QString &title, const QString &text);
