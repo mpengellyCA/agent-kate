@@ -56,6 +56,12 @@ type agentStartParams struct {
 	Attachments    []agent.Attachment `json:"attachments"`
 	CoworkEnabled  bool               `json:"coworkEnabled"`      // opt into the KDE Cowork desktop tools
 	Provider       *agent.Provider    `json:"provider,omitempty"` // third-party API routing; nil = Claude direct
+	// SystemPrompt / Agents are the persona channels (plan 16 P3). Both are
+	// capability-gated per harness and reported as applied-truth by Launch —
+	// a harness without the channel names the request as unapplied rather
+	// than emulating it.
+	SystemPrompt string                 `json:"systemPrompt,omitempty"`
+	Agents       []harness.AgentProfile `json:"agents,omitempty"`
 }
 
 type agentSendParams struct {
@@ -160,12 +166,18 @@ func (d handlerDeps) agentInterrupt(threadID string) error {
 	return d.harnessFor(threadID).Interrupt(threadID)
 }
 
-// unsupported is THE capability-gate error: every optional feature a harness
-// lacks is rejected with this one message shape, so the wording never drifts
-// per call site.
+// unsupportedDetail is THE capability-gate wording: one message shape for
+// every feature a harness lacks, so it never drifts per call site. Used both
+// by the hard gate below and by the applied-truth reports, where a missing
+// capability is a downgrade to name rather than a request to refuse.
+func unsupportedDetail(feature string, caps harness.Capabilities) string {
+	return feature + " is not supported by " + caps.DisplayName + " agents"
+}
+
+// unsupported is the capability-gate error: an optional RPC a harness cannot
+// serve is rejected outright with the shared wording.
 func unsupported(feature string, caps harness.Capabilities) error {
-	return ipc.Errorf(ipc.CodeInvalidParams,
-		feature+" is not supported by "+caps.DisplayName+" agents")
+	return ipc.Errorf(ipc.CodeInvalidParams, unsupportedDetail(feature, caps))
 }
 
 // recordAttachments appends a compact, body-free attachment sidecar entry for a

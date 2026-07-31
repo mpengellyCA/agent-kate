@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"agentkate/internal/coop"
+	"agentkate/internal/harness"
 	"agentkate/internal/ipc"
 	"agentkate/internal/safe"
 )
@@ -440,6 +441,10 @@ func (b *mcpBridge) runTool(name string, args json.RawMessage) (string, error) {
 			PermissionMode string `json:"permission_mode"`
 			Effort         string `json:"effort"`
 			Wait           bool   `json:"wait"`
+			// The persona channels travel verbatim to the core, which owns
+			// the per-harness applied-truth (plan 16 P3).
+			SystemPrompt string                 `json:"system_prompt"`
+			Agents       []harness.AgentProfile `json:"agents"`
 		}
 		if len(args) > 0 {
 			if err := json.Unmarshal(args, &a); err != nil {
@@ -456,10 +461,16 @@ func (b *mcpBridge) runTool(name string, args json.RawMessage) (string, error) {
 			Isolated  bool              `json:"isolated"`
 			Branch    string            `json:"branch"`
 			Applied   map[string]string `json:"applied"`
-			Unapplied []struct {
+			// Persona applied-truth (plan 16 P3): what the target harness
+			// could express of the requested system prompt / subagent
+			// profiles, and — in Unapplied — what it could not, and why.
+			SystemPromptApplied bool     `json:"systemPromptApplied"`
+			AppliedAgents       []string `json:"appliedAgents"`
+			Unapplied           []struct {
 				Option    string `json:"option"`
 				Requested string `json:"requested"`
 				Applied   string `json:"applied"`
+				Reason    string `json:"reason"`
 			} `json:"unapplied"`
 		}
 		// Synchronous launch: worktree creation plus a CLI handshake can take
@@ -473,6 +484,8 @@ func (b *mcpBridge) runTool(name string, args json.RawMessage) (string, error) {
 			"isolation":      a.Isolation,
 			"permissionMode": a.PermissionMode,
 			"effort":         a.Effort,
+			"systemPrompt":   a.SystemPrompt,
+			"agents":         a.Agents,
 		}, &res, 3*time.Minute); err != nil {
 			return "", err
 		}
@@ -486,7 +499,20 @@ func (b *mcpBridge) runTool(name string, args json.RawMessage) (string, error) {
 		if m := res.Applied["model"]; m != "" {
 			fmt.Fprintf(&sb, "Model: %s\n", m)
 		}
+		if res.SystemPromptApplied {
+			sb.WriteString("System prompt: your text runs alongside the engine's own.\n")
+		}
+		if len(res.AppliedAgents) > 0 {
+			fmt.Fprintf(&sb, "Subagent profiles available to the worker: %s.\n",
+				strings.Join(res.AppliedAgents, ", "))
+		}
 		for _, u := range res.Unapplied {
+			// A downgraded option reports the value it fell back to; a persona
+			// channel the engine lacks reports why instead.
+			if u.Reason != "" {
+				fmt.Fprintf(&sb, "NOT APPLIED: %s — %s.\n", u.Option, u.Reason)
+				continue
+			}
 			fmt.Fprintf(&sb, "NOT APPLIED: %s %q was not accepted (running with %q instead).\n",
 				u.Option, u.Requested, u.Applied)
 		}
@@ -800,7 +826,10 @@ func toolDefs() []map[string]any {
 				"backend rejects are reported back as NOT APPLIED — never silently " +
 				"emulated. Workers needing tool approval prompt the HUMAN, which can stall " +
 				"an unattended worker: pass an auto-approving permission_mode (e.g. " +
-				"\"acceptEdits\") for autonomous work. With wait=true this call blocks " +
+				"\"acceptEdits\") for autonomous work. 'system_prompt' and 'agents' shape " +
+				"the worker's persona and its own subagent roster where its engine " +
+				"supports them; where it does not they come back as NOT APPLIED and " +
+				"belong in the prompt instead. With wait=true this call blocks " +
 				"until the worker finishes its first turn and returns its reply.",
 			"inputSchema": map[string]any{
 				"type": "object",
@@ -821,6 +850,29 @@ func toolDefs() []map[string]any {
 						"description": "Reasoning effort / thinking level in the backend's vocabulary. Empty = default."},
 					"wait": map[string]any{"type": "boolean",
 						"description": "Block until the worker's first turn completes and include its reply."},
+					"system_prompt": map[string]any{"type": "string",
+						"description": "Persona text to run the worker with, alongside its engine's own system prompt. Engines without the channel report it NOT APPLIED — put the persona in 'prompt' instead."},
+					"agents": map[string]any{
+						"type":        "array",
+						"description": "Custom subagent profiles the worker may delegate to. Engines with a fixed subagent set report each one NOT APPLIED.",
+						"items": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"name": map[string]any{"type": "string",
+									"description": "How the worker refers to this subagent."},
+								"description": map[string]any{"type": "string",
+									"description": "When the worker should delegate to it (required)."},
+								"prompt": map[string]any{"type": "string",
+									"description": "The subagent's own system prompt (required)."},
+								"tools": map[string]any{"type": "array",
+									"items":       map[string]any{"type": "string"},
+									"description": "Tool allow-list for the subagent. Omit for all tools."},
+								"model": map[string]any{"type": "string",
+									"description": "Model for the subagent, in the worker backend's vocabulary. Omit to inherit."},
+							},
+							"required": []string{"name", "description", "prompt"},
+						},
+					},
 				},
 				"required": []string{"prompt"},
 			},

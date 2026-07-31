@@ -142,6 +142,55 @@ func unappliedOptions(requested map[string]string, launched harness.Launched) []
 	return out
 }
 
+// unappliedPersona is the same applied-truth pass for the persona channels
+// (plan 16 P3). These entries carry a "reason" instead of a requested/applied
+// pair: there is no downgraded value to report, only what was lost and why.
+func unappliedPersona(systemPrompt string, profiles []harness.AgentProfile,
+	launched harness.Launched, caps harness.Capabilities) []map[string]string {
+	var out []map[string]string
+	if strings.TrimSpace(systemPrompt) != "" && !launched.SystemPromptApplied {
+		out = append(out, map[string]string{
+			"option": "system_prompt",
+			"reason": unsupportedDetail("a custom system prompt", caps) +
+				"; put the persona in the worker's opening prompt instead",
+		})
+	}
+	for _, a := range launched.Agents {
+		if a.Applied && len(a.Unapplied) == 0 {
+			continue
+		}
+		reason := strings.Join(a.Unapplied, "; ")
+		if reason == "" {
+			reason = unsupportedDetail("this subagent profile", caps)
+		}
+		out = append(out, map[string]string{
+			"option": "agents[" + profileLabel(a.Name) + "]",
+			"reason": reason,
+		})
+	}
+	// Backstop: an adapter that reports NOTHING for a requested profile would
+	// otherwise drop it silently, which is exactly what applied-truth forbids.
+	// Launched.Agents carries one entry per request, so anything past its end
+	// is unaccounted for.
+	for i := len(launched.Agents); i < len(profiles); i++ {
+		out = append(out, map[string]string{
+			"option": "agents[" + profileLabel(profiles[i].Name) + "]",
+			"reason": caps.DisplayName + " did not report whether this subagent " +
+				"profile was applied; assume it was not",
+		})
+	}
+	return out
+}
+
+// profileLabel names a profile in applied-truth output, standing in for the
+// nameless (which no harness can register anyway).
+func profileLabel(name string) string {
+	if strings.TrimSpace(name) == "" {
+		return "(unnamed)"
+	}
+	return name
+}
+
 func registerOrchestrationHandlers(d handlerDeps) {
 	// agent.wait blocks until the thread is idle (no turn in flight, or the
 	// process ended) or the timeout fires, and returns the thread's last
@@ -192,14 +241,16 @@ func registerOrchestrationHandlers(d handlerDeps) {
 	// the launcher and appears in the roster like any human-started agent.
 	d.srv.Handle("agent.launchWorker", func(_ context.Context, raw json.RawMessage) (any, error) {
 		var p struct {
-			ParentThreadID string `json:"parentThreadId"`
-			Backend        string `json:"backend"`
-			Model          string `json:"model"`
-			Prompt         string `json:"prompt"`
-			Title          string `json:"title"`
-			Isolation      string `json:"isolation"`
-			PermissionMode string `json:"permissionMode"`
-			Effort         string `json:"effort"`
+			ParentThreadID string                 `json:"parentThreadId"`
+			Backend        string                 `json:"backend"`
+			Model          string                 `json:"model"`
+			Prompt         string                 `json:"prompt"`
+			Title          string                 `json:"title"`
+			Isolation      string                 `json:"isolation"`
+			PermissionMode string                 `json:"permissionMode"`
+			Effort         string                 `json:"effort"`
+			SystemPrompt   string                 `json:"systemPrompt"`
+			Agents         []harness.AgentProfile `json:"agents"`
 		}
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
@@ -250,6 +301,8 @@ func registerOrchestrationHandlers(d handlerDeps) {
 			Model:          p.Model,
 			Backend:        caps.ID,
 			Isolation:      p.Isolation,
+			SystemPrompt:   p.SystemPrompt,
+			Agents:         p.Agents,
 		}, launchMeta{ParentThreadID: p.ParentThreadID, Title: p.Title})
 		if err != nil {
 			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
@@ -264,6 +317,21 @@ func registerOrchestrationHandlers(d handlerDeps) {
 				}
 			})
 		}
+		// Applied-truth: the downgraded options first, then the persona
+		// channels — one flat list the bridge renders verbatim.
+		unapplied := unappliedOptions(map[string]string{
+			"model":          p.Model,
+			"effort":         p.Effort,
+			"permissionMode": p.PermissionMode,
+		}, launched)
+		unapplied = append(unapplied,
+			unappliedPersona(p.SystemPrompt, p.Agents, launched, caps)...)
+		var appliedAgents []string
+		for _, a := range launched.Agents {
+			if a.Applied {
+				appliedAgents = append(appliedAgents, a.Name)
+			}
+		}
 		return map[string]any{
 			"threadId":  threadID,
 			"sessionId": launched.SessionID,
@@ -275,11 +343,9 @@ func registerOrchestrationHandlers(d handlerDeps) {
 				"effort":         launched.Effort,
 				"permissionMode": launched.PermissionMode,
 			},
-			"unapplied": unappliedOptions(map[string]string{
-				"model":          p.Model,
-				"effort":         p.Effort,
-				"permissionMode": p.PermissionMode,
-			}, launched),
+			"systemPromptApplied": launched.SystemPromptApplied,
+			"appliedAgents":       appliedAgents,
+			"unapplied":           unapplied,
 		}, nil
 	})
 }

@@ -112,6 +112,79 @@ type StartOptions struct {
 	ForkSession    bool         // with Resume: --fork-session — branch a NEW session off the resumed context
 	CoworkEnabled  bool         // opt this thread into the KDE Cowork desktop MCP server
 	Provider       *Provider    // optional third-party API routing; nil/empty BaseURL = Claude direct
+	SystemPrompt   string       // claude --append-system-prompt; empty = none
+	AgentsJSON     string       // claude --agents payload, pre-rendered by the adapter; empty = none
+}
+
+// buildStartArgs assembles the `claude` argv for one thread. Split out of
+// Start so the flag plumbing is testable without spawning the CLI — the
+// process-shaping decisions (env, process group, pipes) stay in Start.
+func buildStartArgs(opts StartOptions) []string {
+	mode := opts.PermissionMode
+	if mode == "" {
+		mode = "acceptEdits"
+	}
+	// The Cooperation MCP is always allowed; the opt-in Cowork desktop server is
+	// added only when the thread enabled it. Consent for individual desktop
+	// actions is enforced server-side (the cowork consent authority), NOT by this
+	// allow-list — so --permission-mode cannot bypass it.
+	allowedTools := "mcp__cooperation"
+	if opts.CoworkEnabled {
+		allowedTools += ",mcp__cowork"
+	}
+	args := []string{
+		"--print",
+		"--output-format", "stream-json",
+		"--input-format", "stream-json",
+		"--verbose",
+		"--permission-mode", mode,
+		"--allowedTools", allowedTools,
+	}
+	// Reasoning effort is optional: an empty value leaves Claude Code on
+	// whatever default the user has configured.
+	if opts.Effort != "" {
+		args = append(args, "--effort", opts.Effort)
+	}
+	// Model is optional: empty means inherit Claude Code's configured default
+	// (typically Opus). Smoke tests pin Haiku to keep their token spend low.
+	if opts.Model != "" {
+		args = append(args, "--model", opts.Model)
+	}
+	// Persona text rides ALONGSIDE Claude Code's own system prompt (verified
+	// in print mode against claude 2.1.220); --system-prompt would replace it,
+	// hiding the tool and skill injections, so it is deliberately not used.
+	if opts.SystemPrompt != "" {
+		args = append(args, "--append-system-prompt", opts.SystemPrompt)
+	}
+	// Custom subagent definitions for this session, already rendered into the
+	// CLI's JSON-object shape by the adapter (harness_claude.go owns that
+	// vocabulary, including which fields the binary honors).
+	if opts.AgentsJSON != "" {
+		args = append(args, "--agents", opts.AgentsJSON)
+	}
+	// A fresh thread is pinned to a session id we choose, so it can be resumed
+	// later; a resumed thread replays that same Claude Code session.
+	if opts.SessionID != "" {
+		if opts.Resume {
+			args = append(args, "--resume", opts.SessionID)
+			// A fork replays the resumed session's context but mints a fresh
+			// session id for the new turns, leaving the source session untouched.
+			// The init event reports that new id, which the run loop persists.
+			if opts.ForkSession {
+				args = append(args, "--fork-session")
+			}
+		} else {
+			args = append(args, "--session-id", opts.SessionID)
+		}
+	}
+	if opts.MCPConfig != "" {
+		args = append(args,
+			"--mcp-config", opts.MCPConfig,
+			// Gated tools (Bash and the like) route to our MCP approval tool,
+			// which surfaces an approve/deny prompt in the agent panel.
+			"--permission-prompt-tool", "mcp__cooperation__request_permission")
+	}
+	return args
 }
 
 // buildUserContent assembles a stream-json user message content array from the
@@ -312,61 +385,7 @@ func NewThreadID() string {
 // tools stay gated. Every tool call is still surfaced to the UI. M2 will move
 // each thread into its own git worktree and add per-tool approval.
 func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
-	mode := opts.PermissionMode
-	if mode == "" {
-		mode = "acceptEdits"
-	}
-	// The Cooperation MCP is always allowed; the opt-in Cowork desktop server is
-	// added only when the thread enabled it. Consent for individual desktop
-	// actions is enforced server-side (the cowork consent authority), NOT by this
-	// allow-list — so --permission-mode cannot bypass it.
-	allowedTools := "mcp__cooperation"
-	if opts.CoworkEnabled {
-		allowedTools += ",mcp__cowork"
-	}
-	args := []string{
-		"--print",
-		"--output-format", "stream-json",
-		"--input-format", "stream-json",
-		"--verbose",
-		"--permission-mode", mode,
-		"--allowedTools", allowedTools,
-	}
-	// Reasoning effort is optional: an empty value leaves Claude Code on
-	// whatever default the user has configured.
-	if opts.Effort != "" {
-		args = append(args, "--effort", opts.Effort)
-	}
-	// Model is optional: empty means inherit Claude Code's configured default
-	// (typically Opus). Smoke tests pin Haiku to keep their token spend low.
-	if opts.Model != "" {
-		args = append(args, "--model", opts.Model)
-	}
-	// A fresh thread is pinned to a session id we choose, so it can be resumed
-	// later; a resumed thread replays that same Claude Code session.
-	if opts.SessionID != "" {
-		if opts.Resume {
-			args = append(args, "--resume", opts.SessionID)
-			// A fork replays the resumed session's context but mints a fresh
-			// session id for the new turns, leaving the source session untouched.
-			// The init event reports that new id, which the run loop persists.
-			if opts.ForkSession {
-				args = append(args, "--fork-session")
-			}
-		} else {
-			args = append(args, "--session-id", opts.SessionID)
-		}
-	}
-	if opts.MCPConfig != "" {
-		args = append(args,
-			"--mcp-config", opts.MCPConfig,
-			// Gated tools (Bash and the like) route to our MCP approval tool,
-			// which surfaces an approve/deny prompt in the agent panel.
-			"--permission-prompt-tool", "mcp__cooperation__request_permission",
-		)
-	}
-
-	cmd := exec.Command(s.claudeBin, args...)
+	cmd := exec.Command(s.claudeBin, buildStartArgs(opts)...)
 	cmd.Dir = opts.WorkDir
 	// Route this child at a third-party Anthropic-compatible endpoint when a
 	// provider is selected; buildEnv scrubs any inherited Anthropic credentials

@@ -38,10 +38,37 @@ func (h *kimiHarness) Capabilities() harness.Capabilities {
 		// past kimi sessions show up in the "Resume a Session…" browser.
 		SessionBrowse: true,
 		ModelPicker:   harness.ModelPickerDiscovered,
-		// PermissionModes/Efforts empty: the vocabularies come from the
-		// session handshake's configOptions ("mode", "thinking").
+		// SystemPrompt / CustomSubagents stay false — see below for what was
+		// probed. PermissionModes/Efforts empty: the vocabularies come from
+		// the session handshake's configOptions ("mode", "thinking").
 	}
 }
+
+// Why the two persona channels are off for kimi, probed against kimi 0.30.0:
+//
+//   - `kimi acp` accepts no system-prompt channel. The only replace-the-prompt
+//     lever ($KIMI_CODE_HOME/SYSTEM.md) is a whole-prompt override that would
+//     hide the CLI's own tool and skill injections, so it is not a persona
+//     channel; callers fold the persona into the opening message instead,
+//     which behaves identically on every harness.
+//   - `kimi acp` runs kimi's v1 engine, whose subagent resolver reads a
+//     COMPILED-IN profile table (coder / explore / plan) and no filesystem
+//     catalogue at all. The documented `.agents/agents/*.md` and
+//     `.kimi-code/agents/*.md` directories are read only by the v2 engine,
+//     which is reachable exclusively through `kimi -p` with
+//     KIMI_CODE_EXPERIMENTAL_FLAG=1 — never over ACP. Verified live: with the
+//     file in place, a session/prompt delegation answered `subagent error:
+//     Subagent profile "akprobe" was not found` (from inside the worktree,
+//     with and without the experimental flag), while
+//     `KIMI_CODE_EXPERIMENTAL_FLAG=1 kimi --agent akprobe -p` found the very
+//     same file. Writing agent files here would therefore leave dead files in
+//     the user's worktree and report a capability the agent cannot use.
+//
+// Only the subagent side needs a constant: per-profile reasons are
+// adapter-supplied, while a missing system-prompt channel is described by the
+// shared unsupportedDetail wording, so a downgrade and a refusal read alike.
+const kimiNoCustomSubagents = "Kimi Code agents cannot be given custom subagent " +
+	"profiles over ACP (its subagent set is fixed: coder, explore, plan)"
 
 func (h *kimiHarness) Launch(spec harness.StartSpec) (harness.Launched, error) {
 	th, err := h.ksup.Start(kimi.StartOptions{
@@ -64,11 +91,15 @@ func (h *kimiHarness) Launch(spec harness.StartSpec) (harness.Launched, error) {
 	// Kimi assigns its own session id during the ACP handshake, and downgrades a
 	// rejected model/thinking/mode to its default — report what the handshake
 	// actually applied (not the request) so the record replays reality.
+	// A requested persona or subagent profile is reported unapplied rather than
+	// emulated — see the kimiNo* constants for the probe results behind that.
 	return harness.Launched{
-		SessionID:      th.SessionID(),
-		Model:          th.Model(),
-		Effort:         th.Thinking(),
-		PermissionMode: th.Mode(),
+		SessionID:           th.SessionID(),
+		Model:               th.Model(),
+		Effort:              th.Thinking(),
+		PermissionMode:      th.Mode(),
+		SystemPromptApplied: false,
+		Agents:              harness.UnappliedAgents(spec.Agents, kimiNoCustomSubagents),
 	}, nil
 }
 

@@ -101,6 +101,10 @@ func TestUnappliedOptions(t *testing.T) {
 type fakeHarness struct {
 	mu   sync.Mutex
 	last harness.StartSpec
+	// personaApplied makes the fake stand in for a harness that DOES support
+	// the plan 16 P3 persona channels; the zero value stands in for one that
+	// does not and reports nothing about them.
+	personaApplied bool
 }
 
 func (f *fakeHarness) Capabilities() harness.Capabilities {
@@ -110,11 +114,27 @@ func (f *fakeHarness) Capabilities() harness.Capabilities {
 func (f *fakeHarness) Launch(spec harness.StartSpec) (harness.Launched, error) {
 	f.mu.Lock()
 	f.last = spec
+	persona := f.personaApplied
 	f.mu.Unlock()
-	return harness.Launched{
+	out := harness.Launched{
 		SessionID: spec.SessionID, Model: "fake-small",
 		Effort: spec.Effort, PermissionMode: "default",
-	}, nil
+	}
+	if persona {
+		out.SystemPromptApplied = spec.SystemPrompt != ""
+		for _, p := range spec.Agents {
+			out.Agents = append(out.Agents,
+				harness.AppliedAgent{Name: p.Name, Applied: true})
+		}
+	}
+	return out, nil
+}
+
+// spec returns the StartSpec of the last Launch.
+func (f *fakeHarness) spec() harness.StartSpec {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.last
 }
 
 func (f *fakeHarness) Send(string, string, []agent.Attachment) error { return nil }
@@ -209,8 +229,13 @@ func permAutoResponder(t *testing.T, sock string, broker *permission.Broker,
 // orchTestCore spins a real IPC server with the orchestration handlers over
 // real (empty) supervisors plus a registered fakeHarness, and returns a
 // connected client.
-func orchTestCore(t *testing.T, sessions *session.Store, turns *agent.TurnTracker) *ipc.Client {
+func orchTestCore(t *testing.T, sessions *session.Store, turns *agent.TurnTracker,
+	fakes ...*fakeHarness) *ipc.Client {
 	t.Helper()
+	fake := &fakeHarness{}
+	if len(fakes) > 0 {
+		fake = fakes[0]
+	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	sock := filepath.Join(t.TempDir(), "orch.sock")
 	srv := ipc.NewServer(sock, log)
@@ -218,7 +243,7 @@ func orchTestCore(t *testing.T, sessions *session.Store, turns *agent.TurnTracke
 	sup := agent.NewSupervisor("", log, func(string, []json.RawMessage) {})
 	harnesses := harness.NewRegistry("claude")
 	harnesses.Register(newClaudeHarness(sup, "", ""))
-	harnesses.Register(&fakeHarness{})
+	harnesses.Register(fake)
 	gitCache := gitstatus.NewCache(log)
 	t.Cleanup(func() { _ = gitCache.Close() })
 	d := handlerDeps{
@@ -520,6 +545,75 @@ func TestLaunchWorkerAppliedTruth(t *testing.T) {
 	if parent, _ := sessions.Get("t-parent"); parent.Role != session.RoleController {
 		t.Fatalf("parent role = %q, want controller", parent.Role)
 	}
+}
+
+// TestLaunchWorkerPersonaAppliedTruth drives the persona channels (plan 16 P3)
+// through the whole launch path: agent.launchWorker params → agentStartParams
+// → StartSpec (the harness sees them verbatim) → Launched → the applied-truth
+// the bridge renders. A harness that applies neither must have both NAMED as
+// unapplied; one that applies both must report them and name nothing.
+func TestLaunchWorkerPersonaAppliedTruth(t *testing.T) {
+	profiles := []map[string]any{{
+		"name": "reviewer", "description": "Reviews code",
+		"prompt": "You review.", "tools": []string{"Read"}, "model": "fake-small",
+	}}
+	launch := func(t *testing.T, fake *fakeHarness) (map[string]any, harness.StartSpec) {
+		t.Helper()
+		sessions := testSessions(t)
+		if err := sessions.Put(session.Record{
+			ThreadID: "t-parent", Project: t.TempDir(), Created: time.Now(),
+		}); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+		client := orchTestCore(t, sessions, agent.NewTurnTracker(), fake)
+		var res map[string]any
+		if err := client.Call("agent.launchWorker", map[string]any{
+			"parentThreadId": "t-parent",
+			"backend":        "fake",
+			"prompt":         "do the thing",
+			"isolation":      "workspace",
+			"systemPrompt":   "You are the arena's scout.",
+			"agents":         profiles,
+		}, &res); err != nil {
+			t.Fatalf("launchWorker: %v", err)
+		}
+		return res, fake.spec()
+	}
+
+	t.Run("unsupported", func(t *testing.T) {
+		res, spec := launch(t, &fakeHarness{})
+		// The harness must SEE the request even when it cannot honor it.
+		if spec.SystemPrompt != "You are the arena's scout." || len(spec.Agents) != 1 ||
+			spec.Agents[0].Name != "reviewer" || spec.Agents[0].Model != "fake-small" ||
+			len(spec.Agents[0].Tools) != 1 || spec.Agents[0].Tools[0] != "Read" {
+			t.Fatalf("StartSpec persona = %q / %+v", spec.SystemPrompt, spec.Agents)
+		}
+		if res["systemPromptApplied"] != false || res["appliedAgents"] != nil {
+			t.Errorf("applied persona reported for a harness without it: %v", res)
+		}
+		var options []string
+		for _, u := range res["unapplied"].([]any) {
+			options = append(options, u.(map[string]any)["option"].(string))
+		}
+		if len(options) != 2 || options[0] != "system_prompt" ||
+			options[1] != "agents[reviewer]" {
+			t.Fatalf("unapplied = %v, want the system prompt and the profile", options)
+		}
+	})
+
+	t.Run("supported", func(t *testing.T) {
+		res, _ := launch(t, &fakeHarness{personaApplied: true})
+		if res["systemPromptApplied"] != true {
+			t.Errorf("systemPromptApplied = %v", res["systemPromptApplied"])
+		}
+		applied, _ := res["appliedAgents"].([]any)
+		if len(applied) != 1 || applied[0] != "reviewer" {
+			t.Errorf("appliedAgents = %v", res["appliedAgents"])
+		}
+		if u, _ := res["unapplied"].([]any); len(u) != 0 {
+			t.Errorf("fully applied persona reported as unapplied: %v", u)
+		}
+	})
 }
 
 // stubCore registers canned RPC handlers and returns a bridge wired to them,

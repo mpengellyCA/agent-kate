@@ -49,6 +49,8 @@ HarnessTraits claudeDefaults()
     t.providerRouting = t.cowork = true;
     t.usageReporting = t.sessionBrowse = true;
     t.transcriptPreview = true; // claude keeps the on-disk session store
+    // --append-system-prompt and --agents, both verified in print mode.
+    t.systemPrompt = t.customSubagents = true;
     // Models are discovered live (`claude -p /model`, or a routed provider's
     // /v1/models); mode/effort stay static vocabularies below.
     t.modelPicker = QStringLiteral("discovered");
@@ -69,7 +71,9 @@ HarnessTraits kimiDefaults()
     t.effortLive = true;
     t.sessionBrowse = true; // session/list via a one-shot probe (mirrors the Go adapter)
     // transcriptPreview stays false: kimi's transcript is the core's event log,
-    // not a previewable/forgettable on-disk store.
+    // not a previewable/forgettable on-disk store. systemPrompt and
+    // customSubagents stay false too: `kimi acp` takes no system-prompt channel
+    // and resolves subagents from a compiled-in set (see harness_kimi.go).
     t.modelPicker = QStringLiteral("discovered");
     return t;
 }
@@ -89,6 +93,8 @@ HarnessTraits fromJson(const QJsonObject &o)
     t.usageReporting = o.value(QStringLiteral("usageReporting")).toBool();
     t.sessionBrowse = o.value(QStringLiteral("sessionBrowse")).toBool();
     t.transcriptPreview = o.value(QStringLiteral("transcriptPreview")).toBool();
+    t.systemPrompt = o.value(QStringLiteral("systemPrompt")).toBool();
+    t.customSubagents = o.value(QStringLiteral("customSubagents")).toBool();
     t.modelPicker = o.value(QStringLiteral("modelPicker")).toString();
     t.permissionModes.clear();
     const QJsonArray modes = o.value(QStringLiteral("permissionModes")).toArray();

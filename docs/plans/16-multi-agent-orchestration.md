@@ -57,14 +57,17 @@ report what was actually applied.
 - ACP `session/new` accepts `cwd` + `mcpServers` (stdio/http/sse forwarded);
   model/thinking/mode are post-handshake `session/set_config_option` values
   (already implemented in `core/internal/kimi/thread.go:486-510`).
-- **Custom agents are discovered from directories**, which works regardless of
-  launch flags: `<project>/.agents/agents/*.md` and `<project>/.kimi-code/agents/*.md`
-  (project scope), `~/.agents/agents/` + `$KIMI_CODE_HOME/agents/` (user scope).
-  Agent file = YAML frontmatter (`name`, `description`, `tools`,
-  `disallowedTools`, `subagents`, `model_preference`) + Markdown body that *is*
-  the system prompt. `model_preference: secondary` routes the subagent to the
-  `[secondary_model]` config model when
-  `KIMI_CODE_EXPERIMENTAL_SECONDARY_MODEL=1` is set.
+- ~~**Custom agents are discovered from directories**, which works regardless of
+  launch flags~~ — **CORRECTED IN P3, see that phase's retrospective.** The
+  directories are real (`<project>/.agents/agents/*.md`,
+  `<project>/.kimi-code/agents/*.md`, `~/.agents/agents/`,
+  `$KIMI_CODE_HOME/agents/`) and the file format is as documented (YAML
+  frontmatter `name`, `description`, `tools`, `disallowedTools`, `subagents`,
+  `model_preference` + a Markdown body that *is* the system prompt), but they
+  are read ONLY by kimi's **v2 engine**, which `kimi acp` never runs. Over ACP
+  the subagent set is a compiled-in table. Directory discovery therefore does
+  NOT work "regardless of launch flags"; it works only under `kimi -p` with
+  `KIMI_CODE_EXPERIMENTAL_FLAG=1`.
 - `$KIMI_CODE_HOME/SYSTEM.md` replaces the main agent's system prompt; kimi
   honors `KIMI_CODE_HOME` for all per-user state (→ per-thread isolation lever).
 - Built-in subagents `coder` / `explore` / `plan`; subagent transcripts live at
@@ -187,11 +190,15 @@ type AgentProfile struct {
   → `--append-system-prompt`; `Agents` → `--agents '<json>'` (verified flag).
   Both fully supported → capabilities true.
 - **Kimi adapter** (`harness_kimi.go` / `core/internal/kimi/thread.go:260-412`):
-  ACP accepts no launch flags, so: `Agents` → write each profile as a Markdown
+  ~~ACP accepts no launch flags, so: `Agents` → write each profile as a Markdown
   agent file into the thread worktree at `.agents/agents/<name>.md` (verified
   project-scope discovery; `model` maps to `model_preference` only as
   primary/secondary — concrete model ids are not expressible, so a non-empty
-  `Model` is reported as *not applied*). `SystemPrompt` → **not supported**:
+  `Model` is reported as *not applied*).~~ **CORRECTED IN P3:** `kimi acp` runs
+  the v1 engine, which resolves subagents from a compiled-in table and reads no
+  agent-file directory at all, so those files would be dead on arrival —
+  `CustomSubagents` is **false** and every profile is reported unapplied. See
+  P3's retrospective for the probe. `SystemPrompt` → **not supported**:
   capability false, `Launched` reports it unapplied, and the caller (Feature 3)
   folds the persona into the opening prompt instead — which works identically on
   both harnesses. (Alternative considered: per-thread `KIMI_CODE_HOME` with a
@@ -327,11 +334,14 @@ them). Fix what's *ours*:
   subagent spawn as a recognizable tool row, and the dialog live-tails the wire
   file with the same chat rendering. Claude keeps its `agent-<id>.jsonl` path —
   one dialog, two adapters behind a harness capability `SubagentTranscripts`.
-- **Kimi custom agents from the UI.** The discovered-agents vocabulary
+- ~~**Kimi custom agents from the UI.** The discovered-agents vocabulary
   (project + user `.agents/agents/`, `.kimi-code/agents/`) can be surfaced as
-  "subagent profiles" in the ensemble editor's worker rows (read-only listing via
-  a `kimi`-side probe, mirroring `DiscoverOptions`). Main-agent `--agent`
-  selection remains unavailable over ACP — documented, not emulated.
+  "subagent profiles" in the ensemble editor's worker rows.~~ **DROPPED by
+  P3's probe:** those directories feed kimi's v2 engine only, so an ACP thread
+  can use none of them — listing them in the editor would offer the user
+  profiles their agent cannot reach. Kimi's usable subagent vocabulary over
+  ACP is exactly `coder` / `explore` / `plan`. Main-agent `--agent` selection
+  likewise remains unavailable over ACP — documented, not emulated.
 - **Skills for kimi threads.** The skills installer currently symlinks into
   `<target>/.claude/skills/` (`core/internal/skills`) — Claude-shaped. Extend to
   also link `.agents/skills/` (kimi's cross-tool discovery dir, same convention
@@ -543,9 +553,99 @@ static-true for Claude, false/absent for Kimi unless noted):
     receive its response and NOTHING else (the `NotifyUI` exclusion, proven
     from the excluded side), `bridge.identify` from a UI connection is
     refused, and the panic path is pinned end to end.
-- **P3 — Persona channel + custom subagents (Feature 2)**. `StartSpec`
-  extensions, claude `--append-system-prompt`/`--agents`, kimi agent-file
-  writer, capability flags, applied-truth reporting.
+- **P3 — Persona channel + custom subagents (Feature 2). ✅ LANDED.**
+  `StartSpec.SystemPrompt` + `StartSpec.Agents []AgentProfile`, the
+  `SystemPrompt`/`CustomSubagents` capability flags, claude
+  `--append-system-prompt`/`--agents`, per-profile applied-truth in
+  `Launched`, `agent.start` + `launch_agent` plumbing, UI fallback traits.
+  `scripts/smoke-orchestrate.py` green in both directions with the SAME
+  persona request: applied on the claude worker, named as NOT APPLIED on the
+  kimi one.
+
+  **Probed before writing either adapter** (claude 2.1.220, kimi 0.30.0 — the
+  plan-14/15 convention; every fact below was observed, none taken from docs):
+  - `--append-system-prompt` works in print mode: a probe persona
+    ("end every reply with ZEBRAFISH-7788") changed the reply, the control run
+    did not.
+  - `--agents` is honored in print mode — the init event's `agents` array
+    lists the custom name alongside the built-ins — and **its `tools` and
+    `model` are both real**: a haiku main agent delegating to a profile with
+    `{"tools":["Read","Glob"],"model":"sonnet"}` produced a subagent that
+    reported exactly Read and Glob, and whose transcript
+    (`subagents/agent-*.jsonl`) recorded `claude-sonnet-5` while the main
+    transcript recorded `claude-haiku-4-5-20251001`. So no claude field is
+    reported unapplied for a well-formed profile.
+  - **`--agents` validates NOTHING.** Malformed JSON, an entry missing
+    `description` or `prompt`, and `tools` given as a comma-separated string
+    are each accepted with exit 0 and the agent (or the whole flag) silently
+    vanishes — the init event's `agents` array is the only tell. The map KEY
+    is the name; a `name` field inside the object is ignored; unknown extra
+    fields are tolerated; a bogus `model` id is accepted at registration. The
+    adapter therefore does the validating: a profile claude would silently
+    discard is refused up front and reported unapplied instead.
+  - **The plan's kimi premise was wrong, and this is the phase's one real
+    deviation.** `kimi acp` runs kimi's **v1 engine**, whose subagent resolver
+    reads a compiled-in profile table (`DEFAULT_AGENT_PROFILES` →
+    `agent`/`coder`/`explore`/`plan`, loaded from bundled YAML) and consults
+    no filesystem catalogue at all. `.agents/agents/*.md` is parsed by
+    `agent-core-v2`, reachable only from `runPrompt` when
+    `KIMI_CODE_EXPERIMENTAL_FLAG` is set — i.e. `kimi -p`, never `kimi acp`.
+    Live proof, with the agent file present in a git **worktree** (`.git` a
+    file, the case that mattered): an ACP `session/prompt` delegation returned
+    `subagent error: Subagent profile "akprobe" was not found` — with the ACP
+    child's process cwd inside the worktree, and again with
+    `KIMI_CODE_EXPERIMENTAL_FLAG=1` in its env — while
+    `KIMI_CODE_EXPERIMENTAL_FLAG=1 kimi --agent akprobe -p` found that very
+    file (and `--agent nosuchagent` enumerated `plan, agent, coder, explore,
+    akprobe`, from `/tmp` only the four built-ins). **So the planned kimi
+    agent-file writer was NOT built**: it would have written files into the
+    user's worktree that the running agent provably cannot read, which is
+    silent emulation. `CustomSubagents` is false for kimi, and every requested
+    profile is reported unapplied with the reason. (The v2 frontmatter parser,
+    read out of the binary, also pins the format for whenever ACP does reach
+    v2: `description` required, name kebab-case and defaulted from the
+    filename, `tools` a list *or* a comma string, `model_preference` strictly
+    `primary`/`secondary` — a concrete model id is a parse ERROR, not a
+    downgrade, which is why the plan's "map Model to model_preference" idea
+    was never expressible anyway.)
+
+  Where the sketch met the real code:
+  - **`Launched` reports per-profile truth, not one flag.** A harness can lose
+    a whole profile (kimi) or one field of it, so `Launched.Agents` carries one
+    `AppliedAgent{Name, Applied, Unapplied []string}` per REQUESTED profile, in
+    request order. `harness.UnappliedAgents(profiles, reason)` is the one-liner
+    for a capability-false adapter. `unappliedPersona` (orchestrate.go) turns
+    that into the same `unapplied` list P1 already rendered, plus a
+    **backstop**: any requested profile the adapter reported nothing about is
+    named anyway, so a future adapter that ignores `spec.Agents` cannot make
+    the request disappear.
+  - **The claude argv builder moved out of `Supervisor.Start`.** The flags
+    were untestable without spawning the CLI; `buildStartArgs(opts)` is now a
+    pure function (`internal/agent/startargs_test.go` pins the two new flags,
+    that `--system-prompt` is never used — it would REPLACE claude's own
+    prompt and hide the tool/skill injections — and the resume/fork/cowork
+    argv that came along for the ride).
+  - **The `--agents` JSON is built in the adapter, not the supervisor.**
+    `harness_claude.go` owns the CLI's vocabulary (which fields exist, which
+    are required), and `agent.StartOptions.AgentsJSON` is the rendered
+    payload. That keeps the "what claude accepts" knowledge in the same file
+    as the capability that claims it.
+  - **One wording for capability gates, two exits.** `unsupported()` (the hard
+    RPC error) and the persona reports now share `unsupportedDetail()`, so a
+    downgrade and a refusal describe a missing capability identically.
+  - The bridge passes both channels through **verbatim** as
+    `harness.AgentProfile` — the bridge is the same package as the core, so
+    the neutral shape is shared rather than re-declared, and `launch_agent`'s
+    schema advertises `system_prompt` + `agents` with `name`/`description`/
+    `prompt` required. Its result gained `System prompt: …` /
+    `Subagent profiles available to the worker: …` lines, and `NOT APPLIED:
+    <option> — <reason>.` for entries that carry a reason instead of a
+    downgraded value.
+  - `kimi -p` + `KIMI_CODE_EXPERIMENTAL_FLAG=1` is NOT a workaround worth
+    taking: it is a different protocol (v1 event shapes, no ACP session
+    handshake, no `session/set_config_option`), i.e. a second kimi harness,
+    not a P3 flag. Left for a future plan if the v2 engine ever reaches ACP.
+  - No UI beyond the two fallback traits, as scoped — P4 gates on them.
 - **P4 — Ensembles (Feature 3)**. `core/internal/modes`, `mode.*` RPCs, built-in
   ensembles, master-prompt template, `NewAgentDialog`/quick-menu picker,
   ensemble editor dialog.

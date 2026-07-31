@@ -24,6 +24,11 @@ func TestHarnessCapabilities(t *testing.T) {
 		"SessionBrowse":     claude.SessionBrowse,
 		"TranscriptPreview": claude.TranscriptPreview,
 		"MintsSessionID":    claude.MintsSessionID,
+		// Verified against claude 2.1.220 in print mode: the persona reaches
+		// the model via --append-system-prompt, and --agents registers custom
+		// subagents whose tools and model are both honored.
+		"SystemPrompt":    claude.SystemPrompt,
+		"CustomSubagents": claude.CustomSubagents,
 	} {
 		if !got {
 			t.Errorf("claude capability %s = false, want true", name)
@@ -55,6 +60,13 @@ func TestHarnessCapabilities(t *testing.T) {
 		"UsageReporting":    kimi.UsageReporting,
 		"TranscriptPreview": kimi.TranscriptPreview,
 		"MintsSessionID":    kimi.MintsSessionID,
+		// `kimi acp` exposes no system-prompt channel, and its v1 engine
+		// resolves subagents from a COMPILED-IN table (coder/explore/plan) —
+		// the .agents/agents/*.md catalogue belongs to the v2 engine, which is
+		// reachable only through `kimi -p` with KIMI_CODE_EXPERIMENTAL_FLAG=1.
+		// Probed live on kimi 0.30.0; see harness_kimi.go.
+		"SystemPrompt":    kimi.SystemPrompt,
+		"CustomSubagents": kimi.CustomSubagents,
 	} {
 		if got {
 			t.Errorf("kimi capability %s = true, want false (honestly gated, not emulated)", name)

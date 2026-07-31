@@ -33,6 +33,13 @@ struct HarnessTraits {
     bool usageReporting = false;
     bool sessionBrowse = false;
     bool transcriptPreview = false; // previewable/forgettable on-disk transcript
+    // Persona channels. systemPrompt: the engine runs caller-supplied persona
+    // text alongside its own system prompt. customSubagents: it accepts
+    // caller-defined subagent profiles for the session. Where either is false
+    // the core reports the request as a downgrade instead of emulating it, and
+    // the persona belongs in the opening message.
+    bool systemPrompt = false;
+    bool customSubagents = false;
 
     QString modelPicker = QStringLiteral("tiers"); // "tiers" | "discovered"
     // Static vocabularies (wire values; the UI owns the human labels). Empty =

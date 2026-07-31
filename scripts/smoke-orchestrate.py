@@ -7,10 +7,15 @@ Starts akcore and runs BOTH orchestration directions through the JSON-RPC bus:
      to start a Kimi worker with wait=true, and reports the worker's reply;
   B. a Kimi controller does the same in reverse, launching a Claude worker.
 
+Both launches also request the plan 16 P3 persona channels (a system prompt
+and a custom subagent profile), which Claude supports and Kimi does not — so
+the same call must come back APPLIED in one direction and NOT APPLIED, named,
+in the other.
+
 A passing run proves the launch_agent/wait_agent bridge tools, the synchronous
 agent.launchWorker path, the agent.wait turn tracker, the ParentThreadID/Role
-linkage in agent.list, and the core-broadcast `mcp.activity` feed (plan 16 P2)
-— for both harnesses in both roles.
+linkage in agent.list, the core-broadcast `mcp.activity` feed (plan 16 P2) and
+the persona applied-truth (plan 16 P3) — for both harnesses in both roles.
 
 Requires: a built ./build/akcore and authenticated `claude` + `kimi` CLIs.
 Run unbuffered for live output:  python3 -u scripts/smoke-orchestrate.py
@@ -119,13 +124,18 @@ class Bus:
 
 
 def run_direction(bus, name, controller_backend, controller_extra, prompt,
-                  worker_backend, magic_word):
-    """Start a controller, let it orchestrate one worker, verify the outcome."""
+                  worker_backend, magic_word, persona_applied):
+    """Start a controller, let it orchestrate one worker, verify the outcome.
+
+    persona_applied says whether the WORKER's engine supports the P3 persona
+    channels, i.e. whether launch_agent must report them applied or must name
+    them in its NOT APPLIED list.
+    """
     log(f"\n=== direction {name}: {controller_backend or 'claude'} controller "
         f"-> {worker_backend} worker ===")
     checks = {}
     state = {"thread": None, "done": False, "tool_use": False,
-             "launched": False, "magic": False}
+             "launched": False, "magic": False, "launch_text": ""}
     acts = []  # mcp.activity notifications (plan 16 P2's core-side MCP feed)
 
     start = bus.call("agent.start", dict(controller_extra,
@@ -170,6 +180,7 @@ def run_direction(bus, name, controller_backend, controller_extra, prompt,
                             x.get("text", "") for x in c if isinstance(x, dict))
                         if "Launched worker" in txt:
                             state["launched"] = True
+                            state["launch_text"] = txt
             if ev.get("type") == "result":
                 if magic_word in str(ev.get("result", "")):
                     state["magic"] = True
@@ -182,6 +193,25 @@ def run_direction(bus, name, controller_backend, controller_extra, prompt,
     checks["controller called launch_agent"] = state["tool_use"]
     checks["launch_agent reported a launched worker"] = state["launched"]
     checks[f"controller relayed the worker's reply ({magic_word})"] = state["magic"]
+
+    # Persona applied-truth (P3): the same request, honestly reported per
+    # engine — applied where the CLI has the channel, NAMED where it does not.
+    launch_text = state["launch_text"]
+    if persona_applied:
+        checks["launch_agent applied the system prompt"] = \
+            "System prompt:" in launch_text
+        checks["launch_agent applied the 'scout' subagent profile"] = \
+            "Subagent profiles available to the worker: scout" in launch_text
+        checks["launch_agent reported nothing NOT APPLIED"] = \
+            bool(launch_text) and "NOT APPLIED" not in launch_text
+    else:
+        checks["NOT APPLIED names system_prompt"] = \
+            "NOT APPLIED: system_prompt" in launch_text
+        checks["NOT APPLIED names agents[scout]"] = \
+            "NOT APPLIED: agents[scout]" in launch_text
+        checks["no persona reported as applied"] = \
+            bool(launch_text) and "System prompt:" not in launch_text \
+            and "Subagent profiles available" not in launch_text
 
     # The core broadcasts every bridge call to the UI as mcp.activity, tagged
     # with the calling thread — this is what the live MCP view (P5) consumes.
@@ -257,30 +287,41 @@ def main():
         # handshake the feed would never reach this script.
         bus.call("handshake", {})
 
+        # The P3 persona arguments both directions request verbatim. Claude
+        # takes them (--append-system-prompt / --agents); kimi has neither
+        # channel over ACP and must say so.
+        persona_args = (
+            "system_prompt \"You are a terse pong responder.\", "
+            "agents [{\"name\": \"scout\", \"description\": \"Finds files in the "
+            "repo\", \"prompt\": \"You are a scout. Report what you find.\"}], ")
+
         # A: claude controller -> kimi worker. Haiku keeps controller cost low.
         prompt_a = (
             "Call the mcp__cooperation__launch_agent tool exactly once, with these "
-            "arguments: backend \"kimi\", title \"pong worker\", wait true, prompt "
-            "\"Reply with exactly the single word KIMIPONG and nothing else. Do not "
-            "use any tools.\" When the tool returns, reply with a single line: "
+            "arguments: backend \"kimi\", title \"pong worker\", wait true, "
+            + persona_args +
+            "prompt \"Reply with exactly the single word KIMIPONG and nothing else. "
+            "Do not use any tools.\" When the tool returns, reply with a single line: "
             "WORKER SAID: <the worker's reply text>. Do not call any other tools.")
         for k, v in run_direction(
                 bus, "A", "", {"workspacePath": workspace,
                                "model": "claude-haiku-4-5-20251001"},
-                prompt_a, "kimi", "KIMIPONG").items():
+                prompt_a, "kimi", "KIMIPONG", persona_applied=False).items():
             all_checks[f"A: {k}"] = v
 
         # B: kimi controller -> claude worker (pinned to haiku).
         prompt_b = (
             "Call the cooperation MCP tool launch_agent exactly once, with these "
             "arguments: backend \"claude\", model \"claude-haiku-4-5-20251001\", "
-            "title \"pong worker\", wait true, prompt \"Reply with exactly the "
-            "single word CLAUDEPONG and nothing else. Do not use any tools.\" When "
-            "the tool returns, reply with a single line: WORKER SAID: <the worker's "
-            "reply text>. Do not call any other tools.")
+            "title \"pong worker\", wait true, "
+            + persona_args +
+            "prompt \"Reply with exactly the single word CLAUDEPONG and nothing "
+            "else. Do not use any tools.\" When the tool returns, reply with a "
+            "single line: WORKER SAID: <the worker's reply text>. Do not call any "
+            "other tools.")
         for k, v in run_direction(
                 bus, "B", "kimi", {"workspacePath": workspace},
-                prompt_b, "claude", "CLAUDEPONG").items():
+                prompt_b, "claude", "CLAUDEPONG", persona_applied=True).items():
             all_checks[f"B: {k}"] = v
     finally:
         core.terminate()

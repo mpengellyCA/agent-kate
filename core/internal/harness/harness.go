@@ -56,6 +56,18 @@ type Capabilities struct {
 	// captured from the init event.
 	MintsSessionID bool `json:"mintsSessionId"`
 
+	// SystemPrompt: the CLI takes caller-supplied persona text ALONGSIDE its
+	// own system prompt (claude --append-system-prompt). False means the
+	// channel does not exist — Launch reports a requested StartSpec.SystemPrompt
+	// as unapplied and the caller folds the persona into the opening message
+	// instead, which works on every harness.
+	SystemPrompt bool `json:"systemPrompt"`
+	// CustomSubagents: the CLI takes caller-defined subagent profiles for the
+	// session (claude --agents), so the thread's agent can delegate to them.
+	// False means the CLI's subagent vocabulary is fixed; Launch reports every
+	// requested StartSpec.AgentProfile as unapplied.
+	CustomSubagents bool `json:"customSubagents"`
+
 	ModelPicker string `json:"modelPicker"` // ModelPickerTiers | ModelPickerDiscovered
 	// PermissionModes / Efforts: the harness's static vocabularies (values
 	// only; the UI owns the human labels). Empty = the vocabulary is
@@ -109,6 +121,52 @@ type StartSpec struct {
 
 	Cowork   bool            // opt into the Cowork desktop MCP server
 	Provider *agent.Provider // third-party API routing; nil = direct
+
+	// SystemPrompt is persona text to run the thread's agent with, on top of
+	// the CLI's own system prompt. Gated by Capabilities.SystemPrompt: a
+	// harness without the channel reports it unapplied rather than emulating
+	// it (an emulated persona would silently outrank the CLI's own prompt).
+	SystemPrompt string
+	// Agents are custom subagent definitions the thread's agent may delegate
+	// to. Gated by Capabilities.CustomSubagents; reported per profile in
+	// Launched.Agents, since a harness may express some fields and not others.
+	Agents []AgentProfile
+}
+
+// AgentProfile is one custom subagent definition, harness-neutrally. Adapters
+// translate it into their CLI's own vocabulary and report, per profile, what
+// they could express (Launched.Agents).
+type AgentProfile struct {
+	Name        string   `json:"name"`
+	Description string   `json:"description"`
+	Prompt      string   `json:"prompt"`          // body / system prompt
+	Tools       []string `json:"tools,omitempty"` // allowlist; empty = all
+	Model       string   `json:"model,omitempty"` // harness-specific id or ""
+}
+
+// AppliedAgent is the applied-truth for one requested AgentProfile: whether
+// the profile reached the CLI at all, and — when it did — which of its fields
+// the CLI could not express. Reasons are human-readable; they reach the
+// launching agent verbatim.
+type AppliedAgent struct {
+	Name      string   // the profile's name, as requested
+	Applied   bool     // the profile itself reached the harness
+	Unapplied []string // what could not be expressed; empty = fully applied
+}
+
+// UnappliedAgents reports every requested profile as not applied under one
+// shared reason — what an adapter whose CustomSubagents capability is false
+// returns from Launch, so the request surfaces as a downgrade instead of
+// vanishing.
+func UnappliedAgents(profiles []AgentProfile, reason string) []AppliedAgent {
+	if len(profiles) == 0 {
+		return nil
+	}
+	out := make([]AppliedAgent, 0, len(profiles))
+	for _, p := range profiles {
+		out = append(out, AppliedAgent{Name: p.Name, Unapplied: []string{reason}})
+	}
+	return out
 }
 
 // Launched reports what a Launch actually applied, for the thread's record —
@@ -119,6 +177,14 @@ type Launched struct {
 	Model          string
 	Effort         string
 	PermissionMode string
+
+	// SystemPromptApplied reports whether a requested StartSpec.SystemPrompt
+	// actually reached the CLI. False with no request simply means none was
+	// asked for — callers compare it against what they sent.
+	SystemPromptApplied bool
+	// Agents carries one entry per requested StartSpec.AgentProfile, in the
+	// same order, so a caller can name exactly which profile lost what.
+	Agents []AppliedAgent
 }
 
 // Harness is one agent backend. Implementations wrap a supervisor owning the

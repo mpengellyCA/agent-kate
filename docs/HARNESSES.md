@@ -81,10 +81,43 @@ Declare `Capabilities()` honestly — every flag gates real behavior:
 | `MintsSessionID` | whether the core pre-mints the session id (claude `--session-id`) or your CLI assigns one that `Launch` reports back |
 | `ModelPicker` | `tiers` (fixed tokens the core resolves) vs `discovered` (per-session enumeration + free text) |
 | `PermissionModes` / `Efforts` | static vocabularies; empty = discovered per session via `configOptions` |
+| `SystemPrompt` | whether `StartSpec.SystemPrompt` reaches the CLI (persona alongside its own prompt) |
+| `CustomSubagents` | whether `StartSpec.Agents` reaches the CLI (caller-defined subagent profiles) |
 
 **Do not emulate what the CLI lacks.** A missing capability is honestly gated
 with one shared message ("X is not supported by <DisplayName> agents"), never
 faked.
+
+### The two persona channels
+
+`StartSpec` carries a persona in two forms, each capability-gated:
+
+- **`SystemPrompt`** — text the agent runs with in ADDITION to the CLI's own
+  system prompt. A flag that *replaces* the prompt is not this channel: it
+  hides the CLI's tool and skill injections, so an adapter without an additive
+  flag declares `SystemPrompt: false` rather than substituting one.
+- **`Agents []AgentProfile`** — `{Name, Description, Prompt, Tools, Model}`
+  subagent definitions for the session (`Tools` empty = all tools, `Model`
+  empty = the thread's own).
+
+Neither is ever a hard failure. `Launch` reports what it managed —
+`Launched.SystemPromptApplied`, and one `Launched.AppliedAgent` per requested
+profile naming per-field losses — and the orchestration layer surfaces the
+rest as downgrades. An adapter whose capability is false returns
+`harness.UnappliedAgents(spec.Agents, reason)` and leaves
+`SystemPromptApplied` false; there is a backstop for the profiles an adapter
+forgets to report, so a request can be refused but never silently dropped.
+
+Today: **claude** applies both (`--append-system-prompt`, `--agents`; the
+`--agents` JSON keys the profile by name and honors `tools` and `model`, but
+validates nothing — the adapter refuses profiles the CLI would silently
+discard). **kimi** applies neither: `kimi acp` has no system-prompt channel,
+and its v1 engine resolves subagents from a compiled-in table
+(`coder`/`explore`/`plan`). Kimi's documented `.agents/agents/*.md` catalogue
+belongs to its v2 engine, which is reachable only via `kimi -p` with
+`KIMI_CODE_EXPERIMENTAL_FLAG=1` — never over ACP — so writing agent files
+would leave dead files in the worktree. Callers fold the persona into the
+opening message instead, which behaves identically on every harness.
 
 ## 3. Register it
 

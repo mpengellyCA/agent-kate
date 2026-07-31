@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"agentkate/internal/agent"
@@ -47,6 +48,13 @@ func (h *claudeHarness) Capabilities() harness.Capabilities {
 		SessionBrowse:     true,
 		TranscriptPreview: true, // claude keeps the on-disk session store
 		MintsSessionID:    true,
+		// Both verified against claude 2.1.220 in print mode:
+		// --append-system-prompt reaches the model (a probe persona changed the
+		// reply), and --agents registers custom subagents whose tools AND model
+		// are honored (a haiku main agent's "sonnet" profile ran on
+		// claude-sonnet-5 and saw only its allow-listed tools).
+		SystemPrompt:    true,
+		CustomSubagents: true,
 		// Models are discovered live (`claude -p /model` for direct, the
 		// provider's /v1/models for routed); the picker lists those plus free
 		// text. Permission modes and effort remain static vocabularies below.
@@ -58,6 +66,73 @@ func (h *claudeHarness) Capabilities() harness.Capabilities {
 	}
 }
 
+// claudeAgentEntry is one value of claude's --agents JSON object (the name is
+// the object KEY, not a field). Verified against claude 2.1.220: "description"
+// and "prompt" are required — an entry missing either is dropped SILENTLY,
+// with no CLI error — "tools" must be a JSON array (a comma-separated string
+// drops the whole entry), and "model" is honored for that profile's subagent
+// turns. Unknown extra fields are tolerated.
+type claudeAgentEntry struct {
+	Description string   `json:"description"`
+	Prompt      string   `json:"prompt"`
+	Tools       []string `json:"tools,omitempty"`
+	Model       string   `json:"model,omitempty"`
+}
+
+// buildAgentsJSON renders the profiles claude can actually register into the
+// --agents payload, and reports per-profile applied-truth for the rest. The
+// binary validates nothing (a malformed payload or an incomplete entry is
+// silently ignored), so the checks live here: a profile that would vanish
+// inside the CLI is refused up front and named as unapplied instead.
+func buildAgentsJSON(profiles []harness.AgentProfile) (string, []harness.AppliedAgent) {
+	if len(profiles) == 0 {
+		return "", nil
+	}
+	entries := make(map[string]claudeAgentEntry, len(profiles))
+	applied := make([]harness.AppliedAgent, 0, len(profiles))
+	for _, p := range profiles {
+		name := strings.TrimSpace(p.Name)
+		a := harness.AppliedAgent{Name: p.Name}
+		switch {
+		case name == "":
+			a.Unapplied = []string{"the profile has no name"}
+		case strings.TrimSpace(p.Description) == "":
+			a.Unapplied = []string{"a description is required (Claude Code drops a profile without one)"}
+		case strings.TrimSpace(p.Prompt) == "":
+			a.Unapplied = []string{"a prompt is required (Claude Code drops a profile without one)"}
+		default:
+			if _, dup := entries[name]; dup {
+				a.Unapplied = []string{"another profile is already named " + name}
+				break
+			}
+			entries[name] = claudeAgentEntry{
+				Description: p.Description,
+				Prompt:      p.Prompt,
+				Tools:       p.Tools,
+				Model:       p.Model,
+			}
+			a.Applied = true
+		}
+		applied = append(applied, a)
+	}
+	if len(entries) == 0 {
+		return "", applied
+	}
+	payload, err := json.Marshal(entries)
+	if err != nil {
+		// Unreachable for these field types, but a payload claude would ignore
+		// must never be reported as applied.
+		for i := range applied {
+			if applied[i].Applied {
+				applied[i].Applied = false
+				applied[i].Unapplied = []string{"the profile could not be encoded: " + err.Error()}
+			}
+		}
+		return "", applied
+	}
+	return string(payload), applied
+}
+
 func (h *claudeHarness) Launch(spec harness.StartSpec) (harness.Launched, error) {
 	mcpConfig, err := writeMCPConfig(h.exePath, h.socketPath, spec.ThreadID,
 		spec.WorkDir, spec.Cowork)
@@ -65,6 +140,7 @@ func (h *claudeHarness) Launch(spec harness.StartSpec) (harness.Launched, error)
 		return harness.Launched{}, fmt.Errorf("mcp config: %w", err)
 	}
 	model := resolveModel(spec.Model)
+	agentsJSON, appliedAgents := buildAgentsJSON(spec.Agents)
 	if _, err := h.sup.Start(agent.StartOptions{
 		ID:             spec.ThreadID,
 		WorkDir:        spec.WorkDir,
@@ -79,6 +155,8 @@ func (h *claudeHarness) Launch(spec harness.StartSpec) (harness.Launched, error)
 		ForkSession:    spec.ForkSession,
 		CoworkEnabled:  spec.Cowork,
 		Provider:       spec.Provider,
+		SystemPrompt:   spec.SystemPrompt,
+		AgentsJSON:     agentsJSON,
 	}); err != nil {
 		os.Remove(mcpConfig)
 		return harness.Launched{}, err
@@ -98,6 +176,10 @@ func (h *claudeHarness) Launch(spec harness.StartSpec) (harness.Launched, error)
 		Model:          model,
 		Effort:         spec.Effort,
 		PermissionMode: mode,
+		// --append-system-prompt is unconditional once the CLI has started, so
+		// the request IS the applied truth here.
+		SystemPromptApplied: spec.SystemPrompt != "",
+		Agents:              appliedAgents,
 	}, nil
 }
 

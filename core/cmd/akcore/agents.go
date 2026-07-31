@@ -68,6 +68,8 @@ func launchThread(d handlerDeps, h harness.Harness, threadID, sessionID string,
 		SessionID:      sessionID,
 		Cowork:         p.CoworkEnabled,
 		Provider:       p.Provider,
+		SystemPrompt:   p.SystemPrompt,
+		Agents:         p.Agents,
 	})
 	if err != nil {
 		emitLifecycle(d, threadID, "error", err.Error(), &wt)
