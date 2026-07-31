@@ -67,6 +67,21 @@ hardening, not an isolation boundary:
 **Bottom line:** the socket is a per-uid boundary. Any process at your uid can
 connect to it.
 
+### Orchestration approvals ride on self-asserted identity
+
+The plan-16 orchestration verbs (`send_agent` / `close_agent` / `discard_agent`
+targeting a thread outside the caller's own worker subtree) require a one-time
+human approval per (caller, target, action), asked through the normal permission
+flow (`core/cmd/akcore/orchestrate.go`, `authorizeAgentTarget`). Note that the
+`fromThreadId` this gate keys on is **self-asserted** by the calling bridge
+process — the IPC server does not bind orchestration RPCs to a connection
+identity the way the Cowork keystone does (§2). Within the trust model above
+that is the intended tier: the gate is a guardrail that keeps a *well-behaved*
+agent from steering or destroying threads it doesn't own without the human
+noticing — it is not authentication, and any same-uid process (including an
+agent's own tools talking to the socket directly) could assert another thread's
+id. Grants live in memory only and last for the current core run.
+
 ---
 
 ## 2. The Cowork keystone — per-connection identity

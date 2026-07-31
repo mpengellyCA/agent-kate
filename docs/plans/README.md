@@ -22,6 +22,7 @@ daily dogfooding. Each item has its own grounded plan file with the relevant
 | 13 | Agent experience overhaul (chat selection/copy, interrupt vs stop, save+autosave, attachments, tool inspector, fork agent, roster cards v2, Git Log v2, Worktrees v2, Cowork control centre, file-browser worktree tabs) | Core (Go) + UI (C++) | [13-agent-experience-overhaul.md](13-agent-experience-overhaul.md) | XL (11 phases, one major release) |
 | 14 | Harness abstraction & feature parity (capability registry, Engine picker, thinking/plan/subagent/background-shell rendering, mid-session control, context-fill & token observability) | Core (Go) + UI (C++) | [14-harness-abstraction-and-parity.md](14-harness-abstraction-and-parity.md) | XL (7 phases) |
 | 15 | Kimi parity finish (option discovery, engine-aware new-agent quick menu, session browse) | Core (Go) + UI (C++) | [15-kimi-parity-finish.md](15-kimi-parity-finish.md) | M |
+| 16 | Multi-agent orchestration (cross-harness launch/send/wait MCP tools, user-defined controller/worker ensembles, live MCP traffic view, Kimi first-class parity, Claude flag sweep) | Core (Go) + UI (C++) | [16-multi-agent-orchestration.md](16-multi-agent-orchestration.md) | XL (6 phases) |
 
 Size key: **S** ≈ <½ day, **M** ≈ 1–2 days, **L** ≈ 3–5 days.
 

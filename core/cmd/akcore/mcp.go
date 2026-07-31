@@ -406,8 +406,11 @@ func (b *mcpBridge) runTool(name string, args json.RawMessage) (string, error) {
 			return "", fmt.Errorf("thread %s is still running; stop it first or pass force=true",
 				a.ThreadID)
 		}
-		if err := b.client.Call("agent.discard",
-			map[string]any{"threadId": a.ThreadID}, nil); err != nil {
+		// A cross-subtree discard needs a one-time human approval core-side,
+		// which can take minutes — same long timeout as the other gated verbs.
+		if err := b.client.CallTimeout("agent.discard",
+			map[string]any{"threadId": a.ThreadID, "fromThreadId": b.thread},
+			nil, 10*time.Minute); err != nil {
 			return "", err
 		}
 		detail := "removed from registry"
@@ -428,7 +431,11 @@ func (b *mcpBridge) runTool(name string, args json.RawMessage) (string, error) {
 			Effort         string `json:"effort"`
 			Wait           bool   `json:"wait"`
 		}
-		_ = json.Unmarshal(args, &a)
+		if len(args) > 0 {
+			if err := json.Unmarshal(args, &a); err != nil {
+				return "", fmt.Errorf("launch_agent: malformed arguments: %w", err)
+			}
+		}
 		if strings.TrimSpace(a.Prompt) == "" {
 			return "", fmt.Errorf("launch_agent requires a non-empty 'prompt'")
 		}
@@ -491,10 +498,17 @@ func (b *mcpBridge) runTool(name string, args json.RawMessage) (string, error) {
 			Message  string `json:"message"`
 			Wait     bool   `json:"wait"`
 		}
-		_ = json.Unmarshal(args, &a)
+		if len(args) > 0 {
+			if err := json.Unmarshal(args, &a); err != nil {
+				return "", fmt.Errorf("send_agent: malformed arguments: %w", err)
+			}
+		}
 		a.ThreadID = strings.TrimSpace(a.ThreadID)
 		if a.ThreadID == "" || strings.TrimSpace(a.Message) == "" {
 			return "", fmt.Errorf("send_agent requires 'thread_id' and a non-empty 'message'")
+		}
+		if a.ThreadID == b.thread {
+			return "", fmt.Errorf("an agent cannot message itself — %s is your own thread; just continue your turn", b.thread)
 		}
 		// A target outside this agent's own subtree needs one human approval,
 		// which can take minutes — the long timeout mirrors request_permission.
@@ -516,10 +530,17 @@ func (b *mcpBridge) runTool(name string, args json.RawMessage) (string, error) {
 			ThreadID   string `json:"thread_id"`
 			TimeoutSec int    `json:"timeout_sec"`
 		}
-		_ = json.Unmarshal(args, &a)
+		if len(args) > 0 {
+			if err := json.Unmarshal(args, &a); err != nil {
+				return "", fmt.Errorf("wait_agent: malformed arguments: %w", err)
+			}
+		}
 		a.ThreadID = strings.TrimSpace(a.ThreadID)
 		if a.ThreadID == "" {
 			return "", fmt.Errorf("wait_agent requires 'thread_id'")
+		}
+		if a.ThreadID == b.thread {
+			return "", fmt.Errorf("an agent cannot wait on itself — %s is your own thread and its turn is the one running now", b.thread)
 		}
 		return b.waitAgent(a.ThreadID, a.TimeoutSec)
 
@@ -527,13 +548,17 @@ func (b *mcpBridge) runTool(name string, args json.RawMessage) (string, error) {
 		var a struct {
 			ThreadID string `json:"thread_id"`
 		}
-		_ = json.Unmarshal(args, &a)
+		if len(args) > 0 {
+			if err := json.Unmarshal(args, &a); err != nil {
+				return "", fmt.Errorf("close_agent: malformed arguments: %w", err)
+			}
+		}
 		a.ThreadID = strings.TrimSpace(a.ThreadID)
 		if a.ThreadID == "" {
 			return "", fmt.Errorf("close_agent requires 'thread_id'")
 		}
 		if a.ThreadID == b.thread {
-			return "", fmt.Errorf("an agent cannot close itself — ask the human to close this thread")
+			return "", fmt.Errorf("an agent cannot close itself — %s is your own thread; ask the human to close it", b.thread)
 		}
 		// Stopping a busy thread waits for its turn to wind down, and a
 		// cross-subtree target may need a human approval first.
@@ -626,7 +651,7 @@ func (b *mcpBridge) waitAgent(threadID string, timeoutSec int) (string, error) {
 	case "idle":
 		fmt.Fprintf(&sb, "Agent %s is idle (turn complete; it accepts follow-ups via send_agent).\n", threadID)
 	case "exited":
-		fmt.Fprintf(&sb, "Agent %s has finished and its process exited (send_agent would resume it — ask the human if unsure).\n", threadID)
+		fmt.Fprintf(&sb, "Agent %s has finished and its process has exited. It cannot receive send_agent messages while dormant — the human (or agent.resume) must bring it back first.\n", threadID)
 	case "timeout":
 		fmt.Fprintf(&sb, "Timed out after %ds: agent %s is STILL WORKING (it may also be blocked on a human permission). Call wait_agent again to keep waiting.\n", effective, threadID)
 	default:
@@ -735,8 +760,10 @@ func toolDefs() []map[string]any {
 			"description": "Permanently delete an agent thread: stop its process, remove " +
 				"its git worktree, and delete its branch. DESTRUCTIVE — any uncommitted " +
 				"work in that worktree is lost. Refuses to discard the calling agent or " +
-				"a running thread (pass force=true to override the running check). Use " +
-				"list_agents first to pick the right thread_id.",
+				"a running thread (pass force=true to override the running check). " +
+				"Targets outside your own worker subtree need a one-time human approval " +
+				"(the grant lasts for the current Agent Kate run). Use list_agents first " +
+				"to pick the right thread_id.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -757,22 +784,21 @@ func toolDefs() []map[string]any {
 			"description": "Launch a WORKER: a real Agent Kate agent thread parented to you. " +
 				"It gets its own worktree (per 'isolation'), appears in the human's roster " +
 				"with a live transcript, and the human can inspect or take it over at any " +
-				"time. 'backend' is an engine id from this arena's registry — \"claude\" " +
-				"(Claude Code) or \"kimi\" (Kimi Code); omit it to use your own engine. " +
-				"'model' must belong to that backend's vocabulary (see agent list / ask the " +
-				"human if unsure); options the backend rejects are reported back as NOT " +
-				"APPLIED — never silently emulated. Workers needing tool approval prompt " +
-				"the HUMAN, which can stall an unattended worker: pass permission_mode " +
-				"\"acceptEdits\" (or \"auto\" on claude) for autonomous work. With " +
-				"wait=true this call blocks until the worker finishes its first turn and " +
-				"returns its reply.",
+				"time. 'backend' is an engine id from this arena's registry (list_agents " +
+				"shows each thread's engine; ask the human if unsure); omit it to use your " +
+				"own engine. 'model' must belong to that backend's vocabulary; options the " +
+				"backend rejects are reported back as NOT APPLIED — never silently " +
+				"emulated. Workers needing tool approval prompt the HUMAN, which can stall " +
+				"an unattended worker: pass an auto-approving permission_mode (e.g. " +
+				"\"acceptEdits\") for autonomous work. With wait=true this call blocks " +
+				"until the worker finishes its first turn and returns its reply.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"prompt": map[string]any{"type": "string",
 						"description": "The worker's opening instruction (its whole briefing)."},
 					"backend": map[string]any{"type": "string",
-						"description": "Engine id: \"claude\" or \"kimi\". Empty = same engine as you."},
+						"description": "Engine id from the arena's registry. Empty = same engine as you."},
 					"model": map[string]any{"type": "string",
 						"description": "Model id in the target backend's vocabulary. Empty = its default."},
 					"title": map[string]any{"type": "string",
@@ -792,9 +818,10 @@ func toolDefs() []map[string]any {
 		{
 			"name": "send_agent",
 			"description": "Send a follow-up message to a running agent thread (use " +
-				"list_agents for ids). Targets outside your own worker subtree need a " +
-				"one-time human approval. Set wait=true to block until the reply lands " +
-				"and get its text back.",
+				"list_agents for ids; not your own). Targets outside your own worker " +
+				"subtree need a one-time human approval (the grant lasts for the current " +
+				"Agent Kate run). Set wait=true to block until the reply lands and get " +
+				"its text back.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -833,7 +860,7 @@ func toolDefs() []map[string]any {
 				"— the record and worktree survive and the human can restore it; use " +
 				"discard_agent only when the worktree should be destroyed. Refuses to " +
 				"close yourself; targets outside your own worker subtree need a one-time " +
-				"human approval.",
+				"human approval (the grant lasts for the current Agent Kate run).",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{

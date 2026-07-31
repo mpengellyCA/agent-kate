@@ -174,6 +174,12 @@ func resumeThread(d handlerDeps, h harness.Harness, rec session.Record, provOver
 		spec.Resume = true
 	}
 
+	// The seeded summary prompt is a real turn: track it so a wait_agent
+	// racing this resume never sees a false idle while the acknowledgement
+	// turn runs. A failed launch emits the "error" lifecycle, which clears it.
+	if seeded {
+		d.turns.TurnQueued(rec.ThreadID)
+	}
 	launched, err := h.Launch(spec)
 	if err != nil {
 		emitLifecycle(d, rec.ThreadID, "error", err.Error(), &rec.Worktree)
@@ -376,6 +382,12 @@ func runHotCompactIfConfigured(d handlerDeps, threadID string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
+	// The compact prompt is a turn the supervisor sends internally; track it
+	// so waiters see the thread busy until the summary's result lands. If the
+	// summary never comes, the imminent exit lifecycle clears the count.
+	if d.turns != nil {
+		d.turns.TurnQueued(threadID)
+	}
 	text, err := d.sup.Compact(ctx, threadID, compact.CompactPrompt)
 	if err != nil {
 		d.log.Warn("hot-opus compact failed", "thread", threadID, "err", err)

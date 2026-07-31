@@ -416,6 +416,37 @@ static-true for Claude, false/absent for Kimi unless noted):
     because this machine's `~/.kimi-code/config.toml` sets
     `default_permission_mode = "auto"`, which auto-approves and bypassed the
     very permission bridge the smoke proves.
+
+  **P1 remediation** (post-landing review of c3c73fc):
+  - `discard_agent` closed the approval hole: the bridge now sends
+    `fromThreadId` and the `agent.discard` handler runs
+    `authorizeAgentTarget` before anything else — cross-subtree discards need
+    the same one-time human approval as send/close; UI discards stay ungated.
+  - Honest wait contract: the "exited" message no longer claims `send_agent`
+    resumes a dormant thread (both backends reject sends to dead processes);
+    it now says the human / `agent.resume` must bring it back.
+  - Untracked-turn gaps: the seeded-resume summary prompt and the hot-compact
+    prompt (both `runHotCompactIfConfigured` and `agent.compactNow`'s hot
+    path) now `TurnQueued` before sending, so `wait_agent` cannot see a false
+    idle during those turns.
+  - Self-targeting refused bridge-side for `send_agent` / `wait_agent` /
+    `close_agent` (a self send/wait would park the caller's own turn until
+    timeout by construction).
+  - Hygiene: approval grants are pruned when a thread is discarded (and the
+    catalogue says grants last for the current core run); malformed tool
+    arguments surface the JSON error instead of a misleading required-field
+    message; `agent.stopClose` forgets the thread in the turn tracker;
+    `agent.wait` selects on the request context so a disconnected bridge
+    releases its waiter; the `launch_agent` catalogue no longer hardcodes
+    engine names.
+  - `docs/security-model.md` §1 now notes `fromThreadId` is self-asserted —
+    the gate is a guardrail inside the localhost trust model, not
+    authentication.
+  - New tests: approval gate semantics (approve-once, deny-not-cached,
+    per-action grants, prune), discard-through-the-gate over the full handler
+    set, `launchWorker` applied-truth via a fake registered harness, tracker
+    interrupt/multi-turn/ctx-cancel/seeded-resume cases, bridge self-refusals
+    and malformed-args.
 - **P2 — MCP traffic core + transcript rendering (4a + 4b)**. `mcp.activity`
   notifications; `permSummary`/`activityFor`/ToolInspector/delegate glyph.
   Immediately useful for the existing cooperation tools.

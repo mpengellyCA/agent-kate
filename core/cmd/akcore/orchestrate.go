@@ -56,6 +56,20 @@ func (g *orchGrants) grant(from, target, action string) {
 	g.granted[g.key(from, target, action)] = true
 }
 
+// forgetThread drops every grant that names the thread — as granter or as
+// target. A discarded thread's approvals must not linger to silently cover a
+// future thread that happens to reuse the id.
+func (g *orchGrants) forgetThread(threadID string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for k := range g.granted {
+		parts := strings.SplitN(k, "\x00", 3)
+		if len(parts) == 3 && (parts[0] == threadID || parts[1] == threadID) {
+			delete(g.granted, k)
+		}
+	}
+}
+
 // inSubtree reports whether target lies in caller's own subtree: the caller
 // itself, or a thread whose ParentThreadID chain reaches the caller. The
 // depth cap guards against a cyclic chain in a hand-edited threads.json.
@@ -154,7 +168,12 @@ func registerOrchestrationHandlers(d handlerDeps) {
 				timeout = waitMaxTimeout
 			}
 		}
-		lastText, timedOut := d.turns.Wait(p.ThreadID, timeout)
+		lastText, timedOut := d.turns.Wait(ctx, p.ThreadID, timeout)
+		// A cancelled context means the caller (a bridge whose agent died, a
+		// disconnecting client) is gone — report that rather than a timeout.
+		if err := ctx.Err(); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, "wait cancelled: "+err.Error())
+		}
 		status := "idle"
 		switch {
 		case timedOut:

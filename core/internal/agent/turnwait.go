@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"sync"
@@ -179,10 +180,11 @@ func (tt *TurnTracker) LastText(threadID string) string {
 }
 
 // Wait blocks until the thread is idle — no turn in flight, or the thread
-// ended — or the timeout fires. It returns the thread's last assistant text
-// and whether the deadline was hit (timedOut true means the thread was still
-// mid-turn when Wait gave up).
-func (tt *TurnTracker) Wait(threadID string, timeout time.Duration) (lastText string, timedOut bool) {
+// ended — or the timeout fires, or ctx is cancelled (a disconnected bridge
+// must release its waiter, not park it until the deadline). It returns the
+// thread's last assistant text and whether the wait gave up before idle
+// (deadline or cancellation) — check ctx.Err() to tell the two apart.
+func (tt *TurnTracker) Wait(ctx context.Context, threadID string, timeout time.Duration) (lastText string, timedOut bool) {
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	for {
@@ -197,6 +199,8 @@ func (tt *TurnTracker) Wait(threadID string, timeout time.Duration) (lastText st
 		tt.mu.Unlock()
 		select {
 		case <-ch:
+		case <-ctx.Done():
+			return tt.LastText(threadID), true
 		case <-deadline.C:
 			return tt.LastText(threadID), true
 		}

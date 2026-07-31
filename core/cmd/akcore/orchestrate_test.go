@@ -1,19 +1,26 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"agentkate/internal/agent"
+	"agentkate/internal/coop"
+	"agentkate/internal/gitstatus"
 	"agentkate/internal/harness"
 	"agentkate/internal/ipc"
+	"agentkate/internal/permission"
 	"agentkate/internal/session"
 )
 
@@ -88,8 +95,120 @@ func TestUnappliedOptions(t *testing.T) {
 	}
 }
 
+// fakeHarness is a registrable no-process harness for exercising the
+// launchWorker path: it "applies" whatever effort was asked but downgrades
+// every requested model to "fake-small", the way a real handshake might.
+type fakeHarness struct {
+	mu   sync.Mutex
+	last harness.StartSpec
+}
+
+func (f *fakeHarness) Capabilities() harness.Capabilities {
+	return harness.Capabilities{ID: "fake", DisplayName: "Fake Engine", MintsSessionID: true}
+}
+
+func (f *fakeHarness) Launch(spec harness.StartSpec) (harness.Launched, error) {
+	f.mu.Lock()
+	f.last = spec
+	f.mu.Unlock()
+	return harness.Launched{
+		SessionID: spec.SessionID, Model: "fake-small",
+		Effort: spec.Effort, PermissionMode: "default",
+	}, nil
+}
+
+func (f *fakeHarness) Send(string, string, []agent.Attachment) error { return nil }
+func (f *fakeHarness) Interrupt(string) error                        { return nil }
+func (f *fakeHarness) Stop(string) error                             { return nil }
+func (f *fakeHarness) Running(string) bool                           { return false }
+func (f *fakeHarness) StopAll()                                      {}
+func (f *fakeHarness) ReadTranscript(string, string) ([]json.RawMessage, error) {
+	return nil, nil
+}
+func (f *fakeHarness) SetOption(string, string, string) (string, error) { return "", nil }
+func (f *fakeHarness) DiscoverOptions() ([]harness.DiscoveredOption, error) {
+	return nil, nil
+}
+func (f *fakeHarness) BrowseSessions() ([]harness.BrowsableSession, error) { return nil, nil }
+
+// serveIPC starts srv on sock and blocks until the socket exists.
+func serveIPC(t *testing.T, srv *ipc.Server, sock string) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = srv.Serve(ctx) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(sock); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("server socket never appeared")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// permAutoResponder connects a raw notification listener that answers every
+// permission.requested by resolving the broker with the current allow flag,
+// counting the asks — the test's stand-in for the human in the UI.
+func permAutoResponder(t *testing.T, sock string, broker *permission.Broker,
+	allow *atomic.Bool, asks *atomic.Int32) {
+	t.Helper()
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatalf("responder dial: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	accepted := make(chan struct{})
+	go func() {
+		barriered := false
+		sc := bufio.NewScanner(conn)
+		sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+		for sc.Scan() {
+			var f ipc.Frame
+			if json.Unmarshal(sc.Bytes(), &f) != nil {
+				continue
+			}
+			if f.Method == "" { // the barrier's reply
+				if !barriered {
+					barriered = true
+					close(accepted)
+				}
+				continue
+			}
+			if f.Method != "permission.requested" {
+				continue
+			}
+			var p struct {
+				RequestID string `json:"requestId"`
+			}
+			if json.Unmarshal(f.Params, &p) != nil || p.RequestID == "" {
+				continue
+			}
+			asks.Add(1)
+			broker.Resolve(p.RequestID, permission.Decision{Allow: allow.Load()})
+		}
+	}()
+	// One round trip before returning: permission.requested is a fire-and-forget
+	// broadcast to the connections the server has REGISTERED, so an ask racing
+	// this connection's accept would be delivered to nobody and the test would
+	// hang for the whole permission timeout. Any method answers — a
+	// method-not-found reply proves the accept happened.
+	if _, err := conn.Write([]byte(
+		`{"jsonrpc":"2.0","id":1,"method":"responder.barrier"}` + "\n")); err != nil {
+		t.Fatalf("responder barrier: %v", err)
+	}
+	select {
+	case <-accepted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("responder connection was never accepted by the server")
+	}
+}
+
 // orchTestCore spins a real IPC server with the orchestration handlers over
-// real (empty) supervisors, and returns a connected client.
+// real (empty) supervisors plus a registered fakeHarness, and returns a
+// connected client.
 func orchTestCore(t *testing.T, sessions *session.Store, turns *agent.TurnTracker) *ipc.Client {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -99,26 +218,18 @@ func orchTestCore(t *testing.T, sessions *session.Store, turns *agent.TurnTracke
 	sup := agent.NewSupervisor("", log, func(string, []json.RawMessage) {})
 	harnesses := harness.NewRegistry("claude")
 	harnesses.Register(newClaudeHarness(sup, "", ""))
+	harnesses.Register(&fakeHarness{})
+	gitCache := gitstatus.NewCache(log)
+	t.Cleanup(func() { _ = gitCache.Close() })
 	d := handlerDeps{
 		srv: srv, sup: sup, harnesses: harnesses,
 		turns: turns, orchGrants: newOrchGrants(),
+		threads: newThreadRegistry(), gitCache: gitCache,
 		sessions: sessions, log: log,
 	}
 	registerOrchestrationHandlers(d)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	go func() { _ = srv.Serve(ctx) }()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		if _, err := os.Stat(sock); err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("server socket never appeared")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+	serveIPC(t, srv, sock)
 	client, err := ipc.Dial(sock)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -213,6 +324,204 @@ func TestLaunchWorkerValidation(t *testing.T) {
 	}
 }
 
+// TestAuthorizeAgentTarget pins the cross-subtree approval gate: subtree
+// targets never ask; a cross-subtree target asks exactly once per (caller,
+// target, action) and caches only approvals — a denial is re-asked; pruning a
+// thread's grants makes the next call ask again.
+func TestAuthorizeAgentTarget(t *testing.T) {
+	sessions := testSessions(t)
+	for id, parent := range map[string]string{
+		"t-a": "", "t-b": "", "t-c": "t-a",
+	} {
+		if err := sessions.Put(session.Record{
+			ThreadID: id, Project: "/p", ParentThreadID: parent, Created: time.Now(),
+		}); err != nil {
+			t.Fatalf("Put(%s): %v", id, err)
+		}
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	sock := filepath.Join(t.TempDir(), "auth.sock")
+	srv := ipc.NewServer(sock, log)
+	broker := permission.New()
+	d := handlerDeps{
+		srv: srv, broker: broker, orchGrants: newOrchGrants(),
+		sessions: sessions, log: log,
+	}
+	serveIPC(t, srv, sock)
+	var allow atomic.Bool
+	var asks atomic.Int32
+	permAutoResponder(t, sock, broker, &allow, &asks)
+
+	allow.Store(true)
+	// Own subtree: no ask.
+	if err := d.authorizeAgentTarget("t-a", "t-c", "send_agent", nil); err != nil {
+		t.Fatalf("subtree target: %v", err)
+	}
+	if asks.Load() != 0 {
+		t.Fatalf("subtree target asked the human (%d asks)", asks.Load())
+	}
+	// Cross-subtree: exactly one ask, then the grant is reused.
+	if err := d.authorizeAgentTarget("t-a", "t-b", "send_agent", nil); err != nil {
+		t.Fatalf("approved cross target: %v", err)
+	}
+	if err := d.authorizeAgentTarget("t-a", "t-b", "send_agent", nil); err != nil {
+		t.Fatalf("second call after approval: %v", err)
+	}
+	if asks.Load() != 1 {
+		t.Fatalf("approve-once broken: %d asks, want 1", asks.Load())
+	}
+	// A grant does NOT cover a different action on the same pair.
+	if err := d.authorizeAgentTarget("t-a", "t-b", "close_agent", nil); err != nil {
+		t.Fatalf("close after send approval: %v", err)
+	}
+	if asks.Load() != 2 {
+		t.Fatalf("action scoping broken: %d asks, want 2", asks.Load())
+	}
+	// Denials are never cached: every denied call re-asks.
+	allow.Store(false)
+	if err := d.authorizeAgentTarget("t-b", "t-a", "discard_agent", nil); err == nil {
+		t.Fatal("denied discard reported success")
+	}
+	if err := d.authorizeAgentTarget("t-b", "t-a", "discard_agent", nil); err == nil {
+		t.Fatal("second denied discard reported success")
+	}
+	if asks.Load() != 4 {
+		t.Fatalf("denial caching broken: %d asks, want 4", asks.Load())
+	}
+	// Pruning either party's grants forces a fresh ask.
+	d.orchGrants.forgetThread("t-b")
+	allow.Store(true)
+	if err := d.authorizeAgentTarget("t-a", "t-b", "send_agent", nil); err != nil {
+		t.Fatalf("post-prune send: %v", err)
+	}
+	if asks.Load() != 5 {
+		t.Fatalf("forgetThread did not prune the grant: %d asks, want 5", asks.Load())
+	}
+}
+
+// TestDiscardGoesThroughGate proves agent.discard is gated for agent-driven
+// calls (deny blocks it BEFORE any destructive step; approval falls through
+// to the normal unknown-thread validation) and stays ungated for the UI.
+func TestDiscardGoesThroughGate(t *testing.T) {
+	sessions := testSessions(t)
+	for _, id := range []string{"t-a", "t-b"} {
+		if err := sessions.Put(session.Record{
+			ThreadID: id, Project: "/p", Created: time.Now(),
+		}); err != nil {
+			t.Fatalf("Put(%s): %v", id, err)
+		}
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	sock := filepath.Join(t.TempDir(), "gate.sock")
+	srv := ipc.NewServer(sock, log)
+	broker := permission.New()
+	sup := agent.NewSupervisor("", log, func(string, []json.RawMessage) {})
+	harnesses := harness.NewRegistry("claude")
+	harnesses.Register(newClaudeHarness(sup, "", ""))
+	d := handlerDeps{
+		srv: srv, sup: sup, harnesses: harnesses,
+		turns: agent.NewTurnTracker(), orchGrants: newOrchGrants(),
+		coop: coop.NewState(), threads: newThreadRegistry(),
+		broker: broker, sessions: sessions, log: log,
+	}
+	registerHandlers(d) // the real handler set, gate included
+	serveIPC(t, srv, sock)
+	var allow atomic.Bool
+	var asks atomic.Int32
+	permAutoResponder(t, sock, broker, &allow, &asks)
+	client, err := ipc.Dial(sock)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	// Denied: the discard fails at the gate, before any lookup or removal.
+	allow.Store(false)
+	err = client.Call("agent.discard",
+		map[string]any{"threadId": "t-b", "fromThreadId": "t-a"}, nil)
+	if err == nil || !strings.Contains(err.Error(), "not approved") {
+		t.Fatalf("denied discard: err = %v, want not-approved", err)
+	}
+	if _, ok := sessions.Get("t-b"); !ok {
+		t.Fatal("denied discard removed the record")
+	}
+	// Approved: the gate passes and the handler proceeds to its normal
+	// validation ("unknown thread" — t-b has no registered worktree here).
+	allow.Store(true)
+	err = client.Call("agent.discard",
+		map[string]any{"threadId": "t-b", "fromThreadId": "t-a"}, nil)
+	if err == nil || !strings.Contains(err.Error(), "unknown thread") {
+		t.Fatalf("approved discard: err = %v, want unknown-thread", err)
+	}
+	if asks.Load() != 2 {
+		t.Fatalf("asks = %d, want 2 (deny + approve)", asks.Load())
+	}
+	// UI-driven (no fromThreadId): never gated, straight to validation.
+	err = client.Call("agent.discard", map[string]any{"threadId": "t-b"}, nil)
+	if err == nil || !strings.Contains(err.Error(), "unknown thread") {
+		t.Fatalf("UI discard: err = %v", err)
+	}
+	if asks.Load() != 2 {
+		t.Fatalf("UI discard asked the human (%d asks)", asks.Load())
+	}
+}
+
+// TestLaunchWorkerAppliedTruth drives agent.launchWorker end to end over a
+// fake harness: the reply carries what was actually applied, the unapplied
+// diff names the downgraded model, and the records gain the parent linkage.
+func TestLaunchWorkerAppliedTruth(t *testing.T) {
+	sessions := testSessions(t)
+	proj := t.TempDir()
+	if err := sessions.Put(session.Record{
+		ThreadID: "t-parent", Project: proj, Created: time.Now(),
+	}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	client := orchTestCore(t, sessions, agent.NewTurnTracker())
+
+	var res struct {
+		ThreadID  string            `json:"threadId"`
+		SessionID string            `json:"sessionId"`
+		Backend   string            `json:"backend"`
+		Isolated  bool              `json:"isolated"`
+		Applied   map[string]string `json:"applied"`
+		Unapplied []map[string]string
+	}
+	if err := client.Call("agent.launchWorker", map[string]any{
+		"parentThreadId": "t-parent",
+		"backend":        "fake",
+		"model":          "fake-big",
+		"effort":         "high",
+		"prompt":         "do the thing",
+		"title":          "fake worker",
+		"isolation":      "workspace",
+	}, &res); err != nil {
+		t.Fatalf("launchWorker: %v", err)
+	}
+	if res.Backend != "fake" || res.SessionID == "" || res.Isolated {
+		t.Fatalf("reply = %+v", res)
+	}
+	if res.Applied["model"] != "fake-small" || res.Applied["effort"] != "high" {
+		t.Fatalf("applied = %v", res.Applied)
+	}
+	if len(res.Unapplied) != 1 || res.Unapplied[0]["option"] != "model" ||
+		res.Unapplied[0]["requested"] != "fake-big" ||
+		res.Unapplied[0]["applied"] != "fake-small" {
+		t.Fatalf("unapplied = %v", res.Unapplied)
+	}
+	worker, ok := sessions.Get(res.ThreadID)
+	if !ok {
+		t.Fatal("worker record missing")
+	}
+	if worker.ParentThreadID != "t-parent" || worker.Role != session.RoleWorker ||
+		worker.Model != "fake-small" || worker.Title != "fake worker" {
+		t.Fatalf("worker record = %+v", worker)
+	}
+	if parent, _ := sessions.Get("t-parent"); parent.Role != session.RoleController {
+		t.Fatalf("parent role = %q, want controller", parent.Role)
+	}
+}
+
 // stubCore registers canned RPC handlers and returns a bridge wired to them,
 // so the bridge tools can be exercised without any real agent processes.
 func stubCore(t *testing.T, handlers map[string]ipc.Handler) *mcpBridge {
@@ -249,8 +558,18 @@ func stubCore(t *testing.T, handlers map[string]ipc.Handler) *mcpBridge {
 // parentThreadId is always the bridge's own thread), applied-truth rendering
 // and the self-close refusal.
 func TestBridgeOrchestrationTools(t *testing.T) {
-	var launchParams, sendParams, closeParams map[string]any
+	var launchParams, sendParams, closeParams, discardParams map[string]any
 	b := stubCore(t, map[string]ipc.Handler{
+		"agent.list": func(_ context.Context, _ json.RawMessage) (any, error) {
+			return map[string]any{"threads": []map[string]any{{
+				"threadId": "t-w", "status": "dormant",
+				"branch": "agentkate/t-w", "path": "/p", "isolated": true,
+			}}}, nil
+		},
+		"agent.discard": func(_ context.Context, raw json.RawMessage) (any, error) {
+			_ = json.Unmarshal(raw, &discardParams)
+			return map[string]any{"ok": true}, nil
+		},
 		"agent.launchWorker": func(_ context.Context, raw json.RawMessage) (any, error) {
 			_ = json.Unmarshal(raw, &launchParams)
 			return map[string]any{
@@ -315,10 +634,45 @@ func TestBridgeOrchestrationTools(t *testing.T) {
 		t.Error("wait_agent accepted a missing thread_id")
 	}
 
+	// Self-targeting is refused bridge-side for all three verbs — a self
+	// send/wait would deadlock the caller's own turn until timeout.
 	if _, err := b.runTool("close_agent", json.RawMessage(`{"thread_id":"t-ctrl"}`)); err == nil ||
 		!strings.Contains(err.Error(), "cannot close itself") {
 		t.Errorf("self-close: err = %v, want refusal", err)
 	}
+	if _, err := b.runTool("send_agent",
+		json.RawMessage(`{"thread_id":"t-ctrl","message":"hi"}`)); err == nil ||
+		!strings.Contains(err.Error(), "cannot message itself") {
+		t.Errorf("self-send: err = %v, want refusal", err)
+	}
+	if _, err := b.runTool("wait_agent",
+		json.RawMessage(`{"thread_id":"t-ctrl"}`)); err == nil ||
+		!strings.Contains(err.Error(), "cannot wait on itself") {
+		t.Errorf("self-wait: err = %v, want refusal", err)
+	}
+
+	// Malformed arguments surface the JSON error, not a misleading
+	// missing-field message.
+	for tool, bad := range map[string]string{
+		"launch_agent": `{"prompt":123}`,
+		"send_agent":   `{"thread_id":"t-w","message":"x","wait":"yes"}`,
+		"wait_agent":   `{"thread_id":42}`,
+		"close_agent":  `{"thread_id":[]}`,
+	} {
+		if _, err := b.runTool(tool, json.RawMessage(bad)); err == nil ||
+			!strings.Contains(err.Error(), "malformed arguments") {
+			t.Errorf("%s(%s): err = %v, want malformed-arguments", tool, bad, err)
+		}
+	}
+
+	// discard_agent carries the caller's identity so the core can gate it.
+	if _, err := b.runTool("discard_agent", json.RawMessage(`{"thread_id":"t-w"}`)); err != nil {
+		t.Fatalf("discard_agent: %v", err)
+	}
+	if discardParams["fromThreadId"] != "t-ctrl" || discardParams["threadId"] != "t-w" {
+		t.Errorf("discard params = %v", discardParams)
+	}
+
 	out, err = b.runTool("close_agent", json.RawMessage(`{"thread_id":"t-w"}`))
 	if err != nil {
 		t.Fatalf("close_agent: %v", err)

@@ -717,6 +717,7 @@ func registerHandlers(d handlerDeps) {
 		}
 		// Drop the live-thread bookkeeping; the worktree on disk is left intact.
 		d.gitCache.Forget(p.ThreadID)
+		d.turns.Forget(p.ThreadID)
 		d.threads.remove(p.ThreadID)
 		d.log.Info("agent stopped & closed (archived)", "thread", p.ThreadID)
 		return map[string]any{"ok": true}, nil
@@ -1041,9 +1042,19 @@ func registerHandlers(d handlerDeps) {
 	d.srv.Handle("agent.discard", func(_ context.Context, raw json.RawMessage) (any, error) {
 		var p struct {
 			ThreadID string `json:"threadId"`
+			// FromThreadID names the agent thread issuing the discard (the
+			// bridge's discard_agent); empty for UI-driven discards. Same
+			// cross-subtree approval rule as sends/closes — without it any
+			// agent could destroy any thread's worktree, its controller's
+			// included.
+			FromThreadID string `json:"fromThreadId,omitempty"`
 		}
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		if err := d.authorizeAgentTarget(p.FromThreadID, p.ThreadID,
+			"discard_agent", nil); err != nil {
+			return nil, err
 		}
 		wt, ok := d.threads.get(p.ThreadID)
 		if !ok {
@@ -1061,6 +1072,10 @@ func registerHandlers(d handlerDeps) {
 		}
 		d.gitCache.Forget(p.ThreadID)
 		d.turns.Forget(p.ThreadID)
+		// Approval grants that named this thread (as granter or target) are
+		// meaningless now — and must not silently cover a future thread that
+		// happens to reuse the id.
+		d.orchGrants.forgetThread(p.ThreadID)
 		// Tell every UI client to drop this thread from its roster.
 		d.srv.Notify("agent.discarded", map[string]any{"threadId": p.ThreadID})
 		return map[string]any{"ok": true}, nil
@@ -1166,6 +1181,10 @@ func registerHandlers(d handlerDeps) {
 			}
 			hctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 			defer cancel()
+			// The compact prompt is a turn; track it so waiters see the
+			// thread busy until the summary's result lands (same bracketing
+			// as runHotCompactIfConfigured).
+			d.turns.TurnQueued(p.ThreadID)
 			text, herr := d.sup.Compact(hctx, p.ThreadID, compact.CompactPrompt)
 			if herr != nil {
 				return nil, ipc.Errorf(ipc.CodeInternalError, herr.Error())
