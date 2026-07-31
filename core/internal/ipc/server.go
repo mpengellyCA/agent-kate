@@ -45,6 +45,14 @@ const maxInFlightPerConn = 256
 // CodeInternalError.
 type Handler func(ctx context.Context, params json.RawMessage) (any, error)
 
+// BridgeActivityFunc observes one completed request from an agent's MCP bridge
+// (plan 16 P2's `mcp.activity` feed). threadID is the connection's bound thread,
+// params the raw request params, dur the handler's own runtime, and errText the
+// failure message ("" on success). It runs on the dispatch goroutine after the
+// reply has been queued, so it must not block.
+type BridgeActivityFunc func(threadID, method string, params json.RawMessage,
+	dur time.Duration, errText string)
+
 // Server is a JSON-RPC 2.0 server over a Unix domain socket. Multiple UI
 // clients may connect at once; Notify broadcasts to all of them.
 type Server struct {
@@ -56,6 +64,9 @@ type Server struct {
 	conns       map[*conn]struct{}
 	onAllGone   func()
 	primaryConn *conn // the first UI to handshake; runs portal sessions (Cowork keystone)
+	// onBridgeActivity is set once before Serve (registerMCPActivity) and read
+	// without locking thereafter, like handlers.
+	onBridgeActivity BridgeActivityFunc
 }
 
 // NewServer creates a server bound to socketPath. Call Handle to register
@@ -73,6 +84,11 @@ func NewServer(socketPath string, log *slog.Logger) *Server {
 func (s *Server) Handle(method string, h Handler) {
 	s.handlers[method] = h
 }
+
+// OnBridgeActivity registers the observer for completed agent-bridge requests.
+// Call before Serve. Only requests (not notifications) on connections tagged as
+// bridges are reported.
+func (s *Server) OnBridgeActivity(f BridgeActivityFunc) { s.onBridgeActivity = f }
 
 // OnAllClientsGone registers a callback fired whenever the last connected UI
 // client disconnects. The core uses this to shut itself down rather than be
@@ -216,6 +232,7 @@ func (s *Server) dispatch(ctx context.Context, c *conn, raw []byte) {
 	}
 
 	resp := Frame{JSONRPC: "2.0", ID: f.ID}
+	started := time.Now()
 	switch {
 	case !ok:
 		resp.Error = Errorf(CodeMethodNotFound, "method not found: "+f.Method)
@@ -234,7 +251,20 @@ func (s *Server) dispatch(ctx context.Context, c *conn, raw []byte) {
 			resp.Result = b
 		}
 	}
+	dur := time.Since(started)
 	c.enqueue(&resp)
+
+	// Every request an agent's MCP bridge completes is one MCP tool call the
+	// human should be able to watch (plan 16 §4a). Reported after the reply is
+	// queued so the observer never delays the agent, and only for bridges — UI
+	// traffic is not MCP traffic.
+	if s.onBridgeActivity != nil && c.getRole() == "bridge" {
+		errText := ""
+		if resp.Error != nil {
+			errText = resp.Error.Message
+		}
+		s.onBridgeActivity(c.getThreadID(), f.Method, f.Params, dur, errText)
+	}
 }
 
 // Notify broadcasts a notification to every connected UI client.
@@ -251,6 +281,31 @@ func (s *Server) Notify(method string, params any) {
 	conns := make([]*conn, 0, len(s.conns))
 	for c := range s.conns {
 		conns = append(conns, c)
+	}
+	s.mu.RUnlock()
+
+	for _, c := range conns {
+		c.enqueue(&f)
+	}
+}
+
+// NotifyUI broadcasts a notification to the connected UI clients only —
+// connections that identified themselves as the UI. An agent bridge never sees
+// it, so a feed about one agent's activity cannot reach another agent.
+func (s *Server) NotifyUI(method string, params any) {
+	b, err := json.Marshal(params)
+	if err != nil {
+		s.log.Warn("notify-ui marshal failed", "method", method, "err", err)
+		return
+	}
+	f := Frame{JSONRPC: "2.0", Method: method, Params: json.RawMessage(b)}
+
+	s.mu.RLock()
+	conns := make([]*conn, 0, len(s.conns))
+	for c := range s.conns {
+		if c.getRole() == "ui" {
+			conns = append(conns, c)
+		}
 	}
 	s.mu.RUnlock()
 

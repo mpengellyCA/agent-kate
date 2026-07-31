@@ -103,9 +103,18 @@ handlers (`core/internal/ipc/server.go:278-301`, `core/internal/ipc/server.go:41
   agent capability, and a bridge trying to switch to a *different* thread
   (`core/internal/ipc/server.go:470-493`). This is what stops cross-thread grant
   theft: thread A's bridge cannot claim `threadId:B` to spend B's grant.
+- **`bridge.identify`** is the same binding, done up front: every `akcore mcp`
+  bridge (Cooperation and Cowork alike) calls it once at startup
+  (`core/cmd/akcore/mcpactivity.go`), so a connection's role and thread are
+  known before its first tool call rather than on first Cowork use. It carries
+  no new trust — it is the same trust-on-first-use assertion `BindBridge`
+  always made — but it is what lets the core attribute the `mcp.activity` feed
+  to a thread from the connection instead of a self-asserted parameter.
 - **`RequireUI`** gates the UI-only RPCs — grant responses, kill-switch,
   revoke, enable — so an agent can never grant itself anything
-  (`core/internal/ipc/server.go:495-500`).
+  (`core/internal/ipc/server.go:495-500`). `NotifyUI` is its notification
+  counterpart: the `mcp.activity` feed goes only to UI connections, so one
+  agent never receives another agent's tool traffic.
 - **`NotifyPrimaryUI`** routes portal requests only to the primary UI, and
   returns false (fail-closed) when no primary UI is connected
   (`core/internal/ipc/server.go:502-518`; the primary is cleared on disconnect at

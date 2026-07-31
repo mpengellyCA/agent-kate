@@ -67,6 +67,16 @@ Frames:
 - response: `{"jsonrpc":"2.0","id":1,"result":{…}}` / `…,"error":{…}`
 - notification: `{"jsonrpc":"2.0","method":"event.…","params":{…}}`
 
+Notifications the core pushes include `agent.event` (translated stream-json, in
+coalesced batches), `permission.requested`, and `mcp.activity` — one per request
+an agent's MCP bridge completes:
+`{threadId, tool, argsSummary, durationMs, ok, error?}`. It is emitted core-side
+from the IPC dispatch (never by the bridge), keyed by RPC method so it is
+harness-agnostic, and broadcast to UI connections only — an agent never sees
+another agent's feed. `argsSummary` is a capped, tool-aware digest (a path, a
+note's first line, a worker's engine and title) that deliberately excludes
+prompt bodies, typed text and gated-tool inputs.
+
 ## Cooperation MCP
 
 Tools exposed to every spawned agent so agents — and the human — stay aware of each

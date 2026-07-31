@@ -447,9 +447,65 @@ static-true for Claude, false/absent for Kimi unless noted):
     set, `launchWorker` applied-truth via a fake registered harness, tracker
     interrupt/multi-turn/ctx-cancel/seeded-resume cases, bridge self-refusals
     and malformed-args.
-- **P2 — MCP traffic core + transcript rendering (4a + 4b)**. `mcp.activity`
-  notifications; `permSummary`/`activityFor`/ToolInspector/delegate glyph.
-  Immediately useful for the existing cooperation tools.
+- **P2 — MCP traffic core + transcript rendering (4a + 4b). ✅ LANDED.**
+  `mcp.activity` notifications broadcast from the IPC dispatch;
+  `permSummary`/`activityFor` MCP branches, ToolInspector overview entries and
+  the ⇄ delegate glyph. Immediately useful for the existing cooperation tools.
+  Where the sketch met the real code:
+  - **Bridge connections were NOT identifiable.** The sketch assumed a bridge
+    conn is recognisable because it is "spawned per thread with `--thread`",
+    but the only thing that ever tagged one was the Cowork keystone's
+    `BindBridge`, called lazily from `requireCoworkBridge` — a Cooperation
+    bridge's connection carried role `""` for its whole life. P2 adds a
+    one-call `bridge.identify` handshake at bridge startup (both catalogues),
+    so `conn.role`/`connTID` are set before the first tool can run. The feed's
+    `threadId` is therefore the *connection's bound* thread, never a
+    self-asserted param — and Cowork's own lazy bind still agrees with it.
+  - **The feed is UI-only**: a new `ipc.Server.NotifyUI` sends to connections
+    that identified as the UI, not the existing broadcast `Notify` (which
+    reaches bridges too). One agent's activity must not land on another
+    agent's bridge — that is both an information-leak and a prompt-injection
+    surface, and bridges have no use for notifications anyway.
+  - **The map is keyed by RPC method, not by tool name.** Both harnesses'
+    bridges make the identical calls, so keying on the method is what makes
+    the feed harness-agnostic by construction (no `backend == "…"` anywhere).
+    `TestMCPToolMapCoversBridgeCallSites` scrapes `mcp.go`/`mcp_cowork.go` for
+    every `client.Call*` literal and fails in BOTH directions (an unmapped
+    call site, a map entry nobody calls), plus asserts every mapped name is a
+    tool the catalogues actually advertise. Unknown methods still report under
+    their raw name — a new RPC can never make traffic vanish.
+  - **`argsSummary` is a redaction boundary, not just a length cap.**
+    `request_permission` names the gated tool but never its input (a Bash
+    command line is exactly where a token lives); `desktop_set_text` names the
+    element but never the text (it may be a password); `launch_agent` shows
+    `<backend>/<model>: <title>` but never the briefing; message-like fields
+    keep only their first line; unmapped methods get an EMPTY summary rather
+    than a params dump. Everything is capped at 120 bytes on a rune boundary.
+  - Dropped the sketch's `server` field: the tool name already says which
+    catalogue it came from (`desktop_*` vs the rest), so it was pure
+    duplication in every row.
+  - `list_agents` activity includes the bridge's own internal `agent.list`
+    lookups (`discard_agent` does one before discarding). That is real RPC
+    traffic on the wire and is shown honestly rather than filtered.
+  - **The UI needed no notification plumbing**: `CoreClient::notification` is
+    a generic signal, so `mcp.activity` already flows to any subscriber. No
+    panel consumes it yet (the cross-thread timeline is P5), so the pipe is
+    proved end-to-end in `scripts/smoke-orchestrate.py` instead — which had to
+    start sending `handshake`, since the feed is UI-only.
+  - The ⇄ glyph is `mcp__cooperation__*` only; Cowork rows keep the 🔧 wrench,
+    since driving the desktop is tool use rather than agent-to-agent traffic.
+  - Wiring `permSummary` into `TranscriptModelTest` pulled
+    `AgentChatHelpers` → `HarnessTraits` → `ProviderConfig`/`CoreClient` into
+    that target (its `modelAvailable` helpers need the registry); the test
+    target gained those sources and `Qt6::Network`.
+  - Incidental fix while getting the suite green (folded into the P1
+    remediation commit, since it repairs a P1 test): `permAutoResponder`
+    (P1's stand-in for the human) raced the server's `accept` —
+    `permission.requested` is a fire-and-forget broadcast to *registered*
+    connections, so an ask fired microseconds after the responder's `Dial`
+    reached nobody and `TestAuthorizeAgentTarget` hung for the full 8-minute
+    permission timeout. It now does one request/reply round trip before
+    returning. Reproduced once under load, green over repeated runs since.
 - **P3 — Persona channel + custom subagents (Feature 2)**. `StartSpec`
   extensions, claude `--append-system-prompt`/`--agents`, kimi agent-file
   writer, capability flags, applied-truth reporting.

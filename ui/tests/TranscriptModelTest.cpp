@@ -6,6 +6,7 @@
 //    change re-measures, and a model mutation (stableId bump) busts the entry —
 //    which is what makes window-edge resize O(visible rows).
 
+#include "AgentChatHelpers.h"
 #include "TranscriptDelegate.h"
 #include "TranscriptModel.h"
 
@@ -30,6 +31,7 @@ private Q_SLOTS:
     void thinkingRowExpands();
     void checklistUpdatesInPlace();
     void toolAttachmentsAddChips();
+    void mcpToolsSummarizeTheirArguments();
 };
 
 void TranscriptModelTest::appendsGrowRowCount()
@@ -349,6 +351,88 @@ void TranscriptModelTest::toolAttachmentsAddChips()
     const int note = m.appendNote(QStringLiteral("n"), QStringLiteral("sys"));
     m.setToolAttachments(note, got);
     QVERIFY(m.data(m.index(1), TranscriptModel::AttachmentsRole).toJsonArray().isEmpty());
+}
+
+// Cooperation and Cowork tool rows (plan 16 P2 / Feature 4b) read as sentences
+// instead of raw JSON: each verb's summary names what it did, long bodies are
+// reduced to their first line, and payloads that may hold secrets (a typed
+// value) never appear. Unknown mcp__ servers keep the compact-JSON fallback.
+void TranscriptModelTest::mcpToolsSummarizeTheirArguments()
+{
+    using agentkate::permSummary;
+    const auto coop = [](const char *verb) {
+        return QStringLiteral("mcp__cooperation__") + QLatin1String(verb);
+    };
+
+    QCOMPARE(permSummary(coop("post_note"),
+                         QJsonObject{{QStringLiteral("text"),
+                                      QStringLiteral("claiming the parser\nthen editing")}}),
+             QStringLiteral("claiming the parser"));
+    QCOMPARE(permSummary(coop("claim_file"),
+                         QJsonObject{{QStringLiteral("path"), QStringLiteral("src/main.go")}}),
+             QStringLiteral("src/main.go"));
+    QCOMPARE(permSummary(coop("request_review"),
+                         QJsonObject{{QStringLiteral("summary"), QStringLiteral("rewired the relay")}}),
+             QStringLiteral("rewired the relay"));
+    QCOMPARE(permSummary(coop("launch_agent"),
+                         QJsonObject{{QStringLiteral("backend"), QStringLiteral("kimi")},
+                                     {QStringLiteral("model"), QStringLiteral("kimi-code/k3")},
+                                     {QStringLiteral("title"), QStringLiteral("pong worker")},
+                                     {QStringLiteral("prompt"), QStringLiteral("the briefing")}}),
+             QStringLiteral("kimi/kimi-code/k3: pong worker"));
+    QCOMPARE(permSummary(coop("send_agent"),
+                         QJsonObject{{QStringLiteral("thread_id"), QStringLiteral("t-w")},
+                                     {QStringLiteral("message"), QStringLiteral("do this\nand that")}}),
+             QStringLiteral("t-w: do this"));
+    QCOMPARE(permSummary(coop("wait_agent"),
+                         QJsonObject{{QStringLiteral("thread_id"), QStringLiteral("t-w")}}),
+             QStringLiteral("t-w"));
+    // The core's cross-subtree approval prompt for the same verb names the
+    // target "targetThreadId"; the ask must read like the tool row.
+    QCOMPARE(permSummary(coop("send_agent"),
+                         QJsonObject{{QStringLiteral("targetThreadId"), QStringLiteral("t-x")},
+                                     {QStringLiteral("message"), QStringLiteral("please stop")}}),
+             QStringLiteral("t-x: please stop"));
+    QCOMPARE(permSummary(coop("close_agent"),
+                         QJsonObject{{QStringLiteral("thread_id"), QStringLiteral("t-w")}}),
+             QStringLiteral("t-w"));
+    QCOMPARE(permSummary(coop("discard_agent"),
+                         QJsonObject{{QStringLiteral("thread_id"), QStringLiteral("t-w")},
+                                     {QStringLiteral("force"), true}}),
+             QStringLiteral("t-w"));
+    // Fixed labels for the parameterless verbs — never "{}".
+    for (const char *verb : {"read_notes", "get_presence", "list_open_files", "whoami"}) {
+        const QString s = permSummary(coop(verb), QJsonObject{});
+        QVERIFY2(!s.isEmpty() && !s.startsWith(QLatin1Char('{')),
+                 qPrintable(QStringLiteral("%1 -> %2").arg(QLatin1String(verb), s)));
+    }
+    QCOMPARE(permSummary(coop("list_agents"),
+                         QJsonObject{{QStringLiteral("all_workspaces"), true}}),
+             QStringLiteral("every workspace"));
+
+    // Cowork: the element, never the text being typed into it.
+    const QString typed =
+        permSummary(QStringLiteral("mcp__cowork__desktop_set_text"),
+                    QJsonObject{{QStringLiteral("elementId"), QStringLiteral("el-7")},
+                                {QStringLiteral("text"), QStringLiteral("hunter2")}});
+    QCOMPARE(typed, QStringLiteral("el-7"));
+    QCOMPARE(permSummary(QStringLiteral("mcp__cowork__desktop_click"),
+                         QJsonObject{{QStringLiteral("x"), 100}, {QStringLiteral("y"), 250}}),
+             QStringLiteral("100, 250"));
+
+    // A third-party MCP server keeps today's behaviour (the generic fallback).
+    QCOMPARE(permSummary(QStringLiteral("mcp__other__do_thing"),
+                         QJsonObject{{QStringLiteral("q"), QStringLiteral("v")}}),
+             QStringLiteral("{\"q\":\"v\"}"));
+
+    // The activity line distinguishes orchestration from board chatter and
+    // from desktop work.
+    QCOMPARE(agentkate::activityFor(coop("launch_agent")),
+             QStringLiteral("Agent Kate is directing its team…"));
+    QCOMPARE(agentkate::activityFor(coop("post_note")),
+             QStringLiteral("Agent Kate is coordinating with the team…"));
+    QCOMPARE(agentkate::activityFor(QStringLiteral("mcp__cowork__desktop_click")),
+             QStringLiteral("Agent Kate is working at the desktop…"));
 }
 
 QTEST_MAIN(TranscriptModelTest)

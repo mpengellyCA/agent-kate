@@ -20,6 +20,114 @@
 #include <QTextDocument>
 #include <QVBoxLayout>
 
+namespace
+{
+// The arena's own MCP servers: Cooperation (agent-to-agent coordination and
+// orchestration) and Cowork (the KDE desktop). Their tool rows are the most
+// interesting ones in a transcript, so they get real summaries instead of raw
+// JSON. Argument vocabularies are the catalogues' own — snake_case for
+// Cooperation, camelCase for Cowork (core/cmd/akcore/mcp.go, mcp_cowork.go).
+const QLatin1String kCoopPrefix("mcp__cooperation__");
+const QLatin1String kCoworkPrefix("mcp__cowork__");
+
+// firstLine reduces a multi-line argument to its opening line, elided, so one
+// tool row stays one line however long the message was.
+QString firstLine(const QString &s)
+{
+    const QString flat = s.section(QLatin1Char('\n'), 0, 0).simplified();
+    return flat.size() > 160 ? flat.left(159) + QStringLiteral("…") : flat;
+}
+
+// mcpSummary digests one Cooperation/Cowork tool call. An empty return means
+// "no digest for this tool" and falls through to the generic handling.
+QString mcpSummary(const QString &verb, const QJsonObject &input)
+{
+    const auto str = [&input](const char *key) {
+        return input.value(QLatin1String(key)).toString();
+    };
+    // The tools name the target "thread_id"; the core's cross-subtree approval
+    // prompt for the same verbs names it "targetThreadId" — both read alike.
+    const auto target = [&str] {
+        const QString id = str("thread_id");
+        return id.isEmpty() ? str("targetThreadId") : id;
+    };
+    // --- Cooperation ---------------------------------------------------
+    if (verb == QLatin1String("post_note")) {
+        return firstLine(str("text"));
+    }
+    if (verb == QLatin1String("claim_file") || verb == QLatin1String("release_file")) {
+        return str("path");
+    }
+    if (verb == QLatin1String("request_review")) {
+        return firstLine(str("summary"));
+    }
+    if (verb == QLatin1String("launch_agent")) {
+        QString engine = str("backend");
+        const QString model = str("model");
+        if (!model.isEmpty()) {
+            engine = engine.isEmpty() ? model : engine + QLatin1Char('/') + model;
+        }
+        if (engine.isEmpty()) {
+            engine = QObject::tr("same engine");
+        }
+        const QString title = str("title");
+        return title.isEmpty() ? engine : engine + QStringLiteral(": ") + title;
+    }
+    if (verb == QLatin1String("send_agent")) {
+        const QString msg = firstLine(str("message"));
+        return msg.isEmpty() ? target() : target() + QStringLiteral(": ") + msg;
+    }
+    if (verb == QLatin1String("wait_agent") || verb == QLatin1String("close_agent")
+        || verb == QLatin1String("discard_agent")) {
+        return target();
+    }
+    if (verb == QLatin1String("list_agents")) {
+        return input.value(QStringLiteral("all_workspaces")).toBool()
+                   ? QObject::tr("every workspace")
+                   : QObject::tr("this workspace");
+    }
+    if (verb == QLatin1String("read_notes")) {
+        return QObject::tr("the cooperation board");
+    }
+    if (verb == QLatin1String("get_presence")) {
+        return QObject::tr("who is working where");
+    }
+    if (verb == QLatin1String("list_open_files")) {
+        return QObject::tr("open files");
+    }
+    if (verb == QLatin1String("whoami")) {
+        return QObject::tr("this thread's identity");
+    }
+    // --- Cowork desktop --------------------------------------------------
+    if (verb == QLatin1String("desktop_activate_element")
+        || verb == QLatin1String("desktop_click_element")
+        || verb == QLatin1String("desktop_set_text")) {
+        // Never the text being typed — it may be a password.
+        return str("elementId");
+    }
+    if (verb == QLatin1String("desktop_list_elements")
+        || verb == QLatin1String("desktop_read_text")) {
+        const QString win = str("targetWindowId");
+        return win.isEmpty() ? QObject::tr("the active window") : win;
+    }
+    if (verb == QLatin1String("desktop_open_browser")) {
+        const QString name = str("name");
+        return name.isEmpty() ? QObject::tr("the default browser") : name;
+    }
+    if (verb == QLatin1String("desktop_click") || verb == QLatin1String("desktop_move_pointer")) {
+        return QStringLiteral("%1, %2")
+            .arg(input.value(QStringLiteral("x")).toInt())
+            .arg(input.value(QStringLiteral("y")).toInt());
+    }
+    if (verb == QLatin1String("desktop_inject_input")
+        || verb == QLatin1String("desktop_play_input")) {
+        return QObject::tr("%n event(s)", nullptr,
+                           input.value(QStringLiteral("events")).toArray().size());
+    }
+    return QString();
+}
+} // namespace
+
 namespace agentkate
 {
 QString markdownToHtml(const QString &md)
@@ -39,6 +147,15 @@ QString markdownToHtml(const QString &md)
 
 QString permSummary(const QString &toolName, const QJsonObject &input)
 {
+    if (toolName.startsWith(kCoopPrefix) || toolName.startsWith(kCoworkPrefix)) {
+        // "mcp__<server>__<verb>" — summarize by the verb; anything the digest
+        // does not cover falls through to the generic handling below.
+        const QString summary =
+            mcpSummary(toolName.section(QLatin1String("__"), 2), input);
+        if (!summary.isEmpty()) {
+            return summary;
+        }
+    }
     if (toolName == QLatin1String("Bash")) {
         return input.value(QStringLiteral("command")).toString();
     }
@@ -112,6 +229,17 @@ QString activityFor(const QString &tool)
     }
     if (tool == QLatin1String("Task") || tool == QLatin1String("TodoWrite")) {
         return QStringLiteral("Agent Kate is mapping out the work…");
+    }
+    if (tool.startsWith(kCoopPrefix)) {
+        // Orchestration verbs read differently from board-and-locks chatter.
+        const QString verb = tool.section(QLatin1String("__"), 2);
+        if (verb.endsWith(QLatin1String("_agent")) || verb == QLatin1String("list_agents")) {
+            return QStringLiteral("Agent Kate is directing its team…");
+        }
+        return QStringLiteral("Agent Kate is coordinating with the team…");
+    }
+    if (tool.startsWith(kCoworkPrefix)) {
+        return QStringLiteral("Agent Kate is working at the desktop…");
     }
     if (tool.startsWith(QLatin1String("mcp__"))) {
         return QStringLiteral("Agent Kate is coordinating with the team…");

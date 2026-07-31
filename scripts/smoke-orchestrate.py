@@ -8,8 +8,9 @@ Starts akcore and runs BOTH orchestration directions through the JSON-RPC bus:
   B. a Kimi controller does the same in reverse, launching a Claude worker.
 
 A passing run proves the launch_agent/wait_agent bridge tools, the synchronous
-agent.launchWorker path, the agent.wait turn tracker, and the ParentThreadID/
-Role linkage in agent.list — for both harnesses in both roles.
+agent.launchWorker path, the agent.wait turn tracker, the ParentThreadID/Role
+linkage in agent.list, and the core-broadcast `mcp.activity` feed (plan 16 P2)
+— for both harnesses in both roles.
 
 Requires: a built ./build/akcore and authenticated `claude` + `kimi` CLIs.
 Run unbuffered for live output:  python3 -u scripts/smoke-orchestrate.py
@@ -125,6 +126,7 @@ def run_direction(bus, name, controller_backend, controller_extra, prompt,
     checks = {}
     state = {"thread": None, "done": False, "tool_use": False,
              "launched": False, "magic": False}
+    acts = []  # mcp.activity notifications (plan 16 P2's core-side MCP feed)
 
     start = bus.call("agent.start", dict(controller_extra,
                                          prompt=prompt, backend=controller_backend))
@@ -132,6 +134,13 @@ def run_direction(bus, name, controller_backend, controller_extra, prompt,
     log(f"controller thread: {state['thread']} backend={start.get('backend')!r}")
 
     def on_notify(msg):
+        if msg.get("method") == "mcp.activity":
+            p = msg["params"]
+            acts.append(p)
+            log(f"  ++ mcp.activity {p.get('tool')} thread={p.get('threadId')} "
+                f"ok={p.get('ok')} {p.get('durationMs')}ms "
+                f"args={p.get('argsSummary')!r}")
+            return
         if msg.get("method") == "permission.requested":
             p = msg["params"]
             log(f"  >> permission requested: {p.get('toolName')} — auto-approving")
@@ -173,6 +182,17 @@ def run_direction(bus, name, controller_backend, controller_extra, prompt,
     checks["controller called launch_agent"] = state["tool_use"]
     checks["launch_agent reported a launched worker"] = state["launched"]
     checks[f"controller relayed the worker's reply ({magic_word})"] = state["magic"]
+
+    # The core broadcasts every bridge call to the UI as mcp.activity, tagged
+    # with the calling thread — this is what the live MCP view (P5) consumes.
+    def activity(tool):
+        return [a for a in acts if a.get("tool") == tool
+                and a.get("threadId") == state["thread"] and a.get("ok")]
+
+    checks["mcp.activity: launch_agent, controller thread, ok"] = bool(activity("launch_agent"))
+    checks["mcp.activity: wait_agent, controller thread, ok"] = bool(activity("wait_agent"))
+    checks[f"mcp.activity: launch_agent summary names {worker_backend!r}"] = \
+        any(worker_backend in (a.get("argsSummary") or "") for a in activity("launch_agent"))
 
     # The worker must be a real roster thread, parented to the controller.
     threads = bus.call("agent.list", {"project": ""}).get("threads", [])
@@ -232,6 +252,10 @@ def main():
     all_checks = {}
     try:
         bus = Bus(SOCK)
+        # Identify as a UI client: mcp.activity is broadcast to UI connections
+        # only (an agent bridge never sees another agent's feed), so without the
+        # handshake the feed would never reach this script.
+        bus.call("handshake", {})
 
         # A: claude controller -> kimi worker. Haiku keeps controller cost low.
         prompt_a = (

@@ -3,6 +3,7 @@
 
 #include "ToolInspectorDialog.h"
 
+#include "AgentChatHelpers.h"
 #include "DiffView.h"
 #include "WorkflowMonitorView.h"
 #include "theme/ThemeManager.h"
@@ -34,6 +35,8 @@
 #include <QToolButton>
 #include <QVBoxLayout>
 #include <QWidget>
+
+#include <utility>
 
 namespace {
 
@@ -284,6 +287,36 @@ QWidget *ToolInspectorDialog::buildOverview(const QString &toolName,
         auto *view = new DiffView(diff, host);
         view->setEmptyMessage(i18n("No edits."));
         addSection(i18n("Changes"), view, 1);
+
+    } else if (name.startsWith(QLatin1String("mcp__cooperation__"))
+               || name.startsWith(QLatin1String("mcp__cowork__"))) {
+        // The arena's own MCP servers. Their calls are coordination, not file
+        // edits: show the one-line digest the transcript row shows, then the
+        // long-form argument that carries the intent (a worker's briefing, a
+        // note, a message), then whatever the tool answered. Everything else is
+        // short enough for the key/value form.
+        const QString verb = name.section(QLatin1String("__"), 2);
+        const QString digest = agentkate::permSummary(name, input);
+        auto *call = new QLabel(
+            digest.isEmpty() ? verb : verb + QStringLiteral(" — ") + digest, host);
+        call->setWordWrap(true);
+        call->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        addSection(i18n("Call"), call);
+        addPathRow(input.value(QStringLiteral("path")).toString());
+        for (const auto &field : {std::pair{"prompt", i18n("Briefing")},
+                                  std::pair{"message", i18n("Message")},
+                                  std::pair{"text", i18n("Note")},
+                                  std::pair{"summary", i18n("Summary")}}) {
+            const QString body = input.value(QLatin1String(field.first)).toString();
+            if (!body.isEmpty()) {
+                auto *view = monoView(body, host);
+                view->setLineWrapMode(QPlainTextEdit::WidgetWidth);
+                view->setMaximumHeight(160);
+                addSection(field.second, view);
+            }
+        }
+        auto *out = monoView(fullResult, host);
+        addSection(i18n("Result"), out, 1);
 
     } else if (name == QLatin1String("Grep") || name == QLatin1String("Glob")) {
         const QString pattern = input.value(QStringLiteral("pattern")).toString();

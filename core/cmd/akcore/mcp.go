@@ -58,6 +58,16 @@ func runMCPBridge(args []string) {
 	}
 	defer client.Close()
 
+	// Identify the connection to the core before any tool can run, so every
+	// call it makes is attributable to this thread — the core's `mcp.activity`
+	// feed (plan 16 P2) and the Cowork per-thread binding both key on it. A
+	// core that predates the handshake simply answers method-not-found; the
+	// bridge still works, it is just not seen in the activity feed.
+	if err := client.Call("bridge.identify",
+		map[string]any{"threadId": *thread}, nil); err != nil {
+		log.Warn("mcp bridge could not identify to core", "thread", *thread, "err", err)
+	}
+
 	b := &mcpBridge{
 		client:           client,
 		thread:           *thread,

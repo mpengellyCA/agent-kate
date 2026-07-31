@@ -229,13 +229,19 @@ if(Qt6Test_FOUND)
     set_tests_properties(PanelStackTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
-    # Plan 10 phase 2: the virtualized chat transcript model + delegate.
+    # Plan 10 phase 2: the virtualized chat transcript model + delegate, plus
+    # the stateless formatters that feed them (plan 16 P2's MCP summaries).
+    # AgentChatHelpers pulls the harness traits (and their CoreClient probe) in
+    # for its model-availability helpers — hence the extra sources.
     add_executable(TranscriptModelTest tests/TranscriptModelTest.cpp
         src/TranscriptModel.cpp src/TranscriptDelegate.cpp
+        src/AgentChatHelpers.cpp src/MarkdownUtil.cpp
+        src/state/HarnessTraits.cpp src/ProviderConfig.cpp src/ipc/CoreClient.cpp
         src/theme/ThemeManager.cpp)
     target_include_directories(TranscriptModelTest PRIVATE src)
     target_link_libraries(TranscriptModelTest PRIVATE Qt6::Widgets Qt6::Test
-        KF6::ColorScheme KF6::ConfigCore KF6::I18n KF6::SyntaxHighlighting)
+        Qt6::Network KF6::ColorScheme KF6::ConfigCore KF6::I18n
+        KF6::SyntaxHighlighting)
     add_test(NAME TranscriptModelTest COMMAND TranscriptModelTest)
     set_tests_properties(TranscriptModelTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")

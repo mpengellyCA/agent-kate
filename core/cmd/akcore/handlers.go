@@ -212,6 +212,9 @@ func registerHandlers(d handlerDeps) {
 	// the Cooperation bridge's launch/send/wait/close tools (plan 16 P1).
 	registerOrchestrationHandlers(d)
 
+	// Bridge identity + the `mcp.activity` feed the UI watches (plan 16 P2).
+	registerMCPActivity(d)
+
 	// --- agent threads -----------------------------------------------------
 
 	// agent.capabilities lists the registered harnesses with their capability

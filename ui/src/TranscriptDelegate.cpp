@@ -535,11 +535,17 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
         painter->drawRoundedRect(card.adjusted(0, 0, -1, -1), 7, 7);
         painter->restore();
 
-        // Header line: arrow + mark + 🔧 name + summary, with a copy glyph right.
+        // Header line: arrow + mark + kind glyph + name + summary, with a copy
+        // glyph right. Cooperation calls (agent-to-agent coordination and
+        // orchestration) carry ⇄ instead of the 🔧 file/shell wrench, so a
+        // controller's traffic stands out from its own tool use at a glance.
         const QString arrow = expanded ? QStringLiteral("▾") : QStringLiteral("▸");
         const QString mark = done ? QStringLiteral("✓") : QStringLiteral("⋯");
-        const QString header = QStringLiteral("%1  %2  \U0001f527 %3   %4")
-                                   .arg(arrow, mark, name, summary);
+        const QString kind = name.startsWith(QLatin1String("mcp__cooperation__"))
+                                 ? QStringLiteral("⇄")
+                                 : QStringLiteral("\U0001f527");
+        const QString header = QStringLiteral("%1  %2  %3 %4   %5")
+                                   .arg(arrow, mark, kind, name, summary);
         const QRect hdr(card.left() + 8, card.top(),
                         card.width() - 8 - kToolCopyW - kToolInspectW, kToolHeaderH);
         painter->save();
