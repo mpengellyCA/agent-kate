@@ -167,6 +167,11 @@ func runCore() {
 	// after handlers are registered, well past that point.
 	var harnesses *harness.Registry
 
+	// Turn tracker: the backend-agnostic idle/busy mirror agent.wait blocks on.
+	// The handlers mark turns queued; the relay below feeds every event back in
+	// (results end turns, terminal lifecycles end threads).
+	turns := agent.NewTurnTracker()
+
 	// The agent supervisors relay every thread event to the UI as a
 	// notification, so the agent panel can render the conversation live. Events
 	// arrive pre-coalesced as an ordered batch; we forward the whole batch in a
@@ -179,6 +184,7 @@ func runCore() {
 		}
 		srv.Notify("agent.event", agentEventParams{ThreadID: threadID, Events: events})
 		for _, event := range events {
+			turns.Observe(threadID, event)
 			var probe struct {
 				Type      string `json:"type"`
 				Phase     string `json:"phase"`
@@ -311,6 +317,8 @@ func runCore() {
 		srv:        srv,
 		sup:        sup,
 		harnesses:  harnesses,
+		turns:      turns,
+		orchGrants: newOrchGrants(),
 		coop:       coopState,
 		threads:    threads,
 		broker:     broker,

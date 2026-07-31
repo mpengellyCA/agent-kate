@@ -62,10 +62,17 @@ type agentSendParams struct {
 	ThreadID    string             `json:"threadId"`
 	Text        string             `json:"text"`
 	Attachments []agent.Attachment `json:"attachments"`
+	// FromThreadID names the AGENT thread issuing the send (the Cooperation
+	// bridge's send_agent). Empty for UI-driven sends. When set and the target
+	// is outside the caller's own subtree, the human must approve once.
+	FromThreadID string `json:"fromThreadId,omitempty"`
 }
 
 type agentStopParams struct {
 	ThreadID string `json:"threadId"`
+	// FromThreadID names the agent thread issuing the stop (close_agent);
+	// empty for UI-driven stops. Same cross-subtree approval rule as sends.
+	FromThreadID string `json:"fromThreadId,omitempty"`
 }
 
 type agentDiffParams struct {
@@ -90,6 +97,8 @@ type handlerDeps struct {
 	// goes through harnesses.
 	sup        *agent.Supervisor
 	harnesses  *harness.Registry
+	turns      *agent.TurnTracker // backend-agnostic idle/busy mirror (agent.wait)
+	orchGrants *orchGrants        // one-shot human approvals for cross-subtree agent control
 	coop       *coop.State
 	threads    *threadRegistry
 	broker     *permission.Broker
@@ -199,6 +208,10 @@ func registerHandlers(d handlerDeps) {
 	// Cowork (KDE desktop see/control) RPCs. No-op if the service is unavailable.
 	registerCoworkHandlers(d)
 
+	// Orchestration RPCs (agent.wait / agent.launchWorker) — the core side of
+	// the Cooperation bridge's launch/send/wait/close tools (plan 16 P1).
+	registerOrchestrationHandlers(d)
+
 	// --- agent threads -----------------------------------------------------
 
 	// agent.capabilities lists the registered harnesses with their capability
@@ -298,6 +311,10 @@ func registerHandlers(d handlerDeps) {
 		if caps.MintsSessionID {
 			sessionID = session.NewID()
 		}
+		// The opening prompt is a turn: mark it queued BEFORE the async start so
+		// an agent.wait racing the launch never sees a false idle. A launch
+		// failure emits an "error" lifecycle, which clears it.
+		d.turns.TurnQueued(threadID)
 		safe.Go("agent.startThread", func() { startThread(d, h, threadID, sessionID, p) })
 		// The opening prompt's attachments are recorded against the new thread id
 		// (the record is created asynchronously above, but the sidecar is keyed by
@@ -617,7 +634,15 @@ func registerHandlers(d handlerDeps) {
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
+		// Agent-to-agent sends outside the caller's own subtree need one human
+		// approval (UI sends carry no FromThreadID and are never gated).
+		if err := d.authorizeAgentTarget(p.FromThreadID, p.ThreadID, "send_agent",
+			map[string]any{"message": p.Text}); err != nil {
+			return nil, err
+		}
+		d.turns.TurnQueued(p.ThreadID)
 		if err := d.agentSend(p.ThreadID, p.Text, p.Attachments); err != nil {
+			d.turns.TurnFailed(p.ThreadID)
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
 		// Persist a compact attachment sidecar so the "You" card's chips survive
@@ -653,6 +678,19 @@ func registerHandlers(d handlerDeps) {
 		var p agentStopParams
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		// close_agent (agent-driven): refuse self-close — a thread stopping
+		// itself mid-turn wedges its own tool call — and gate targets outside
+		// the caller's subtree behind one human approval.
+		if p.FromThreadID != "" {
+			if p.FromThreadID == p.ThreadID {
+				return nil, ipc.Errorf(ipc.CodeInvalidParams,
+					"an agent cannot close itself — ask the human to close this thread")
+			}
+			if err := d.authorizeAgentTarget(p.FromThreadID, p.ThreadID,
+				"close_agent", nil); err != nil {
+				return nil, err
+			}
 		}
 		// Hot-compaction must run against the live session, before termination.
 		// It is a no-op for a dormant thread (guards on d.sup.Running internally).
@@ -851,6 +889,10 @@ func registerHandlers(d handlerDeps) {
 				"lastTurn": r.LastTurnAt,
 				"model":    r.Model,
 				"tags":     r.Tags,
+				// Orchestration linkage: which thread launched this one (empty
+				// for human-launched threads) and its controller/worker role.
+				"parentThreadId": r.ParentThreadID,
+				"role":           r.Role,
 			}
 			// The record's harness capabilities, resolved (a legacy "" backend
 			// reports the default harness), so a consumer never re-derives them.
@@ -1018,6 +1060,7 @@ func registerHandlers(d handlerDeps) {
 			_ = d.attachSide.Remove(p.ThreadID)
 		}
 		d.gitCache.Forget(p.ThreadID)
+		d.turns.Forget(p.ThreadID)
 		// Tell every UI client to drop this thread from its roster.
 		d.srv.Notify("agent.discarded", map[string]any{"threadId": p.ThreadID})
 		return map[string]any{"ok": true}, nil
@@ -2532,8 +2575,15 @@ func askHumanPermission(srv *ipc.Server, broker *permission.Broker, threadID, to
 	}
 }
 
-// emitLifecycle pushes a synthetic _lifecycle agent event to the UI.
-func emitLifecycle(srv *ipc.Server, threadID, phase, detail string, wt *worktree.Worktree) {
+// emitLifecycle pushes a synthetic _lifecycle agent event to the UI, and
+// mirrors the phase into the turn tracker — the orchestration-layer phases
+// (started/resumed and, crucially, launch "error") never cross the supervisor
+// relay, and an unobserved launch error would leave agent.wait blocked on a
+// turn whose thread never came up.
+func emitLifecycle(d handlerDeps, threadID, phase, detail string, wt *worktree.Worktree) {
+	if d.turns != nil {
+		d.turns.ObserveLifecycle(threadID, phase)
+	}
 	ev := map[string]any{"type": "_lifecycle", "phase": phase, "detail": detail}
 	if wt != nil {
 		ev["isolated"] = wt.Isolated
@@ -2546,7 +2596,7 @@ func emitLifecycle(srv *ipc.Server, threadID, phase, detail string, wt *worktree
 	}
 	// Single lifecycle event, but sent in the same batch shape as the supervisor
 	// relay so the UI has exactly one wire contract to parse.
-	srv.Notify("agent.event", agentEventParams{
+	d.srv.Notify("agent.event", agentEventParams{
 		ThreadID: threadID,
 		Events:   []json.RawMessage{b},
 	})

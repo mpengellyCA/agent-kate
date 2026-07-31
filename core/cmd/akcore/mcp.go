@@ -312,6 +312,8 @@ func (b *mcpBridge) runTool(name string, args json.RawMessage) (string, error) {
 				Created  time.Time `json:"created"`
 				LastTurn time.Time `json:"lastTurn"`
 				Model    string    `json:"model"`
+				Parent   string    `json:"parentThreadId"`
+				Role     string    `json:"role"`
 			} `json:"threads"`
 		}
 		if err := b.client.Call("agent.list",
@@ -343,6 +345,13 @@ func (b *mcpBridge) runTool(name string, args json.RawMessage) (string, error) {
 			}
 			fmt.Fprintf(&sb, "#%d %s%s — %s [%s, %s, age %s%s]\n",
 				t.Number, t.ThreadID, self, title, t.Status, wtKind, age, idleNote)
+			if t.Role != "" {
+				linkage := t.Role
+				if t.Parent != "" {
+					linkage += " of " + t.Parent
+				}
+				fmt.Fprintf(&sb, "    role:   %s\n", linkage)
+			}
 			if t.Branch != "" {
 				fmt.Fprintf(&sb, "    branch: %s\n", t.Branch)
 			}
@@ -408,6 +417,136 @@ func (b *mcpBridge) runTool(name string, args json.RawMessage) (string, error) {
 		}
 		return fmt.Sprintf("Discarded agent %s (%s).", a.ThreadID, detail), nil
 
+	case "launch_agent":
+		var a struct {
+			Backend        string `json:"backend"`
+			Model          string `json:"model"`
+			Prompt         string `json:"prompt"`
+			Title          string `json:"title"`
+			Isolation      string `json:"isolation"`
+			PermissionMode string `json:"permission_mode"`
+			Effort         string `json:"effort"`
+			Wait           bool   `json:"wait"`
+		}
+		_ = json.Unmarshal(args, &a)
+		if strings.TrimSpace(a.Prompt) == "" {
+			return "", fmt.Errorf("launch_agent requires a non-empty 'prompt'")
+		}
+		var res struct {
+			ThreadID  string            `json:"threadId"`
+			SessionID string            `json:"sessionId"`
+			Backend   string            `json:"backend"`
+			Isolated  bool              `json:"isolated"`
+			Branch    string            `json:"branch"`
+			Applied   map[string]string `json:"applied"`
+			Unapplied []struct {
+				Option    string `json:"option"`
+				Requested string `json:"requested"`
+				Applied   string `json:"applied"`
+			} `json:"unapplied"`
+		}
+		// Synchronous launch: worktree creation plus a CLI handshake can take
+		// a while (kimi's ACP handshake in particular), so give it room.
+		if err := b.client.CallTimeout("agent.launchWorker", map[string]any{
+			"parentThreadId": b.thread,
+			"backend":        a.Backend,
+			"model":          a.Model,
+			"prompt":         a.Prompt,
+			"title":          a.Title,
+			"isolation":      a.Isolation,
+			"permissionMode": a.PermissionMode,
+			"effort":         a.Effort,
+		}, &res, 3*time.Minute); err != nil {
+			return "", err
+		}
+		var sb strings.Builder
+		fmt.Fprintf(&sb, "Launched worker %s on the %s backend.\n", res.ThreadID, res.Backend)
+		if res.Isolated {
+			fmt.Fprintf(&sb, "It runs in its own isolated worktree on branch %s.\n", res.Branch)
+		} else {
+			sb.WriteString("It runs directly in the workspace (no isolated worktree).\n")
+		}
+		if m := res.Applied["model"]; m != "" {
+			fmt.Fprintf(&sb, "Model: %s\n", m)
+		}
+		for _, u := range res.Unapplied {
+			fmt.Fprintf(&sb, "NOT APPLIED: %s %q was not accepted (running with %q instead).\n",
+				u.Option, u.Requested, u.Applied)
+		}
+		if a.Wait {
+			waitText, err := b.waitAgent(res.ThreadID, 0)
+			if err != nil {
+				return "", fmt.Errorf("worker %s launched, but waiting on it failed: %w",
+					res.ThreadID, err)
+			}
+			sb.WriteString(waitText)
+		} else {
+			sb.WriteString("It is working now; collect its result with wait_agent.")
+		}
+		return strings.TrimRight(sb.String(), "\n"), nil
+
+	case "send_agent":
+		var a struct {
+			ThreadID string `json:"thread_id"`
+			Message  string `json:"message"`
+			Wait     bool   `json:"wait"`
+		}
+		_ = json.Unmarshal(args, &a)
+		a.ThreadID = strings.TrimSpace(a.ThreadID)
+		if a.ThreadID == "" || strings.TrimSpace(a.Message) == "" {
+			return "", fmt.Errorf("send_agent requires 'thread_id' and a non-empty 'message'")
+		}
+		// A target outside this agent's own subtree needs one human approval,
+		// which can take minutes — the long timeout mirrors request_permission.
+		if err := b.client.CallTimeout("agent.send", map[string]any{
+			"threadId":     a.ThreadID,
+			"text":         a.Message,
+			"fromThreadId": b.thread,
+		}, nil, 10*time.Minute); err != nil {
+			return "", err
+		}
+		if a.Wait {
+			return b.waitAgent(a.ThreadID, 0)
+		}
+		return fmt.Sprintf("Message delivered to %s; collect its reply with wait_agent.",
+			a.ThreadID), nil
+
+	case "wait_agent":
+		var a struct {
+			ThreadID   string `json:"thread_id"`
+			TimeoutSec int    `json:"timeout_sec"`
+		}
+		_ = json.Unmarshal(args, &a)
+		a.ThreadID = strings.TrimSpace(a.ThreadID)
+		if a.ThreadID == "" {
+			return "", fmt.Errorf("wait_agent requires 'thread_id'")
+		}
+		return b.waitAgent(a.ThreadID, a.TimeoutSec)
+
+	case "close_agent":
+		var a struct {
+			ThreadID string `json:"thread_id"`
+		}
+		_ = json.Unmarshal(args, &a)
+		a.ThreadID = strings.TrimSpace(a.ThreadID)
+		if a.ThreadID == "" {
+			return "", fmt.Errorf("close_agent requires 'thread_id'")
+		}
+		if a.ThreadID == b.thread {
+			return "", fmt.Errorf("an agent cannot close itself — ask the human to close this thread")
+		}
+		// Stopping a busy thread waits for its turn to wind down, and a
+		// cross-subtree target may need a human approval first.
+		if err := b.client.CallTimeout("agent.stopClose", map[string]any{
+			"threadId":     a.ThreadID,
+			"fromThreadId": b.thread,
+		}, nil, 10*time.Minute); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("Closed agent %s: stopped politely and archived (reversible — "+
+			"the human can restore it from the Sessions browser). Its worktree is untouched.",
+			a.ThreadID), nil
+
 	case "request_permission":
 		// Claude Code calls this for any gated tool. Forward the request to
 		// the core (which prompts the human in the agent panel) and answer
@@ -462,6 +601,43 @@ func (b *mcpBridge) runTool(name string, args json.RawMessage) (string, error) {
 	default:
 		return "", fmt.Errorf("unknown tool %q", name)
 	}
+}
+
+// waitAgent blocks on the core's agent.wait until the target thread goes idle
+// (or the timeout fires) and formats the outcome for the calling agent.
+// timeoutSec <= 0 uses the core's default (5 minutes). The IPC timeout is the
+// wait timeout plus slack, so the blocking RPC itself never races the wait.
+func (b *mcpBridge) waitAgent(threadID string, timeoutSec int) (string, error) {
+	effective := timeoutSec
+	if effective <= 0 {
+		effective = 300
+	}
+	var res struct {
+		Status   string `json:"status"`
+		LastText string `json:"lastText"`
+	}
+	if err := b.client.CallTimeout("agent.wait",
+		map[string]any{"threadId": threadID, "timeoutSec": timeoutSec},
+		&res, time.Duration(effective)*time.Second+30*time.Second); err != nil {
+		return "", err
+	}
+	var sb strings.Builder
+	switch res.Status {
+	case "idle":
+		fmt.Fprintf(&sb, "Agent %s is idle (turn complete; it accepts follow-ups via send_agent).\n", threadID)
+	case "exited":
+		fmt.Fprintf(&sb, "Agent %s has finished and its process exited (send_agent would resume it — ask the human if unsure).\n", threadID)
+	case "timeout":
+		fmt.Fprintf(&sb, "Timed out after %ds: agent %s is STILL WORKING (it may also be blocked on a human permission). Call wait_agent again to keep waiting.\n", effective, threadID)
+	default:
+		fmt.Fprintf(&sb, "Agent %s: %s.\n", threadID, res.Status)
+	}
+	if res.LastText != "" {
+		fmt.Fprintf(&sb, "Its last reply:\n%s", res.LastText)
+	} else {
+		sb.WriteString("It has produced no reply text yet.")
+	}
+	return strings.TrimRight(sb.String(), "\n"), nil
 }
 
 // toolDefs is the Cooperation MCP tool catalogue advertised via tools/list.
@@ -572,6 +748,97 @@ func toolDefs() []map[string]any {
 						"type":        "boolean",
 						"description": "Discard even if the thread is currently running.",
 					},
+				},
+				"required": []string{"thread_id"},
+			},
+		},
+		{
+			"name": "launch_agent",
+			"description": "Launch a WORKER: a real Agent Kate agent thread parented to you. " +
+				"It gets its own worktree (per 'isolation'), appears in the human's roster " +
+				"with a live transcript, and the human can inspect or take it over at any " +
+				"time. 'backend' is an engine id from this arena's registry — \"claude\" " +
+				"(Claude Code) or \"kimi\" (Kimi Code); omit it to use your own engine. " +
+				"'model' must belong to that backend's vocabulary (see agent list / ask the " +
+				"human if unsure); options the backend rejects are reported back as NOT " +
+				"APPLIED — never silently emulated. Workers needing tool approval prompt " +
+				"the HUMAN, which can stall an unattended worker: pass permission_mode " +
+				"\"acceptEdits\" (or \"auto\" on claude) for autonomous work. With " +
+				"wait=true this call blocks until the worker finishes its first turn and " +
+				"returns its reply.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"prompt": map[string]any{"type": "string",
+						"description": "The worker's opening instruction (its whole briefing)."},
+					"backend": map[string]any{"type": "string",
+						"description": "Engine id: \"claude\" or \"kimi\". Empty = same engine as you."},
+					"model": map[string]any{"type": "string",
+						"description": "Model id in the target backend's vocabulary. Empty = its default."},
+					"title": map[string]any{"type": "string",
+						"description": "Short roster title. Empty = derived from the prompt."},
+					"isolation": map[string]any{"type": "string",
+						"description": "\"auto\" (default: isolated worktree when the repo has commits), \"isolated\", or \"workspace\"."},
+					"permission_mode": map[string]any{"type": "string",
+						"description": "The backend's permission mode. Empty = its default (gated tools then prompt the human)."},
+					"effort": map[string]any{"type": "string",
+						"description": "Reasoning effort / thinking level in the backend's vocabulary. Empty = default."},
+					"wait": map[string]any{"type": "boolean",
+						"description": "Block until the worker's first turn completes and include its reply."},
+				},
+				"required": []string{"prompt"},
+			},
+		},
+		{
+			"name": "send_agent",
+			"description": "Send a follow-up message to a running agent thread (use " +
+				"list_agents for ids). Targets outside your own worker subtree need a " +
+				"one-time human approval. Set wait=true to block until the reply lands " +
+				"and get its text back.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"thread_id": map[string]any{"type": "string",
+						"description": "Target agent thread id."},
+					"message": map[string]any{"type": "string",
+						"description": "The message to deliver."},
+					"wait": map[string]any{"type": "boolean",
+						"description": "Block until the target finishes the turn and include its reply."},
+				},
+				"required": []string{"thread_id", "message"},
+			},
+		},
+		{
+			"name": "wait_agent",
+			"description": "Block until an agent thread is idle (its current turn finished " +
+				"or its process ended) and return its status plus its last reply text. " +
+				"Times out after timeout_sec (default 300) with status \"timeout\" if the " +
+				"agent is still working — call again to keep waiting. Note: a worker " +
+				"blocked on a human permission counts as working.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"thread_id": map[string]any{"type": "string",
+						"description": "Agent thread id to wait on."},
+					"timeout_sec": map[string]any{"type": "integer",
+						"description": "Give up after this many seconds (default 300, max 3600)."},
+				},
+				"required": []string{"thread_id"},
+			},
+		},
+		{
+			"name": "close_agent",
+			"description": "Politely retire an agent thread: stop its process (letting a " +
+				"running turn wind down) and ARCHIVE it out of the live roster. Reversible " +
+				"— the record and worktree survive and the human can restore it; use " +
+				"discard_agent only when the worktree should be destroyed. Refuses to " +
+				"close yourself; targets outside your own worker subtree need a one-time " +
+				"human approval.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"thread_id": map[string]any{"type": "string",
+						"description": "Agent thread id to close."},
 				},
 				"required": []string{"thread_id"},
 			},

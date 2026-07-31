@@ -77,6 +77,41 @@ func TestPersistAcrossReopen(t *testing.T) {
 	}
 }
 
+// TestOrchestrationFieldsRoundTrip guards the plan-16 worker linkage: a
+// worker's ParentThreadID and Role must persist in threads.json like every
+// other field, and ordinary records must keep omitting them.
+func TestOrchestrationFieldsRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "threads.json")
+	store, _ := NewStore(path)
+	rec := sampleRecord("t-worker")
+	rec.ParentThreadID = "t-controller"
+	rec.Role = RoleWorker
+	if err := store.Put(rec); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := store.Put(sampleRecord("t-plain")); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	reopened, err := NewStore(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	got, ok := reopened.Get("t-worker")
+	if !ok {
+		t.Fatal("worker record did not survive reopen")
+	}
+	if got.ParentThreadID != "t-controller" || got.Role != RoleWorker {
+		t.Fatalf("linkage = %q/%q, want t-controller/worker",
+			got.ParentThreadID, got.Role)
+	}
+	// omitempty keeps ordinary records free of orchestration keys on disk.
+	raw, _ := os.ReadFile(path)
+	if n := strings.Count(string(raw), "parentThreadId"); n != 1 {
+		t.Fatalf("parentThreadId appears %d times on disk, want 1", n)
+	}
+}
+
 func TestUpdate(t *testing.T) {
 	store, _ := NewStore(filepath.Join(t.TempDir(), "threads.json"))
 	store.Put(sampleRecord("t-u"))

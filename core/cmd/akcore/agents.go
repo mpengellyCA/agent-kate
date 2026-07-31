@@ -27,12 +27,30 @@ import (
 // (claude --session-id), empty otherwise — the harness assigns its own during
 // launch and Launch reports it back.
 func startThread(d handlerDeps, h harness.Harness, threadID, sessionID string, p agentStartParams) {
+	_, _, _ = launchThread(d, h, threadID, sessionID, p, launchMeta{})
+}
+
+// launchMeta carries the orchestration extras of a worker launch (plan 16):
+// the launching thread's id (persisted as the worker's ParentThreadID) and an
+// optional roster title. Zero value = an ordinary human-launched thread.
+type launchMeta struct {
+	ParentThreadID string
+	Title          string
+}
+
+// launchThread is the shared start path behind agent.start (async, results
+// ignored — failures surface as lifecycle events) and agent.launchWorker
+// (synchronous — the bridge reports applied-truth back to the launching
+// agent). Lifecycle events are emitted either way, so the UI narrative is
+// identical for human- and agent-launched threads.
+func launchThread(d handlerDeps, h harness.Harness, threadID, sessionID string,
+	p agentStartParams, meta launchMeta) (harness.Launched, worktree.Worktree, error) {
 	caps := h.Capabilities()
 	wt, err := worktree.Create(p.WorkspacePath, threadID, p.Isolation)
 	if err != nil {
 		d.log.Error("worktree create failed", "thread", threadID, "err", err)
-		emitLifecycle(d.srv, threadID, "error", "worktree: "+err.Error(), nil)
-		return
+		emitLifecycle(d, threadID, "error", "worktree: "+err.Error(), nil)
+		return harness.Launched{}, worktree.Worktree{}, err
 	}
 	wt.Number = d.sessions.NextNumber(p.WorkspacePath)
 	d.threads.put(threadID, wt)
@@ -52,14 +70,22 @@ func startThread(d handlerDeps, h harness.Harness, threadID, sessionID string, p
 		Provider:       p.Provider,
 	})
 	if err != nil {
-		emitLifecycle(d.srv, threadID, "error", err.Error(), &wt)
-		return
+		emitLifecycle(d, threadID, "error", err.Error(), &wt)
+		return harness.Launched{}, wt, err
 	}
 
 	// Persist the thread so it survives a stop, a crash or an Agent Kate
 	// restart, and can later be resumed on the same session. The record holds
 	// what the harness actually APPLIED (resolved model, defaulted mode, the
 	// session id it assigned), so a later resume replays reality.
+	title := meta.Title
+	if strings.TrimSpace(title) == "" {
+		title = p.Prompt
+	}
+	role := ""
+	if meta.ParentThreadID != "" {
+		role = session.RoleWorker
+	}
 	rec := session.Record{
 		ThreadID:       threadID,
 		SessionID:      launched.SessionID,
@@ -69,7 +95,9 @@ func startThread(d handlerDeps, h harness.Harness, threadID, sessionID string, p
 		PermissionMode: launched.PermissionMode,
 		Effort:         launched.Effort,
 		Model:          launched.Model,
-		Title:          summarizePrompt(p.Prompt),
+		Title:          summarizePrompt(title),
+		ParentThreadID: meta.ParentThreadID,
+		Role:           role,
 		Created:        time.Now(),
 		Status:         session.StatusRunning,
 		CoworkEnabled:  p.CoworkEnabled,
@@ -84,8 +112,9 @@ func startThread(d handlerDeps, h harness.Harness, threadID, sessionID string, p
 		mode = "in an isolated worktree on " + wt.Branch
 	}
 	d.log.Info("agent thread started", "thread", threadID, "harness", caps.ID,
-		"isolated", wt.Isolated, "dir", wt.Path)
-	emitLifecycle(d.srv, threadID, "started", "running "+mode, &wt)
+		"isolated", wt.Isolated, "parent", meta.ParentThreadID, "dir", wt.Path)
+	emitLifecycle(d, threadID, "started", "running "+mode, &wt)
+	return launched, wt, nil
 }
 
 // resumeThread re-launches a dormant thread through its harness, in the same
@@ -96,7 +125,7 @@ func startThread(d handlerDeps, h harness.Harness, threadID, sessionID string, p
 func resumeThread(d handlerDeps, h harness.Harness, rec session.Record, provOverride *agent.Provider) {
 	caps := h.Capabilities()
 	if _, err := os.Stat(rec.Worktree.Path); err != nil {
-		emitLifecycle(d.srv, rec.ThreadID, "error",
+		emitLifecycle(d, rec.ThreadID, "error",
 			"worktree no longer exists: "+rec.Worktree.Path, nil)
 		return
 	}
@@ -147,7 +176,7 @@ func resumeThread(d handlerDeps, h harness.Harness, rec session.Record, provOver
 
 	launched, err := h.Launch(spec)
 	if err != nil {
-		emitLifecycle(d.srv, rec.ThreadID, "error", err.Error(), &rec.Worktree)
+		emitLifecycle(d, rec.ThreadID, "error", err.Error(), &rec.Worktree)
 		return
 	}
 
@@ -169,7 +198,7 @@ func resumeThread(d handlerDeps, h harness.Harness, rec session.Record, provOver
 	}
 	d.log.Info("agent thread resumed", "thread", rec.ThreadID, "harness", caps.ID,
 		"session", launched.SessionID, "seeded", seeded)
-	emitLifecycle(d.srv, rec.ThreadID, "resumed", detail, &rec.Worktree)
+	emitLifecycle(d, rec.ThreadID, "resumed", detail, &rec.Worktree)
 }
 
 // forkAgentThread branches a source thread's conversation into a brand-new
@@ -188,14 +217,14 @@ func forkAgentThread(d handlerDeps, h harness.Harness, src session.Record, newTh
 	// from exactly the committed state the conversation was continuing from.
 	base, ok := worktree.Head(src.Worktree.Path)
 	if !ok {
-		emitLifecycle(d.srv, newThreadID, "error",
+		emitLifecycle(d, newThreadID, "error",
 			"fork: cannot read the source worktree's HEAD (no commits to branch from)", nil)
 		return
 	}
 	wt, err := worktree.CreateFrom(src.Project, newThreadID, base)
 	if err != nil {
 		d.log.Error("fork worktree create failed", "thread", newThreadID, "err", err)
-		emitLifecycle(d.srv, newThreadID, "error", "fork worktree: "+err.Error(), nil)
+		emitLifecycle(d, newThreadID, "error", "fork worktree: "+err.Error(), nil)
 		return
 	}
 	wt.Number = d.sessions.NextNumber(src.Project)
@@ -229,7 +258,7 @@ func forkAgentThread(d handlerDeps, h harness.Harness, src session.Record, newTh
 		Provider:       providerFromRecord(src),
 	})
 	if err != nil {
-		emitLifecycle(d.srv, newThreadID, "error", err.Error(), &wt)
+		emitLifecycle(d, newThreadID, "error", err.Error(), &wt)
 		return
 	}
 
@@ -267,7 +296,7 @@ func forkAgentThread(d handlerDeps, h harness.Harness, src session.Record, newTh
 	d.log.Info("agent thread forked",
 		"from", src.ThreadID, "thread", newThreadID, "branch", wt.Branch,
 		"model", launched.Model, "effort", launched.Effort)
-	emitLifecycle(d.srv, newThreadID, "started",
+	emitLifecycle(d, newThreadID, "started",
 		"forked from #"+strconv.Itoa(src.Worktree.Number)+" on "+wt.Branch, &wt)
 }
 
@@ -286,7 +315,7 @@ func promoteAgentThread(d handlerDeps, h harness.Harness, rec session.Record) {
 	if err != nil && !iso.Isolated {
 		// Promote failed before it created the worktree — there is nothing to
 		// adopt, so the record stays as-is and we just report the failure.
-		emitLifecycle(d.srv, rec.ThreadID, "error", "promote: "+err.Error(), &rec.Worktree)
+		emitLifecycle(d, rec.ThreadID, "error", "promote: "+err.Error(), &rec.Worktree)
 		return
 	}
 	// A non-nil err with a valid isolated worktree means the worktree WAS created
@@ -300,7 +329,7 @@ func promoteAgentThread(d handlerDeps, h harness.Harness, rec session.Record) {
 	}
 	// Relocate the Claude Code session so `--resume` finds it in the worktree.
 	if err := session.PromoteTranscript(rec.SessionID, rec.ThreadID); err != nil {
-		emitLifecycle(d.srv, rec.ThreadID, "error", "promote: "+err.Error(), &iso)
+		emitLifecycle(d, rec.ThreadID, "error", "promote: "+err.Error(), &iso)
 		return
 	}
 
@@ -312,11 +341,11 @@ func promoteAgentThread(d handlerDeps, h harness.Harness, rec session.Record) {
 	if promoteWarning != "" {
 		d.log.Warn("agent thread promoted with conflict",
 			"thread", rec.ThreadID, "branch", iso.Branch, "warn", promoteWarning)
-		emitLifecycle(d.srv, rec.ThreadID, "promoted",
+		emitLifecycle(d, rec.ThreadID, "promoted",
 			"promoted to an isolated worktree on "+iso.Branch+" — "+promoteWarning, &iso)
 	} else {
 		d.log.Info("agent thread promoted", "thread", rec.ThreadID, "branch", iso.Branch)
-		emitLifecycle(d.srv, rec.ThreadID, "promoted",
+		emitLifecycle(d, rec.ThreadID, "promoted",
 			"promoted to an isolated worktree on "+iso.Branch, &iso)
 	}
 

@@ -125,10 +125,14 @@ def main():
               f"echo agentkate-perm-ok > {perm_file} && cat {perm_file}. Then use the "
               f"cooperation MCP tool request_review with summary 'kimi smoke test'. "
               f"Finally reply with the single word DONE and nothing else.")
+    # Pin the approval mode: this machine's kimi config may default to "auto"
+    # (auto-approve), which would bypass the very permission bridge this smoke
+    # exists to prove. "default" = manual approvals, routed to the human.
     start_id = call("agent.start", {
         "workspacePath": workspace,
         "prompt": prompt,
         "backend": "kimi",
+        "permissionMode": "default",
     })
 
     saw_backend = False

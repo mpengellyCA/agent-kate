@@ -61,6 +61,13 @@ def summarize(ev):
         log(f"  event: {t}")
 
 
+def events_of(params):
+    """agent.event arrives either as a single event or a batch."""
+    if "event" in params:
+        return [params["event"]]
+    return params.get("events", [])
+
+
 def main():
     if not os.path.exists(AKCORE):
         sys.exit("build akcore first: scripts/build.sh")
@@ -200,33 +207,33 @@ def main():
                     continue
 
                 if msg.get("method") == "agent.event":
-                    ev = msg["params"]["event"]
-                    summarize(ev)
-                    if ev.get("type") == "system":
-                        for srv in ev.get("mcp_servers", []):
-                            if srv.get("name") == "cooperation" and srv.get("status") == "connected":
-                                saw_mcp_connected = True
-                    if ev.get("type") == "user":
-                        for block in ev.get("message", {}).get("content", []):
-                            if block.get("type") == "tool_result":
-                                c = block.get("content")
-                                txt = c if isinstance(c, str) else " ".join(
-                                    x.get("text", "") for x in c if isinstance(x, dict))
-                                if "agentkate-perm-ok" in txt:
-                                    saw_bash_output = True
-                    if ev.get("type") == "result":
-                        saw_result = True
-                        result_text = ev.get("result")
-                        # The streaming session stays alive for follow-ups;
-                        # for the smoke test, end it once the turn completes.
-                        if thread_id:
-                            log("  (turn complete; stopping agent)")
-                            call("agent.stop", {"threadId": thread_id})
-                    if ev.get("type") == "_lifecycle":
-                        if ev.get("phase") == "started" and ev.get("isolated"):
-                            saw_isolated = True
-                        if ev.get("phase") == "exited":
-                            raise StopIteration
+                    for ev in events_of(msg["params"]):
+                        summarize(ev)
+                        if ev.get("type") == "system":
+                            for srv in ev.get("mcp_servers", []):
+                                if srv.get("name") == "cooperation" and srv.get("status") == "connected":
+                                    saw_mcp_connected = True
+                        if ev.get("type") == "user":
+                            for block in ev.get("message", {}).get("content", []):
+                                if block.get("type") == "tool_result":
+                                    c = block.get("content")
+                                    txt = c if isinstance(c, str) else " ".join(
+                                        x.get("text", "") for x in c if isinstance(x, dict))
+                                    if "agentkate-perm-ok" in txt:
+                                        saw_bash_output = True
+                        if ev.get("type") == "result":
+                            saw_result = True
+                            result_text = ev.get("result")
+                            # The streaming session stays alive for follow-ups;
+                            # for the smoke test, end it once the turn completes.
+                            if thread_id:
+                                log("  (turn complete; stopping agent)")
+                                call("agent.stop", {"threadId": thread_id})
+                        if ev.get("type") == "_lifecycle":
+                            if ev.get("phase") == "started" and ev.get("isolated"):
+                                saw_isolated = True
+                            if ev.get("phase") == "exited":
+                                raise StopIteration
     except StopIteration:
         pass
     finally:

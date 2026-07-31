@@ -27,6 +27,12 @@ const (
 	StatusArchived = "archived" // moved out of the live roster; reversible
 )
 
+// Orchestration roles for Record.Role (empty = ordinary human-launched thread).
+const (
+	RoleController = "controller" // has launched workers via the Cooperation bridge
+	RoleWorker     = "worker"     // launched by another thread (ParentThreadID)
+)
+
 // Agent backends. BackendClaude is empty so records written before the field
 // existed — all Claude threads — decode correctly.
 const (
@@ -61,6 +67,14 @@ type Record struct {
 	CompactStrip     bool      `json:"compactStrip,omitempty"`
 	SummaryUpdatedAt time.Time `json:"summaryUpdatedAt,omitempty"`
 	LastTurnAt       time.Time `json:"lastTurnAt,omitempty"`
+
+	// Orchestration linkage (plan 16). A worker launched by another agent via
+	// the Cooperation bridge's launch_agent carries its launcher's thread id in
+	// ParentThreadID; Role marks the thread's place in that tree ("controller"
+	// launched workers, "worker" was launched by one, "" is an ordinary
+	// human-launched thread). Both empty outside orchestration.
+	ParentThreadID string `json:"parentThreadId,omitempty"`
+	Role           string `json:"role,omitempty"`
 
 	// CoworkEnabled opts this thread into the KDE Plasma Cowork MCP server
 	// (desktop see/control). Off by default; only the UI may flip it

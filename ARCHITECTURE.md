@@ -80,6 +80,12 @@ other:
 | `post_note` / `read_notes` | message board between agents and the human |
 | `whoami` | the agent's thread / worktree identity |
 | `request_review` | flag a change for the human in the UI |
+| `list_agents` | every agent thread on record — id, status, worktree, parent/role linkage |
+| `launch_agent` | start a real worker thread (any registered backend), parented to the caller; reports applied-truth |
+| `send_agent` | follow-up message to another thread (outside the caller's subtree: one human approval) |
+| `wait_agent` | block until a thread is idle; returns status + its last reply text |
+| `close_agent` | polite stop + archive (reversible) |
+| `discard_agent` | destructive removal of a thread and its worktree |
 
 ## Repository layout
 
