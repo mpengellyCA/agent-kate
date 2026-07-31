@@ -28,15 +28,16 @@ SkillsDialog::SkillsDialog(CoreClient *core, const QString &target, QWidget *par
     , m_core(core)
     , m_target(target)
 {
-    setWindowTitle(i18n("Manage Claude Skills"));
+    setWindowTitle(i18n("Manage Skills"));
     resize(720, 480);
 
     auto *layout = new QVBoxLayout(this);
 
     auto *intro = new QLabel(
-        i18n("Install Claude Code skills from the central Agent Kate catalog "
-             "into this project. Installed skills are symlinked, so editing "
-             "the catalog copy updates every project that uses it."),
+        i18n("Install skills from the central Agent Kate catalog into this "
+             "project. Installed skills are symlinked — so editing the catalog "
+             "copy updates every project that uses it — and are linked for "
+             "every engine, so Claude and Kimi agents see the same catalog."),
         this);
     intro->setWordWrap(true);
     layout->addWidget(intro);

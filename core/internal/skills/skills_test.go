@@ -70,6 +70,23 @@ func TestListAndInstall(t *testing.T) {
 		}
 	}
 
+	// One catalog, every engine (plan 16 P6): the same skill is linked into
+	// BOTH engines' directories. Verified against kimi 0.30.0 — a skill in
+	// .agents/skills/ reaches an ACP session; a Claude-only install would have
+	// left kimi threads with no skills at all.
+	for _, rel := range skillDirs {
+		for _, name := range []string{"review", "quickfix.md"} {
+			link := filepath.Join(target, rel, name)
+			st, err := os.Lstat(link)
+			if err != nil {
+				t.Fatalf("%s was not installed: %v", link, err)
+			}
+			if st.Mode()&os.ModeSymlink == 0 {
+				t.Errorf("%s is not a symlink into the catalog", link)
+			}
+		}
+	}
+
 	// Re-install replaces cleanly.
 	if _, err := c.Install("review", target); err != nil {
 		t.Fatalf("re-install: %v", err)
@@ -88,6 +105,47 @@ func TestListAndInstall(t *testing.T) {
 	}
 	if len(installed) != 0 {
 		t.Errorf("want 0 installed after uninstall, got %+v", installed)
+	}
+	// …from every engine's directory, not just the canonical one.
+	for _, rel := range skillDirs {
+		entries, err := os.ReadDir(filepath.Join(target, rel))
+		if err != nil {
+			t.Fatalf("read %s: %v", rel, err)
+		}
+		if len(entries) != 0 {
+			t.Errorf("%s still holds %d entries after uninstall", rel, len(entries))
+		}
+	}
+}
+
+// TestUninstallLeavesForeignLinksAlone: the refusal to delete something the
+// catalog does not own has to hold in EVERY engine directory, not just the
+// first one Uninstall happens to visit.
+func TestUninstallLeavesForeignLinksAlone(t *testing.T) {
+	root := t.TempDir()
+	catDir := filepath.Join(root, "catalog")
+	writeFile(t, filepath.Join(catDir, "review", "SKILL.md"),
+		"---\nname: review\ndescription: d\n---\nbody\n")
+	c := New(catDir)
+	target := filepath.Join(root, "project")
+	if _, err := c.Install("review", target); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	// Someone replaced the .agents link with a symlink of their own.
+	foreign := filepath.Join(root, "elsewhere")
+	writeFile(t, filepath.Join(foreign, "SKILL.md"), "---\n---\n")
+	link := filepath.Join(target, skillDirs[1], "review")
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(foreign, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Uninstall("review", target); err == nil {
+		t.Error("uninstall removed a link that does not point into the catalog")
+	}
+	if _, err := os.Lstat(link); err != nil {
+		t.Errorf("the foreign link was removed: %v", err)
 	}
 }
 

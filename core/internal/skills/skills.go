@@ -5,8 +5,17 @@
 // format) — a single standalone "<name>.md" file is also accepted. The
 // catalog lives under XDG_DATA_HOME/agentkate/skills (default
 // ~/.local/share/agentkate/skills); installing a skill into a target creates
-// a symlink at <target>/.claude/skills/<name> pointing back at the catalog,
-// so edits to the central copy propagate without re-installing.
+// a symlink under each of skillDirs pointing back at the catalog, so edits to
+// the central copy propagate without re-installing.
+//
+// One catalog, every engine: the same skill is linked into BOTH
+// <target>/.claude/skills/ (Claude Code) and <target>/.agents/skills/ (the
+// cross-tool convention kimi reads). Verified against kimi 0.30.0 — a skill
+// dropped in .agents/skills/ shows up in an ACP session's command list as
+// `skill:<name>` and the agent lists it when asked. That check mattered: the
+// sibling .agents/agents/ subagent catalogue is v2-engine-only and invisible
+// over ACP (plan 16 P3), so "kimi documents this directory" was not evidence
+// enough on its own.
 package skills
 
 import (
@@ -19,6 +28,13 @@ import (
 	"path/filepath"
 	"strings"
 )
+
+// skillDirs are the per-target directories a skill is linked into, relative to
+// the target root. The first is the canonical one for listing.
+var skillDirs = []string{
+	filepath.Join(".claude", "skills"), // Claude Code
+	filepath.Join(".agents", "skills"), // kimi (and other .agents-aware tools)
+}
 
 // Skill is one entry in the central catalog.
 type Skill struct {
@@ -205,9 +221,10 @@ func sanitizeDescription(s string) string {
 	return s
 }
 
-// Install symlinks skillName from the catalog into target/.claude/skills.
-// An existing entry of the same name is replaced; the catalog directory and
-// the target's .claude/skills directory are created if needed.
+// Install symlinks skillName from the catalog into every directory of
+// skillDirs under target, so both engines see the same skill. An existing
+// entry of the same name is replaced; missing directories are created. The
+// returned path is the canonical (first) link.
 func (c *Catalog) Install(skillName, target string) (string, error) {
 	if target == "" {
 		return "", errors.New("target is required")
@@ -216,30 +233,36 @@ func (c *Catalog) Install(skillName, target string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	dest := filepath.Join(target, ".claude", "skills")
-	if err := os.MkdirAll(dest, 0o755); err != nil {
-		return "", err
-	}
 	linkName := skill.Name
 	if !skill.IsDir {
 		linkName = skill.Name + ".md"
 	}
-	linkPath := filepath.Join(dest, linkName)
-	// Replace any previous install so re-installing always reflects the
-	// catalog's current shape (a single-file skill replacing a directory or
-	// vice versa).
-	if err := removeIfPresent(linkPath); err != nil {
-		return "", err
+	first := ""
+	for _, rel := range skillDirs {
+		dest := filepath.Join(target, rel)
+		if err := os.MkdirAll(dest, 0o755); err != nil {
+			return "", err
+		}
+		linkPath := filepath.Join(dest, linkName)
+		// Replace any previous install so re-installing always reflects the
+		// catalog's current shape (a single-file skill replacing a directory or
+		// vice versa).
+		if err := removeIfPresent(linkPath); err != nil {
+			return "", err
+		}
+		if err := os.Symlink(skill.Path, linkPath); err != nil {
+			return "", err
+		}
+		if first == "" {
+			first = linkPath
+		}
 	}
-	if err := os.Symlink(skill.Path, linkPath); err != nil {
-		return "", err
-	}
-	return linkPath, nil
+	return first, nil
 }
 
-// Uninstall removes a previously installed skill from target/.claude/skills.
-// Only entries that resolve back into the catalog are removed — a hand-edited
-// skill of the same name in the target is left alone.
+// Uninstall removes a previously installed skill from every skillDirs
+// directory under target. Only entries that resolve back into the catalog are
+// removed — a hand-edited skill of the same name in the target is left alone.
 func (c *Catalog) Uninstall(skillName, target string) error {
 	if err := validateName(skillName); err != nil {
 		return err
@@ -247,23 +270,25 @@ func (c *Catalog) Uninstall(skillName, target string) error {
 	if target == "" {
 		return errors.New("target is required")
 	}
-	dest := filepath.Join(target, ".claude", "skills")
-	for _, n := range []string{skillName, skillName + ".md"} {
-		p := filepath.Join(dest, n)
-		st, err := os.Lstat(p)
-		if err != nil {
-			continue
-		}
-		if st.Mode()&os.ModeSymlink == 0 {
-			// Not a symlink — refuse to delete a real, possibly user-owned dir.
-			return fmt.Errorf("%s is not a managed skill (not a symlink)", p)
-		}
-		dest, _ := os.Readlink(p)
-		if !linkPointsInto(dest, c.dir) {
-			return fmt.Errorf("%s does not point into the catalog; refusing to remove", p)
-		}
-		if err := os.Remove(p); err != nil {
-			return err
+	for _, rel := range skillDirs {
+		dir := filepath.Join(target, rel)
+		for _, n := range []string{skillName, skillName + ".md"} {
+			p := filepath.Join(dir, n)
+			st, err := os.Lstat(p)
+			if err != nil {
+				continue
+			}
+			if st.Mode()&os.ModeSymlink == 0 {
+				// Not a symlink — refuse to delete a real, possibly user-owned dir.
+				return fmt.Errorf("%s is not a managed skill (not a symlink)", p)
+			}
+			resolved, _ := os.Readlink(p)
+			if !linkPointsInto(resolved, c.dir) {
+				return fmt.Errorf("%s does not point into the catalog; refusing to remove", p)
+			}
+			if err := os.Remove(p); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -277,14 +302,17 @@ type Installed struct {
 	InCatalog bool   `json:"inCatalog"` // true when the link resolves into this catalog
 }
 
-// ListInstalled returns every entry under target/.claude/skills, flagging
-// which ones this catalog owns. A target with no .claude/skills directory is
-// not an error — it just has nothing installed yet.
+// ListInstalled returns every entry under the CANONICAL skills directory
+// (skillDirs[0]), flagging which ones this catalog owns. It lists one
+// directory on purpose: Install writes the same set of links to every
+// skillDirs entry, so listing them all would report each skill once per
+// engine. A target with no skills directory is not an error — it just has
+// nothing installed yet.
 func (c *Catalog) ListInstalled(target string) ([]Installed, error) {
 	if target == "" {
 		return nil, errors.New("target is required")
 	}
-	dir := filepath.Join(target, ".claude", "skills")
+	dir := filepath.Join(target, skillDirs[0])
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
