@@ -258,6 +258,20 @@ if(Qt6Test_FOUND)
     set_tests_properties(MarkdownUtilTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
+    # Plan 16 P5: the roster is no longer a two-level tree — workers nest under
+    # their controller. Guards the traversals and the two ways a nested agent
+    # could be lost (a closed controller, a filter match under a hidden parent).
+    add_executable(AgentRosterTest tests/AgentRosterTest.cpp
+        src/AgentRoster.cpp src/AgentCardDelegate.cpp src/shell/ChipPainter.cpp
+        src/shell/FlowLayout.cpp src/theme/ThemeManager.cpp)
+    target_include_directories(AgentRosterTest PRIVATE src)
+    target_link_libraries(AgentRosterTest PRIVATE Qt6::Widgets Qt6::Test
+        KF6::ColorScheme KF6::ConfigCore KF6::I18n KF6::CoreAddons
+        KF6::SyntaxHighlighting)
+    add_test(NAME AgentRosterTest COMMAND AgentRosterTest)
+    set_tests_properties(AgentRosterTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
     # Plan 16 P4: the ensemble round-trip and the editable model combo, the two
     # places the editor could silently write an ensemble that is wrong.
     add_executable(EnsembleDialogTest tests/EnsembleDialogTest.cpp

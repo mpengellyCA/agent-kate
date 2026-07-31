@@ -148,6 +148,15 @@ void AgentCardDelegate::paint(QPainter *painter, const QStyleOptionViewItem &opt
     const auto status      = AgentRoles::AgentStatus(idx.data(AgentRoles::StatusRole).toInt());
     const qint64 activity  = idx.data(AgentRoles::LastActivity).toLongLong();
     const QStringList tags = idx.data(AgentRoles::Tags).toStringList();
+    // Orchestration linkage (plan 16 P5): a controller carries a ⇄ chip with
+    // its live worker count; a worker carries a bare ⇄ so a row nested under
+    // one still reads as "launched by an agent" when the tree is collapsed.
+    const QString role = idx.data(AgentRoles::Role).toString();
+    const int workers = idx.data(AgentRoles::WorkerCount).toInt();
+    const QString orchestrationChip =
+        role == QLatin1String("controller")
+        ? (workers > 0 ? QStringLiteral("⇄ %1").arg(workers) : QStringLiteral("⇄"))
+        : (role == QLatin1String("worker") ? QStringLiteral("⇄") : QString());
     // A background agent that needs the user's input gets a palette-driven
     // marker — but only while it isn't the row the user is already looking at.
     const bool attention = idx.data(AgentRoles::Attention).toBool()
@@ -319,9 +328,16 @@ void AgentCardDelegate::paint(QPainter *painter, const QStyleOptionViewItem &opt
                                      : opt.palette.color(QPalette::PlaceholderText);
 
     const QFont chipFont = chipFontFor(opt.font);
-    if (number > 0 || !tags.isEmpty()) {
+    if (number > 0 || !tags.isEmpty() || !orchestrationChip.isEmpty()) {
         const int chipH = ChipPainter::chipHeight(chipFont);
         int x = r.left();
+        if (!orchestrationChip.isEmpty()) {
+            const int ow = QFontMetrics(chipFont).horizontalAdvance(orchestrationChip)
+                           + kNumHPad * 2;
+            ChipPainter::drawChip(painter, QRect(x, y, ow, chipH), orchestrationChip,
+                                  chipFont, chipFill, chipText, chipOutline);
+            x += ow + ChipPainter::kChipGap;
+        }
         if (number > 0) {
             const QString num = QStringLiteral("#%1").arg(number);
             const int nw = QFontMetrics(chipFont).horizontalAdvance(num)
@@ -353,7 +369,8 @@ QSize AgentCardDelegate::sizeHint(const QStyleOptionViewItem &opt,
             + kLineGap + kPreviewLines * fmPreview.height();
     // A "#N" badge or tags add the chip row.
     const bool hasChips = idx.data(AgentRoles::Number).toInt() > 0
-                          || !idx.data(AgentRoles::Tags).toStringList().isEmpty();
+                          || !idx.data(AgentRoles::Tags).toStringList().isEmpty()
+                          || !idx.data(AgentRoles::Role).toString().isEmpty();
     if (hasChips) {
         h += kChipRowGap + ChipPainter::chipHeight(chipFontFor(opt.font));
     }

@@ -10,11 +10,16 @@
 #include <QJsonArray>
 #include <QLabel>
 #include <QScrollArea>
+#include <QTime>
 #include <QTimer>
 #include <QTreeWidget>
 #include <QVBoxLayout>
 
 namespace {
+// The Recent activity strip answers "what just happened", so it stays short;
+// the AI Inspector's all-threads mode is the full timeline.
+constexpr int kMaxActivityRows = 25;
+
 // A compact section: a titled group box wrapping a flat, header-styled tree.
 QTreeWidget *makeSection(const QString &title, const QStringList &headers, QWidget *parent,
                          QVBoxLayout *into)
@@ -80,6 +85,11 @@ CooperationPanel::CooperationPanel(CoreClient *core, QWidget *parent)
                             {i18n("Agent"), i18n("Summary"), i18n("When")}, content, layout);
     m_notes = makeSection(i18n("Notes board"),
                           {i18n("Author"), i18n("Note"), i18n("When")}, content, layout);
+    // What agents just did to each other. coop.getState is a snapshot of the
+    // board's *state*; this is the traffic that produced it, including the
+    // orchestration calls (launch/wait/close) that leave no state behind.
+    m_activityView = makeSection(i18n("Recent activity"),
+                                 {i18n("When"), i18n("Agent"), i18n("Did")}, content, layout);
     layout->addStretch(1);
     scroll->setWidget(content);
 
@@ -87,14 +97,37 @@ CooperationPanel::CooperationPanel(CoreClient *core, QWidget *parent)
     m_debounce = new QTimer(this);
     m_debounce->setSingleShot(true);
     m_debounce->setInterval(150);
-    connect(m_debounce, &QTimer::timeout, this, &CooperationPanel::refresh);
+    connect(m_debounce, &QTimer::timeout, this, [this] {
+        refresh();
+        applyActivity();
+    });
 
     connect(m_core, &CoreClient::connected, this, &CooperationPanel::refresh);
     connect(m_core, &CoreClient::notification, this,
-            [this](const QString &method, const QJsonObject &) {
+            [this](const QString &method, const QJsonObject &params) {
                 if (method == QLatin1String("coop.changed")) {
                     scheduleRefresh();
+                    return;
                 }
+                if (method != QLatin1String("mcp.activity")) {
+                    return;
+                }
+                const QString tool = params.value(QStringLiteral("tool")).toString();
+                if (tool.isEmpty()) {
+                    return;
+                }
+                m_activity.append(
+                    {QTime::currentTime().toString(QStringLiteral("HH:mm:ss")),
+                     params.value(QStringLiteral("threadId")).toString(),
+                     tool,
+                     params.value(QStringLiteral("ok")).toBool()
+                         ? params.value(QStringLiteral("argsSummary")).toString()
+                         : params.value(QStringLiteral("error")).toString(),
+                     params.value(QStringLiteral("ok")).toBool()});
+                while (m_activity.size() > kMaxActivityRows) {
+                    m_activity.removeFirst();
+                }
+                scheduleRefresh(); // same 150 ms coalescing as the state sections
             });
     if (m_core->isConnected()) {
         refresh();
@@ -119,6 +152,27 @@ void CooperationPanel::refresh()
                      applyState(result);
                  },
                  this); // lifetime guard against a late reply after teardown
+}
+
+void CooperationPanel::applyActivity()
+{
+    if (!m_activityView) {
+        return;
+    }
+    m_activityView->clear();
+    // Newest first: the strip is short, so the interesting end goes on top
+    // rather than requiring a scroll.
+    for (int i = m_activity.size() - 1; i >= 0; --i) {
+        const ActivityRow &r = m_activity.at(i);
+        auto *item = new QTreeWidgetItem(
+            m_activityView,
+            {r.time, r.thread.left(8),
+             r.ok ? i18nc("cooperation activity: tool and its summary", "%1 %2", r.tool,
+                          r.summary)
+                  : i18nc("failed cooperation call: tool and error", "%1 ✗ %2", r.tool,
+                          r.summary)});
+        item->setToolTip(1, r.thread);
+    }
 }
 
 void CooperationPanel::applyState(const QJsonObject &state)

@@ -777,8 +777,59 @@ static-true for Claude, false/absent for Kimi unless noted):
     (`docs/security-model.md` §1), not a new surface — the cross-subtree
     approval gate exists for *controlling other threads*, which mode.apply
     does not do.
-- **P5 — Cross-thread UI (4c)**. All-threads inspector timeline, roster
-  controller/worker nesting, cooperation activity feed.
+- **P5 — Cross-thread UI (4c). ✅ LANDED.** The AI Inspector's follow-mode
+  toggle with its merged all-threads timeline, roster nesting of workers under
+  their controller (⇄ badge + live-worker count, orphans re-homed), and the
+  Cooperation panel's Recent activity strip. `ui/tests/AgentRosterTest`
+  (7 cases) guards the tree; a live offscreen run of the real app driving a
+  real ensemble is the end-to-end evidence.
+
+  Where the sketch met the real code:
+  - **Agent-launched workers were never in the roster at all.** The plan
+    assumed nesting was a presentation problem, but the UI only ever learned
+    about threads through `session.listThreads` at project-open — a worker a
+    controller launched mid-run appeared nowhere until the next restart. P5
+    adds `AgentDock::refreshOrchestrationLinks`, which adopts worker records
+    into panels (binding a *running* one live via P4's `adoptStartedThread`,
+    so it is not offered a pointless Resume) and then nests + badges them. It
+    runs on a project's restore and on the `mcp.activity` feed for exactly
+    `launch_agent` / `close_agent` / `discard_agent` — 250 ms behind the tool,
+    so the record it reads is already written. Without this the whole feature
+    would have rendered an empty tree.
+  - **Nesting broke every roster traversal.** The tree had been project→agent
+    everywhere: the working animation, the text/tag filter, the tag menu, the
+    attention roll-up and `agentItem` all walked `project->child(j)`, and
+    `selectedProject()` took exactly one step up. They now go through
+    `agentRows()` (depth-first) and `projectOf()`.
+  - **Two ways a nested agent could be lost, both found by writing the tests:**
+    closing a controller deleted its workers' ROWS as tree children while the
+    worker threads kept running (they are separate agents — `removeAgent` now
+    re-homes them onto the project first), and a filter match on a nested
+    worker was invisible because Qt hides a row whose parent is hidden (the
+    filter now un-hides the controllers above every visible row). Both are
+    mutation-checked; so is the cycle guard in `setAgentParent`, whose absence
+    makes the test *hang* rather than fail.
+  - **The all-threads timeline is a separate bounded model**, as the plan
+    required: a 500-row ring in its own `QTreeWidget`, collected even while the
+    per-thread view is showing (switching modes has history, not an empty
+    pane). It shows time, source agent, tool, digest and duration, and names
+    the agent from the roster's own titles (`agentTitlesChanged`, already
+    emitted for the WorktreeDashboard) rather than a bare thread id.
+  - **Redaction boundary unchanged**: both new views render the core's
+    `argsSummary` verbatim and add no new field to the feed. A failed call
+    shows the feed's `error`, which P2's remediation documented as inside the
+    boundary (`TestBridgeErrorsCarryNoSecrets`) — a failed launch reading as a
+    blank row would be worse.
+  - The Cooperation panel's strip reuses its existing 150 ms debounce (it now
+    also fires for `mcp.activity`), and is deliberately short (25 rows,
+    newest first): it answers "what just happened", while the inspector is the
+    timeline.
+  - **Live evidence**: the real `agentkate` binary, run offscreen against a
+    throwaway XDG home, applied an ensemble whose controller launched a worker;
+    the worker was adopted (`role: worker`, parented to the controller), the UI
+    stayed alive, and its log contained **zero** Qt warnings/asserts. The
+    roster's rendering itself is not observable from outside the process — that
+    is what `AgentRosterTest` covers.
 - **P6 — Parity & feature sweep (Features 5 + 6)**. Compaction behind the
   interface, kimi env overlay + wire transcripts + skills dirs, Claude flag
   sweep. Independently sliceable; land in any order after P1.

@@ -75,6 +75,15 @@ public:
     void setAgentTags(int agentId, const QStringList &tags);
     QStringList agentTags(int agentId) const;
     void setAgentDormant(int agentId, bool dormant);
+    // Orchestration linkage (plan 16 P5). setAgentParent nests a worker's row
+    // under the controller that launched it; a parentAgentId of -1 (or one that
+    // is not in the roster — a controller the human discarded or archived)
+    // returns the row to its project's top level, so an orphaned worker stays
+    // reachable rather than disappearing with its parent.
+    void setAgentParent(int agentId, int parentAgentId);
+    // "controller" / "worker" / "" — drives the ⇄ badge and the live-worker
+    // count on a controller's card.
+    void setAgentRole(int agentId, const QString &role);
     // "Needs your input" (Attention) signal, drawn as a card marker and rolled
     // up into a per-project count suffix. Busy ("working a turn") is intentionally
     // not surfaced in the roster — the status dot already conveys it.
@@ -155,6 +164,14 @@ private:
     QTreeWidgetItem *projectItem(const QString &path) const;
     QTreeWidgetItem *agentItem(int agentId) const;
     QString selectedProject() const;
+    // Every agent row under a project, at any depth — workers nest under the
+    // controller that launched them (plan 16 P5), so nothing may assume the
+    // old project→agent two-level shape.
+    static QList<QTreeWidgetItem *> agentRows(QTreeWidgetItem *project);
+    // The project row an item belongs to, however deeply nested.
+    static QTreeWidgetItem *projectOf(QTreeWidgetItem *item);
+    // Recount a controller's live (non-dormant) workers for its ⇄ badge.
+    void recomputeWorkerCount(QTreeWidgetItem *controller);
 
     QLineEdit *m_filterEdit = nullptr;
     QToolButton *m_newButton = nullptr;

@@ -470,6 +470,14 @@ void MainWindow::setupUi()
             });
     connect(m_agent, &AgentDock::agentTitlesChanged, m_worktreeDashboard,
             &WorktreeDashboard::setAgentTitles);
+    // The same titles name the agents in the inspector's all-threads timeline,
+    // so a cross-agent call reads as "Reviewer" rather than a bare thread id.
+    connect(m_agent, &AgentDock::agentTitlesChanged, this,
+            [this](const QHash<QString, QString> &titles) {
+                if (m_inspectorPanel) {
+                    m_inspectorPanel->setAgentTitles(titles);
+                }
+            });
     connect(m_agent, &AgentDock::openDiff, this,
             [this](const QString &title, const QString &diff) {
                 m_editor->openDiff(groupKey(), title, diff);

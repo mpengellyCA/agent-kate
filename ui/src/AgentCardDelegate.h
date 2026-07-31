@@ -27,6 +27,10 @@ constexpr int Tags      = Qt::UserRole + 9; // QStringList — organization labe
 constexpr int StatusRole = Qt::UserRole + 10; // AgentStatus — the source of truth
 constexpr int Preview   = Qt::UserRole + 11; // last chat line ("You: …" for user)
 constexpr int LastActivity = Qt::UserRole + 12; // secs-since-epoch of last message
+// Orchestration linkage (plan 16 P5). Role is "controller" / "worker" / "";
+// WorkerCount is a controller's live worker tally, drawn next to the ⇄ mark.
+constexpr int Role        = Qt::UserRole + 13; // QString
+constexpr int WorkerCount = Qt::UserRole + 14; // int
 
 // AgentStatus is the single source of truth for a card's status badge, replacing
 // the old raw-hex Dot role. The delegate maps each state to a symbol + a

@@ -164,6 +164,10 @@ private:
     void closeOtherProjects(const QString &keepPath);
     void wireAgentPanel(int agentId, AgentPanel *panel);
     void restoreThreads(const QString &project);
+    // Reconcile the roster with the core's orchestration linkage (plan 16 P5):
+    // adopt agent-launched workers, nest them under their controller, and push
+    // roles for the ⇄ badges.
+    void refreshOrchestrationLinks();
     // After a project's threads are restored on initial open, focus the
     // last-active one (dormant, not resumed) and prune the blank starter agent.
     void restoreInitialFocus(const QString &project);

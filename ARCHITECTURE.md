@@ -80,7 +80,10 @@ from the IPC dispatch (never by the bridge), keyed by RPC method so it is
 harness-agnostic, and broadcast to UI connections only — an agent never sees
 another agent's feed. `argsSummary` is a capped, tool-aware digest (a path, a
 note's first line, a worker's engine and title) that deliberately excludes
-prompt bodies, typed text and gated-tool inputs.
+prompt bodies, typed text and gated-tool inputs. The UI consumes it in two
+places: the AI Inspector's **All threads** follow mode (one merged, bounded
+orchestration timeline) and the Cooperation panel's **Recent activity** strip.
+Both render the digest verbatim — the redaction happens core-side, once.
 
 ## Cooperation MCP
 

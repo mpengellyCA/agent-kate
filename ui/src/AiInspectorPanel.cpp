@@ -7,15 +7,23 @@
 
 #include <algorithm>
 
+#include <QComboBox>
+#include <QHBoxLayout>
 #include <QHeaderView>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QLabel>
 #include <QLocale>
+#include <QStackedWidget>
+#include <QTime>
 #include <QTreeWidget>
 #include <QVBoxLayout>
 
 namespace {
+// The merged all-threads timeline is a bounded ring: an ensemble mid-run emits
+// bridge traffic indefinitely, and the oldest rows are the least interesting.
+constexpr int kMaxActivityRows = 500;
+
 // est_tokens ≈ chars/4 — the same rough ranking estimate the core's toolMeter
 // uses; good enough to compare tools against each other.
 QString resultSummary(const QString &text, bool isError)
@@ -37,6 +45,20 @@ AiInspectorPanel::AiInspectorPanel(CoreClient *core, QWidget *parent)
     layout->setContentsMargins(6, 6, 6, 6);
     layout->setSpacing(6);
 
+    // Follow mode: this agent, or the whole arena. Kept as a compact row above
+    // the totals so the panel reads the same in both modes.
+    auto *followRow = new QHBoxLayout;
+    followRow->setContentsMargins(0, 0, 0, 0);
+    followRow->addWidget(new QLabel(i18n("Following:"), this));
+    m_follow = new QComboBox(this);
+    m_follow->addItem(i18n("Active thread"), false);
+    m_follow->addItem(i18n("All threads"), true);
+    m_follow->setToolTip(i18n(
+        "“All threads” shows every agent's MCP traffic as one timeline — what a "
+        "controller launches, waits on and reports, live."));
+    followRow->addWidget(m_follow, 1);
+    layout->addLayout(followRow);
+
     m_totals = new QLabel(this);
     m_totals->setWordWrap(true);
     m_totals->setTextFormat(Qt::PlainText);
@@ -51,12 +73,39 @@ AiInspectorPanel::AiInspectorPanel(CoreClient *core, QWidget *parent)
     m_timeline->header()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
     m_timeline->header()->setSectionResizeMode(1, QHeaderView::Stretch);
     m_timeline->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
-    layout->addWidget(m_timeline, 1);
+
+    m_activity = new QTreeWidget(this);
+    m_activity->setHeaderLabels(
+        {i18n("Time"), i18n("Agent"), i18n("Tool"), i18n("Detail"), i18n("Took")});
+    m_activity->setRootIsDecorated(false);
+    m_activity->setUniformRowHeights(true);
+    m_activity->setSelectionMode(QAbstractItemView::NoSelection);
+    m_activity->header()->setStretchLastSection(false);
+    m_activity->header()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+    m_activity->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    m_activity->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    m_activity->header()->setSectionResizeMode(3, QHeaderView::Stretch);
+    m_activity->header()->setSectionResizeMode(4, QHeaderView::ResizeToContents);
+
+    m_views = new QStackedWidget(this);
+    m_views->addWidget(m_timeline);
+    m_views->addWidget(m_activity);
+    layout->addWidget(m_views, 1);
 
     updateTotals();
+    connect(m_follow, &QComboBox::currentIndexChanged, this,
+            &AiInspectorPanel::applyFollowMode);
 
     connect(m_core, &CoreClient::notification, this,
             [this](const QString &method, const QJsonObject &params) {
+                // The all-threads timeline is fed by the core's cross-thread
+                // feed, which is collected even while the per-thread view is
+                // showing — switching modes then has history to show rather
+                // than an empty pane.
+                if (method == QLatin1String("mcp.activity")) {
+                    appendActivity(params);
+                    return;
+                }
                 if (method != QLatin1String("agent.event")) {
                     return;
                 }
@@ -66,6 +115,74 @@ AiInspectorPanel::AiInspectorPanel(CoreClient *core, QWidget *parent)
                 }
                 handleEvents(params.value(QStringLiteral("events")).toArray());
             });
+}
+
+void AiInspectorPanel::applyFollowMode()
+{
+    const bool all = m_follow->currentData().toBool();
+    m_views->setCurrentWidget(all ? m_activity : m_timeline);
+    updateTotals();
+}
+
+void AiInspectorPanel::setAgentTitles(const QHash<QString, QString> &titlesByThread)
+{
+    if (titlesByThread == m_titles) {
+        return;
+    }
+    m_titles = titlesByThread;
+    // Re-label the rows already on screen; a worker's title usually lands after
+    // its first activity row, so without this the feed keeps the bare id.
+    for (int i = 0; i < m_activity->topLevelItemCount(); ++i) {
+        QTreeWidgetItem *row = m_activity->topLevelItem(i);
+        row->setText(1, threadLabel(row->data(0, Qt::UserRole).toString()));
+    }
+}
+
+QString AiInspectorPanel::threadLabel(const QString &threadId) const
+{
+    if (threadId.isEmpty()) {
+        return i18nc("mcp activity from no particular thread", "—");
+    }
+    const QString title = m_titles.value(threadId);
+    // Thread ids are "t-<hex>"; the first few hex digits are enough to tell two
+    // agents apart at a glance, and the full id is in the tooltip.
+    const QString shortId = threadId.left(8);
+    return title.isEmpty() ? shortId
+                           : i18nc("agent title and short thread id", "%1 (%2)",
+                                   title, shortId);
+}
+
+void AiInspectorPanel::appendActivity(const QJsonObject &params)
+{
+    const QString threadId = params.value(QStringLiteral("threadId")).toString();
+    const QString tool = params.value(QStringLiteral("tool")).toString();
+    const bool ok = params.value(QStringLiteral("ok")).toBool();
+    const QString summary = ok
+        ? params.value(QStringLiteral("argsSummary")).toString()
+        : i18nc("failed MCP call: the summary, then the error", "%1 — %2",
+                params.value(QStringLiteral("argsSummary")).toString(),
+                params.value(QStringLiteral("error")).toString());
+    const int ms = params.value(QStringLiteral("durationMs")).toInt();
+
+    auto *row = new QTreeWidgetItem(
+        m_activity,
+        {QTime::currentTime().toString(QStringLiteral("HH:mm:ss")),
+         threadLabel(threadId),
+         ok ? tool : i18nc("failed tool call marker", "%1 ✗", tool), summary.simplified(),
+         ms >= 1000 ? i18nc("duration in seconds", "%1s", QString::number(ms / 1000.0, 'f', 1))
+                    : i18nc("duration in milliseconds", "%1ms", ms)});
+    row->setData(0, Qt::UserRole, threadId);
+    row->setToolTip(1, threadId);
+    if (!ok) {
+        row->setForeground(2, palette().color(QPalette::Disabled, QPalette::WindowText));
+    }
+    // Bounded ring: drop the oldest rows once the cap is passed.
+    while (m_activity->topLevelItemCount() > kMaxActivityRows) {
+        delete m_activity->takeTopLevelItem(0);
+    }
+    if (m_views->currentWidget() == m_activity) {
+        m_activity->scrollToItem(row);
+    }
 }
 
 void AiInspectorPanel::setActiveThread(const QString &threadId)
@@ -203,6 +320,15 @@ void AiInspectorPanel::handleEvent(const QJsonObject &ev)
 
 void AiInspectorPanel::updateTotals()
 {
+    if (m_follow && m_follow->currentData().toBool()) {
+        m_totals->setText(
+            m_activity->topLevelItemCount() == 0
+                ? i18n("Watching every agent's MCP traffic. Nothing yet — this fills as "
+                       "agents post notes, claim files, and launch or wait on each other.")
+                : i18ncp("all-threads activity summary", "%1 cross-agent call so far.",
+                         "%1 cross-agent calls so far.", m_activity->topLevelItemCount()));
+        return;
+    }
     if (m_threadId.isEmpty()) {
         m_totals->setText(i18n("Select an agent to inspect its tool calls and token spend."));
         return;

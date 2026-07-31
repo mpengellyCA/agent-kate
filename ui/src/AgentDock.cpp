@@ -133,6 +133,20 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
             [this](const QString &method, const QJsonObject &params) {
                 if (method == QLatin1String("git.invalidated")) {
                     refreshAgentNumbers();
+                } else if (method == QLatin1String("mcp.activity")) {
+                    // An agent launching, closing or discarding another changes
+                    // the roster tree — and a launched worker has no other way
+                    // into it. Reconcile on exactly those tools, not on every
+                    // note or file claim.
+                    const QString tool = params.value(QStringLiteral("tool")).toString();
+                    if (tool == QLatin1String("launch_agent")
+                        || tool == QLatin1String("close_agent")
+                        || tool == QLatin1String("discard_agent")) {
+                        // The record lands as the tool returns; a short delay
+                        // keeps this one sweep behind rather than racing it.
+                        QTimer::singleShot(250, this,
+                                           [this] { refreshOrchestrationLinks(); });
+                    }
                 } else if (method == QLatin1String("agent.discarded")) {
                     const QString threadId =
                         params.value(QStringLiteral("threadId")).toString();
@@ -851,6 +865,87 @@ AgentPanel *AgentDock::addDormantAgent(const QString &project, const QString &th
     return panel;
 }
 
+// refreshOrchestrationLinks pulls every persisted thread and reconciles the
+// roster's orchestration view with it (plan 16 P5): workers an AGENT launched
+// are adopted into the roster (nothing else would ever create their rows — the
+// human never asked for them), each one is nested under the controller that
+// launched it, and roles drive the ⇄ badges.
+//
+// It is called on the same triggers that can change the tree: a project's
+// restore, and a successful launch_agent/close_agent seen on the mcp.activity
+// feed. Cheap — one RPC returning the records the core already holds.
+void AgentDock::refreshOrchestrationLinks()
+{
+    if (!m_core || !m_core->isConnected()) {
+        return;
+    }
+    QPointer<AgentDock> self(this);
+    m_core->call(
+        QStringLiteral("session.listThreads"), QJsonObject{},
+        [self](const QJsonObject &result, const QJsonObject &error) {
+            if (!self || !error.isEmpty()) {
+                return;
+            }
+            const QJsonArray threads = result.value(QStringLiteral("threads")).toArray();
+            // Pass 1: adopt worker threads this window has never seen. Only for
+            // projects that are open — a worker in a closed project belongs to
+            // that project's roster, not this one's.
+            for (const QJsonValue &v : threads) {
+                const QJsonObject rec = v.toObject();
+                const QString threadId = rec.value(QStringLiteral("threadId")).toString();
+                const QString parentId =
+                    rec.value(QStringLiteral("parentThreadId")).toString();
+                const QString project = rec.value(QStringLiteral("project")).toString();
+                if (threadId.isEmpty() || parentId.isEmpty()
+                    || self->hasThread(threadId)
+                    || !self->m_projects.contains(project)) {
+                    continue;
+                }
+                const QString title = rec.value(QStringLiteral("title")).toString();
+                const bool isolated = rec.value(QStringLiteral("worktree"))
+                                          .toObject()
+                                          .value(QStringLiteral("isolated"))
+                                          .toBool();
+                const QString backend = rec.value(QStringLiteral("backend")).toString();
+                const bool running =
+                    rec.value(QStringLiteral("status")).toString()
+                    == QLatin1String("running");
+                AgentPanel *panel =
+                    self->addDormantAgent(project, threadId, title, isolated, backend);
+                if (running) {
+                    // A live worker is not resumable — it is already working.
+                    // Bind the panel to the running thread and replay what it
+                    // has said so far (it started before we knew about it).
+                    panel->adoptStartedThread(
+                        threadId,
+                        i18n("launched by another agent — its conversation continues here."),
+                        isolated, backend);
+                }
+            }
+            // Pass 2: nest and badge. Done after every adoption so a controller
+            // and its worker that arrive in the same sweep still link up.
+            for (const QJsonValue &v : threads) {
+                const QJsonObject rec = v.toObject();
+                const QString threadId = rec.value(QStringLiteral("threadId")).toString();
+                Entry *e = self->entryByThread(threadId);
+                if (!e) {
+                    continue;
+                }
+                self->m_roster->setAgentRole(e->id,
+                                             rec.value(QStringLiteral("role")).toString());
+                const QString parentId =
+                    rec.value(QStringLiteral("parentThreadId")).toString();
+                Entry *parent = parentId.isEmpty() ? nullptr
+                                                   : self->entryByThread(parentId);
+                // No parent entry (never launched here, or the human closed the
+                // controller) → -1 puts the worker at the project's top level
+                // rather than dropping it.
+                self->m_roster->setAgentParent(e->id, parent ? parent->id : -1);
+            }
+        },
+        this);
+}
+
 void AgentDock::wireAgentPanel(int agentId, AgentPanel *panel)
 {
     connect(panel, &AgentPanel::statusMessage, this, &AgentDock::statusMessage);
@@ -952,6 +1047,8 @@ void AgentDock::restoreThreads(const QString &project)
                          }
                      }
                      refreshAgentNumbers();
+                     // Nest any restored workers under their controllers.
+                     refreshOrchestrationLinks();
                      // First restore for this project: land in the last-active
                      // session instead of the blank starter agent.
                      if (m_pendingFocusProjects.remove(project)) {

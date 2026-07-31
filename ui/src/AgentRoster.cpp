@@ -520,9 +520,9 @@ void AgentRoster::updateWorkingAnimation()
 {
     bool anyWorking = false;
     for (int i = 0; i < m_tree->topLevelItemCount() && !anyWorking; ++i) {
-        QTreeWidgetItem *project = m_tree->topLevelItem(i);
-        for (int j = 0; j < project->childCount(); ++j) {
-            if (AgentRoles::AgentStatus(project->child(j)->data(0, AgentRoles::StatusRole).toInt())
+        const QList<QTreeWidgetItem *> rows = agentRows(m_tree->topLevelItem(i));
+        for (QTreeWidgetItem *agent : rows) {
+            if (AgentRoles::AgentStatus(agent->data(0, AgentRoles::StatusRole).toInt())
                 == AgentRoles::AgentStatus::Working) {
                 anyWorking = true;
                 break;
@@ -541,9 +541,8 @@ void AgentRoster::updateWorkingAnimation()
 void AgentRoster::repaintWorkingRows()
 {
     for (int i = 0; i < m_tree->topLevelItemCount(); ++i) {
-        QTreeWidgetItem *project = m_tree->topLevelItem(i);
-        for (int j = 0; j < project->childCount(); ++j) {
-            QTreeWidgetItem *agent = project->child(j);
+        const QList<QTreeWidgetItem *> rows = agentRows(m_tree->topLevelItem(i));
+        for (QTreeWidgetItem *agent : rows) {
             if (agent->isHidden()) {
                 continue;
             }
@@ -594,6 +593,8 @@ void AgentRoster::setAgentDormant(int agentId, bool dormant)
 {
     if (QTreeWidgetItem *item = agentItem(agentId)) {
         item->setData(0, AgentRoles::Dormant, dormant);
+        // A worker going dormant (or waking) changes its controller's live tally.
+        recomputeWorkerCount(item->parent());
     }
 }
 
@@ -630,12 +631,28 @@ void AgentRoster::applyAttentionDisplay(QTreeWidgetItem *item)
 
 void AgentRoster::removeAgent(int agentId)
 {
-    if (QTreeWidgetItem *item = agentItem(agentId)) {
-        QTreeWidgetItem *project = item->parent();
-        delete item;
-        recomputeProjectBadge(project);
-        updateWorkingAnimation(); // a removed Working agent may stop the timer
+    QTreeWidgetItem *item = agentItem(agentId);
+    if (!item) {
+        return;
     }
+    QTreeWidgetItem *project = projectOf(item);
+    QTreeWidgetItem *parent = item->parent();
+    // Closing a controller must not take its workers with it: they are separate
+    // agents, still running, and deleting the row here would delete their rows
+    // as children. Re-home them onto the project first — an orphaned worker is
+    // an ordinary top-level agent (plan 16 P5).
+    while (item->childCount() > 0) {
+        QTreeWidgetItem *worker = item->takeChild(0);
+        if (project) {
+            project->addChild(worker);
+        } else {
+            delete worker; // no project row left to hold it
+        }
+    }
+    delete item;
+    recomputeWorkerCount(parent);
+    recomputeProjectBadge(project);
+    updateWorkingAnimation(); // a removed Working agent may stop the timer
 }
 
 void AgentRoster::removeProject(const QString &path)
@@ -689,8 +706,8 @@ void AgentRoster::applyFilter()
             !textFiltering || name.contains(m_filter, Qt::CaseInsensitive)
             || path.contains(m_filter, Qt::CaseInsensitive);
         int visibleChildren = 0;
-        for (int j = 0; j < project->childCount(); ++j) {
-            QTreeWidgetItem *agent = project->child(j);
+        const QList<QTreeWidgetItem *> rows = agentRows(project);
+        for (QTreeWidgetItem *agent : rows) {
             const QString title = agent->data(0, Title).toString();
             bool show = !textFiltering || projectTextMatches
                 || title.contains(m_filter, Qt::CaseInsensitive);
@@ -717,6 +734,21 @@ void AgentRoster::applyFilter()
                 ++visibleChildren;
             }
         }
+        // A matching worker must stay reachable: Qt hides a row whose parent is
+        // hidden, so un-hide the controllers above every visible row (they are
+        // context for the match, not matches themselves).
+        for (QTreeWidgetItem *agent : rows) {
+            if (agent->isHidden()) {
+                continue;
+            }
+            for (QTreeWidgetItem *up = agent->parent(); up && up->parent();
+                 up = up->parent()) {
+                if (up->isHidden()) {
+                    up->setHidden(false);
+                    ++visibleChildren;
+                }
+            }
+        }
         // While filtering, hide projects that match nothing. A pure tag filter
         // keeps projects that still have visible agents; the text filter also
         // keeps name/path matches. Otherwise always show them (even empty ones).
@@ -737,8 +769,9 @@ QStringList AgentRoster::projectTags(const QString &projectPath) const
             && project->data(0, Qt::UserRole).toString() != projectPath) {
             continue;
         }
-        for (int j = 0; j < project->childCount(); ++j) {
-            const QStringList tags = project->child(j)->data(0, Tags).toStringList();
+        const QList<QTreeWidgetItem *> rows = agentRows(project);
+        for (QTreeWidgetItem *agent : rows) {
+            const QStringList tags = agent->data(0, Tags).toStringList();
             for (const QString &t : tags) {
                 const QString key = t.toLower();
                 if (!seen.contains(key)) {
@@ -870,8 +903,9 @@ void AgentRoster::recomputeProjectBadge(QTreeWidgetItem *project)
         return;
     }
     int attention = 0;
-    for (int j = 0; j < project->childCount(); ++j) {
-        if (project->child(j)->data(0, AgentRoles::Attention).toBool()) {
+    const QList<QTreeWidgetItem *> rows = agentRows(project);
+    for (QTreeWidgetItem *agent : rows) {
+        if (agent->data(0, AgentRoles::Attention).toBool()) {
             ++attention;
         }
     }
@@ -956,12 +990,43 @@ QTreeWidgetItem *AgentRoster::projectItem(const QString &path) const
     return nullptr;
 }
 
+// agentRows flattens a project's agent subtree, depth-first. Worker rows nest
+// under their controller (plan 16 P5), so every traversal that used to walk
+// project->child(j) goes through this instead — a worker two levels down still
+// animates, filters, and counts toward its project's badge.
+QList<QTreeWidgetItem *> AgentRoster::agentRows(QTreeWidgetItem *project)
+{
+    QList<QTreeWidgetItem *> out;
+    if (!project) {
+        return out;
+    }
+    QList<QTreeWidgetItem *> stack;
+    for (int i = project->childCount() - 1; i >= 0; --i) {
+        stack.append(project->child(i));
+    }
+    while (!stack.isEmpty()) {
+        QTreeWidgetItem *item = stack.takeLast();
+        out.append(item);
+        for (int i = item->childCount() - 1; i >= 0; --i) {
+            stack.append(item->child(i));
+        }
+    }
+    return out;
+}
+
+QTreeWidgetItem *AgentRoster::projectOf(QTreeWidgetItem *item)
+{
+    while (item && item->parent()) {
+        item = item->parent();
+    }
+    return item;
+}
+
 QTreeWidgetItem *AgentRoster::agentItem(int agentId) const
 {
     for (int i = 0; i < m_tree->topLevelItemCount(); ++i) {
-        QTreeWidgetItem *project = m_tree->topLevelItem(i);
-        for (int j = 0; j < project->childCount(); ++j) {
-            QTreeWidgetItem *agent = project->child(j);
+        const QList<QTreeWidgetItem *> rows = agentRows(m_tree->topLevelItem(i));
+        for (QTreeWidgetItem *agent : rows) {
             if (agent->data(0, Qt::UserRole).toInt() == agentId) {
                 return agent;
             }
@@ -970,14 +1035,82 @@ QTreeWidgetItem *AgentRoster::agentItem(int agentId) const
     return nullptr;
 }
 
+void AgentRoster::setAgentParent(int agentId, int parentAgentId)
+{
+    QTreeWidgetItem *item = agentItem(agentId);
+    if (!item) {
+        return;
+    }
+    QTreeWidgetItem *project = projectOf(item);
+    QTreeWidgetItem *parent = parentAgentId >= 0 ? agentItem(parentAgentId) : nullptr;
+    // A worker may not nest under itself or under its own descendant (a cycle
+    // would detach the whole subtree from the tree and leak it).
+    for (QTreeWidgetItem *p = parent; p; p = p->parent()) {
+        if (p == item) {
+            parent = nullptr;
+            break;
+        }
+    }
+    // No controller row (never launched from this window, or the human archived
+    // it): the worker belongs at the project's top level, not nowhere.
+    QTreeWidgetItem *target = parent ? parent : project;
+    if (!target || item->parent() == target) {
+        return;
+    }
+    QTreeWidgetItem *oldParent = item->parent();
+    const bool wasCurrent = m_tree->currentItem() == item;
+    // takeChild detaches without deleting; the item keeps all its roles.
+    if (oldParent) {
+        oldParent->removeChild(item);
+    } else if (project) {
+        project->removeChild(item);
+    }
+    target->addChild(item);
+    target->setExpanded(true);
+    if (wasCurrent) {
+        m_tree->setCurrentItem(item); // reparenting must not steal the selection
+    }
+    recomputeWorkerCount(oldParent);
+    recomputeWorkerCount(target);
+}
+
+void AgentRoster::setAgentRole(int agentId, const QString &role)
+{
+    QTreeWidgetItem *item = agentItem(agentId);
+    if (!item || item->data(0, AgentRoles::Role).toString() == role) {
+        return;
+    }
+    item->setData(0, AgentRoles::Role, role);
+    recomputeWorkerCount(item);
+}
+
+// recomputeWorkerCount tallies a controller's LIVE workers (dormant ones are
+// not "running under" anybody), for the ⇄ badge. A no-op for project rows and
+// for agents with no children.
+void AgentRoster::recomputeWorkerCount(QTreeWidgetItem *controller)
+{
+    if (!controller || !controller->parent()) {
+        return; // project row (or detached) — no worker badge
+    }
+    int live = 0;
+    const QList<QTreeWidgetItem *> rows = agentRows(controller);
+    for (QTreeWidgetItem *row : rows) {
+        if (!row->data(0, AgentRoles::Dormant).toBool()) {
+            ++live;
+        }
+    }
+    if (controller->data(0, AgentRoles::WorkerCount).toInt() != live) {
+        controller->setData(0, AgentRoles::WorkerCount, live);
+    }
+}
+
 QString AgentRoster::selectedProject() const
 {
     QTreeWidgetItem *item = m_tree->currentItem();
     if (!item) {
         return QString();
     }
-    if (item->parent()) {
-        return item->parent()->data(0, Qt::UserRole).toString();
-    }
-    return item->data(0, Qt::UserRole).toString();
+    // Walk to the top-level row: a worker sits two (or more) levels down.
+    QTreeWidgetItem *project = projectOf(item);
+    return project ? project->data(0, Qt::UserRole).toString() : QString();
 }
