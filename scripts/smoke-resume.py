@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """End-to-end smoke test for session resume (M-resume increment 1).
 
-Starts an agent thread, tells it a secret, then *kills the core entirely* —
-simulating an Agent Kate restart — starts a fresh core, and resumes the thread
-from its persisted Claude Code session. A passing run proves the thread record
-survived on disk and that `claude --resume` restored the conversation: the
-resumed agent still recalls the secret.
+Starts an agent thread, gives it a fact to hold, then *kills the core
+entirely* — simulating an Agent Kate restart — starts a fresh core, and resumes
+the thread from its persisted Claude Code session. A passing run proves the
+thread record survived on disk and that `claude --resume` restored the
+conversation: the resumed agent still recalls the fact.
 
 Requires: a built ./build/akcore and an authenticated `claude` CLI.
 Run unbuffered for live output:  python3 -u scripts/smoke-resume.py
@@ -23,6 +23,10 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 AKCORE = os.path.join(ROOT, "build", "akcore")
 SOCK = os.path.join(tempfile.gettempdir(), "ak-resume.sock")
+# The fact the resumed thread must still know. Phrased as ordinary project
+# context, NOT as a "secret code you must remember": the latter reads like a
+# compliance probe and current models decline it outright, which failed this
+# smoke for a reason that had nothing to do with resume.
 SECRET = "7321"
 TURN_TIMEOUT = 200
 
@@ -92,7 +96,13 @@ class Core:
                 return msg
 
     def _events(self, thread_id, deadline):
-        """Yield agent.event payloads for thread_id until the deadline."""
+        """Yield individual agent.event objects for thread_id until the deadline.
+
+        The core delivers events as a coalesced batch under the `events` key;
+        we flatten it and yield each event in order. (This script predated the
+        batch shape and read the old singular `event` key, so it saw nothing
+        and timed out — the same fix smoke-agent.py needed.)
+        """
         while True:
             msg = self._read(deadline)
             if msg is None:
@@ -100,8 +110,10 @@ class Core:
             if msg.get("method") != "agent.event":
                 continue
             p = msg.get("params", {})
-            if p.get("threadId") == thread_id:
-                yield p.get("event", {})
+            if p.get("threadId") != thread_id:
+                continue
+            for ev in p.get("events", []):
+                yield ev
 
     def wait_for_lifecycle(self, thread_id, phases, timeout=40):
         deadline = time.time() + timeout
@@ -168,8 +180,9 @@ def main():
         # code across a restart.
         start = c1.call("agent.start", {
             "workspacePath": workspace,
-            "prompt": (f"Remember this secret code for later: {SECRET}. "
-                       f"Do not use any tools. Reply with only the word OK."),
+            "prompt": (f"For this project, the build id is {SECRET}. "
+                       f"I'll ask you for it later. No need to write it down "
+                       f"or look anything up — just reply OK."),
             "model": "claude-haiku-4-5-20251001",
         })
         if start.get("error"):
@@ -211,13 +224,12 @@ def main():
 
         c2.call("agent.send", {
             "threadId": thread_id,
-            "text": ("What is the secret code I told you earlier? "
-                     "Reply with only the digits, nothing else."),
+            "text": "What was the build id I gave you earlier?",
         })
         result2, texts2 = c2.wait_for_result(thread_id)
         haystack = result2 + " " + " ".join(texts2)
         log(f"turn 2 result: {result2!r}")
-        checks["resumed agent recalls the secret"] = SECRET in haystack
+        checks["resumed agent recalls the build id"] = SECRET in haystack
     finally:
         if c1:
             c1.stop()
