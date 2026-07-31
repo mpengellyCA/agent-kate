@@ -830,9 +830,102 @@ static-true for Claude, false/absent for Kimi unless noted):
     stayed alive, and its log contained **zero** Qt warnings/asserts. The
     roster's rendering itself is not observable from outside the process — that
     is what `AgentRosterTest` covers.
-- **P6 — Parity & feature sweep (Features 5 + 6)**. Compaction behind the
-  interface, kimi env overlay + wire transcripts + skills dirs, Claude flag
-  sweep. Independently sliceable; land in any order after P1.
+- **P6 — Parity & feature sweep (Features 5 + 6). ✅ LANDED**, as five commits
+  in the order (a) compaction → (b) env overlay → (d) skills → (e) claude
+  sweep → (c) subagent transcripts. Every claim below was probed against the
+  real binaries first; three of the five probes changed what got built.
+
+  **(a) Registry-honest compaction.** `Compact(ctx, CompactSpec)` is a Harness
+  method; one spec covers both mechanisms (`Hot` = an in-session turn, cold =
+  a fresh pass over the stored session). The claude adapter owns both — the
+  subprocess moved to `agent.Supervisor.CompactCold`, where the binary path
+  lives — and `compact/llm.go` became `prompt.go`: an instruction to a model,
+  with no CLI knowledge left in a harness-neutral package. kimi returns the
+  shared `harness.Unsupported` wording, which a test pins against the RPC
+  gate's so a downgrade and a refusal read alike.
+  - **Removing `d.sup` exposed a real bug it had been hiding.** Four
+    destructive guards asked the CLAUDE supervisor whether a thread of ANY
+    engine was running: "discard changes", "remove worktree" and the cleanup
+    analysis all read a live *kimi* agent as not running and would have
+    proceeded to touch its worktree underneath it. They ask the registry now.
+    `handlerDeps` has no supervisor handle at all any more.
+  - The exit-compaction tracker resolves each record's own harness and skips
+    one that cannot compact, instead of spawning a `claude` for every
+    cold-strategy record whatever ran the thread.
+
+  **(b) Per-thread env overlay.** `StartSpec.Env`, applied identically by both
+  adapters (`agent.ApplyEnvOverlay`, after provider routing).
+  - **Probed:** `KIMI_CODE_HOME=/tmp/x kimi acp` wrote `device_id`, `logs/`
+    and `migrations-effort.json` under the override, and the real home holds
+    `sessions/`, `session_index.jsonl`, `credentials` and `oauth`. So the
+    variable relocates a thread's ENTIRE kimi state — which also means
+    pointing one at an empty directory **un-authenticates** it. That sharp
+    edge is why this ships as a lever with no default policy: a per-thread-home
+    feature has to solve credentials first.
+  - Persisted and replayed on resume/fork/promote (a relaunch without it would
+    look for the session in a different home), and deliberately unreachable
+    from `launch_agent` — a worker's environment decides where its credentials
+    come from and which endpoint they go to, so accepting it from a model
+    would route around the permission prompt guarding every other route. A
+    test drives the RPC with an `env` parameter and asserts it is ignored.
+
+  **(d) Skills for every engine.** Install/Uninstall now maintain
+  `<target>/.agents/skills/` alongside `.claude/skills/`.
+  - **Probed, because P3's lesson is that kimi documenting a directory proves
+    nothing about ACP:** a probe skill dropped in `<project>/.agents/skills/`
+    appeared in a live ACP session's command list as `skill:akprobeskill`, and
+    the agent named it when asked. (The binary also carries `.agents/skills`
+    and `.kimi-code/skills` as literal discovery paths, and its own bundled
+    import skill states `.agents` skills are supported by default.) Unlike
+    `.agents/agents/`, this one is real over ACP — so the links are not dead
+    files.
+  - `ListInstalled` still reads the canonical `.claude` directory (Install
+    writes the same links everywhere; listing all would report each skill once
+    per engine), and Uninstall's "refuse to delete what we do not own" check
+    now runs per directory.
+
+  **(e) Claude launch-option sweep.** `FallbackModels` / `DisallowedTools` /
+  `AddDirs` on `StartSpec`, each with its own capability flag and its own
+  advanced field in the New Agent dialog.
+  - **Probed:** all three exist on 2.1.220, but two are VARIADIC
+    (`<tools...>`, `<directories...>`) and greedily eat the argv that follows —
+    `claude -p --add-dir /tmp "prompt"` swallowed the prompt and failed with
+    *"Input must be provided"*. Our threads pass the prompt over stdin as
+    stream-json, so nothing is at risk today; each list value is still passed
+    as its own flag occurrence so that stays true if the argv ever changes.
+  - **The plan's kimi mapping is dropped, not faked.** "DisallowedTools maps
+    onto written profile frontmatter when profiles exist" has nowhere to land:
+    P3 proved agent files are unreachable over ACP. kimi declares all three
+    false and reports a request for any of them per option with its own
+    reason, through the new `Launched.UnappliedOptions`.
+  - Persisted and replayed like the persona and the env: a resume that forgot
+    `DisallowedTools` would hand the thread back a tool the human took away.
+  - The UI hides a row an engine cannot apply, and `collect()` reads nothing
+    from a hidden row — so a value typed before switching engines cannot leak
+    into the launch. That is why a UI-driven start never has to report these
+    as downgrades: it only offers what the engine can do.
+
+  **(c) Subagent transcripts, both engines.** `agent.subagentTranscripts`
+  behind a new `SubagentTranscripts` capability, served through an optional
+  `subagentTranscriber` interface (the `modelDiscoverer` pattern) so a backend
+  without subagent files carries no stub.
+  - **Probed on disk:** claude keeps
+    `<project>/<session>/subagents/agent-<id>.jsonl` (files, transcript shape);
+    kimi keeps `<session-dir>/agents/<id>/wire.jsonl` — one DIRECTORY per
+    subagent, ids `main` / `agent-0` / `agent-1`, holding its own wire
+    protocol. `main` is the THREAD's own log and is never offered as a helper.
+  - kimi's log types were read out of real sessions: `context.append_message`
+    is already the transcript shape, and `context.append_loop_event` carries
+    `content.part` (text and think), `tool.call {name,args}` and
+    `tool.result {result.output}` — which map onto the blocks the dialog
+    already renders. Engine bookkeeping (`llm.request`, `usage.record`,
+    `step.begin/end`, tool snapshots) has nothing to show. The label a menu
+    entry carries is the `profileName` the wire log records — `coder` /
+    `explore` / `plan`, the compiled-in set P3 documented.
+  - UI: a "Helpers" menu on the agent panel, hidden entirely for an engine
+    that writes no such files (a greyed button would suggest the conversations
+    exist but are out of reach), rebuilt from the core on every open since
+    subagents appear as the agent delegates.
 
 Sequencing rationale: P1 is the keystone and UI-free; P2 makes it observable
 before P4 builds automation on top; P3 is P4's persona plumbing; P5/P6 are
@@ -866,13 +959,22 @@ parallel-friendly once P1's record fields exist.
 
 ## Verify
 
-- `cd core && go test ./...` (new: bridge tool handlers, `agent.wait`, modes
-  store round-trip, kimi agent-file writer, capability matrix in
-  `harness_caps_test.go`).
-- `cmake --build build && ctest --test-dir build` (new: TranscriptModelTest
-  cases for MCP summaries; ensemble editor dialog test).
-- `python3 scripts/smoke-orchestrate.py` (P1, both directions), plus existing
-  `smoke-agent.py` / `smoke-kimi.py` / `smoke-fork.py` stay green.
-- Manual dogfood: apply "Kimi K3 Controls K2.7 Code", watch the all-threads
-  inspector show `launch_agent` → worker thread → `wait_agent` result; take
-  over a worker mid-run; close the ensemble via `close_agent`.
+- `cd core && go test ./...` — bridge tool handlers, `agent.wait`, the modes
+  store round-trip and built-in vocabulary, `mode.*` over the bus, the
+  compaction routing + capability gate, the env/sweep record round-trips and
+  replay, the subagent-transcript layouts, and the capability matrix in
+  `harness_caps_test.go`. (The planned "kimi agent-file writer" was never
+  built: P3 proved agent files are unreachable over ACP.)
+- `cmake --build build && ctest --test-dir build` — 7 targets, including
+  `EnsembleDialogTest` (P4) and `AgentRosterTest` (P5). The planned
+  TranscriptModelTest MCP cases landed with P2.
+- `python3 scripts/smoke-orchestrate.py` — three legs now: claude→kimi,
+  kimi→claude, and an ensemble whose briefing alone drives a real launch.
+  `smoke-agent.py` / `smoke-kimi.py` / `smoke-resume.py` / `smoke-fork.py` /
+  `smoke-interrupt.py` stay green.
+- Dogfood: P5's UI paths were exercised by running the real `agentkate`
+  binary offscreen against a throwaway XDG home, applying an ensemble and
+  watching its controller launch a worker (adopted with role "worker",
+  parented, zero Qt warnings). The remaining manual pass — take over a worker
+  mid-run, close the ensemble via `close_agent`, watch the all-threads
+  inspector fill — is the human's, and needs a real desktop session.
