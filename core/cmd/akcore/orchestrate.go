@@ -29,32 +29,69 @@ const (
 	waitMaxTimeout     = time.Hour
 )
 
+// orchGrantTTL is how long one human approval of a cross-subtree (caller →
+// target → action) pairing keeps covering later calls (audit F24).
+//
+// It used to be the WHOLE CORE RUN. Agent Kate is a desktop app people leave
+// open for days, so "approved once" meant an approval given on Monday silently
+// authorising a send on Thursday — to a thread outside the caller's own worker
+// subtree, i.e. exactly the case the prompt exists for. A grant that never
+// expires is indistinguishable from no gate at all on a long-lived process, and
+// the human has no way to see, let alone withdraw, what they are still holding
+// open.
+//
+// Fifteen minutes is chosen against the work, not the clock: a controller
+// coordinating with a sibling crew does it in bursts, so a real collaboration
+// re-asks at most a few times an hour, while an injected instruction that lands
+// hours after the human walked away gets stopped. Every use SLIDES the window
+// (see has), so an active conversation is never interrupted mid-flow.
+const orchGrantTTL = 15 * time.Minute
+
 // orchGrants remembers which cross-subtree (caller → target → action) triples
-// the human has already approved, so each pairing asks exactly once per core
-// run rather than on every send.
+// the human has already approved, so an active collaboration asks once rather
+// than on every send — and stops being covered once it goes quiet.
 type orchGrants struct {
 	mu      sync.Mutex
-	granted map[string]bool
+	granted map[string]time.Time // key -> when the grant stops covering calls
+	// now is the clock, injectable so the expiry is testable without sleeping.
+	now func() time.Time
 }
 
 func newOrchGrants() *orchGrants {
-	return &orchGrants{granted: make(map[string]bool)}
+	return &orchGrants{granted: make(map[string]time.Time), now: time.Now}
 }
 
 func (g *orchGrants) key(from, target, action string) string {
 	return from + "\x00" + target + "\x00" + action
 }
 
+// has reports whether a live grant covers this triple, and SLIDES its expiry
+// when one does: the window bounds idle time, not the length of a conversation
+// the human already approved. An expired entry is deleted on the way past, so
+// the map cannot accumulate dead grants over a long run.
 func (g *orchGrants) has(from, target, action string) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.granted[g.key(from, target, action)]
+	k := g.key(from, target, action)
+	exp, ok := g.granted[k]
+	if !ok {
+		return false
+	}
+	now := g.now()
+	// FAIL CLOSED on the boundary: !now.Before(exp) treats "exactly expired" as
+	// expired, so a grant is never extended by a tie.
+	if !now.Before(exp) {
+		delete(g.granted, k)
+		return false
+	}
+	g.granted[k] = now.Add(orchGrantTTL)
+	return true
 }
 
 func (g *orchGrants) grant(from, target, action string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.granted[g.key(from, target, action)] = true
+	g.granted[g.key(from, target, action)] = g.now().Add(orchGrantTTL)
 }
 
 // forgetThread drops every grant that names the thread — as granter or as
@@ -89,11 +126,51 @@ func (d handlerDeps) inSubtree(callerID, targetID string) bool {
 	return false
 }
 
+// requireCallerThread binds a self-declared `fromThreadId` to the connection
+// that sent it. Every per-thread handler that takes one MUST run this before
+// authorizeAgentTarget, because authorizeAgentTarget measures the relationship
+// between two ids and proves nothing about WHO is speaking:
+//
+//   - fromID == "" means "the UI" to it, and it returns nil — so a bridge that
+//     simply OMITS fromThreadId skipped the whole gate, human approval included;
+//   - a bridge that names a DIFFERENT thread as fromID is measured as that
+//     thread — so naming its own controller bought it the controller's subtree,
+//     and with it every worker in the arena that controller launched.
+//
+// Neither needed a secret, a grant or a click: the parameter was the authority.
+// Here the caller is established first, from the connection identity that
+// bridge.identify authenticated (audit F13), and only then is the relationship
+// measured.
+//
+// The UI passes with any fromID (including none): it is the human, the one
+// authority these gates exist to consult. A connection that is neither the UI
+// nor a bridge bound to fromID is refused — fail closed, including for a caller
+// with no connection identity at all.
+func requireCallerThread(d handlerDeps, ctx context.Context, fromThreadID string) error {
+	if d.srv.RequireUI(ctx) {
+		return nil
+	}
+	if fromThreadID == "" {
+		return ipc.Errorf(ipc.CodeInvalidParams,
+			"fromThreadId is required: only the Agent Kate window may act on a "+
+				"thread without naming the thread it is acting for")
+	}
+	if ok, reason := d.srv.RequireBridge(ctx, fromThreadID); !ok {
+		return ipc.Errorf(ipc.CodeInvalidParams,
+			"this connection may not act for thread "+fromThreadID+": "+reason)
+	}
+	return nil
+}
+
 // authorizeAgentTarget gates one agent acting on another thread. UI-driven
 // calls (empty fromID) are never gated; a target inside the caller's own
 // subtree is always allowed; anything else needs one human approval per
 // (caller, target, action), through the same permission flow every gated tool
 // uses — so the ask shows up in the caller's panel like any other approval.
+//
+// fromID must already have been bound to the calling connection by
+// requireCallerThread. This function TRUSTS it: on its own it is arithmetic on
+// two thread ids, not an authentication.
 func (d handlerDeps) authorizeAgentTarget(fromID, targetID, action string, detail map[string]any) error {
 	if fromID == "" {
 		return nil
@@ -214,6 +291,13 @@ func profileLabel(name string) string {
 }
 
 func registerOrchestrationHandlers(d handlerDeps) {
+	// The fan-out reservation ledger is not optional: without it every worker
+	// launch fails closed (authority.go). Filled in here as well as in run.go so
+	// that no assembly of handlerDeps can accidentally register a launch path
+	// with no ledger behind it — the handlers close over this copy.
+	if d.workerSlots == nil {
+		d.workerSlots = newWorkerSlots()
+	}
 	// agent.wait blocks until the thread is idle (no turn in flight, or the
 	// process ended) or the timeout fires, and returns the thread's last
 	// assistant text. Backed by the turn tracker's broadcast wait — the IPC
@@ -261,7 +345,7 @@ func registerOrchestrationHandlers(d handlerDeps) {
 	// thread (the Cooperation bridge's launch_agent), synchronously — the
 	// caller gets applied-truth back, not a promise. The worker is parented to
 	// the launcher and appears in the roster like any human-started agent.
-	d.srv.Handle("agent.launchWorker", func(_ context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("agent.launchWorker", func(ctx context.Context, raw json.RawMessage) (any, error) {
 		var p struct {
 			ParentThreadID string                 `json:"parentThreadId"`
 			Backend        string                 `json:"backend"`
@@ -274,6 +358,13 @@ func registerOrchestrationHandlers(d handlerDeps) {
 			SystemPrompt   string                 `json:"systemPrompt"`
 			Agents         []harness.AgentProfile `json:"agents"`
 			Cowork         bool                   `json:"cowork"`
+			// The per-thread restriction fields. Not advertised by the
+			// launch_agent tool — an agent has no way to ask for them — but
+			// measured anyway, because this handler is reachable from the
+			// socket and "the bridge doesn't send it" is not a gate. nil means
+			// "inherit the parent's" (authority.go, inheritRestrictions).
+			DisallowedTools []string `json:"disallowedTools"`
+			AddDirs         []string `json:"addDirs"`
 		}
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
@@ -281,6 +372,15 @@ func registerOrchestrationHandlers(d handlerDeps) {
 		if p.ParentThreadID == "" || strings.TrimSpace(p.Prompt) == "" {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams,
 				"parentThreadId and prompt are required")
+		}
+		// Bind the caller to the thread it claims to be launching FROM (audit
+		// F1/§4). The whole gate below measures the requested authority against
+		// the PARENT's — which measures nothing at all if any connection can
+		// name any parent. A bridge may launch only from its own thread; the UI
+		// passes because a human at the New Agent dialog is the authority the
+		// gate exists to consult.
+		if err := requireUIOrOwnBridge(d, ctx, p.ParentThreadID); err != nil {
+			return nil, err
 		}
 		parent, ok := d.sessions.Get(p.ParentThreadID)
 		if !ok {
@@ -304,6 +404,41 @@ func registerOrchestrationHandlers(d handlerDeps) {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams,
 				"isolation must be auto, isolated or workspace")
 		}
+
+		// The authority gate (audit F1): a reserved worker slot, plus one human
+		// approval when this launch would give the worker more authority than
+		// the launcher holds — a more permissive mode, the human's main
+		// checkout to work in, or fewer restrictions than bind the launcher.
+		// Asked BEFORE anything is created, so a refusal leaves no worktree, no
+		// record and no process behind. See authority.go for the ordering, the
+		// caps and the per-field reasoning.
+		req := workerLaunchRequest{
+			ParentThreadID:  p.ParentThreadID,
+			Backend:         backend,
+			PermissionMode:  p.PermissionMode,
+			Isolation:       p.Isolation,
+			Title:           p.Title,
+			Prompt:          p.Prompt,
+			DisallowedTools: p.DisallowedTools,
+			AddDirs:         p.AddDirs,
+		}
+		// The engine's own default is only consulted for a launch that names NO
+		// mode — the only case whose rank it decides — so a specified mode never
+		// pays for the harness's option probe.
+		engineDefault := ""
+		if strings.TrimSpace(p.PermissionMode) == "" {
+			engineDefault = engineDefaultPermissionMode(h, caps)
+		}
+		release, err := d.authorizeWorkerLaunch(parent, caps, engineDefault, req)
+		if err != nil {
+			return nil, err
+		}
+		// Hold the slot until the launch is over, whichever way it goes: from
+		// then on the worker's own persisted record is what the cap counts.
+		defer release()
+		// What the worker is actually restricted BY: the parent's fields unless
+		// the human approved something looser above.
+		disallowedTools, addDirs, _ := inheritRestrictions(parent, req)
 
 		// Desktop access for a worker follows the same rule as enable_cowork:
 		// an agent may ask, the human decides. Asked BEFORE the launch, so a
@@ -344,6 +479,14 @@ func registerOrchestrationHandlers(d handlerDeps) {
 			SystemPrompt:   p.SystemPrompt,
 			Agents:         p.Agents,
 			CoworkEnabled:  cowork,
+			// Restrictions travel DOWN the tree: a worker cannot shed the deny
+			// list or the extra roots its launcher runs under, and cannot shed
+			// the launcher's MCP isolation or spend ceiling either. Before this,
+			// none of these were set at all and every worker escaped them.
+			DisallowedTools: disallowedTools,
+			AddDirs:         addDirs,
+			StrictMCPConfig: parent.StrictMCPConfig,
+			MaxBudgetUSD:    parent.MaxBudgetUSD,
 		}, launchMeta{ParentThreadID: p.ParentThreadID, Title: p.Title})
 		if err != nil {
 			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())

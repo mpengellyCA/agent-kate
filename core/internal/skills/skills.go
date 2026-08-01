@@ -226,8 +226,8 @@ func sanitizeDescription(s string) string {
 // entry of the same name is replaced; missing directories are created. The
 // returned path is the canonical (first) link.
 func (c *Catalog) Install(skillName, target string) (string, error) {
-	if target == "" {
-		return "", errors.New("target is required")
+	if err := validateTarget(target); err != nil {
+		return "", err
 	}
 	skill, err := c.Get(skillName)
 	if err != nil {
@@ -386,6 +386,26 @@ func cleanYAMLValue(s string) string {
 		s = s[1 : len(s)-1]
 	}
 	return s
+}
+
+// validateTarget rejects install targets that are not an existing directory.
+// target arrives over the IPC socket (i.e. potentially from an agent) and
+// Install does MkdirAll under it, so without this an arbitrary caller-supplied
+// string would seed .claude/skills trees anywhere on the filesystem. Requiring
+// the project directory to already exist keeps every write inside a tree the
+// user already has. Fails closed: an unstattable target is refused.
+func validateTarget(target string) error {
+	if strings.TrimSpace(target) == "" {
+		return errors.New("target is required")
+	}
+	st, err := os.Stat(target)
+	if err != nil {
+		return fmt.Errorf("target %q is not usable: %w", target, err)
+	}
+	if !st.IsDir() {
+		return fmt.Errorf("target %q is not a directory", target)
+	}
+	return nil
 }
 
 // validateName rejects names that would let a caller escape the catalog dir.

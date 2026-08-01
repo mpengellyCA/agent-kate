@@ -128,6 +128,11 @@ func TestUninstallLeavesForeignLinksAlone(t *testing.T) {
 		"---\nname: review\ndescription: d\n---\nbody\n")
 	c := New(catDir)
 	target := filepath.Join(root, "project")
+	// Install requires the project directory to already exist (it refuses to
+	// seed a skills tree into an arbitrary caller-supplied path).
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := c.Install("review", target); err != nil {
 		t.Fatalf("install: %v", err)
 	}

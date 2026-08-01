@@ -236,8 +236,9 @@ func TestLaunchWorkerRecordsAppliedPersona(t *testing.T) {
 			}); err != nil {
 				t.Fatalf("Put: %v", err)
 			}
-			client := orchTestCore(t, sessions, agent.NewTurnTracker(),
+			client, secrets := orchTestCore(t, sessions, agent.NewTurnTracker(),
 				&fakeHarness{personaApplied: tc.applies})
+			asBridge(t, secrets, client, "t-parent")
 			var res struct {
 				ThreadID string `json:"threadId"`
 			}

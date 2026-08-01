@@ -57,4 +57,3 @@ func initLinearRepo(t *testing.T, n int) (string, []string) {
 func wtFor(path string) worktree.Worktree {
 	return worktree.Worktree{Path: path, RepoRoot: path}
 }
-

@@ -3,11 +3,15 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -84,9 +88,17 @@ func launchThread(d handlerDeps, h harness.Harness, threadID, sessionID string,
 	d.gitCache.Register(wt)
 	d.gitCache.Activate(threadID) // an agent is about to run here — watch it live
 
+	// The identities this launch's MCP bridges will prove to the core: one per
+	// bridge process, handed to them in their environment (F13). Minted before
+	// the launch so a failure to mint is a launch that cannot identify, never a
+	// launch that skips the check.
+	secrets := d.bridgeSecrets.mintLaunch(threadID)
 	launched, err := h.Launch(harness.StartSpec{
-		ThreadID:       threadID,
-		WorkDir:        wt.Path,
+		ThreadID:           threadID,
+		WorkDir:            wt.Path,
+		BridgeSecret:       secrets.Coop,
+		CoworkBridgeSecret: secrets.Cowork,
+
 		Prompt:         p.Prompt,
 		Attachments:    p.Attachments,
 		Model:          p.Model,
@@ -97,11 +109,23 @@ func launchThread(d handlerDeps, h harness.Harness, threadID, sessionID string,
 		Provider:       p.Provider,
 		SystemPrompt:   p.SystemPrompt,
 		Agents:         p.Agents,
-		Env:            p.Env,
+		// LaunchEnv drops entries whose value is the "not stored" marker — a
+		// credential-shaped overlay key the store deliberately never persisted
+		// and that this process could not re-resolve. Applied on every spawn
+		// path, including this one, because the UI can hand back an overlay it
+		// read from a listed record.
+		Env: session.LaunchEnv(p.Env),
 
 		FallbackModels:  p.FallbackModels,
 		DisallowedTools: p.DisallowedTools,
 		AddDirs:         p.AddDirs,
+
+		StrictMCPConfig: p.StrictMCPConfig,
+		MaxBudgetUSD:    p.MaxBudgetUSD,
+		// The thread's human title, so the session is identifiable in the CLI's
+		// own listings. meta.Title is the caller's label; the opening prompt is
+		// the fallback, exactly as for the record's Title below.
+		Title: launchTitle(meta.Title, p.Prompt),
 	})
 	if err != nil {
 		emitLifecycle(d, threadID, "error", err.Error(), &wt)
@@ -143,6 +167,9 @@ func launchThread(d handlerDeps, h harness.Harness, threadID, sessionID string,
 		FallbackModels:  p.FallbackModels,
 		DisallowedTools: p.DisallowedTools,
 		AddDirs:         p.AddDirs,
+
+		StrictMCPConfig: p.StrictMCPConfig,
+		MaxBudgetUSD:    p.MaxBudgetUSD,
 	}
 	applyProviderToRecord(&rec, p.Provider)
 	if err := d.sessions.Put(rec); err != nil {
@@ -175,9 +202,16 @@ func resumeThread(d handlerDeps, h harness.Harness, rec session.Record, provOver
 	d.gitCache.Register(rec.Worktree)
 	d.gitCache.Activate(rec.ThreadID) // resuming — this thread is active again, watch it
 
+	// A resume spawns fresh bridges, so it mints fresh secrets (F13). The
+	// previous launch's stay valid briefly so bridges from the run being
+	// replaced are not orphaned mid-teardown.
+	resumeSecrets := d.bridgeSecrets.mintLaunch(rec.ThreadID)
 	spec := harness.StartSpec{
-		ThreadID:       rec.ThreadID,
-		WorkDir:        rec.Worktree.Path,
+		ThreadID:           rec.ThreadID,
+		WorkDir:            rec.Worktree.Path,
+		BridgeSecret:       resumeSecrets.Coop,
+		CoworkBridgeSecret: resumeSecrets.Cowork,
+
 		Model:          rec.Model,
 		Effort:         rec.Effort,
 		PermissionMode: rec.PermissionMode,
@@ -192,12 +226,19 @@ func resumeThread(d handlerDeps, h harness.Harness, rec session.Record, provOver
 		Agents:       rec.Agents,
 		// Without this a resumed thread would run against a different CLI home
 		// than it was launched with — and its session lives in the old one.
-		Env: rec.Env,
+		// Credential-shaped values were never persisted: load() re-resolved
+		// them from akcore's own environment, and LaunchEnv drops the ones it
+		// could not (see session.EnvNotStored).
+		Env: session.LaunchEnv(rec.Env),
 		// Same reasoning for the sweep: a resume that forgot the deny-list
 		// would hand the thread back a tool the human took away.
 		FallbackModels:  rec.FallbackModels,
 		DisallowedTools: rec.DisallowedTools,
 		AddDirs:         rec.AddDirs,
+
+		StrictMCPConfig: rec.StrictMCPConfig,
+		MaxBudgetUSD:    rec.MaxBudgetUSD,
+		Title:           rec.Title,
 	}
 	// A fresh override (the UI re-supplying a KWallet-held token the Record never
 	// stores) takes precedence over the env-var resolution baked into the snapshot.
@@ -212,7 +253,10 @@ func resumeThread(d handlerDeps, h harness.Harness, rec session.Record, provOver
 	seeded := false
 	if caps.Compaction {
 		sum, _ = d.summaries.Get(rec.ThreadID)
-		seeded = sum != nil &&
+		// A summary with no body is not a summary. Seeding from one would
+		// start a BRAND NEW session carrying nothing in place of the whole
+		// conversation, so an empty (or whitespace) body resumes normally.
+		seeded = sum != nil && strings.TrimSpace(sum.Body) != "" &&
 			(rec.LastTurnAt.IsZero() || !rec.LastTurnAt.After(rec.SummaryUpdatedAt))
 	}
 	detail := "resumed " + caps.DisplayName + " session"
@@ -308,9 +352,15 @@ func forkAgentThread(d handlerDeps, h harness.Harness, src session.Record, newTh
 		forkEffort = effort
 	}
 
+	// The fork is its own thread with its own bridges — and so its own secrets.
+	// It never inherits the source thread's (F13).
+	forkSecrets := d.bridgeSecrets.mintLaunch(newThreadID)
 	launched, err := h.Launch(harness.StartSpec{
-		ThreadID:       newThreadID,
-		WorkDir:        wt.Path,
+		ThreadID:           newThreadID,
+		WorkDir:            wt.Path,
+		BridgeSecret:       forkSecrets.Coop,
+		CoworkBridgeSecret: forkSecrets.Cowork,
+
 		Model:          forkModel,
 		Effort:         forkEffort,
 		PermissionMode: src.PermissionMode,
@@ -324,11 +374,15 @@ func forkAgentThread(d handlerDeps, h harness.Harness, src session.Record, newTh
 		// its environment, which is where the source's CLI state lives.
 		SystemPrompt: src.SystemPrompt,
 		Agents:       src.Agents,
-		Env:          src.Env,
+		Env:          session.LaunchEnv(src.Env),
 
 		FallbackModels:  src.FallbackModels,
 		DisallowedTools: src.DisallowedTools,
 		AddDirs:         src.AddDirs,
+
+		StrictMCPConfig: src.StrictMCPConfig,
+		MaxBudgetUSD:    src.MaxBudgetUSD,
+		Title:           launchTitle(title, "Fork of "+src.Title),
 	})
 	if err != nil {
 		emitLifecycle(d, newThreadID, "error", err.Error(), &wt)
@@ -367,6 +421,9 @@ func forkAgentThread(d handlerDeps, h harness.Harness, src session.Record, newTh
 		FallbackModels:  src.FallbackModels,
 		DisallowedTools: src.DisallowedTools,
 		AddDirs:         src.AddDirs,
+
+		StrictMCPConfig: src.StrictMCPConfig,
+		MaxBudgetUSD:    src.MaxBudgetUSD,
 	}
 	applyProviderToRecord(&rec, providerFromRecord(src))
 	if err := d.sessions.Put(rec); err != nil {
@@ -456,11 +513,37 @@ func runHotCompactIfConfigured(d handlerDeps, threadID string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	// The compact prompt is a turn the supervisor sends internally; track it
-	// so waiters see the thread busy until the summary's result lands. If the
-	// summary never comes, the imminent exit lifecycle clears the count.
+	// The compact prompt is a turn the supervisor sends internally; track it so
+	// waiters see the thread busy until the summary's result lands.
+	//
+	// Every path out of this function that is NOT a completed turn must give the
+	// slot back (audit F24). The old comment claimed "the imminent exit lifecycle
+	// clears the count", which is true only when the exit actually happens: if the
+	// compact errors and the subsequent agentStop then fails, nothing ever
+	// decrements, and the thread reads BUSY forever — wait_agent parks on it and
+	// the Jobs panel shows work that is not running. The defer below is the honest
+	// version: it releases unless a real turn was observed for this compaction.
+	//
+	// `compacted` means "the compaction turn RAN, so its result event already
+	// decremented the count" — the only case where releasing again would be a
+	// double-release that steals a slot from some other turn (TurnFailed clamps
+	// at zero, so it cannot go negative, but it can mark a live turn idle).
+	//
+	// A hot compaction is an ordinary turn: the supervisor Sends the compact
+	// prompt and the relay carries the events, so TurnTracker.Observe decrements
+	// on the result. That is true both when the harness returns text and when it
+	// returns ErrCompactedInPlace (kimi's `/compact` completes its turn and only
+	// then reports it had no summary body to hand back) — so BOTH set the flag.
+	// Every other exit — the thread was not running, the send never reached the
+	// agent, the two-minute deadline — had no result event and must release.
+	compacted := false
 	if d.turns != nil {
 		d.turns.TurnQueued(threadID)
+		defer func() {
+			if !compacted {
+				d.turns.TurnFailed(threadID)
+			}
+		}()
 	}
 	text, err := d.harnessFor(threadID).Compact(ctx, harness.CompactSpec{
 		ThreadID: threadID,
@@ -468,9 +551,18 @@ func runHotCompactIfConfigured(d handlerDeps, threadID string) {
 		Hot:      true,
 	})
 	if err != nil {
+		// A harness that compacts in place succeeded; it just has no text to
+		// hand back. Nothing to store — its own session keeps the compacted
+		// context and resume re-attaches to it.
+		if errors.Is(err, ErrCompactedInPlace) {
+			compacted = true
+			d.log.Info("compacted in place; no summary stored", "thread", threadID)
+			return
+		}
 		d.log.Warn("hot-opus compact failed", "thread", threadID, "err", err)
 		return
 	}
+	compacted = true
 	if strings.TrimSpace(text) == "" {
 		d.log.Warn("hot-opus compact returned empty body", "thread", threadID)
 		return
@@ -560,7 +652,7 @@ type exitCompactTracker struct {
 	ctx context.Context
 	// harnesses resolves each record's own backend, so a cold compaction runs
 	// through the thread's harness instead of assuming a claude subprocess
-	// (plan 16 P6). A record whose harness has no Compaction capability never
+	// (plan 16 P6). A record whose harness has no ColdCompact capability never
 	// reaches here — the exit hook checks first — but Compact refuses anyway.
 	harnesses *harness.Registry
 }
@@ -571,8 +663,8 @@ type exitCompactTracker struct {
 func (e *exitCompactTracker) spawn(log *slog.Logger, sessions *session.Store,
 	summaries *compact.Store, rec session.Record, strategy compact.Strategy) {
 	h, ok := e.harnesses.Get(rec.Backend)
-	if !ok || !h.Capabilities().Compaction {
-		return // nothing to run: this thread's engine cannot compact
+	if !ok || !h.Capabilities().ColdCompact {
+		return // nothing to run: this engine has no compaction off the live session
 	}
 	e.wg.Add(1)
 	safe.Go("shutdown.exitCompact", func() {
@@ -634,6 +726,10 @@ func runExitCompact(ctx context.Context, h harness.Harness, log *slog.Logger,
 		Timeout:   5 * time.Minute,
 	})
 	if err != nil {
+		if errors.Is(err, ErrCompactedInPlace) {
+			log.Info("compacted in place; no summary stored", "thread", rec.ThreadID)
+			return
+		}
 		log.Warn("exit compaction failed",
 			"thread", rec.ThreadID, "strategy", strategy, "err", err)
 		return
@@ -656,6 +752,17 @@ func runExitCompact(ctx context.Context, h harness.Harness, log *slog.Logger,
 	log.Info("exit compaction complete",
 		"thread", rec.ThreadID, "strategy", strategy,
 		"turns", sum.Turns, "body_bytes", len(sum.Body))
+}
+
+// launchTitle is the label handed to the harness as StartSpec.Title — the same
+// text that becomes the record's Title, so a session listed by the CLI's own
+// tooling carries the name the human sees in the roster. Falls back to the
+// opening prompt when the caller supplied no title.
+func launchTitle(title, fallback string) string {
+	if t := strings.TrimSpace(title); t != "" {
+		return summarizePrompt(t)
+	}
+	return summarizePrompt(fallback)
 }
 
 // summarizePrompt makes a short, single-line title from an opening prompt.
@@ -765,15 +872,28 @@ func mcpBridgeArgs(socketPath, threadID, workspace string, cowork, noPermissionT
 	return args
 }
 
+// bridgeSecretEnv carries the launch's per-bridge secret to an ACP stdio server
+// entry. Empty when no secret was minted (a deps assembly with no ledger): the
+// bridge then fails its identify and exits, rather than coming up unbound.
+func bridgeSecretEnv(secret string) []kimi.MCPEnv {
+	if secret == "" {
+		return []kimi.MCPEnv{}
+	}
+	return []kimi.MCPEnv{{Name: bridgeSecretEnvVar, Value: secret}}
+}
+
 // coopMCPServer describes the Cooperation MCP bridge as an ACP stdio server
 // for a kimi thread's session/new. The permission tool is hidden: kimi
 // permissions flow over ACP (session/request_permission), not MCP.
-func coopMCPServer(exePath, socketPath, threadID, workspace string) kimi.MCPServer {
+//
+// The secret travels in Env, never in Args: argv is world-readable and the
+// secret is what proves this bridge speaks for this thread (audit F13).
+func coopMCPServer(exePath, socketPath, threadID, workspace, secret string) kimi.MCPServer {
 	return kimi.MCPServer{
 		Name:    "cooperation",
 		Command: exePath,
 		Args:    mcpBridgeArgs(socketPath, threadID, workspace, false, true),
-		Env:     []kimi.MCPEnv{},
+		Env:     bridgeSecretEnv(secret),
 	}
 }
 
@@ -781,12 +901,12 @@ func coopMCPServer(exePath, socketPath, threadID, workspace string) kimi.MCPServ
 // into every kimi session for the same reason the claude config always carries
 // it: the server list is fixed at session/new, so a bridge missing at handshake
 // time can never appear later. It lists no tools until the thread opts in.
-func coworkMCPServer(exePath, socketPath, threadID, workspace string) kimi.MCPServer {
+func coworkMCPServer(exePath, socketPath, threadID, workspace, secret string) kimi.MCPServer {
 	return kimi.MCPServer{
 		Name:    "cowork",
 		Command: exePath,
 		Args:    mcpBridgeArgs(socketPath, threadID, workspace, true, true),
-		Env:     []kimi.MCPEnv{},
+		Env:     bridgeSecretEnv(secret),
 	}
 }
 
@@ -801,17 +921,41 @@ func coworkMCPServer(exePath, socketPath, threadID, workspace string) kimi.MCPSe
 // thread opts in (advertisedTools) and the core refuses every desktop call from
 // a thread that has not (requireCoworkBridge), so an always-present server
 // grants nothing on its own.
-func writeMCPConfig(exePath, socketPath, threadID, workspace string) (string, error) {
+//
+// Each server carries ITS OWN bridge secret in its `env` block (claude merges
+// it into that server process's environment — `claude mcp add -e KEY=v` writes
+// the same field). One secret per server, not one per launch: a redeemed secret
+// is spent while its bridge is connected, so a shared one would make whichever
+// server claude spawns second look like a replay of the first (F13).
+//
+// It is in env and not args because argv is world-readable via /proc/<pid>/cmdline
+// while the file below is 0600 in a 0700 directory. Note what that does and does
+// not buy: the file is unreadable by OTHER users, and the supervisor deletes it
+// when the thread's process exits (internal/agent, mcpConfig cleanup) — but a
+// same-uid process can read it while the thread runs, exactly as it can read a
+// live bridge's /proc/<pid>/environ. That is why the replay gate exists: the
+// secret's value is not the whole defence, spending it is.
+func writeMCPConfig(exePath, socketPath, threadID, workspace, coopSecret,
+	coworkSecret string) (string, error) {
+	serverEnv := func(secret string) map[string]any {
+		env := map[string]any{}
+		if secret != "" {
+			env[bridgeSecretEnvVar] = secret
+		}
+		return env
+	}
 	servers := map[string]any{
 		"cooperation": map[string]any{
 			"type":    "stdio",
 			"command": exePath,
 			"args":    mcpBridgeArgs(socketPath, threadID, workspace, false, false),
+			"env":     serverEnv(coopSecret),
 		},
 		"cowork": map[string]any{
 			"type":    "stdio",
 			"command": exePath,
 			"args":    mcpBridgeArgs(socketPath, threadID, workspace, true, false),
+			"env":     serverEnv(coworkSecret),
 		},
 	}
 	cfg := map[string]any{"mcpServers": servers}
@@ -819,7 +963,11 @@ func writeMCPConfig(exePath, socketPath, threadID, workspace string) (string, er
 	if err != nil {
 		return "", err
 	}
-	f, err := os.CreateTemp("", "agentkate-mcp-"+threadID+"-*.json")
+	dir, err := mcpConfigDir()
+	if err != nil {
+		return "", err
+	}
+	f, err := os.CreateTemp(dir, "mcp-"+threadID+"-*.json")
 	if err != nil {
 		return "", err
 	}
@@ -828,4 +976,44 @@ func writeMCPConfig(exePath, socketPath, threadID, workspace string) (string, er
 		return "", err
 	}
 	return f.Name(), nil
+}
+
+// mcpConfigDir is where a launch's secret-bearing --mcp-config file lives: a
+// 0700 directory of our own, under $XDG_RUNTIME_DIR when there is one (a
+// per-login tmpfs the session cleans up) and otherwise under the temp dir.
+//
+// Not bare /tmp, which is world-listable: the old path published one
+// `agentkate-mcp-<threadId>-*.json` per live thread to every user on the box.
+// The contents were already 0600, so this is about not advertising the roster —
+// and about keeping a same-uid harvest to a directory it has to know about
+// rather than a glob it can guess.
+//
+// FAILS CLOSED on anything it does not own. MkdirAll succeeds against a
+// directory another user planted first, and it never tightens an existing
+// mode — so the directory is checked, not assumed: a symlink, another uid's
+// directory, or a mode we cannot bring back to 0700 aborts the launch rather
+// than writing a secret somewhere someone else can follow.
+func mcpConfigDir() (string, error) {
+	base := os.Getenv("XDG_RUNTIME_DIR")
+	if base == "" {
+		base = os.TempDir()
+	}
+	dir := filepath.Join(base, "agentkate", "mcp")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return "", err
+	}
+	if !fi.IsDir() || fi.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("%s is not a directory we own", dir)
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok && int(st.Uid) != os.Getuid() {
+		return "", fmt.Errorf("%s belongs to another user (uid %d)", dir, st.Uid)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return "", err
+	}
+	return dir, nil
 }

@@ -20,16 +20,16 @@ var registry = map[string]recipeResolver{
 	// Extensions that delegate to a language-server binary the user installs
 	// separately. Each recipe looks the binary up on PATH; the matching entry
 	// in externalServerHint() supplies a helpful message when it's missing.
-	"golang.go":                  pathRecipeResolver("gopls", nil, []string{"go"}, []string{".go"}),
-	"rust-lang.rust-analyzer":    pathRecipeResolver("rust-analyzer", nil, []string{"rust"}, []string{".rs"}),
-	"vscode.cpp":                 pathRecipeResolver("clangd", nil, []string{"c", "cpp"}, []string{".c", ".h", ".cc", ".cpp", ".hpp", ".cxx", ".hxx"}),
-	"vscode.typescript":          pathRecipeResolver("typescript-language-server", []string{"--stdio"}, []string{"typescript", "typescriptreact", "javascript", "javascriptreact"}, []string{".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}),
-	"hashicorp.terraform":        pathRecipeResolver("terraform-ls", []string{"serve"}, []string{"terraform"}, []string{".tf", ".tfvars"}),
-	"redhat.vscode-xml":          pathRecipeResolver("lemminx", nil, []string{"xml", "xsl", "xsd", "dtd"}, []string{".xml", ".xsl", ".xsd", ".dtd"}),
-	"redhat.java":                pathRecipeResolver("jdtls", nil, []string{"java"}, []string{".java"}),
+	"golang.go":                   pathRecipeResolver("gopls", nil, []string{"go"}, []string{".go"}),
+	"rust-lang.rust-analyzer":     pathRecipeResolver("rust-analyzer", nil, []string{"rust"}, []string{".rs"}),
+	"vscode.cpp":                  pathRecipeResolver("clangd", nil, []string{"c", "cpp"}, []string{".c", ".h", ".cc", ".cpp", ".hpp", ".cxx", ".hxx"}),
+	"vscode.typescript":           pathRecipeResolver("typescript-language-server", []string{"--stdio"}, []string{"typescript", "typescriptreact", "javascript", "javascriptreact"}, []string{".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}),
+	"hashicorp.terraform":         pathRecipeResolver("terraform-ls", []string{"serve"}, []string{"terraform"}, []string{".tf", ".tfvars"}),
+	"redhat.vscode-xml":           pathRecipeResolver("lemminx", nil, []string{"xml", "xsl", "xsd", "dtd"}, []string{".xml", ".xsl", ".xsd", ".dtd"}),
+	"redhat.java":                 pathRecipeResolver("jdtls", nil, []string{"java"}, []string{".java"}),
 	"ms-azuretools.vscode-docker": pathRecipeResolver("docker-langserver", []string{"--stdio"}, []string{"dockerfile"}, []string{"Dockerfile"}),
-	"charliermarsh.ruff":         pathRecipeResolver("ruff", []string{"server"}, []string{"python"}, []string{".py", ".pyi"}),
-	"ms-python.python":           resolvePython,
+	"charliermarsh.ruff":          pathRecipeResolver("ruff", []string{"server"}, []string{"python"}, []string{".py", ".pyi"}),
+	"ms-python.python":            resolvePython,
 }
 
 // pathRecipeResolver returns a resolver that looks bin up on PATH and produces

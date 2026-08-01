@@ -14,9 +14,12 @@ package session
 
 import (
 	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
+
+	"agentkate/internal/fsperm"
 )
 
 // AttachmentMeta is the compact, body-free description of one attached file.
@@ -57,8 +60,25 @@ func DefaultAttachmentDir() string {
 }
 
 // NewAttachmentStore opens (lazily) the sidecar directory at dir. The directory
-// is created on first write, not here, so a read-only session never touches disk.
+// is still created on first write, not here, so a session that never attaches
+// anything never creates it.
+//
+// It does MIGRATE an existing directory's permissions: sidecars written by
+// earlier builds are 0644 in a 0755 directory and name every file the human
+// ever attached, with its full path. Deferring that to the next write would
+// leave a thread nobody attaches to again exposed forever.
+//
+// A migration failure is logged, not fatal, and does not stop the store from
+// opening: the data root above it is 0700 by then (session.Store.harden), so
+// the sidecars are already unreachable by other users, and refusing to open the
+// store would cost every attachment chip in the UI over a defence-in-depth
+// layer. New writes below are 0600 regardless.
 func NewAttachmentStore(dir string) *AttachmentStore {
+	if n, err := fsperm.HardenTree(dir); err != nil {
+		slog.Warn("could not tighten attachment sidecar permissions", "dir", dir, "err", err)
+	} else {
+		fsperm.LogMigration(dir, n)
+	}
 	return &AttachmentStore{dir: dir}
 }
 
@@ -129,11 +149,14 @@ func (s *AttachmentStore) write(threadID string, turns []AttachmentTurn) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(s.dir, 0o755); err != nil {
+	// 0700/0600: a sidecar lists the name, origin path and workspace-outside
+	// flag of every file the human attached to this thread. Same data class as
+	// the transcript itself, same discipline.
+	if err := fsperm.MkdirAll(s.dir); err != nil {
 		return err
 	}
 	tmp := s.pathFor(threadID) + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+	if err := fsperm.WriteFile(tmp, b); err != nil {
 		return err
 	}
 	return os.Rename(tmp, s.pathFor(threadID))

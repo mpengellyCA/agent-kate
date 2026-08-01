@@ -158,8 +158,15 @@ func (f *fakeHarness) Compact(context.Context, harness.CompactSpec) (string, err
 }
 
 // serveIPC starts srv on sock and blocks until the socket exists.
+//
+// The socket directory is tightened to 0700 first: Serve refuses to bind inside
+// a group/world-traversable directory (assertPrivateDir, audit F20a) and
+// t.TempDir hands out 0755, so every bus test would otherwise fail to listen.
 func serveIPC(t *testing.T, srv *ipc.Server, sock string) {
 	t.Helper()
+	if err := os.Chmod(filepath.Dir(sock), 0o700); err != nil {
+		t.Fatalf("chmod socket dir: %v", err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	go func() { _ = srv.Serve(ctx) }()
@@ -178,9 +185,19 @@ func serveIPC(t *testing.T, srv *ipc.Server, sock string) {
 // permAutoResponder connects a raw notification listener that answers every
 // permission.requested by resolving the broker with the current allow flag,
 // counting the asks — the test's stand-in for the human in the UI.
-func permAutoResponder(t *testing.T, sock string, broker *permission.Broker,
+//
+// It takes the UI role, because permission.requested is a UI-ONLY notification
+// since audit F6 (the raw tool input must not reach every connection). Standing
+// in for the human means holding the human's role.
+func permAutoResponder(t *testing.T, srv *ipc.Server, sock string, broker *permission.Broker,
 	allow *atomic.Bool, asks *atomic.Int32) {
 	t.Helper()
+	srv.Handle("test.markUI", func(ctx context.Context, _ json.RawMessage) (any, error) {
+		if !srv.MarkUI(ctx) {
+			return nil, ipc.Errorf(ipc.CodeInvalidRequest, "UI role refused")
+		}
+		return map[string]any{"ok": true}, nil
+	})
 	conn, err := net.Dial("unix", sock)
 	if err != nil {
 		t.Fatalf("responder dial: %v", err)
@@ -216,13 +233,12 @@ func permAutoResponder(t *testing.T, sock string, broker *permission.Broker,
 			broker.Resolve(p.RequestID, permission.Decision{Allow: allow.Load()})
 		}
 	}()
-	// One round trip before returning: permission.requested is a fire-and-forget
-	// broadcast to the connections the server has REGISTERED, so an ask racing
-	// this connection's accept would be delivered to nobody and the test would
-	// hang for the whole permission timeout. Any method answers — a
-	// method-not-found reply proves the accept happened.
+	// One round trip before returning, and it is the role claim: an ask racing
+	// this connection's accept — or its handshake — would be delivered to
+	// nobody and the test would hang for the whole permission timeout. The
+	// reply proves both that the accept happened and that the role is bound.
 	if _, err := conn.Write([]byte(
-		`{"jsonrpc":"2.0","id":1,"method":"responder.barrier"}` + "\n")); err != nil {
+		`{"jsonrpc":"2.0","id":1,"method":"test.markUI"}` + "\n")); err != nil {
 		t.Fatalf("responder barrier: %v", err)
 	}
 	select {
@@ -232,11 +248,24 @@ func permAutoResponder(t *testing.T, sock string, broker *permission.Broker,
 	}
 }
 
+// asBridge identifies client as threadID's agent bridge, minting the secret
+// core-side exactly as a launch does (audit F13). Every test that speaks for an
+// agent must do this: the core refuses a connection that never proved it is
+// that thread's bridge, so an un-identified client can reach no agent-facing
+// handler at all.
+func asBridge(t *testing.T, secrets *bridgeSecrets, client *ipc.Client, threadID string) {
+	t.Helper()
+	if err := client.Call("bridge.identify", map[string]any{
+		"threadId": threadID, "secret": secrets.mint(threadID)}, nil); err != nil {
+		t.Fatalf("bridge.identify(%s): %v", threadID, err)
+	}
+}
+
 // orchTestCore spins a real IPC server with the orchestration handlers over
 // real (empty) supervisors plus a registered fakeHarness, and returns a
-// connected client.
+// connected client and the core's bridge-secret ledger (for asBridge).
 func orchTestCore(t *testing.T, sessions *session.Store, turns *agent.TurnTracker,
-	fakes ...*fakeHarness) *ipc.Client {
+	fakes ...*fakeHarness) (*ipc.Client, *bridgeSecrets) {
 	t.Helper()
 	fake := &fakeHarness{}
 	if len(fakes) > 0 {
@@ -252,21 +281,35 @@ func orchTestCore(t *testing.T, sessions *session.Store, turns *agent.TurnTracke
 	harnesses.Register(fake)
 	gitCache := gitstatus.NewCache(log)
 	t.Cleanup(func() { _ = gitCache.Close() })
+	broker := permission.New()
+	secrets := newBridgeSecrets()
 	d := handlerDeps{
-		srv: srv, harnesses: harnesses,
+		srv: srv, harnesses: harnesses, broker: broker,
 		turns: turns, orchGrants: newOrchGrants(),
 		threads: newThreadRegistry(), gitCache: gitCache,
-		sessions: sessions, log: log,
+		sessions: sessions, log: log, bridgeSecrets: secrets,
 	}
 	registerOrchestrationHandlers(d)
+	// bridge.identify lives here — the one door to an agent identity, and the
+	// gate every agent-facing handler below now asserts against.
+	registerMCPActivity(d)
 
 	serveIPC(t, srv, sock)
+	// A standing "yes" from the human: these suites are about applied-truth and
+	// wiring, not about the launch authority gate (which has its own suite in
+	// authority_test.go), but the gate is real and several of them launch into
+	// the workspace — which always asks. Without a responder they would sit out
+	// the whole permission timeout.
+	var allow atomic.Bool
+	allow.Store(true)
+	var asks atomic.Int32
+	permAutoResponder(t, srv, sock, broker, &allow, &asks)
 	client, err := ipc.Dial(sock)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	t.Cleanup(func() { _ = client.Close() })
-	return client
+	return client, secrets
 }
 
 // TestAgentWaitRPC drives agent.wait end to end over the bus: immediate
@@ -281,7 +324,7 @@ func TestAgentWaitRPC(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	client := orchTestCore(t, sessions, turns)
+	client, _ := orchTestCore(t, sessions, turns)
 
 	var res struct {
 		Status   string `json:"status"`
@@ -340,7 +383,10 @@ func TestLaunchWorkerValidation(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	client := orchTestCore(t, sessions, agent.NewTurnTracker())
+	client, secrets := orchTestCore(t, sessions, agent.NewTurnTracker())
+	// Speak as t-parent's own bridge, so what refuses below is the parameter
+	// gate rather than the identity gate.
+	asBridge(t, secrets, client, "t-parent")
 
 	for name, params := range map[string]map[string]any{
 		"missing prompt":  {"parentThreadId": "t-parent"},
@@ -381,7 +427,7 @@ func TestAuthorizeAgentTarget(t *testing.T) {
 	serveIPC(t, srv, sock)
 	var allow atomic.Bool
 	var asks atomic.Int32
-	permAutoResponder(t, sock, broker, &allow, &asks)
+	permAutoResponder(t, srv, sock, broker, &allow, &asks)
 
 	allow.Store(true)
 	// Own subtree: no ask.
@@ -449,22 +495,29 @@ func TestDiscardGoesThroughGate(t *testing.T) {
 	sup := agent.NewSupervisor("", log, func(string, []json.RawMessage) {})
 	harnesses := harness.NewRegistry("claude")
 	harnesses.Register(newClaudeHarness(sup, "", ""))
+	secrets := newBridgeSecrets()
 	d := handlerDeps{
 		srv: srv, harnesses: harnesses,
 		turns: agent.NewTurnTracker(), orchGrants: newOrchGrants(),
 		coop: coop.NewState(), threads: newThreadRegistry(),
 		broker: broker, sessions: sessions, log: log,
+		bridgeSecrets: secrets,
 	}
 	registerHandlers(d) // the real handler set, gate included
 	serveIPC(t, srv, sock)
 	var allow atomic.Bool
 	var asks atomic.Int32
-	permAutoResponder(t, sock, broker, &allow, &asks)
+	permAutoResponder(t, srv, sock, broker, &allow, &asks)
 	client, err := ipc.Dial(sock)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	t.Cleanup(func() { _ = client.Close() })
+	// The caller must BE t-a, not merely claim to be (audit F13/§4): the gate
+	// below measures a relationship between two thread ids, so the id it
+	// measures has to be bound to this connection first. The UI-driven half of
+	// that rule is pinned in TestPerThreadHandlersBindTheCaller.
+	asBridge(t, secrets, client, "t-a")
 
 	// Denied: the discard fails at the gate, before any lookup or removal.
 	allow.Store(false)
@@ -487,13 +540,15 @@ func TestDiscardGoesThroughGate(t *testing.T) {
 	if asks.Load() != 2 {
 		t.Fatalf("asks = %d, want 2 (deny + approve)", asks.Load())
 	}
-	// UI-driven (no fromThreadId): never gated, straight to validation.
+	// An agent connection that simply OMITS fromThreadId is not the UI: it used
+	// to read as one and skip the gate entirely. It is refused, and the human is
+	// not asked — a bridge's silence is not a human's approval.
 	err = client.Call("agent.discard", map[string]any{"threadId": "t-b"}, nil)
-	if err == nil || !strings.Contains(err.Error(), "unknown thread") {
-		t.Fatalf("UI discard: err = %v", err)
+	if err == nil || !strings.Contains(err.Error(), "fromThreadId is required") {
+		t.Fatalf("bridge discard with no fromThreadId: err = %v", err)
 	}
 	if asks.Load() != 2 {
-		t.Fatalf("UI discard asked the human (%d asks)", asks.Load())
+		t.Fatalf("the refused discard asked the human (%d asks)", asks.Load())
 	}
 }
 
@@ -508,7 +563,8 @@ func TestLaunchWorkerAppliedTruth(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	client := orchTestCore(t, sessions, agent.NewTurnTracker())
+	client, secrets := orchTestCore(t, sessions, agent.NewTurnTracker())
+	asBridge(t, secrets, client, "t-parent")
 
 	var res struct {
 		ThreadID  string            `json:"threadId"`
@@ -571,7 +627,8 @@ func TestLaunchWorkerPersonaAppliedTruth(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
-		client := orchTestCore(t, sessions, agent.NewTurnTracker(), fake)
+		client, secrets := orchTestCore(t, sessions, agent.NewTurnTracker(), fake)
+		asBridge(t, secrets, client, "t-parent")
 		var res map[string]any
 		if err := client.Call("agent.launchWorker", map[string]any{
 			"parentThreadId": "t-parent",
@@ -631,6 +688,11 @@ func stubCore(t *testing.T, handlers map[string]ipc.Handler) *mcpBridge {
 	srv := ipc.NewServer(sock, log)
 	for method, h := range handlers {
 		srv.Handle(method, h)
+	}
+	// 0700 for the same reason serveIPC does it: Serve refuses a
+	// group/world-traversable socket directory (audit F20a).
+	if err := os.Chmod(filepath.Dir(sock), 0o700); err != nil {
+		t.Fatalf("chmod stub socket dir: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -799,5 +861,54 @@ func TestOrchestrationToolsAdvertised(t *testing.T) {
 		if !names[want] {
 			t.Errorf("tool %s not advertised", want)
 		}
+	}
+}
+
+// TestOrchGrantExpires pins audit F24's fix: a cross-subtree approval used to
+// last for the whole core run, which on an app people leave open for days meant
+// one Monday click authorising a Thursday send. The grant now covers a WINDOW,
+// and every use slides it — so an active collaboration is never interrupted,
+// while one that has gone quiet re-asks.
+//
+// Time is injected rather than slept: the assertions are about the boundary, and
+// a test that sleeps 15 minutes is a test nobody runs.
+func TestOrchGrantExpires(t *testing.T) {
+	g := newOrchGrants()
+	base := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	now := base
+	g.now = func() time.Time { return now }
+
+	g.grant("t-a", "t-b", "send_agent")
+	if !g.has("t-a", "t-b", "send_agent") {
+		t.Fatal("a fresh grant does not cover its own pairing")
+	}
+
+	// Just inside the window: still covered.
+	now = base.Add(orchGrantTTL - time.Second)
+	if !g.has("t-a", "t-b", "send_agent") {
+		t.Fatal("grant expired before its TTL")
+	}
+	// That use slid the window, so the ORIGINAL deadline is now irrelevant.
+	now = base.Add(orchGrantTTL + time.Second)
+	if !g.has("t-a", "t-b", "send_agent") {
+		t.Fatal("using a grant did not slide its window")
+	}
+
+	// Go quiet for a full TTL: the grant stops covering, and re-asking is the
+	// only way back.
+	now = now.Add(orchGrantTTL)
+	if g.has("t-a", "t-b", "send_agent") {
+		t.Fatal("an idle grant still covered a call a full TTL later")
+	}
+	if len(g.granted) != 0 {
+		t.Errorf("expired grant was not dropped from the map: %d left", len(g.granted))
+	}
+
+	// The boundary itself is a refusal, not an extension.
+	now = base.Add(10 * time.Hour)
+	g.grant("t-a", "t-b", "close_agent")
+	now = now.Add(orchGrantTTL)
+	if g.has("t-a", "t-b", "close_agent") {
+		t.Fatal("a grant exactly at its deadline was treated as live")
 	}
 }

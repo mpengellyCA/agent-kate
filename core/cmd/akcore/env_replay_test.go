@@ -131,7 +131,8 @@ func TestLaunchWorkerIgnoresEnv(t *testing.T) {
 		t.Fatalf("Put: %v", err)
 	}
 	fake := &fakeHarness{}
-	client := orchTestCore(t, sessions, agent.NewTurnTracker(), fake)
+	client, secrets := orchTestCore(t, sessions, agent.NewTurnTracker(), fake)
+	asBridge(t, secrets, client, "t-parent")
 
 	if err := client.Call("agent.launchWorker", map[string]any{
 		"parentThreadId": "t-parent",

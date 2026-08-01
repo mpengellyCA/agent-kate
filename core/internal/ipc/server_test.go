@@ -7,12 +7,26 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// privateSocketDir returns a 0700 directory to bind test sockets in. Serve
+// refuses a group/world-accessible socket directory (audit F20a) and t.TempDir
+// hands out 0755 subdirectories, so tests must model the real deployment:
+// $XDG_RUNTIME_DIR, which is 0700.
+func privateSocketDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir() + "/run"
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	return dir
+}
 
 // waitFor polls cond until it is true or the deadline elapses.
 func waitFor(t *testing.T, d time.Duration, cond func() bool) bool {
@@ -32,7 +46,7 @@ func waitFor(t *testing.T, d time.Duration, cond func() bool) bool {
 // that many handlers are in flight the reader backpressures (stops dispatching)
 // until a handler completes and frees a slot.
 func TestDispatchBoundIsPerConn(t *testing.T) {
-	sock := t.TempDir() + "/ipc.sock"
+	sock := privateSocketDir(t) + "/ipc.sock"
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv := NewServer(sock, log)
 
@@ -172,7 +186,7 @@ func writeOversizeFrame(t *testing.T, c net.Conn, prefix string) {
 // stopped the entire core: the connection must stay usable and the sender must
 // get an error reply naming the cap.
 func TestOversizeFrameIsSurvivable(t *testing.T) {
-	sock := t.TempDir() + "/ipc.sock"
+	sock := privateSocketDir(t) + "/ipc.sock"
 	srv := NewServer(sock, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	srv.Handle("echo", func(_ context.Context, p json.RawMessage) (any, error) {
 		return map[string]any{"got": string(p)}, nil
@@ -232,7 +246,7 @@ func TestOversizeFrameIsSurvivable(t *testing.T) {
 // TestOversizeFrameWithoutRecoverableID covers the case where the discarded
 // prefix carries no id: nothing is sent back, but the connection survives.
 func TestOversizeFrameWithoutRecoverableID(t *testing.T) {
-	sock := t.TempDir() + "/ipc.sock"
+	sock := privateSocketDir(t) + "/ipc.sock"
 	srv := NewServer(sock, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	srv.Handle("echo", func(_ context.Context, p json.RawMessage) (any, error) {
 		return map[string]any{"got": string(p)}, nil
@@ -314,7 +328,7 @@ func nonRepeatingPayload(n int) string {
 // than readBufferBytes but under the cap is stitched across many ErrBufferFull
 // reads and must arrive intact, byte for byte, in both directions.
 func TestLargeValidFrameRoundTrip(t *testing.T) {
-	sock := t.TempDir() + "/ipc.sock"
+	sock := privateSocketDir(t) + "/ipc.sock"
 	srv := NewServer(sock, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	srv.Handle("echo", func(_ context.Context, p json.RawMessage) (any, error) {
 		var s string
@@ -428,7 +442,7 @@ func TestReadFrameBoundaries(t *testing.T) {
 // an over-cap core→bridge response (a huge cowork.screenshot result) must not
 // end the read loop, or every later Call would block for its full timeout.
 func TestClientSurvivesOversizeFrame(t *testing.T) {
-	sock := t.TempDir() + "/ipc.sock"
+	sock := privateSocketDir(t) + "/ipc.sock"
 	srv := NewServer(sock, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	srv.Handle("big", func(_ context.Context, _ json.RawMessage) (any, error) {
 		return strings.Repeat("y", maxFrameBytes+4096), nil
@@ -459,5 +473,104 @@ func TestClientSurvivesOversizeFrame(t *testing.T) {
 	}
 	if out != "pong" {
 		t.Fatalf("follow-up result = %q, want pong", out)
+	}
+}
+
+// TestHandlerContextCancelledOnDisconnect pins the disconnect-release contract
+// (audit F17): a handler parked in a long wait (agent.wait parks for up to an
+// hour) must be released when the connection that asked for it goes away, not
+// left to run out its deadline. Without a per-connection context, every
+// stop/restart of a waiting controller bridge leaks one parked goroutine.
+func TestHandlerContextCancelledOnDisconnect(t *testing.T) {
+	sock := privateSocketDir(t) + "/ipc.sock"
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := NewServer(sock, log)
+
+	entered := make(chan struct{})
+	released := make(chan error, 1)
+	srv.Handle("park", func(ctx context.Context, _ json.RawMessage) (any, error) {
+		close(entered)
+		select {
+		case <-ctx.Done():
+			released <- ctx.Err()
+		case <-time.After(10 * time.Second): // stand-in for the 1 h wait deadline
+			released <- nil
+		}
+		return map[string]any{"ok": true}, nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = srv.Serve(ctx) }()
+
+	var c net.Conn
+	if !waitFor(t, 2*time.Second, func() bool {
+		conn, err := net.Dial("unix", sock)
+		if err != nil {
+			return false
+		}
+		c = conn
+		return true
+	}) {
+		t.Fatal("server never accepted a connection")
+	}
+
+	if _, err := c.Write([]byte(`{"jsonrpc":"2.0","id":1,"method":"park","params":{}}` + "\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler never ran")
+	}
+
+	// The caller vanishes mid-wait.
+	c.Close()
+
+	select {
+	case err := <-released:
+		if err == nil {
+			t.Fatal("handler ran to its own deadline instead of being released on disconnect")
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("released with %v, want context.Canceled", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("handler was not released when its connection dropped")
+	}
+
+	// The server context is still live: a disconnect must not cancel it.
+	if ctx.Err() != nil {
+		t.Fatalf("server context cancelled by a client disconnect: %v", ctx.Err())
+	}
+}
+
+// TestServeRefusesWorldAccessibleSocketDir pins audit F20a: binding the socket
+// in a directory other users can traverse (the /tmp fallback when
+// XDG_RUNTIME_DIR is unset) lets another user pre-create the path — the core
+// then cannot remove it and refuses to start — and leaves the socket carrying
+// umask permissions for the window between Listen and Chmod. Serve must refuse
+// such a directory outright rather than bind and hope.
+func TestServeRefusesWorldAccessibleSocketDir(t *testing.T) {
+	open := t.TempDir() + "/shared"
+	if err := os.Mkdir(open, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	srv := NewServer(open+"/ipc.sock", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	err := srv.Serve(context.Background())
+	if err == nil {
+		t.Fatal("Serve accepted a world-traversable socket directory")
+	}
+	if !strings.Contains(err.Error(), "accessible") {
+		t.Fatalf("unexpected error %v", err)
+	}
+	if _, statErr := os.Stat(open + "/ipc.sock"); statErr == nil {
+		t.Fatal("Serve bound the socket anyway")
+	}
+
+	// And the missing-directory case must fail closed too, not be waved through.
+	srv2 := NewServer(t.TempDir()+"/gone/ipc.sock", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := srv2.Serve(context.Background()); err == nil {
+		t.Fatal("Serve accepted a socket directory it could not stat")
 	}
 }

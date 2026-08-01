@@ -11,9 +11,11 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"regexp"
 	"runtime/debug"
 	"sync"
+	"syscall"
 	"time"
 
 	"agentkate/internal/safe"
@@ -117,8 +119,47 @@ func (s *Server) OnAllClientsGone(f func()) {
 	s.onAllGone = f
 }
 
+// assertPrivateDir refuses any socket directory another user could reach. It is
+// what makes the unavoidable window between Listen and Chmod harmless: the
+// socket may briefly carry umask permissions, but nobody else can traverse the
+// directory to find it — and nobody else can pre-create a squatting socket
+// there either (audit F20a).
+//
+// Deliberately fails CLOSED: every condition it cannot evaluate (stat error,
+// a platform without a Unix stat, a symlinked directory whose target may move
+// under us) is treated as unsafe, because "we could not check" and "it is
+// private" must never be the same answer.
+func assertPrivateDir(dir string) error {
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return fmt.Errorf("socket directory %s: %w", dir, err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("socket directory %s is a symlink; refusing to bind through it", dir)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("socket directory %s is not a directory", dir)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("socket directory %s: cannot determine ownership", dir)
+	}
+	if int(st.Uid) != os.Getuid() {
+		return fmt.Errorf("socket directory %s is owned by uid %d, not %d", dir, st.Uid, os.Getuid())
+	}
+	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
+		return fmt.Errorf("socket directory %s is group/world accessible (mode %04o)", dir, perm)
+	}
+	return nil
+}
+
 // Serve listens on the socket and blocks until ctx is cancelled.
 func (s *Server) Serve(ctx context.Context) error {
+	// The socket's privacy rests on its directory, so check that first — before
+	// removing anything or binding anything inside it.
+	if err := assertPrivateDir(filepath.Dir(s.socketPath)); err != nil {
+		return err
+	}
 	// A stale socket from a previous crash would make Listen fail.
 	if err := os.Remove(s.socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -128,9 +169,10 @@ func (s *Server) Serve(ctx context.Context) error {
 		return err
 	}
 	defer os.Remove(s.socketPath)
-	// Defense in depth: restrict the socket to the owning user. $XDG_RUNTIME_DIR is
-	// already 0700, so this does not stop a same-uid process (see 08 §F Option A),
-	// but it does stop other users on a shared host.
+	// Defense in depth: restrict the socket to the owning user. The directory is
+	// verified 0700 and ours above, so this does not stop a same-uid process
+	// (see 08 §F Option A) and the Listen→Chmod window is not reachable by
+	// anyone else; it is belt-and-braces for a directory mode changed later.
 	if err := os.Chmod(s.socketPath, 0o600); err != nil {
 		s.log.Warn("ipc socket chmod failed", "err", err)
 	}
@@ -155,6 +197,14 @@ func (s *Server) Serve(ctx context.Context) error {
 }
 
 func (s *Server) serveConn(ctx context.Context, netConn net.Conn) {
+	// Every handler dispatched on this connection runs under a context that is
+	// cancelled when the connection goes away, not only when the whole server
+	// shuts down. Long-blocking handlers (agent.wait parks for up to an hour,
+	// permission.request for minutes) are contractually required to release
+	// when their caller's bridge dies — see agent/turnwait.go's disconnect
+	// contract. Without this, each stop/restart of a waiting controller leaks a
+	// parked goroutine for the whole deadline.
+	connCtx, cancelConn := context.WithCancel(ctx)
 	c := &conn{
 		netConn: netConn,
 		w:       bufio.NewWriter(netConn),
@@ -176,6 +226,10 @@ func (s *Server) serveConn(ctx context.Context, netConn net.Conn) {
 
 	safe.Go("ipc.serveConn", func() {
 		defer func() {
+			// Release every handler still parked on this connection BEFORE
+			// anything else: a waiter whose caller is gone has nobody left to
+			// answer.
+			cancelConn()
 			c.close() // stops the writer goroutine; idempotent
 			s.mu.Lock()
 			delete(s.conns, c)
@@ -232,7 +286,7 @@ func (s *Server) serveConn(ctx context.Context, netConn net.Conn) {
 			msg := append([]byte(nil), frame...)
 			safe.Go("ipc.dispatch", func() {
 				defer func() { <-c.sem }()
-				s.dispatch(ctx, c, msg)
+				s.dispatch(connCtx, c, msg)
 			})
 		}
 	})
@@ -705,55 +759,128 @@ func (r *ConnRef) ThreadID() string { return r.c.getThreadID() }
 // IsPrimaryUI reports whether this is the UI that runs portal sessions.
 func (r *ConnRef) IsPrimaryUI() bool { return r.c.getPrimary() }
 
-// MarkUI tags this connection as the UI. The first UI to call becomes primary
-// (runs portal sessions). Called from the existing `handshake` handler.
+// Token identifies THIS connection to bookkeeping that has to outlive the call
+// — the bridge-secret ledger, which must be able to tell "the bridge that
+// redeemed this secret is calling again" from "a second connection is replaying
+// it". A ConnRef is minted per call, so it cannot serve as that key itself.
 //
-// A connection that already identified as an agent bridge is REFUSED — the
-// mirror of BindBridge's refusal of a UI connection. Without it a bridge could
-// re-identify by calling `handshake`, and thereby pass RequireUI (answering its
-// own grant prompts) and receive the UI-only mcp.activity feed for every other
-// agent in the arena. Role is one-way per connection in both directions.
-func (s *Server) MarkUI(ctx context.Context) {
-	ref := ConnFromContext(ctx)
-	if ref == nil {
-		return
-	}
-	c := ref.c
-	// Claim the primary slot first: s.mu and idMu are never held together
-	// (NotifyUI reads roles under s.mu), so the bridge check happens under idMu
-	// alone and hands the slot back if it refuses.
-	s.mu.Lock()
-	primary := false
-	if s.primaryConn == nil {
-		s.primaryConn = c
-		primary = true
-	}
-	s.mu.Unlock()
+// The token is comparable (it wraps the connection pointer) and it keeps the
+// connection object alive for as long as a holder keeps it, which is what makes
+// the identity stable: nothing else can ever be handed the same pointer while
+// the token exists, so there is no ABA.
+func (r *ConnRef) Token() ConnToken { return ConnToken{r.c} }
 
-	c.idMu.Lock()
-	if c.role == "bridge" {
-		boundTo := c.connTID
-		c.idMu.Unlock()
-		if primary {
-			s.mu.Lock()
-			if s.primaryConn == c {
-				s.primaryConn = nil
-			}
-			s.mu.Unlock()
-		}
-		s.log.Warn("refusing to mark an agent bridge connection as the UI",
-			"thread", boundTo)
-		return
+// ConnToken is an opaque, comparable handle to one connection. The zero value
+// belongs to no connection and is never Live — the fail-closed direction for a
+// caller that has no connection identity at all.
+type ConnToken struct{ c *conn }
+
+// Live reports whether the connection is still connected. It reads the same
+// `done` channel serveConn's teardown closes, so a holder that has gone away
+// stops holding anything the moment its socket drops — which is what lets a
+// legitimate bridge reconnect into the slot it used to hold.
+func (t ConnToken) Live() bool {
+	if t.c == nil {
+		return false
 	}
-	c.role = "ui"
-	c.isPrimary = primary
-	c.idMu.Unlock()
+	select {
+	case <-t.c.done:
+		return false
+	default:
+		return true
+	}
 }
 
-// BindBridge tags this connection as an agent bridge for threadID on first use, and
-// reports whether the binding is consistent (a bridge may not switch threads). A UI
-// connection may never act as a bridge.
-func (s *Server) BindBridge(ctx context.Context, threadID string) (ok bool, reason string) {
+// MarkUI tags this connection as the UI. The first UI to call becomes primary
+// (runs portal sessions). Called from the existing `handshake` handler. It
+// reports whether the connection now holds the UI role, so the handshake can
+// answer with a refusal rather than leaving a client to discover it has no
+// authority one rejected call at a time.
+//
+// Two connections are REFUSED the role:
+//
+//   - one that already identified as an agent bridge — the mirror of
+//     IdentifyBridge's refusal of a UI connection. Without it a bridge could
+//     re-identify by calling `handshake`, and thereby pass RequireUI (answering
+//     its own grant prompts) and receive the UI-only mcp.activity feed for every
+//     other agent in the arena. Role is one-way per connection in both
+//     directions.
+//   - a SECOND connection asking for the role while another live connection
+//     already holds it (audit F13). Agent Kate runs one UI; a second claimant is
+//     either a mistake or a same-uid process forging the role, and both are
+//     better refused than admitted to the human's feeds. This does NOT
+//     authenticate the first claimant — the role is still self-asserted on first
+//     contact, and a process that connects before the real UI still wins the
+//     slot. It narrows the window rather than closing it; see
+//     docs/security-model.md §2 for the known gap and the fix that closes it.
+//
+// A disconnect clears the role with the connection, so the real UI reconnecting
+// (or a respawned core) always finds the slot free.
+func (s *Server) MarkUI(ctx context.Context) bool {
+	ref := ConnFromContext(ctx)
+	if ref == nil {
+		return false
+	}
+	c := ref.c
+	// ONE atomic decision, held under s.mu from the scan to the assignment.
+	//
+	// The earlier version scanned for an existing UI under s.mu, RELEASED it,
+	// and only then took c.idMu to write the role — so two connections
+	// handshaking at once could each scan while the other was still roleless
+	// and both come away holding the role, which is exactly what the refusal
+	// exists to prevent. The comment claimed atomicity the code did not have.
+	//
+	// Lock ORDER is s.mu then idMu — the same order NotifyUI uses (it reads
+	// roles under s.mu.RLock, and getRole takes idMu.RLock); nothing takes idMu
+	// first, so holding both cannot deadlock. c.idMu is taken directly rather
+	// than via getRole/getters, since those would re-enter it.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for other := range s.conns {
+		if other == c {
+			continue
+		}
+		if other.getRole() == "ui" {
+			s.log.Warn("refusing a second UI role claim: a client already holds it")
+			return false
+		}
+	}
+	c.idMu.Lock()
+	defer c.idMu.Unlock()
+	if c.role == "bridge" {
+		s.log.Warn("refusing to mark an agent bridge connection as the UI",
+			"thread", c.connTID)
+		return false
+	}
+	c.role = "ui"
+	// The first UI to hold the role runs portal sessions. Claimed only after
+	// the role is granted, so a refused claimant can never leave itself parked
+	// as the primary — the unwind the old two-phase version needed.
+	if s.primaryConn == nil {
+		s.primaryConn = c
+		c.isPrimary = true
+	}
+	return true
+}
+
+// IdentifyBridge tags this connection as the agent bridge for threadID. It is
+// the ONLY way a connection acquires the bridge role, and the caller must have
+// authenticated the claim first — in akcore that is `bridge.identify`, which
+// checks the per-launch secret akcore handed to that thread's bridge before it
+// calls this (see cmd/akcore/bridgeauth.go).
+//
+// This used to be trust-on-first-use, and it was reached from every handler
+// that wanted "the bridge for this thread": an unidentified connection could
+// name ANY thread and take its identity, with the thread's whole authority
+// attached. Binding now happens once, at the authenticated door, and every
+// other handler asserts through RequireBridge instead.
+//
+// A UI connection may never act as a bridge (the mirror of MarkUI's refusal of
+// a bridge), and a bridge may not switch threads. Re-identifying to the SAME
+// thread is idempotent: a thread legitimately runs more than one bridge (the
+// Cooperation and Cowork servers), each on its own connection, and a bridge may
+// re-send its handshake.
+func (s *Server) IdentifyBridge(ctx context.Context, threadID string) (ok bool, reason string) {
 	ref := ConnFromContext(ctx)
 	if ref == nil {
 		return false, "no connection identity"
@@ -770,6 +897,29 @@ func (s *Server) BindBridge(ctx context.Context, threadID string) (ok bool, reas
 		return true, ""
 	}
 	if c.connTID != threadID {
+		return false, "thread mismatch: connection is bound to a different thread"
+	}
+	return true, ""
+}
+
+// RequireBridge asserts that this connection has ALREADY identified as
+// threadID's agent bridge. It never binds: a connection that skipped the
+// authenticated handshake is refused, which is what stops a handler from
+// becoming a second, unauthenticated door into a thread's identity.
+func (s *Server) RequireBridge(ctx context.Context, threadID string) (ok bool, reason string) {
+	ref := ConnFromContext(ctx)
+	if ref == nil {
+		return false, "no connection identity"
+	}
+	c := ref.c
+	c.idMu.RLock()
+	defer c.idMu.RUnlock()
+	switch {
+	case c.role == "ui":
+		return false, "UI connection may not invoke agent capabilities"
+	case c.role != "bridge":
+		return false, "this connection has not identified as an agent bridge"
+	case c.connTID != threadID:
 		return false, "thread mismatch: connection is bound to a different thread"
 	}
 	return true, ""

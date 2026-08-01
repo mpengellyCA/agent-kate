@@ -88,18 +88,18 @@ func UnpushedCount(repoRoot, branch string) (count int, hasUpstream bool) {
 // Snapshot is one worktree's git state at a point in time. JSON-serialised
 // straight to the UI.
 type Snapshot struct {
-	ThreadID     string       `json:"threadId"`
-	Number       int          `json:"number,omitempty"` // project-scoped agent number (#N)
-	RepoRoot     string       `json:"repoRoot"`
-	Path         string       `json:"path"`
-	Branch       string       `json:"branch"`
-	Isolated     bool         `json:"isolated"`
-	HeadSHA      string       `json:"headSha"`
-	Base         string       `json:"base"`
-	Ahead        int          `json:"ahead"`        // commits on Branch since Base
-	BehindBase   int          `json:"behindBase"`   // commits on the workspace's current branch since Base
-	DirtyCount   int          `json:"dirtyCount"`   // tracked changes + untracked + conflicts
-	HasConflicts bool         `json:"hasConflicts"`
+	ThreadID     string `json:"threadId"`
+	Number       int    `json:"number,omitempty"` // project-scoped agent number (#N)
+	RepoRoot     string `json:"repoRoot"`
+	Path         string `json:"path"`
+	Branch       string `json:"branch"`
+	Isolated     bool   `json:"isolated"`
+	HeadSHA      string `json:"headSha"`
+	Base         string `json:"base"`
+	Ahead        int    `json:"ahead"`      // commits on Branch since Base
+	BehindBase   int    `json:"behindBase"` // commits on the workspace's current branch since Base
+	DirtyCount   int    `json:"dirtyCount"` // tracked changes + untracked + conflicts
+	HasConflicts bool   `json:"hasConflicts"`
 	// Remote (origin) tracking, computed purely from local refs — no fetch.
 	// HasUpstream is false when there is no refs/remotes/origin/<branch> ref
 	// (e.g. the branch was never pushed) or when the comparison failed.

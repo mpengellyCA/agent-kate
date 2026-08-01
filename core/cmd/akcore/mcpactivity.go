@@ -235,12 +235,19 @@ func mcpActivityParams(threadID, method string, params json.RawMessage,
 // because the bridge bound its connection first.
 func registerMCPActivity(d handlerDeps) {
 	// bridge.identify tags the connection as an agent bridge for its thread,
-	// once, at bridge startup. Everything it enables was already true — the
-	// Cowork handlers bind the same way on first use — it just happens up
-	// front, so the very first tool call is already attributable.
+	// once, at bridge startup. It is the ONE door to that identity (audit F13):
+	// every other handler asserts an identity that already exists, so this is
+	// the only place the secret has to be checked.
+	//
+	// The secret is the one akcore minted for THIS thread's launch and passed to
+	// its bridges in the environment (bridgeauth.go). It is verified before the
+	// binding, and a failure is refused without saying which half was wrong — a
+	// caller that can name a thread learns nothing about its secret, and one
+	// holding a stale secret learns nothing about the thread.
 	d.srv.Handle("bridge.identify", func(ctx context.Context, raw json.RawMessage) (any, error) {
 		var p struct {
 			ThreadID string `json:"threadId"`
+			Secret   string `json:"secret"`
 		}
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
@@ -248,7 +255,46 @@ func registerMCPActivity(d handlerDeps) {
 		if p.ThreadID == "" {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "threadId is required")
 		}
-		if ok, reason := d.srv.BindBridge(ctx, p.ThreadID); !ok {
+		// Fail closed: no ledger, no secret, a stale secret, an unknown thread,
+		// a caller with no connection identity — and a secret whose bridge is
+		// already connected (the replay gate) — are all the same refusal. Note
+		// this is checked BEFORE the role checks in IdentifyBridge, so a caller
+		// cannot use the reason text to probe which threads have live bridges.
+		//
+		// redeem CLAIMS the secret for this connection, so the check and the
+		// binding cannot drift: a second connection replaying a live bridge's
+		// secret is turned away here, and a bridge whose engine respawned it
+		// (its old connection dropped) walks straight back into its own slot.
+		caller := connIdentityOf(ipc.ConnFromContext(ctx))
+		if !d.bridgeSecrets.redeem(p.ThreadID, p.Secret, caller) {
+			// An EMPTY secret is called out separately: it is what a legitimate
+			// bridge presents when the engine dropped the environment we launched
+			// it with, and that diagnosis is otherwise a long hunt through a CLI
+			// that simply has no cooperation tools.
+			why := "the secret did not match"
+			switch {
+			case strings.TrimSpace(p.Secret) == "":
+				why = "no secret was presented — if this is a real bridge, its " +
+					"engine did not forward the environment it was launched with"
+			case d.bridgeSecrets.heldElsewhere(p.ThreadID, p.Secret, caller):
+				// The one refusal that can hit a legitimate bridge. Named in the
+				// log (never in the reply) so a lockout is diagnosable rather
+				// than indistinguishable from a dropped environment.
+				why = "that secret is already redeemed by a live connection — " +
+					"either this bridge's predecessor has not disconnected yet, " +
+					"or another process redeemed it first"
+			}
+			d.log.Warn("refused a bridge identity", "thread", p.ThreadID, "why", why)
+			return nil, ipc.Errorf(ipc.CodeInvalidParams,
+				"bridge identity refused: this connection did not present the "+
+					"secret Agent Kate issued to that thread's bridge")
+		}
+		if ok, reason := d.srv.IdentifyBridge(ctx, p.ThreadID); !ok {
+			// The binding failed AFTER the claim (a UI connection, or one
+			// already bound to another thread). Give the slot back: a refused
+			// caller must not be able to park the secret its real bridge needs,
+			// which would turn a rejected forgery into a denial of service.
+			d.bridgeSecrets.release(p.ThreadID, p.Secret, caller)
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, reason)
 		}
 		// Observability only — deliberately NOT a rejection. A bridge can

@@ -261,12 +261,12 @@ func TestMainScanCaps(t *testing.T) {
 	// server string sits inside the first cap-bytes window.
 	dir := t.TempDir()
 	prefix := `var x = "./dist/realServer.js"; ` // server reference up front
-	padding := strings.Repeat("x", 1<<20)         // 1 MiB of filler
+	padding := strings.Repeat("x", 1<<20)        // 1 MiB of filler
 	writeExtension(t, dir, `{
 		"name":"big","version":"1.0.0","main":"dist/extension.js",
 		"contributes":{"languages":[{"id":"x","extensions":[".x"]}]}
 	}`, map[string]string{
-		"dist/extension.js": prefix + padding,
+		"dist/extension.js":  prefix + padding,
 		"dist/realServer.js": "//s",
 	})
 	ext, err := load("acme.big", dir)
@@ -348,5 +348,96 @@ func TestNoRecipeForNonLanguageExtension(t *testing.T) {
 	}
 	if ext.Server != nil {
 		t.Fatalf("a theme extension should yield no recipe, got %+v", ext.Server)
+	}
+}
+
+// --- extraction / id containment (audit F4's "same class" sweep) -----------
+
+// A .vsix comes from a public registry, so its entries are attacker-shaped.
+// An entry aimed at a symlink must not be written through it.
+func TestUnzipRefusesToWriteThroughASymlink(t *testing.T) {
+	outside := t.TempDir()
+	victim := filepath.Join(outside, "victim.txt")
+	if err := os.WriteFile(victim, []byte("original"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dest := t.TempDir()
+	if err := os.Symlink(victim, filepath.Join(dest, "planted.txt")); err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(t.TempDir(), "evil.vsix")
+	writeZip(t, src, map[string]string{"planted.txt": "pwned"})
+
+	if err := unzip(src, dest); err == nil {
+		t.Fatal("unzip wrote an entry through a pre-existing symlink")
+	}
+	got, err := os.ReadFile(victim)
+	if err != nil || string(got) != "original" {
+		t.Fatalf("file outside the destination was overwritten: %q %v", got, err)
+	}
+}
+
+// A directory entry that is a symlink out of the destination is refused even
+// though its name is lexically contained.
+func TestUnzipRefusesSymlinkedParentDirectory(t *testing.T) {
+	outside := t.TempDir()
+	dest := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(dest, "extension")); err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(t.TempDir(), "evil.vsix")
+	writeZip(t, src, map[string]string{"extension/payload.txt": "pwned"})
+
+	if err := unzip(src, dest); err == nil {
+		t.Fatal("unzip extracted through a symlinked directory")
+	}
+	if _, err := os.Stat(filepath.Join(outside, "payload.txt")); err == nil {
+		t.Fatal("a file was written outside the destination")
+	}
+}
+
+// Decompressed size is capped: a small archive may not expand without bound.
+func TestUnzipCapsDecompressedSize(t *testing.T) {
+	oldEntry, oldTotal := maxEntryBytes, maxArchiveBytes
+	maxEntryBytes, maxArchiveBytes = 1024, 4096
+	defer func() { maxEntryBytes, maxArchiveBytes = oldEntry, oldTotal }()
+
+	src := filepath.Join(t.TempDir(), "bomb.vsix")
+	writeZip(t, src, map[string]string{
+		"extension/big.txt": strings.Repeat("A", 64*1024),
+	})
+	if err := unzip(src, t.TempDir()); err == nil {
+		t.Fatal("unzip accepted an entry past the decompressed size cap")
+	}
+}
+
+// Extension ids become a path under the cache directory, and Install wipes
+// that path — so an id with a traversal element must be refused everywhere,
+// not just by Remove's belt-and-braces check.
+func TestExtensionIDsCannotEscapeTheCache(t *testing.T) {
+	cache := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "keepme")
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	m := NewManager(cache)
+
+	// "a/../../keepme.x" splits on a dot and would previously have joined into
+	// a path outside the cache.
+	for _, bad := range []string{
+		"a/../../keepme.x", "../keepme.x", "..", ".hidden.x", `a\b.c`,
+	} {
+		if _, _, err := splitID(bad); err == nil {
+			t.Errorf("splitID(%q) should be refused", bad)
+		}
+		if err := m.Remove(bad); err == nil {
+			t.Errorf("Remove(%q) should be refused", bad)
+		}
+		if _, err := m.Get(bad); err == nil {
+			t.Errorf("Get(%q) should be refused", bad)
+		}
+	}
+	if _, err := os.Stat(outside); err != nil {
+		t.Fatalf("a directory outside the cache was touched: %v", err)
 	}
 }

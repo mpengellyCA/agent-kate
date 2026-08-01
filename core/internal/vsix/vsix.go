@@ -12,6 +12,7 @@ package vsix
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -90,7 +91,12 @@ func (m *Manager) InstallProgress(ctx context.Context, extensionID string, onPro
 	if err != nil {
 		return nil, err
 	}
-	dir := filepath.Join(m.cacheDir, extensionID)
+	// Containment before anything destructive: the RemoveAll below wipes this
+	// directory, so it must provably be inside the cache.
+	dir, err := m.extensionDir(extensionID)
+	if err != nil {
+		return nil, err
+	}
 
 	// Already have this exact version unpacked? Reuse it.
 	if cachedVersion(dir) == meta.Version {
@@ -160,7 +166,11 @@ func (m *Manager) List() ([]*Extension, error) {
 
 // Get returns a single installed extension, or an error if it is not present.
 func (m *Manager) Get(extensionID string) (*Extension, error) {
-	return load(extensionID, filepath.Join(m.cacheDir, extensionID))
+	dir, err := m.extensionDir(extensionID)
+	if err != nil {
+		return nil, err
+	}
+	return load(extensionID, dir)
 }
 
 // Remove deletes an installed extension from the cache directory. The id is
@@ -172,20 +182,11 @@ func (m *Manager) Remove(extensionID string) error {
 	if _, _, err := splitID(extensionID); err != nil {
 		return err
 	}
-	dir := filepath.Join(m.cacheDir, extensionID)
 	// Defence in depth: even after splitID, confirm the resolved directory is
 	// genuinely inside cacheDir before any RemoveAll.
-	cacheAbs, err := filepath.Abs(m.cacheDir)
+	dir, err := m.extensionDir(extensionID)
 	if err != nil {
 		return err
-	}
-	dirAbs, err := filepath.Abs(dir)
-	if err != nil {
-		return err
-	}
-	rel, err := filepath.Rel(cacheAbs, dirAbs)
-	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return fmt.Errorf("refusing to remove %q: resolves outside the extension cache", extensionID)
 	}
 	return os.RemoveAll(dir)
 }
@@ -225,13 +226,64 @@ func load(id, dir string) (*Extension, error) {
 	return ext, nil
 }
 
-// splitID splits "publisher.name" on its first dot.
+// splitID splits "publisher.name" on its first dot, after validating that the
+// id is usable as a single path component.
 func splitID(id string) (namespace, name string, err error) {
+	if err := validateExtensionID(id); err != nil {
+		return "", "", err
+	}
 	i := strings.IndexByte(id, '.')
 	if i <= 0 || i == len(id)-1 {
 		return "", "", fmt.Errorf("invalid extension id %q, want publisher.name", id)
 	}
 	return id[:i], id[i+1:], nil
+}
+
+// validateExtensionID rejects any id that is not a single, ordinary path
+// component. Every cache path in this package is filepath.Join(cacheDir, id),
+// and Install RemoveAll's that path before unpacking — so an id containing a
+// separator or a ".." element ("a/../../x.y" passes a naive dot check) would
+// be an arbitrary-directory delete. Ids come in over the IPC socket, i.e. from
+// an agent, so this is the containment boundary for the whole package.
+func validateExtensionID(id string) error {
+	if id == "" {
+		return errors.New("extension id is required")
+	}
+	if strings.ContainsAny(id, `/\`) || strings.ContainsRune(id, 0) {
+		return fmt.Errorf("invalid extension id %q: must be a single name", id)
+	}
+	if id == "." || id == ".." || strings.HasPrefix(id, ".") {
+		return fmt.Errorf("invalid extension id %q", id)
+	}
+	if filepath.Clean(id) != id {
+		return fmt.Errorf("invalid extension id %q", id)
+	}
+	return nil
+}
+
+// extensionDir resolves the cache directory for an extension id, refusing any
+// id that does not stay inside cacheDir. Fails closed: an id whose path cannot
+// be made absolute is an error, not a fallback to the joined path.
+func (m *Manager) extensionDir(extensionID string) (string, error) {
+	if err := validateExtensionID(extensionID); err != nil {
+		return "", err
+	}
+	dir := filepath.Join(m.cacheDir, extensionID)
+	cacheAbs, err := filepath.Abs(m.cacheDir)
+	if err != nil {
+		return "", err
+	}
+	dirAbs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(cacheAbs, dirAbs)
+	if err != nil || rel == "." || rel == ".." ||
+		strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("refusing to use %q: resolves outside the extension cache",
+			extensionID)
+	}
+	return dir, nil
 }
 
 // cachedVersion reads the version marker from an extension cache dir, or "".

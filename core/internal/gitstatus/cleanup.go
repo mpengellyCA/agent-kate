@@ -71,6 +71,11 @@ const (
 	BlockerNotIsolated = "notIsolated"
 	BlockerDetached    = "detachedOrNoBranch"
 	BlockerSnapshot    = "snapshotError"
+	// BlockerUnmanaged — the record's path is not one Agent Kate created (it
+	// does not resolve inside <repoRoot>/.agentkate/worktrees/, or git does not
+	// list it as a worktree of that repo). A tampered or corrupted record, not
+	// a worktree: never removable, and never pre-checked in the UI.
+	BlockerUnmanaged = "unmanagedPath"
 
 	WarnUnmerged   = "unmerged"
 	WarnDirty      = "dirty"
@@ -101,6 +106,27 @@ func AnalyzeCandidate(wt worktree.Worktree, snap *Snapshot, running bool, title 
 		LastActivity: lastActivity,
 		Blockers:     []string{},
 		Warnings:     []string{},
+	}
+
+	// PROVENANCE FIRST. Records come from threads.json, which anything running
+	// as the user can rewrite; a record repointed at an unrelated directory must
+	// never be classified "safe" and pre-checked for the user. worktree.Remove
+	// refuses such a record anyway — this makes the UI agree with it instead of
+	// offering a one-click delete that then errors. The check FAILS CLOSED, so
+	// an unverifiable record is BLOCKED, and it runs before the orphaned
+	// short-circuit so a bogus path that happens not to exist is blocked too.
+	// Only isolated records have a path of our making: a direct-workspace agent
+	// runs in the user's own checkout and is handled by the recordOnly verdict.
+	if wt.Isolated {
+		if err := worktree.VerifyProvenance(wt); err != nil {
+			c.Blockers = append(c.Blockers, BlockerUnmanaged)
+			if c.Error == "" {
+				c.Error = err.Error()
+			}
+			c.State = CleanupBlocked
+			c.Removable = false
+			return c
+		}
 	}
 
 	// Orphaned: the directory is gone. Removing it only prunes git bookkeeping

@@ -2,9 +2,12 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"strings"
@@ -59,14 +62,22 @@ func runMCPBridge(args []string) {
 	}
 	defer client.Close()
 
-	// Identify the connection to the core before any tool can run, so every
-	// call it makes is attributable to this thread — the core's `mcp.activity`
-	// feed (plan 16 P2) and the Cowork per-thread binding both key on it. A
-	// core that predates the handshake simply answers method-not-found; the
-	// bridge still works, it is just not seen in the activity feed.
+	// Identify the connection to the core before any tool can run. This is not
+	// bookkeeping: it is how this process acquires its thread's identity, and
+	// nothing it can call works without it (audit F13). The secret comes from
+	// the environment akcore spawned us with — never from argv, which any local
+	// process can read — and is dropped from our own environment immediately so
+	// that anything we ever exec cannot inherit it.
+	secret := os.Getenv(bridgeSecretEnvVar)
+	_ = os.Unsetenv(bridgeSecretEnvVar)
 	if err := client.Call("bridge.identify",
-		map[string]any{"threadId": *thread}, nil); err != nil {
-		log.Warn("mcp bridge could not identify to core", "thread", *thread, "err", err)
+		map[string]any{"threadId": *thread, "secret": secret}, nil); err != nil {
+		// Fatal, deliberately: a bridge the core will not recognise can serve no
+		// tool, and staying up would present the agent with a catalogue whose
+		// every call is refused. Dying is the visible failure.
+		log.Error("mcp bridge could not identify to core; refusing to serve",
+			"thread", *thread, "err", err)
+		os.Exit(1)
 	}
 
 	b := &mcpBridge{
@@ -85,11 +96,54 @@ func runMCPBridge(args []string) {
 	b.serve()
 }
 
+// maxMCPFrameBytes caps one inbound MCP line. An over-long frame is skipped,
+// not fatal — see readMCPLine.
+const maxMCPFrameBytes = 8 * 1024 * 1024
+
+// readMCPLine reads one newline-terminated frame, resynchronising past any line
+// longer than max instead of ending the read loop.
+//
+// This is why it is not a bufio.Scanner (audit F24): Scanner stops at the first
+// over-long line, and the old loop never checked sc.Err(). The bridge process
+// stayed alive and connected while silently answering nothing ever again —
+// every later tool call from the agent just hung. Skipping one frame and
+// carrying on is always better than going deaf.
+func readMCPLine(r *bufio.Reader) (line []byte, oversize bool, err error) {
+	var buf []byte
+	for {
+		chunk, e := r.ReadSlice('\n')
+		if e == bufio.ErrBufferFull {
+			if len(buf)+len(chunk) <= maxMCPFrameBytes {
+				buf = append(buf, chunk...)
+			} else {
+				oversize = true // keep draining to the newline, keep nothing
+			}
+			continue
+		}
+		if e != nil {
+			return nil, oversize, e
+		}
+		if oversize || len(buf)+len(chunk) > maxMCPFrameBytes {
+			return nil, true, nil
+		}
+		buf = append(buf, chunk...)
+		return bytes.TrimRight(buf, "\r\n"), false, nil
+	}
+}
+
 func (b *mcpBridge) serve() {
-	sc := bufio.NewScanner(os.Stdin)
-	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
-	for sc.Scan() {
-		line := sc.Bytes()
+	r := bufio.NewReaderSize(os.Stdin, 64*1024)
+	for {
+		line, oversize, err := readMCPLine(r)
+		if oversize {
+			b.log.Warn("oversize mcp frame skipped", "cap", maxMCPFrameBytes)
+		}
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				b.log.Warn("mcp stdin read error", "err", err)
+			}
+			return
+		}
 		if len(line) == 0 {
 			continue
 		}
@@ -506,10 +560,10 @@ func (b *mcpBridge) runTool(name string, args json.RawMessage) (string, error) {
 			"systemPrompt":   a.SystemPrompt,
 			"agents":         a.Agents,
 			"cowork":         a.Cowork,
-			// A cowork launch waits on a human decision, so it gets the same
-			// ceiling as the other human-gated verbs rather than the 3 minutes
-			// a plain launch needs.
-		}, &res, launchWorkerTimeout(a.Cowork)); err != nil {
+			// Any launch can stop for a human decision — desktop access, or an
+			// authority escalation the core measures against the caller's own
+			// mode. See launchWorkerTimeout.
+		}, &res, launchWorkerTimeout); err != nil {
 			return "", err
 		}
 		var sb strings.Builder
@@ -905,8 +959,16 @@ func toolDefs() []map[string]any {
 				"own engine. 'model' must belong to that backend's vocabulary; options the " +
 				"backend rejects are reported back as NOT APPLIED — never silently " +
 				"emulated. Workers needing tool approval prompt the HUMAN, which can stall " +
-				"an unattended worker: pass an auto-approving permission_mode (e.g. " +
-				"\"acceptEdits\") for autonomous work. 'system_prompt' and 'agents' shape " +
+				"an unattended worker — but you cannot hand a worker authority you do not " +
+				"hold: a permission_mode more permissive than your own, or " +
+				"isolation=\"workspace\" (the human's main checkout), STOPS the launch and " +
+				"asks the human, who may refuse. Omit permission_mode unless the task " +
+				"truly cannot pause. A worker also INHERITS your own restrictions — the " +
+				"tools you are denied, the directories you may reach, your MCP isolation " +
+				"and your spend ceiling — so it can never be less restricted than you. " +
+				"There is also a cap on workers running at once — " +
+				"close_agent a finished worker before launching another. " +
+				"'system_prompt' and 'agents' shape " +
 				"the worker's persona and its own subagent roster where its engine " +
 				"supports them; where it does not they come back as NOT APPLIED and " +
 				"belong in the prompt instead. With wait=true this call blocks " +
@@ -923,9 +985,11 @@ func toolDefs() []map[string]any {
 					"title": map[string]any{"type": "string",
 						"description": "Short roster title. Empty = derived from the prompt."},
 					"isolation": map[string]any{"type": "string",
-						"description": "\"auto\" (default: isolated worktree when the repo has commits), \"isolated\", or \"workspace\"."},
+						"description": "\"auto\" (default: isolated worktree when the repo has commits), \"isolated\", or \"workspace\". " +
+							"\"workspace\" runs the worker in the human's main checkout and always needs their approval first."},
 					"permission_mode": map[string]any{"type": "string",
-						"description": "The backend's permission mode. Empty = its default (gated tools then prompt the human)."},
+						"description": "The backend's permission mode. Empty = its default (gated tools then prompt the human). " +
+							"Anything more permissive than your own mode needs the human's approval before the worker starts."},
 					"effort": map[string]any{"type": "string",
 						"description": "Reasoning effort / thinking level in the backend's vocabulary. Empty = default."},
 					"wait": map[string]any{"type": "boolean",
@@ -1058,15 +1122,16 @@ func toolDefs() []map[string]any {
 	}
 }
 
-// launchWorkerTimeout bounds the synchronous launch. A plain launch is bounded
-// by worktree creation plus a CLI handshake; one that asks for desktop access
-// also waits on a human answering the approval prompt.
-func launchWorkerTimeout(cowork bool) time.Duration {
-	if cowork {
-		return 10 * time.Minute
-	}
-	return 3 * time.Minute
-}
+// launchWorkerTimeout bounds the synchronous launch. It is the HUMAN-decision
+// ceiling for every launch, not just a cowork one (audit F1): the core asks the
+// human whenever a launch would hand the worker more authority than the caller
+// holds, and that comparison is made against the CALLER'S OWN permission mode,
+// which this bridge cannot see. A launch that looks unremarkable from here — no
+// backend, no mode, auto isolation — still asks when the caller is running in a
+// supervised mode. Timing out at three minutes while the human was still
+// deciding would report a failure to the agent and then launch the worker
+// anyway, which is worse than waiting.
+const launchWorkerTimeout = 10 * time.Minute
 
 func toolResult(text string, isErr bool) map[string]any {
 	return map[string]any{

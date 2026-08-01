@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -46,6 +47,14 @@ type modelDiscoverer interface {
 	DiscoverModels(*agent.Provider) ([]harness.DiscoveredOptionValue, error)
 }
 
+// skillReloader is implemented by harnesses whose CLI can re-read its skill
+// directories mid-session (claude: the reload_skills control request). Without
+// it a skill installed while a thread is running is invisible to that thread
+// until it is relaunched. Harnesses without the mechanism need no stub.
+type skillReloader interface {
+	ReloadSkills(threadID string) error
+}
+
 type agentStartParams struct {
 	WorkspacePath  string             `json:"workspacePath"`
 	Prompt         string             `json:"prompt"`
@@ -72,6 +81,11 @@ type agentStartParams struct {
 	FallbackModels  []string `json:"fallbackModels,omitempty"`
 	DisallowedTools []string `json:"disallowedTools,omitempty"`
 	AddDirs         []string `json:"addDirs,omitempty"`
+	// The control-channel sweep. StrictMCPConfig isolates the thread from the
+	// human's globally-configured MCP servers; MaxBudgetUSD is a hard spend
+	// ceiling the CLI enforces itself (0 = uncapped).
+	StrictMCPConfig bool    `json:"strictMcpConfig,omitempty"`
+	MaxBudgetUSD    float64 `json:"maxBudgetUsd,omitempty"`
 }
 
 type agentSendParams struct {
@@ -116,20 +130,30 @@ type handlerDeps struct {
 	harnesses  *harness.Registry
 	turns      *agent.TurnTracker // backend-agnostic idle/busy mirror (agent.wait)
 	orchGrants *orchGrants        // one-shot human approvals for cross-subtree agent control
-	coop       *coop.State
-	threads    *threadRegistry
-	broker     *permission.Broker
-	extensions *vsix.Manager
-	sessions   *session.Store
-	attachSide *session.AttachmentStore // per-thread attachment metadata sidecars
-	summaries  *compact.Store
-	modes      *modes.Store // user-editable ensembles (plan 16 P4)
-	skills     *skills.Catalog
-	gitCache   *gitstatus.Cache
-	cowork     *cowork.Service // nil if KDE/consent init failed; handlers guard
-	socketPath string
-	exePath    string
-	log        *slog.Logger
+	// workerSlots reserves a worker slot for the whole duration of a launch, so
+	// the fan-out caps hold against CONCURRENT launch_agent calls — the persisted
+	// records they otherwise count only appear after the launch (authority.go).
+	workerSlots *workerSlots
+	// bridgeSecrets authenticates each thread's MCP bridges to the core: akcore
+	// mints one per launch and passes it to that launch's bridges in their
+	// environment, and bridge.identify demands it back (audit F13,
+	// bridgeauth.go). Absent, no bridge can identify — which is the fail-closed
+	// direction, not a bypass.
+	bridgeSecrets *bridgeSecrets
+	coop          *coop.State
+	threads       *threadRegistry
+	broker        *permission.Broker
+	extensions    *vsix.Manager
+	sessions      *session.Store
+	attachSide    *session.AttachmentStore // per-thread attachment metadata sidecars
+	summaries     *compact.Store
+	modes         *modes.Store // user-editable ensembles (plan 16 P4)
+	skills        *skills.Catalog
+	gitCache      *gitstatus.Cache
+	cowork        *cowork.Service // nil if KDE/consent init failed; handlers guard
+	socketPath    string
+	exePath       string
+	log           *slog.Logger
 }
 
 // --- harness routing -------------------------------------------------------
@@ -221,12 +245,23 @@ func registerHandlers(d handlerDeps) {
 	d.srv.Handle("handshake", func(ctx context.Context, _ json.RawMessage) (any, error) {
 		// Tag this connection as the UI (the first UI becomes the primary that runs
 		// Cowork portal sessions) — the Cowork keystone (08 §C).
-		d.srv.MarkUI(ctx)
+		//
+		// A refusal is an ERROR, not a quiet no-op (audit F13): the caller would
+		// otherwise believe it is the UI and discover otherwise one rejected
+		// UI-only call at a time, with panels silently empty. The two refusals
+		// are a bridge connection re-identifying, and a second client asking for
+		// a role another live connection already holds.
+		if !d.srv.MarkUI(ctx) {
+			return nil, ipc.Errorf(ipc.CodeInvalidRequest,
+				"the UI role is already held by another connection (or this "+
+					"connection is an agent bridge); this client has no UI authority")
+		}
 		d.log.Info("handshake received")
 		return map[string]any{
 			"name":    "akcore",
 			"version": version,
 			"pid":     os.Getpid(),
+			"role":    "ui",
 		}, nil
 	})
 
@@ -293,8 +328,9 @@ func registerHandlers(d handlerDeps) {
 
 	// agent.discoverModels enumerates a harness's live model catalogue, optionally
 	// routed through a provider (whose non-secret metadata + transient authToken
-	// the UI supplies, exactly as for agent.start). Claude direct answers from
-	// `claude -p /model`; a routed provider from its /v1/models. It is best-effort:
+	// the UI supplies, exactly as for agent.start). Claude direct answers from the
+	// list_models control request (which also reports each model's supported
+	// effort tiers); a routed provider from its /v1/models. It is best-effort:
 	// harnesses that don't implement discovery, or a probe that fails, return an
 	// empty list so the UI keeps its last cached catalogue.
 	d.srv.Handle("agent.discoverModels", func(_ context.Context, raw json.RawMessage) (any, error) {
@@ -322,7 +358,18 @@ func registerHandlers(d handlerDeps) {
 		return map[string]any{"models": models}, nil
 	})
 
-	d.srv.Handle("agent.start", func(_ context.Context, raw json.RawMessage) (any, error) {
+	// agent.start is the HUMAN's start path, and every one of its parameters is
+	// authority the agent-facing launch_agent deliberately cannot reach (audit
+	// F5): an arbitrary WorkspacePath (any directory on the machine, not the
+	// parent's project), CoworkEnabled (desktop control), a Provider override,
+	// and an Env overlay that is applied AFTER the provider credential scrub
+	// (core/internal/agent/agent.go) — so it can rewrite ANTHROPIC_BASE_URL and
+	// redirect the injected provider token to an endpoint of the caller's
+	// choosing. UI-only, therefore, and not a subset of that: the whole handler.
+	d.srv.Handle("agent.start", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUI(d, ctx); err != nil {
+			return nil, err
+		}
 		var p agentStartParams
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
@@ -340,6 +387,10 @@ func registerHandlers(d handlerDeps) {
 		}
 		if p.CoworkEnabled && !caps.Cowork {
 			return nil, unsupported("Cowork", caps)
+		}
+		if err := authorizeCoworkAtStart(d, ctx, p.CoworkEnabled,
+			summarizePrompt(p.Prompt), firstLine(p.Prompt)); err != nil {
+			return nil, err
 		}
 		// Start asynchronously so this reply — which carries the threadId —
 		// always reaches the UI before any streamed event for the thread. The
@@ -369,7 +420,16 @@ func registerHandlers(d handlerDeps) {
 
 	// agent.resume re-launches a dormant thread on its persisted Claude Code
 	// session, in the same worktree it ran in before.
-	d.srv.Handle("agent.resume", func(_ context.Context, raw json.RawMessage) (any, error) {
+	//
+	// UI-only (audit F5): resume replays the record's persisted authority — its
+	// permission mode, its CoworkEnabled flag, its Env overlay — and accepts a
+	// caller-supplied Provider (with its API token) and Model. An agent bridge
+	// waking a dormant thread would be re-arming authority the human granted to
+	// a thread they believed was finished.
+	d.srv.Handle("agent.resume", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUI(d, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ThreadID string `json:"threadId"`
 			// Optional: replace the persisted model on resume — the UI sends this
@@ -448,6 +508,13 @@ func registerHandlers(d handlerDeps) {
 		if events == nil {
 			events = []json.RawMessage{}
 		}
+		// Bound the reply (audit F10). The whole transcript travels as ONE
+		// JSON-RPC result, and both sides cap an inbound frame at 16 MiB — a
+		// months-old thread would otherwise be an undeliverable frame that cost
+		// hundreds of MB to build on the way to failing. The tail is what the UI
+		// keeps anyway (its row ring), and CapTranscript prepends a visible
+		// notice when it drops anything, so a shortened history is never silent.
+		events = harness.CapTranscript(events)
 		return map[string]any{"events": events, "attachments": attachTurns}, nil
 	})
 
@@ -456,7 +523,18 @@ func registerHandlers(d handlerDeps) {
 	// The source thread is left running and untouched: the fork gets its own
 	// isolated worktree (branched from the source worktree's HEAD; uncommitted
 	// changes are not copied) and its own Claude Code session via --fork-session.
-	d.srv.Handle("agent.fork", func(_ context.Context, raw json.RawMessage) (any, error) {
+	//
+	// UI-only (audit F5): a fork CREATES A THREAD, and it creates one carrying
+	// the source's whole authority — its permission mode, its Env overlay with
+	// the source's provider routing, its persona, and its CoworkEnabled flag.
+	// An agent that could fork would have a way to duplicate any thread's
+	// authority (including a cowork-enabled one) with no human anywhere in the
+	// chain, which is the same escalation F1 closed on launch_agent. The MCP
+	// bridge never calls this; the New Agent / roster UI does.
+	d.srv.Handle("agent.fork", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUI(d, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ThreadID string `json:"threadId"`
 			Model    string `json:"model"`  // tier token ("opus"…); "" keeps the source's model
@@ -478,6 +556,16 @@ func registerHandlers(d handlerDeps) {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams,
 				"this agent has no conversation yet to fork")
 		}
+		// A fork inherits the source's desktop access, so it goes through the
+		// same gate every other thread-creating handler uses — the contract
+		// authorizeCoworkAtStart states for itself. A UI caller passes on the
+		// human's own click (the flag came from the source thread the human
+		// enabled); any other caller has to ask, and cannot get here anyway
+		// while requireUI stands above.
+		if err := authorizeCoworkAtStart(d, ctx, src.CoworkEnabled,
+			"Fork of "+src.Title, "forking thread "+src.ThreadID); err != nil {
+			return nil, err
+		}
 		newThreadID := agent.NewThreadID()
 		safe.Go("agent.forkThread", func() {
 			forkAgentThread(d, h, src, newThreadID, p.Model, p.Effort, p.Title)
@@ -487,7 +575,15 @@ func registerHandlers(d handlerDeps) {
 
 	// agent.promote upgrades a non-isolated thread into a dedicated git
 	// worktree, carrying its working-tree changes and Claude Code session over.
-	d.srv.Handle("agent.promote", func(_ context.Context, raw json.RawMessage) (any, error) {
+	//
+	// UI-only (audit F5): it STOPS the agent, moves the working tree and the
+	// session onto a new branch, and relaunches — a reconfiguration of where a
+	// running thread's authority is pointed, and one that touches the human's
+	// checkout. Not something another connection gets to do to a thread.
+	d.srv.Handle("agent.promote", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUI(d, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ThreadID string `json:"threadId"`
 		}
@@ -568,7 +664,15 @@ func registerHandlers(d handlerDeps) {
 	// session.attach turns a discovered past session into a dormant Agent Kate
 	// thread, which the UI then resumes like any other. backend names the
 	// owning harness (empty = the default).
-	d.srv.Handle("session.attach", func(_ context.Context, raw json.RawMessage) (any, error) {
+	//
+	// UI-only, same class as agent.start (audit F5): it creates a thread rooted
+	// at an ARBITRARY project path from a caller-supplied session id, which
+	// agent.resume then launches. Gating start while leaving its two-step
+	// equivalent open would be no gate at all.
+	d.srv.Handle("session.attach", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUI(d, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			SessionID string `json:"sessionId"`
 			Project   string `json:"project"`
@@ -669,10 +773,16 @@ func registerHandlers(d handlerDeps) {
 		return map[string]any{"ok": true}, nil
 	})
 
-	d.srv.Handle("agent.send", func(_ context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("agent.send", func(ctx context.Context, raw json.RawMessage) (any, error) {
 		var p agentSendParams
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		// WHO is sending, before WHOM they may send to: a bridge may only speak
+		// for its own thread, and a bridge that omitted fromThreadId used to be
+		// read as the UI and skip the approval below entirely.
+		if err := requireCallerThread(d, ctx, p.FromThreadID); err != nil {
+			return nil, err
 		}
 		// Agent-to-agent sends outside the caller's own subtree need one human
 		// approval (UI sends carry no FromThreadID and are never gated).
@@ -714,10 +824,17 @@ func registerHandlers(d handlerDeps) {
 	// which leaves the thread dormant-and-resumable, this clears the roster entry.
 	// The worktree is deliberately NOT removed here (that is cleanup's job), so a
 	// later Restore is lossless.
-	d.srv.Handle("agent.stopClose", func(_ context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("agent.stopClose", func(ctx context.Context, raw json.RawMessage) (any, error) {
 		var p agentStopParams
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		// WHO is closing, before WHOM they may close. Without this the
+		// self-close refusal and the subtree gate below both ran against a
+		// thread id the caller simply asserted — and a bridge that sent no
+		// fromThreadId passed as the UI and closed anything in the arena.
+		if err := requireCallerThread(d, ctx, p.FromThreadID); err != nil {
+			return nil, err
 		}
 		// close_agent (agent-driven): refuse self-close — a thread stopping
 		// itself mid-turn wedges its own tool call — and gate targets outside
@@ -770,7 +887,17 @@ func registerHandlers(d handlerDeps) {
 	// requests, no mid-session effort; kimi: session/set_config_option). The
 	// CLI's own rejection (unknown model id, bad mode) is passed through
 	// verbatim so the UI can show it and revert the picker.
-	d.srv.Handle("agent.setOption", func(_ context.Context, raw json.RawMessage) (any, error) {
+	//
+	// UI-only (audit F5), and this is the sharpest of the three: `option:
+	// "permissionMode"` RE-ARMS A LIVE THREAD'S AUTHORITY. Without the check, a
+	// prompt-injected agent could raise ITS OWN mode to bypassPermissions
+	// mid-turn and skip every gate — a shorter path than launching a worker,
+	// and one the launch gate would never see. The change is persisted too, so
+	// it would survive the resume. Only the human's own pickers may move it.
+	d.srv.Handle("agent.setOption", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUI(d, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ThreadID string `json:"threadId"`
 			Option   string `json:"option"` // "model" | "permissionMode" | "effort"
@@ -1079,7 +1206,7 @@ func registerHandlers(d handlerDeps) {
 		return map[string]any{"proposals": out}, nil
 	})
 
-	d.srv.Handle("agent.discard", func(_ context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("agent.discard", func(ctx context.Context, raw json.RawMessage) (any, error) {
 		var p struct {
 			ThreadID string `json:"threadId"`
 			// FromThreadID names the agent thread issuing the discard (the
@@ -1092,6 +1219,12 @@ func registerHandlers(d handlerDeps) {
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
+		// WHO is discarding, before WHOM they may discard. This is the most
+		// destructive of the three (it removes the worktree), and the id it
+		// gates on was, until now, whatever the caller typed.
+		if err := requireCallerThread(d, ctx, p.FromThreadID); err != nil {
+			return nil, err
+		}
 		if err := d.authorizeAgentTarget(p.FromThreadID, p.ThreadID,
 			"discard_agent", nil); err != nil {
 			return nil, err
@@ -1100,11 +1233,15 @@ func registerHandlers(d handlerDeps) {
 		if !ok {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
 		}
+		// Resolved BEFORE the record is dropped below — harnessFor needs it.
+		h := d.harnessFor(p.ThreadID)
 		_ = d.agentStop(p.ThreadID)
 		if err := worktree.Remove(wt); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
 		}
-		// The worktree is gone, so the thread can never be resumed — forget it.
+		// The worktree is gone, so the thread can never be resumed — forget it,
+		// including the core-owned transcript nothing used to delete (audit F10).
+		deleteThreadTranscript(h, p.ThreadID, d.log)
 		_ = d.sessions.Remove(p.ThreadID)
 		_ = d.summaries.Remove(p.ThreadID)
 		if d.attachSide != nil {
@@ -1116,6 +1253,9 @@ func registerHandlers(d handlerDeps) {
 		// meaningless now — and must not silently cover a future thread that
 		// happens to reuse the id.
 		d.orchGrants.forgetThread(p.ThreadID)
+		// ...and so are its bridge secrets, for the same reason: a reused thread
+		// id must not be identifiable with a dead thread's secret (F13).
+		d.bridgeSecrets.forget(p.ThreadID)
 		// Tell every UI client to drop this thread from its roster.
 		d.srv.Notify("agent.discarded", map[string]any{"threadId": p.ThreadID})
 		return map[string]any{"ok": true}, nil
@@ -1136,8 +1276,18 @@ func registerHandlers(d handlerDeps) {
 		if p.Strategy != "" && !s.Valid() {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown strategy "+p.Strategy)
 		}
-		if caps := d.capsFor(p.ThreadID); !caps.Compaction {
+		caps := d.capsFor(p.ThreadID)
+		if !caps.Compaction {
 			return nil, unsupported("Compaction", caps)
+		}
+		// Every strategy but the hot one runs after the process is gone, off a
+		// transcript the engine may not write. Storing one on an engine with no
+		// cold pass would arm a compaction that can never fire (or, worse, one
+		// that summarises nothing and reseeds the next resume from it).
+		if !caps.ColdCompact && s.Resolve() != compact.ExitOpusHot {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams,
+				caps.DisplayName+" agents compact only inside a live session; "+
+					"the only strategy they support is "+string(compact.ExitOpusHot))
 		}
 		if err := d.sessions.Update(p.ThreadID, func(r *session.Record) {
 			r.CompactStrategy = p.Strategy
@@ -1207,7 +1357,8 @@ func registerHandlers(d handlerDeps) {
 			return nil, unsupported("Compaction", caps)
 		}
 		if rec.SessionID == "" {
-			return nil, ipc.Errorf(ipc.CodeInvalidParams, "thread has no Claude Code session yet")
+			return nil, ipc.Errorf(ipc.CodeInvalidParams,
+				"thread has no "+d.capsFor(p.ThreadID).DisplayName+" session yet")
 		}
 
 		var sum compact.Summary
@@ -1232,9 +1383,31 @@ func registerHandlers(d handlerDeps) {
 				Hot:      true,
 			})
 			if herr != nil {
+				// However it ended, no result event is coming for a turn that
+				// never ran: release it, or the thread stays busy forever for
+				// agent.wait and the Jobs panel. (The in-place sentinel is a
+				// SUCCESS — its turn really ran and its result will land.)
+				if !errors.Is(herr, ErrCompactedInPlace) {
+					d.turns.TurnFailed(p.ThreadID)
+				}
+				// Not every engine's hot compaction yields text. One that
+				// rewrites its own context in place has already succeeded —
+				// there is simply nothing to store and nothing to reseed from,
+				// so report success rather than turning a win into an error.
+				if errors.Is(herr, ErrCompactedInPlace) {
+					d.log.Info("compacted in place; no summary stored",
+						"thread", p.ThreadID)
+					return map[string]any{
+						"ok":               true,
+						"strategy":         string(compact.ExitOpusHot),
+						"compactedInPlace": true,
+						"detail":           herr.Error(),
+					}, nil
+				}
 				return nil, ipc.Errorf(ipc.CodeInternalError, herr.Error())
 			}
 			if strings.TrimSpace(text) == "" {
+				d.turns.TurnFailed(p.ThreadID)
 				return nil, ipc.Errorf(ipc.CodeInternalError, "hot compaction returned empty body")
 			}
 			sum = compact.Summary{
@@ -1246,8 +1419,25 @@ func registerHandlers(d handlerDeps) {
 				Body:      text,
 			}
 		} else {
+			// The cold mechanisms read the session back from disk (local) or
+			// re-run the CLI over it (model pass). A harness without
+			// ColdCompact has neither, and running them anyway would store a
+			// summary of nothing — which the next resume would seed a fresh
+			// session from, throwing the real history away.
+			if caps := d.capsFor(p.ThreadID); !caps.ColdCompact {
+				return nil, ipc.Errorf(ipc.CodeInvalidParams,
+					caps.DisplayName+" agents compact only inside a live session; "+
+						"resume the thread and compact it hot instead")
+			}
 			modelID, strategy, isLocal := resolveCompactModel(p.Model)
 			if isLocal {
+				// Bounded (audit F10): a very long transcript is summarised
+				// from its recent tail, with the truncation notice carried in
+				// the events — Programmatic ignores that event type, so the
+				// summary is simply of the tail. Deliberate: reading hundreds
+				// of MB into the core to summarise it is the freeze the cap
+				// exists to prevent, and the recent turns are what a resume
+				// needs.
 				events, rerr := session.ReadTranscript(rec.SessionID)
 				if rerr != nil {
 					return nil, ipc.Errorf(ipc.CodeInternalError, rerr.Error())
@@ -1442,7 +1632,15 @@ func registerHandlers(d handlerDeps) {
 		return res, nil
 	})
 
-	d.srv.Handle("permission.respond", func(_ context.Context, raw json.RawMessage) (any, error) {
+	// permission.respond carries the HUMAN's answer, so it is UI-only (audit
+	// F6). Without this, any connection could resolve any open request id and
+	// answer an agent's tool prompt on the human's behalf — racing the human to
+	// "Allow" on the primary approval flow of both backends. Same rule as its
+	// Cowork siblings (cowork.respondGrant, cowork.setEnabled).
+	d.srv.Handle("permission.respond", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUI(d, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			RequestID    string          `json:"requestId"`
 			Allow        bool            `json:"allow"`
@@ -1677,7 +1875,8 @@ func registerHandlers(d handlerDeps) {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
 		d.log.Info("skill installed", "name", p.Name, "target", p.Target, "path", path)
-		return map[string]any{"path": path}, nil
+		reloaded := reloadSkillsEverywhere(d, "installed the "+p.Name+" skill")
+		return map[string]any{"path": path, "reloaded": reloaded}, nil
 	})
 
 	d.srv.Handle("skills.uninstall", func(_ context.Context, raw json.RawMessage) (any, error) {
@@ -1692,7 +1891,8 @@ func registerHandlers(d handlerDeps) {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
 		d.log.Info("skill uninstalled", "name", p.Name, "target", p.Target)
-		return map[string]any{"ok": true}, nil
+		reloaded := reloadSkillsEverywhere(d, "removed the "+p.Name+" skill")
+		return map[string]any{"ok": true, "reloaded": reloaded}, nil
 	})
 
 	// skills.read returns the full markdown of a catalog skill for the detail
@@ -1897,11 +2097,15 @@ func registerHandlers(d handlerDeps) {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams,
 				"cannot remove the worktree while the agent is running — stop it first")
 		}
+		// Resolved BEFORE the record is dropped below — harnessFor needs it.
+		h := d.harnessFor(p.ThreadID)
 		if err := worktree.Remove(wt); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
 		}
 		// The worktree is gone; forget its session + cache entry just like
-		// agent.discard does, and tell every UI client to refresh.
+		// agent.discard does — the core-owned transcript included (audit F10) —
+		// and tell every UI client to refresh.
+		deleteThreadTranscript(h, p.ThreadID, d.log)
 		_ = d.sessions.Remove(p.ThreadID)
 		_ = d.summaries.Remove(p.ThreadID)
 		if d.attachSide != nil {
@@ -2380,6 +2584,9 @@ func registerHandlers(d handlerDeps) {
 			}
 			wt = rec.Worktree
 		}
+		// Resolved here, while the record still exists: step 6 archives it, and
+		// after that harnessFor answers with the DEFAULT harness for every id.
+		h := d.harnessFor(p.ThreadID)
 
 		// 2. RE-RUN the analysis NOW, server-side. The snapshot may be stale or
 		//    absent (orphaned); AnalyzeCandidate handles a nil snapshot.
@@ -2423,7 +2630,11 @@ func registerHandlers(d handlerDeps) {
 		// 8. Drop the rest of the thread's state and notify, mirroring
 		//    agent.discard's teardown. This is a permanent removal (the worktree
 		//    is gone), so the attachment sidecar goes too — unlike the reversible
-		//    agent.stopClose archive, where chips must survive un-archive.
+		//    agent.stopClose archive, where chips must survive un-archive. The
+		//    core-owned transcript goes with them for the same reason (audit
+		//    F10); the CLI's own transcript is deliberately left, which is what
+		//    keeps the archived record recoverable.
+		deleteThreadTranscript(h, p.ThreadID, d.log)
 		_ = d.summaries.Remove(p.ThreadID)
 		if d.attachSide != nil {
 			_ = d.attachSide.Remove(p.ThreadID)
@@ -2620,19 +2831,24 @@ func normalizeTags(in []string) []string {
 	return out
 }
 
-// askHumanPermission opens a broker request, pushes the permission.requested
-// notification to the UI, and blocks until the human answers via
-// permission.respond or the 8-minute safety timeout fires. It is shared by
-// the Claude MCP bridge's permission.request RPC and the kimi ACP permission
-// bridge, so both backends present the identical UI approval flow.
 // permissionTimeout bounds how long a permission request may wait for the
 // human. Advertised in the permission.requested notification so the UI's
 // countdown always matches the broker's actual deadline.
 const permissionTimeout = 8 * time.Minute
 
+// askHumanPermission opens a broker request, pushes the permission.requested
+// notification to the UI, and blocks until the human answers via
+// permission.respond or the 8-minute safety timeout fires. It is shared by
+// the Claude MCP bridge's permission.request RPC and the kimi ACP permission
+// bridge, so both backends present the identical UI approval flow.
+// NotifyUI, not Notify (audit F6): the notification carries the request id AND
+// THE RAW TOOL INPUT — bash command lines, file contents, whatever the model
+// passed — so broadcasting it handed every other agent's bridge a live feed of
+// one agent's tool arguments plus the id needed to answer the prompt. The
+// human's question goes to the human's client and nowhere else.
 func askHumanPermission(srv *ipc.Server, broker *permission.Broker, threadID, toolName string, input json.RawMessage) (permission.Decision, bool) {
 	id, ch := broker.Open()
-	srv.Notify("permission.requested", map[string]any{
+	srv.NotifyUI("permission.requested", map[string]any{
 		"threadId":       threadID,
 		"requestId":      id,
 		"toolName":       toolName,
@@ -2646,6 +2862,76 @@ func askHumanPermission(srv *ipc.Server, broker *permission.Broker, threadID, to
 		broker.Close(id)
 		return permission.Decision{}, false
 	}
+}
+
+// skillReloadFanout bounds how many threads are asked to reload at once. The
+// request is a single line on an already-open stdin, so the ceiling is only
+// there to keep a large fleet from spawning one goroutine per thread at once.
+const skillReloadFanout = 16
+
+// reloadSkillsEverywhere tells every RUNNING thread whose harness can do it to
+// re-read its skill directories, and drops a note in each affected panel. It
+// returns the thread ids that took the reload.
+//
+// The broadcast is deliberately unscoped by directory. Skills resolve from
+// several roots at once (the thread's worktree AND the user-level catalogue),
+// so a containment test against the install target would silently miss every
+// thread that a user-level install actually affects. The request is cheap and
+// idempotent — a thread with nothing new to find re-reads and moves on — so
+// over-sending is strictly safer than under-sending here.
+func reloadSkillsEverywhere(d handlerDeps, reason string) []string {
+	type target struct {
+		threadID string
+		reloader skillReloader
+	}
+	var targets []target
+	for _, rec := range d.sessions.List("") {
+		if !d.agentRunning(rec.ThreadID) {
+			continue
+		}
+		if r, ok := d.harnessFor(rec.ThreadID).(skillReloader); ok {
+			targets = append(targets, target{rec.ThreadID, r})
+		}
+	}
+
+	// Fan out. Each ReloadSkills is a control request that blocks until the CLI
+	// answers or the control channel times out, so serial sends would stall this
+	// RPC by that timeout PER wedged thread; concurrent sends bound the whole
+	// broadcast by roughly one timeout no matter how many threads there are.
+	// The semaphore keeps a large fleet from opening an unbounded burst.
+	ok := make([]bool, len(targets))
+	sem := make(chan struct{}, skillReloadFanout)
+	var wg sync.WaitGroup
+	for i, tg := range targets {
+		wg.Add(1)
+		sem <- struct{}{}
+		safe.Go("skills.reload", func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if err := tg.reloader.ReloadSkills(tg.threadID); err != nil {
+				d.log.Debug("skill reload failed", "thread", tg.threadID, "err", err)
+				return
+			}
+			ok[i] = true
+		})
+	}
+	wg.Wait()
+
+	// Notices are emitted here, in session order, so a fleet-wide install reads
+	// the same way in every panel regardless of which reload answered first.
+	var reloaded []string
+	for i, tg := range targets {
+		if !ok[i] {
+			continue
+		}
+		reloaded = append(reloaded, tg.threadID)
+		emitLifecycle(d, tg.threadID, "notice",
+			"skills reloaded — you "+reason+" while this agent was running", nil)
+	}
+	if len(reloaded) > 0 {
+		d.log.Info("skills reloaded on running threads", "threads", len(reloaded))
+	}
+	return reloaded
 }
 
 // emitLifecycle pushes a synthetic _lifecycle agent event to the UI, and
@@ -2668,8 +2954,10 @@ func emitLifecycle(d handlerDeps, threadID, phase, detail string, wt *worktree.W
 		return
 	}
 	// Single lifecycle event, but sent in the same batch shape as the supervisor
-	// relay so the UI has exactly one wire contract to parse.
-	d.srv.Notify("agent.event", agentEventParams{
+	// relay so the UI has exactly one wire contract to parse. NotifyUI for the
+	// same reason the relay uses it (audit F6): a thread's events are that
+	// thread's business and the human's, never every other agent's.
+	d.srv.NotifyUI("agent.event", agentEventParams{
 		ThreadID: threadID,
 		Events:   []json.RawMessage{b},
 	})

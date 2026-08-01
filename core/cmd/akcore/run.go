@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	_ "net/http/pprof" // registers /debug/pprof handlers; only served when AKCORE_PPROF is set
@@ -32,13 +33,58 @@ import (
 	"agentkate/internal/worktree"
 )
 
+// privateTempDir returns a per-user 0700 directory under $TMPDIR, creating it
+// if needed. It is the fallback home for anything that would otherwise land on
+// a predictable world-writable /tmp path, where another local user can
+// pre-create the name (DoS) or plant a symlink (redirected write) — audit F20.
+//
+// Fails CLOSED: if the directory exists but is not ours, is not a directory, or
+// is reachable by group/other, we return the error rather than "fix" it — a
+// path we cannot vouch for must not be used at all.
+func privateTempDir() (string, error) {
+	dir := filepath.Join(os.TempDir(), fmt.Sprintf("agentkate-%d", os.Getuid()))
+	if err := os.Mkdir(dir, 0o700); err != nil && !os.IsExist(err) {
+		return "", err
+	}
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return "", err
+	}
+	if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
+		return "", fmt.Errorf("%s is not a real directory", dir)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return "", fmt.Errorf("%s: cannot determine ownership", dir)
+	}
+	if int(st.Uid) != os.Getuid() {
+		return "", fmt.Errorf("%s is owned by uid %d, not %d", dir, st.Uid, os.Getuid())
+	}
+	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
+		return "", fmt.Errorf("%s is group/world accessible (mode %04o)", dir, perm)
+	}
+	return dir, nil
+}
+
 // defaultSocketPath mirrors the path the UI computes, so a manually launched
 // core and UI still meet. The UI normally passes --socket explicitly.
+//
+// $XDG_RUNTIME_DIR is the normal answer and is already 0700. Without it we fall
+// back to a per-user 0700 directory rather than a bare /tmp/agentkate.sock,
+// which any other local user could squat (audit F20a). If even that cannot be
+// made private, the returned path stays inside the unusable directory: ipc.Serve
+// re-checks and refuses to bind, which is the outcome we want — no socket beats
+// a socket in a directory strangers can reach.
 func defaultSocketPath() string {
 	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
 		return filepath.Join(dir, "agentkate.sock")
 	}
-	return filepath.Join(os.TempDir(), "agentkate.sock")
+	dir, err := privateTempDir()
+	if err != nil {
+		// Deliberately still inside the rejected directory, so Serve fails loudly.
+		return filepath.Join(os.TempDir(), fmt.Sprintf("agentkate-%d", os.Getuid()), "agentkate.sock")
+	}
+	return filepath.Join(dir, "agentkate.sock")
 }
 
 // threadRegistry maps agent thread ids to the worktree each runs in.
@@ -74,7 +120,17 @@ func runCore() {
 	socket := flag.String("socket", defaultSocketPath(), "Unix domain socket path for the UI bus")
 	flag.Parse()
 
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	// Debug level is OFF unless AKCORE_DEBUG is set (audit F24). At Debug the
+	// core logs every child stderr line and raw protocol frames — that is model
+	// and tool output, i.e. file contents, repo text and anything the agent
+	// printed — and it lands in the UI's Output panel and, when akcore is
+	// started by a service manager, in the persistent journal. Diagnostics that
+	// verbose must be an explicit opt-in, not the default posture.
+	level := slog.LevelInfo
+	if os.Getenv("AKCORE_DEBUG") != "" {
+		level = slog.LevelDebug
+	}
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 	log.Info("akcore starting", "version", version, "pid", os.Getpid())
 
 	// Optional debug profiling endpoint, off unless AKCORE_PPROF names a listen
@@ -144,7 +200,24 @@ func runCore() {
 	ensembles, err := modes.NewStore(modes.DefaultPath())
 	if err != nil {
 		log.Warn("cannot open the ensemble store; built-in ensembles only", "err", err)
-		ensembles, _ = modes.NewStore(filepath.Join(os.TempDir(), "agentkate-modes-fallback.json"))
+		// The fallback lives in a per-user 0700 directory, never on a
+		// predictable /tmp path another local user can pre-create or symlink
+		// (audit F20b). If no private directory can be vouched for we run with
+		// built-ins only and no persistence at all — refusing to write beats
+		// writing somewhere we cannot trust.
+		dir, derr := privateTempDir()
+		if derr != nil {
+			// Still inside the rejected directory: reads find nothing (built-ins
+			// only) and every save fails loudly, instead of silently landing on
+			// a path we could not vouch for.
+			log.Warn("no private fallback directory; ensembles will not persist", "err", derr)
+			dir = filepath.Join(os.TempDir(), fmt.Sprintf("agentkate-%d", os.Getuid()))
+		}
+		ensembles, err = modes.NewStore(filepath.Join(dir, "modes-fallback.json"))
+		if err != nil {
+			log.Error("cannot open the fallback ensemble store", "err", err)
+			os.Exit(1)
+		}
 	}
 
 	// Cold-exit compactions are spawned from the thread-exit lifecycle event,
@@ -192,7 +265,14 @@ func runCore() {
 		if len(events) == 0 {
 			return
 		}
-		srv.Notify("agent.event", agentEventParams{ThreadID: threadID, Events: events})
+		// NotifyUI, not Notify (audit F6): this is the FULL LIVE TRANSCRIPT of
+		// one thread — its prompts, its tool inputs, its file contents. Every
+		// connection used to receive it, which meant every agent's MCP bridge
+		// could read every other agent's conversation, the exact leak
+		// mcp.activity's default-deny digest exists to prevent. The UI replays a
+		// dormant thread through agent.transcript, so a reconnecting UI loses
+		// nothing by this feed being UI-only.
+		srv.NotifyUI("agent.event", agentEventParams{ThreadID: threadID, Events: events})
 		for _, event := range events {
 			turns.Observe(threadID, event)
 			var probe struct {
@@ -254,11 +334,11 @@ func runCore() {
 				})
 				// Cold-exit compaction runs only on a normal exit; a user
 				// interrupt is meant to be immediate, so we don't spend a turn
-				// summarising it — and only for harnesses that support
-				// compaction at all.
+				// summarising it — and only for harnesses that can compact a
+				// session that is no longer running (ColdCompact).
 				if probe.Phase == "exited" {
 					if rec, ok := sessions.Get(threadID); ok && harnesses != nil {
-						if h, ok := harnesses.Get(rec.Backend); ok && h.Capabilities().Compaction {
+						if h, ok := harnesses.Get(rec.Backend); ok && h.Capabilities().ColdCompact {
 							strat := compact.Strategy(rec.CompactStrategy).Resolve()
 							if strat.RunsOnExit() && strat != compact.ExitOpusHot {
 								coldCompacts.spawn(log, sessions, summaries, rec, strat)
@@ -275,9 +355,15 @@ func runCore() {
 	// notification the Claude MCP bridge uses, so the UI approval flow is
 	// identical across backends.
 	ksup := kimi.NewSupervisor("", log, relayEvents,
-		func(threadID, toolName string, input json.RawMessage) bool {
+		func(threadID, toolName string, input json.RawMessage) (bool, json.RawMessage) {
 			dec, ok := askHumanPermission(srv, broker, threadID, toolName, input)
-			return ok && dec.Allow
+			if !ok {
+				return false, nil
+			}
+			// UpdatedInput matters beyond permissions: it is how an answered
+			// question comes back (kimi bridges AskUserQuestion over the same
+			// channel), so it must survive to the supervisor.
+			return dec.Allow, dec.UpdatedInput
 		}, "")
 
 	// The harness registry: each supervisor wrapped in its adapter, in the
@@ -332,20 +418,26 @@ func runCore() {
 		harnesses:  harnesses,
 		turns:      turns,
 		orchGrants: newOrchGrants(),
-		coop:       coopState,
-		threads:    threads,
-		broker:     broker,
-		extensions: extensions,
-		sessions:   sessions,
-		attachSide: attachSide,
-		summaries:  summaries,
-		modes:      ensembles,
-		skills:     skillCatalog,
-		gitCache:   gitCache,
-		cowork:     coworkSvc,
-		socketPath: *socket,
-		exePath:    exePath,
-		log:        log,
+		// The fan-out reservation ledger. Absent, every worker launch fails
+		// closed (authority.go) rather than running uncapped.
+		workerSlots: newWorkerSlots(),
+		// The per-bridge identity secrets (audit F13). One ledger for the whole
+		// run: launches mint into it, bridge.identify verifies against it.
+		bridgeSecrets: newBridgeSecrets(),
+		coop:          coopState,
+		threads:       threads,
+		broker:        broker,
+		extensions:    extensions,
+		sessions:      sessions,
+		attachSide:    attachSide,
+		summaries:     summaries,
+		modes:         ensembles,
+		skills:        skillCatalog,
+		gitCache:      gitCache,
+		cowork:        coworkSvc,
+		socketPath:    *socket,
+		exePath:       exePath,
+		log:           log,
 	}
 	registerHandlers(deps)
 

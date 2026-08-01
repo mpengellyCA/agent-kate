@@ -62,6 +62,43 @@ const (
 	ModeWorkspace = "workspace" // always run directly in the workspace
 )
 
+// EffectiveIsolation reports what Create would ACTUALLY do to repoRoot for the
+// requested mode — ModeIsolated (a dedicated worktree) or ModeWorkspace (the
+// human's real checkout) — without creating anything.
+//
+// It exists because the requested mode and the applied one are not the same
+// thing: ModeAuto (and the unspecified default) silently DEGRADES to the real
+// checkout whenever repoRoot has no commit to branch from — a fresh repo, or a
+// workspace that is not a git repository at all. Anything that gates on
+// isolation must gate on this answer, never on the caller's string, or a worker
+// lands in the user's own files while the gate reads the word "auto" and stays
+// quiet (audit F1, isolation half).
+//
+// ModeIsolated is reported as isolated even when repoRoot has no commit: there
+// Create FAILS rather than degrading, and a failed launch grants nothing.
+//
+// Fail closed: an unreadable repo (no git, no HEAD, a path that does not exist)
+// answers ModeWorkspace, because that is exactly what Create then does.
+func EffectiveIsolation(repoRoot, mode string) string {
+	switch mode {
+	case ModeWorkspace:
+		return ModeWorkspace
+	case ModeIsolated:
+		return ModeIsolated
+	}
+	// An empty root is answered without asking git: `git rev-parse` would then
+	// run in the CALLER'S working directory and report on whatever repo happens
+	// to be there, which is an answer about the wrong project. Fail closed.
+	if strings.TrimSpace(repoRoot) == "" {
+		return ModeWorkspace
+	}
+	// ModeAuto and every unrecognised mode, which Create treats as ModeAuto.
+	if _, ok := headCommit(repoRoot); ok {
+		return ModeIsolated
+	}
+	return ModeWorkspace
+}
+
 // Create sets up where an agent thread runs, honouring an isolation mode:
 //
 //   - ModeWorkspace      — always run directly in repoRoot, no isolation.
@@ -557,14 +594,34 @@ func PRDraft(wt Worktree) (title, body string, err error) {
 
 // Remove deletes an isolated worktree and its branch. It is a no-op when the
 // thread was not isolated.
+//
+// SAFETY: the Worktree comes from a session record on disk, which anything
+// running as the user can edit. Before ANY destructive step — git's own remove
+// included, since git will happily delete a worktree the user created by hand
+// — the record must clear VerifyProvenance: the path resolves inside this
+// project's .agentkate/worktrees/ and git lists it as a registered worktree.
+// A record that fails the gate is refused outright; the check FAILS CLOSED, so
+// a provenance question we cannot answer is an error, never a deletion.
 func Remove(wt Worktree) error {
 	if !wt.Isolated {
 		return nil
+	}
+	if err := VerifyProvenance(wt); err != nil {
+		return fmt.Errorf("refusing to remove this agent's worktree: %w", err)
 	}
 	if _, err := git(wt.RepoRoot, "worktree", "remove", "--force", wt.Path); err != nil {
 		// git's own remove failed (e.g. inconsistent worktree metadata); fall back
 		// to a manual delete + prune, then verify the directory is actually gone so
 		// a genuine failure is reported rather than swallowed as success.
+		//
+		// Re-verify immediately before the raw os.RemoveAll: this is the one call
+		// in the package that deletes a tree without git's own consistency checks,
+		// so it re-runs the gate rather than trusting the one above (the failed
+		// git call may itself have changed what is registered).
+		if err2 := VerifyProvenance(wt); err2 != nil {
+			return fmt.Errorf("worktree remove %s: %w (refusing manual cleanup: %v)",
+				wt.Path, err, err2)
+		}
 		if rmErr := os.RemoveAll(wt.Path); rmErr != nil {
 			return fmt.Errorf("worktree remove %s: %w (manual cleanup also failed: %v)",
 				wt.Path, err, rmErr)
@@ -575,7 +632,12 @@ func Remove(wt Worktree) error {
 				wt.Path, err)
 		}
 	}
-	_, _ = git(wt.RepoRoot, "branch", "-D", wt.Branch)
+	// Only ever delete a branch in the namespace this package creates. A record
+	// whose Branch was rewritten to "main" must not turn removal into the loss
+	// of the user's own branch.
+	if isManagedBranch(wt.Branch) {
+		_, _ = git(wt.RepoRoot, "branch", "-D", wt.Branch)
+	}
 	return nil
 }
 
@@ -584,9 +646,18 @@ func Remove(wt Worktree) error {
 // affect that directory tree). This throws away every uncommitted change —
 // callers MUST confirm with the user first. wt.Path must be a non-empty git
 // working directory.
+//
+// SAFETY: `reset --hard` + `clean -fd` destroy uncommitted work as thoroughly
+// as a delete, so the path is gated by VerifyRunPath before git is invoked —
+// an isolated record must resolve inside this project's .agentkate/worktrees/
+// and be git-registered, a direct-workspace record must actually name its own
+// project root. Fails closed: an unverifiable record is refused.
 func DiscardChanges(wt Worktree) error {
 	if wt.Path == "" {
 		return fmt.Errorf("discard: worktree has no path")
+	}
+	if err := VerifyRunPath(wt); err != nil {
+		return fmt.Errorf("refusing to discard changes: %w", err)
 	}
 	if _, err := git(wt.Path, "reset", "--hard", "HEAD"); err != nil {
 		return err

@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"agentkate/internal/fsperm"
 	"agentkate/internal/harness"
 	"agentkate/internal/worktree"
 )
@@ -105,6 +106,13 @@ type Record struct {
 	DisallowedTools []string `json:"disallowedTools,omitempty"`
 	AddDirs         []string `json:"addDirs,omitempty"`
 
+	// The control-channel sweep, persisted for the same reason: a resume that
+	// forgot StrictMCPConfig would hand the thread back the global MCP servers
+	// the human isolated it from, and one that forgot MaxBudgetUSD would drop
+	// the spend ceiling.
+	StrictMCPConfig bool    `json:"strictMcpConfig,omitempty"`
+	MaxBudgetUSD    float64 `json:"maxBudgetUsd,omitempty"`
+
 	// CoworkEnabled opts this thread into the KDE Plasma Cowork MCP server
 	// (desktop see/control). Off by default; only the UI may flip it
 	// (cowork.setEnabled). See docs/plans/08-kde-cowork/.
@@ -146,12 +154,54 @@ func DefaultPath() string {
 // NewStore opens (or starts) the store at path. Any record left as "running"
 // from a previous run is reset to "dormant" — a freshly started core has no
 // live threads.
+//
+// Opening also MIGRATES permissions (see harden): every build before this one
+// created the data directory 0755 and its files 0644, so the records a user
+// already has are the ones that need tightening most.
 func NewStore(path string) (*Store, error) {
 	s := &Store{path: path, recs: make(map[string]Record)}
+	if err := s.harden(); err != nil {
+		return nil, err
+	}
 	if err := s.load(); err != nil {
 		return nil, err
 	}
 	return s, nil
+}
+
+// harden tightens the thread store and the data directory that holds it.
+//
+// The directory is Agent Kate's data root — the thread store sits at its top —
+// so tightening it to 0700 also puts every sibling store behind an
+// unlistable directory: summaries, attachment sidecars, the kimi event logs,
+// modes.json. Each of those tightens its own files as well; this is the
+// umbrella that holds even if one of them is missed.
+//
+// FAIL CLOSED: an error here fails the store open (and so the daemon start)
+// rather than proceeding with a store we could not confirm is private. The
+// only realistic causes are a path we do not own or a store dir replaced by a
+// symlink, both of which deserve a loud stop.
+func (s *Store) harden() error {
+	dir := filepath.Dir(s.path)
+	tightened, err := fsperm.HardenDir(dir)
+	if err != nil {
+		return fmt.Errorf("thread store: %w", err)
+	}
+	n := 0
+	if tightened {
+		n++
+	}
+	for _, p := range []string{s.path, s.path + ".tmp", s.archivePath(), s.archivePath() + ".tmp"} {
+		t, err := fsperm.HardenFile(p)
+		if err != nil {
+			return fmt.Errorf("thread store: %w", err)
+		}
+		if t {
+			n++
+		}
+	}
+	fsperm.LogMigration(dir, n)
+	return nil
 }
 
 func (s *Store) load() error {
@@ -170,6 +220,10 @@ func (s *Store) load() error {
 	}
 	for _, r := range file.Threads {
 		r.Status = StatusDormant // nothing is running in a fresh process
+		// Credential-shaped Env values are never on disk (see flush); re-resolve
+		// them from the environment akcore itself runs in, exactly as the
+		// provider token is re-resolved from ProviderEnvVar at launch.
+		r.Env = resolveEnvFromProcess(r.Env)
 		s.recs[r.ThreadID] = r
 	}
 	// Backfill the project-scoped Worktree.Number for records from before
@@ -237,6 +291,11 @@ func (s *Store) NextNumber(project string) int {
 func (s *Store) flush() error {
 	list := make([]Record, 0, len(s.recs))
 	for _, r := range s.recs {
+		// The single choke point where records become bytes on disk: strip
+		// credential-shaped Env values here so no caller can forget to. The
+		// in-memory record keeps the real value for this process's own
+		// launches; only the file gets the marker.
+		r.Env = redactEnvForPersist(r.Env)
 		list = append(list, r)
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].Created.Before(list[j].Created) })
@@ -247,11 +306,11 @@ func (s *Store) flush() error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
+	if err := fsperm.MkdirAll(filepath.Dir(s.path)); err != nil {
 		return err
 	}
 	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+	if err := fsperm.WriteFile(tmp, b); err != nil {
 		return err
 	}
 	return os.Rename(tmp, s.path)
@@ -330,12 +389,26 @@ func (s *Store) Remove(threadID string) error {
 
 // List returns records newest-first. When project is non-empty only that
 // project's threads are returned.
+//
+// The returned records carry a REDACTED Env: credential-shaped entries are the
+// EnvNotStored marker, exactly as on disk. List is the roster accessor — it
+// feeds the UI (session.listThreads hands its result straight over the socket),
+// the shutdown sweep, the cleanup candidate scan and the worker-cap count, and
+// not one of those needs a credential. Get is the operational accessor and is
+// NOT redacted; every launch path goes through it (agents.go start/resume/
+// clone all read rec via Get and then session.LaunchEnv).
+//
+// The redaction lives here rather than in the handler on purpose: the disk
+// store already redacts at its own boundary (flush/writeArchive), and a
+// boundary that is enforced by every caller remembering to call a helper is not
+// a boundary. Adding a new List caller cannot leak a credential by omission.
 func (s *Store) List(project string) []Record {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]Record, 0, len(s.recs))
 	for _, r := range s.recs {
 		if project == "" || r.Project == project {
+			r.Env = RedactEnvForWire(r.Env)
 			out = append(out, r)
 		}
 	}
@@ -375,27 +448,84 @@ func (s *Store) loadArchive() ([]ArchiveRecord, error) {
 	if err := json.Unmarshal(b, &file); err != nil {
 		return nil, fmt.Errorf("archive store %s: %w", s.archivePath(), err)
 	}
+	for i := range file.Threads {
+		// Same re-resolution as the live store: a restored thread relaunches
+		// with the credential the environment supplies now, never one the
+		// archive kept in cleartext.
+		file.Threads[i].Env = resolveEnvFromProcess(file.Threads[i].Env)
+	}
 	return file.Threads, nil
 }
 
-// writeArchive atomically writes the archive list to disk.
+// Archive retention (audit F10). Nothing ever pruned threads-archive.json:
+// every stop-and-close and every cleanup appended a full Record, forever, in a
+// file the UI reads whole on every cleanup.listArchived. Both caps keep the
+// NEWEST entries — the archive exists so a recently closed thread can be
+// restored, and a two-year-old one is not what anyone reaches for.
+//
+// The byte cap is the one that actually binds: a Record carries a SystemPrompt
+// and an Env overlay, so record count alone is a poor proxy for file size.
+const (
+	maxArchiveRecords = 500
+	maxArchiveBytes   = 4 << 20
+)
+
+// writeArchive atomically writes the archive list to disk, newest-first and
+// bounded by the retention caps above.
 func (s *Store) writeArchive(list []ArchiveRecord) error {
 	sort.Slice(list, func(i, j int) bool { return list[i].ArchivedAt.After(list[j].ArchivedAt) })
-	b, err := json.MarshalIndent(struct {
-		Threads []ArchiveRecord `json:"threads"`
-	}{list}, "", "  ")
+	if len(list) > maxArchiveRecords {
+		list = list[:maxArchiveRecords]
+	}
+	// Redact on the way out, like flush: an archive is FOREVER — a credential
+	// that leaked into an env overlay would otherwise outlive the thread that
+	// carried it, in a file nobody ever looks at again.
+	out := make([]ArchiveRecord, 0, len(list))
+	for _, ar := range list {
+		ar.Env = redactEnvForPersist(ar.Env)
+		out = append(out, ar)
+	}
+	b, err := marshalArchiveWithin(out, maxArchiveBytes)
 	if err != nil {
 		return err
 	}
 	path := s.archivePath()
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := fsperm.MkdirAll(filepath.Dir(path)); err != nil {
 		return err
 	}
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+	if err := fsperm.WriteFile(tmp, b); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+// marshalArchiveWithin encodes the archive, dropping the OLDEST entries (the
+// tail — the list arrives newest-first) until the encoding fits the byte cap.
+//
+// Iterative rather than estimated: records vary by orders of magnitude in size
+// (a bare thread vs one carrying a long system prompt), so a per-record average
+// would either over- or under-shoot. Each round drops a tenth, so it converges
+// in a handful of passes over a list already capped at maxArchiveRecords. The
+// newest entry is never dropped: an archive that cannot hold even one record
+// would make Archive lose the very thread it was asked to preserve.
+func marshalArchiveWithin(list []ArchiveRecord, maxBytes int) ([]byte, error) {
+	for {
+		b, err := json.MarshalIndent(struct {
+			Threads []ArchiveRecord `json:"threads"`
+		}{list}, "", "  ")
+		if err != nil {
+			return nil, err
+		}
+		if len(b) <= maxBytes || len(list) <= 1 {
+			return b, nil
+		}
+		drop := len(list) / 10
+		if drop < 1 {
+			drop = 1
+		}
+		list = list[:len(list)-drop]
+	}
 }
 
 // Archive moves a thread out of the live store into the archive file. It is the
@@ -442,12 +572,22 @@ func (s *Store) Archive(threadID, reason string) error {
 }
 
 // ListArchived returns archived records newest-first.
+//
+// Env is REDACTED here for the same reason as List: cleanup.listArchived hands
+// the result straight over the socket. loadArchive re-resolves EnvNotStored
+// markers from akcore's OWN environment so a Restore relaunches with a live
+// credential — which means an un-redacted ListArchived would hand every socket
+// peer the daemon's credentials, values that were never even on disk. Restore
+// and Archive use loadArchive directly and keep the resolved values.
 func (s *Store) ListArchived() []ArchiveRecord {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	list, err := s.loadArchive()
 	if err != nil {
 		return nil
+	}
+	for i := range list {
+		list[i].Env = RedactEnvForWire(list[i].Env)
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].ArchivedAt.After(list[j].ArchivedAt) })
 	if list == nil {

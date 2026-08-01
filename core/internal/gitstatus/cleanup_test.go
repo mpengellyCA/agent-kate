@@ -467,3 +467,68 @@ func TestAdviseCleanupLLMFailureLeavesVerdictIntact(t *testing.T) {
 		t.Fatalf("no recommendation expected on failure, got %q", out[0].Recommendation)
 	}
 }
+
+// --- provenance (audit F4) -------------------------------------------------
+//
+// The UI pre-checks "safe" rows and deletes them on one click, so a record
+// whose Worktree.Path was repointed at an unrelated directory — threads.json
+// is owner-writable, i.e. reachable by a prompt-injected agent — must be
+// classified BLOCKED here, never safe. worktree.Remove refuses it either way;
+// this keeps the UI's offer honest instead of showing a one-click delete that
+// then errors.
+
+func TestAnalyzeUnmanagedPathBlocked(t *testing.T) {
+	repo, _ := initLinearRepo(t, 1)
+	victim := t.TempDir() // a directory Agent Kate never created
+	if err := os.WriteFile(filepath.Join(victim, "keep.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wt := worktree.Worktree{
+		ThreadID: "tampered",
+		RepoRoot: repo,
+		Path:     victim,
+		Branch:   "agentkate/tampered",
+		Isolated: true,
+	}
+	c := AnalyzeCandidate(wt, nil, false, "", time.Now())
+	if c.Removable || c.State != CleanupBlocked {
+		t.Fatalf("tampered record must be blocked: state=%q removable=%v",
+			c.State, c.Removable)
+	}
+	if !hasCode(c.Blockers, BlockerUnmanaged) {
+		t.Fatalf("missing %s blocker: %v", BlockerUnmanaged, c.Blockers)
+	}
+}
+
+// The same holds when the bogus path does not exist: it must NOT be waved
+// through as "orphaned" (removable) just because there is nothing there now.
+func TestAnalyzeUnmanagedMissingPathIsBlockedNotOrphaned(t *testing.T) {
+	repo, _ := initLinearRepo(t, 1)
+	wt := worktree.Worktree{
+		ThreadID: "ghost",
+		RepoRoot: repo,
+		Path:     filepath.Join(t.TempDir(), "not", "here"),
+		Branch:   "agentkate/ghost",
+		Isolated: true,
+	}
+	c := AnalyzeCandidate(wt, nil, false, "", time.Now())
+	if c.State == CleanupOrphaned || c.Removable {
+		t.Fatalf("a foreign missing path must not be removable: state=%q removable=%v",
+			c.State, c.Removable)
+	}
+}
+
+// A genuinely orphaned worktree of ours (contained path, directory deleted out
+// of band) stays removable — the gate must not strand real cleanup rows.
+func TestAnalyzeOwnOrphanStillRemovable(t *testing.T) {
+	repo, _ := initLinearRepo(t, 1)
+	wt := makeWorktree(t, repo, "orphan-ok")
+	if err := os.RemoveAll(wt.Path); err != nil {
+		t.Fatal(err)
+	}
+	c := AnalyzeCandidate(wt, nil, false, "", time.Now())
+	if c.State != CleanupOrphaned || !c.Removable {
+		t.Fatalf("own orphan must stay removable: state=%q removable=%v blockers=%v",
+			c.State, c.Removable, c.Blockers)
+	}
+}

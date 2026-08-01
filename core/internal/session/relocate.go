@@ -3,15 +3,33 @@ package session
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"agentkate/internal/fsperm"
+	"agentkate/internal/harness"
 )
 
 // ReadTranscript returns the raw JSON lines from a session's Claude Code
 // transcript, in order, so the UI can replay the conversation when reopening a
 // dormant thread. Returns nil with no error if there is no transcript yet.
+//
+// The read is BOUNDED (audit F10), the same way the kimi reader is: only the
+// most recent events that fit the replay caps are kept, and core memory never
+// exceeds those caps however long the on-disk transcript has grown. The old
+// version read the WHOLE file in — a months-old thread cost hundreds of MB in
+// the core before the handler-side cap ever ran, which is the freeze the cap
+// exists to prevent. When older events are dropped the returned slice opens
+// with a truncation notice, so a shortened history is visible rather than
+// silent.
+//
+// Claude Code writes this file; a torn last line is possible if it was killed
+// mid-append, so lines that are not valid JSON are skipped rather than relayed
+// to the UI as a parse error in the panel.
 func ReadTranscript(sessionID string) ([]json.RawMessage, error) {
 	path := findTranscript(sessionID)
 	if path == "" {
@@ -24,18 +42,56 @@ func ReadTranscript(sessionID string) ([]json.RawMessage, error) {
 	defer f.Close()
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-	var out []json.RawMessage
+	// Budget leaves room for the notice event the handler-side cap would
+	// otherwise have to add on top (harness.CapTranscript is then a no-op).
+	maxEvents := harness.MaxReplayEvents - 1
+	maxBytes := harness.MaxReplayBytes - 4096
+
+	var (
+		ring    []json.RawMessage // most recent events, oldest first
+		bytesIn int
+		omitted int
+		torn    int
+	)
 	for sc.Scan() {
 		line := sc.Bytes()
 		if len(line) == 0 {
 			continue
 		}
-		out = append(out, append(json.RawMessage(nil), line...))
+		if !json.Valid(line) {
+			torn++
+			continue
+		}
+		ring = append(ring, append(json.RawMessage(nil), line...))
+		bytesIn += len(line)
+		// Keep at least one event, so a single oversized event still says
+		// something rather than emptying the replay.
+		for len(ring) > maxEvents || (bytesIn > maxBytes && len(ring) > 1) {
+			bytesIn -= len(ring[0])
+			ring = ring[1:]
+			omitted++
+		}
 	}
 	if err := sc.Err(); err != nil {
-		return nil, err
+		// A line longer than the scanner cap ends the read. Everything up to it
+		// is still a usable history, so report what we have rather than nothing
+		// — but say so, because the tail is missing.
+		if !errors.Is(err, bufio.ErrTooLong) {
+			return nil, err
+		}
+		torn++
 	}
-	return out, nil
+	if torn > 0 {
+		slog.Warn("claude transcript: skipped unreadable lines",
+			"session", sessionID, "lines", torn)
+	}
+	if omitted == 0 {
+		return ring, nil
+	}
+	if notice := harness.TruncationNotice(omitted); notice != nil {
+		return append([]json.RawMessage{notice}, ring...), nil
+	}
+	return ring, nil
 }
 
 // PreviewMessage is one role-labelled turn extracted from a transcript for the
@@ -47,9 +103,11 @@ type PreviewMessage struct {
 
 // PreviewTranscript returns up to limit of the most recent user/assistant turns
 // from a session's transcript, for a read-only preview before attaching. It
-// streams the file line by line (never loading the whole transcript into
-// memory) and reports whether earlier messages were dropped. limit <= 0
-// defaults to 20.
+// streams the file line by line and keeps only a limit-sized ring of turns, so
+// peak memory is bounded by what it RETURNS rather than by the file — the
+// comment used to promise this while the accumulator grew for every turn in the
+// transcript, each up to previewMaxRunes. Reports whether earlier messages were
+// dropped. limit <= 0 defaults to 20.
 func PreviewTranscript(sessionID string, limit int) ([]PreviewMessage, bool, error) {
 	if limit <= 0 {
 		limit = 20
@@ -66,7 +124,10 @@ func PreviewTranscript(sessionID string, limit int) ([]PreviewMessage, bool, err
 
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-	var all []PreviewMessage
+	var (
+		ring      []PreviewMessage // most recent turns, oldest first
+		truncated bool
+	)
 	for sc.Scan() {
 		line := sc.Bytes()
 		if len(line) == 0 {
@@ -86,17 +147,16 @@ func PreviewTranscript(sessionID string, limit int) ([]PreviewMessage, bool, err
 		if strings.TrimSpace(text) == "" {
 			continue
 		}
-		all = append(all, PreviewMessage{Role: probe.Type, Text: text})
+		ring = append(ring, PreviewMessage{Role: probe.Type, Text: text})
+		if len(ring) > limit {
+			ring = ring[1:]
+			truncated = true
+		}
 	}
 	if err := sc.Err(); err != nil {
 		return nil, false, err
 	}
-	truncated := false
-	if len(all) > limit {
-		all = all[len(all)-limit:]
-		truncated = true
-	}
-	return all, truncated, nil
+	return ring, truncated, nil
 }
 
 // previewMaxRunes caps each preview turn so a giant message cannot bloat the
@@ -207,7 +267,11 @@ func PromoteTranscript(sessionID, threadID string) error {
 	if src == dst {
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+	// 0700, matching the ~/.claude/projects tree we are creating this project
+	// directory inside: Claude Code keeps its own home owner-only, and a
+	// transcript directory Agent Kate creates there must not be the one
+	// world-readable node in it.
+	if err := fsperm.MkdirAll(filepath.Dir(dst)); err != nil {
 		return err
 	}
 	return os.Rename(src, dst)

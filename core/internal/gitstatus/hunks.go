@@ -30,11 +30,29 @@ type Hunk struct {
 	Kind      string `json:"kind"` // "add" | "modify" | "delete"
 }
 
+// maxHunkFileBytes is the largest file the gutter will diff. The check happens
+// BEFORE the read (audit F11): the budget must bound what is *read*, not only
+// what is admitted, or an agent that commits a 2 GB log makes the core allocate
+// it — twice, plus the line-diff's per-line index — for markers no one can use.
+// A file over the cap simply has no gutter, which is what the UI shows for a
+// binary file anyway.
+const maxHunkFileBytes = 4 << 20
+
 // computeFileHunks diffs a single file in the worktree against its HEAD blob
 // and returns the hunks. A file that's untracked or only-on-disk reports a
-// single "add" hunk spanning all of its lines.
+// single "add" hunk spanning all of its lines. Files larger than
+// maxHunkFileBytes on either side are skipped (no hunks, no error).
 func computeFileHunks(wt worktree.Worktree, relPath string) ([]Hunk, error) {
 	abs := filepath.Join(wt.Path, filepath.FromSlash(relPath))
+	// Size first, then read. Stat, not Lstat: a symlink to a huge file must be
+	// measured by what the read would actually pull in.
+	if st, err := os.Stat(abs); err == nil {
+		if !st.Mode().IsRegular() || st.Size() > maxHunkFileBytes {
+			return nil, nil
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
 	newBytes, newErr := os.ReadFile(abs)
 	if newErr != nil && !errors.Is(newErr, os.ErrNotExist) {
 		return nil, newErr
@@ -50,6 +68,9 @@ func computeFileHunks(wt worktree.Worktree, relPath string) ([]Hunk, error) {
 
 	headBytes, err := readHeadBlob(repo, relPath)
 	if err != nil {
+		if errors.Is(err, errBlobTooLarge) {
+			return nil, nil // too big to diff: no gutter, not an error
+		}
 		return nil, err
 	}
 
@@ -78,6 +99,10 @@ func computeFileHunks(wt worktree.Worktree, relPath string) ([]Hunk, error) {
 	return lineDiffHunks(string(headBytes), string(newBytes)), nil
 }
 
+// errBlobTooLarge reports a HEAD blob past maxHunkFileBytes. Handled by
+// computeFileHunks as "no gutter for this file", never surfaced as a failure.
+var errBlobTooLarge = errors.New("head blob exceeds the diff size cap")
+
 // readHeadBlob returns the file's HEAD contents, or nil if the path is not in
 // HEAD (e.g. an untracked or newly added file).
 func readHeadBlob(repo *git.Repository, relPath string) ([]byte, error) {
@@ -103,6 +128,12 @@ func readHeadBlob(repo *git.Repository, relPath string) ([]byte, error) {
 			return nil, nil
 		}
 		return nil, err
+	}
+	// Same size-before-read rule as the working-tree side (audit F11): the blob
+	// is decompressed into memory, so a huge committed file is the more
+	// expensive half of the pair.
+	if file.Size > maxHunkFileBytes {
+		return nil, errBlobTooLarge
 	}
 	r, err := file.Reader()
 	if err != nil {
