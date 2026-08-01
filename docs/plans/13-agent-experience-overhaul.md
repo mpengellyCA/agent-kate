@@ -29,7 +29,10 @@ QDialogs, KF6 components; custom widgets only where no framework primitive fits.
   semantic colors (`ui/src/theme/`). Never Fusion style, never app-wide stylesheets.
   Delegates use QPalette roles so KDE schemes keep working.
 - **Text into QTextDocument/setMarkdown:** route model-sourced text through
-  `MarkdownUtil::neutralizeMarkdownRawHtml` — raw `<T>` in text otherwise eats content.
+  `MarkdownUtil::setMarkdownSafe` — never `setMarkdown()` directly. Its default
+  features leave md4c's raw-HTML parsing on, which both eats content (a raw `<T>`
+  swallows the text around it) and makes model-authored HTML live rich text.
+  MarkdownUtilTest scans the tree for call sites that opt out.
 - **Responsive rows:** reuse `ui/src/shell/FlowLayout` and `ElidingLabel` for any chip
   row or long label.
 - **Polled/refreshed state:** wrap in `Reactive<T>` with equality guards (see

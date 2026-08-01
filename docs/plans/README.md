@@ -25,9 +25,110 @@ daily dogfooding. Each item has its own grounded plan file with the relevant
 | 16 | Multi-agent orchestration (cross-harness launch/send/wait MCP tools, user-defined controller/worker ensembles, live MCP traffic view, Kimi first-class parity, Claude flag sweep) | Core (Go) + UI (C++) | [16-multi-agent-orchestration.md](16-multi-agent-orchestration.md) | XL (6 phases) |
 | 17 | Editor session scoping (startup reopens files from unrelated projects) | UI (C++) | [17-editor-session-scoping.md](17-editor-session-scoping.md) | S–M |
 | 18 | Cowork mid-session (enable desktop access on a running agent, agent-requested via MCP, OS permission taken up front) | Core (Go) + UI (C++) | [18-cowork-mid-session.md](18-cowork-mid-session.md) | M |
-| 19 | Jobs panel (background work from every agent, filling the last stubbed panel) & attachment durability (cached image copies, total send budget) | UI (C++) + Core (Go) | [19-jobs-panel-and-attachment-durability.md](19-jobs-panel-and-attachment-durability.md) | M |
+| 19 | Jobs panel (background work from every agent, filling the last stubbed panel) & attachment durability (cached image copies, total send budget) — ✅ **landed + hardened**, P1–P4 | UI (C++) + Core (Go) | [19-jobs-panel-and-attachment-durability.md](19-jobs-panel-and-attachment-durability.md) | M |
+| **20** | **Approved features program** — the map for 21–27: clustering, dependency graph, execution order, and how each user note shapes its design | Program doc | [20-approved-features-program.md](20-approved-features-program.md) | — |
+| 21 | Fleet view of detached agents (`claude agents --json` / `--bg`) + the agent-teams spike | Core (Go) + UI (C++) | [21-fleet-and-agent-teams.md](21-fleet-and-agent-teams.md) | L |
+| 22 | Extension catalogue — plugins that subsume Skills, granular per component, cross-engine | Core (Go) + UI (C++) | [22-extension-catalogue.md](22-extension-catalogue.md) | L |
+| 23 | Contained worktrees (agents can no longer escape) + a checkpoint timeline on top | Core (Go) + UI (C++) | [23-contained-worktrees-and-checkpoints.md](23-contained-worktrees-and-checkpoints.md) | XL |
+| 24 | The interaction channel — agents asking the user (both engines), and hooks made visible and per-agent | Core (Go) + UI (C++) | [24-agent-questions-and-hooks.md](24-agent-questions-and-hooks.md) | L |
+| 25 | Session portability — export, visualize, and a cross-engine Fork | Core (Go) + UI (C++) | [25-session-portability-and-fork.md](25-session-portability-and-fork.md) | M–L |
+| 26 | Engine services — the Kimi provider registry, and preflight health for both engines | Core (Go) + UI (C++) | [26-engine-services.md](26-engine-services.md) | M |
+| 27 | KDE presence — one KActionCollection, a system tray item, and global shortcuts | UI (C++) | [27-kde-presence.md](27-kde-presence.md) | M–L |
+| 28 | Native scheduling & resume — persistent timers, rate-window auto-resume, gated agent-requested schedules | Core (Go) + UI (C++) | [28-scheduling-and-autonomy.md](28-scheduling-and-autonomy.md) | L |
 
-Size key: **S** ≈ <½ day, **M** ≈ 1–2 days, **L** ≈ 3–5 days.
+Size key: **S** ≈ <½ day, **M** ≈ 1–2 days, **L** ≈ 3–5 days, **XL** ≈ a release of its own.
+
+Plans **21–28** are one program, approved together from the 2026-08 capability-drift
+and KDE-citizen audits (28 was added to the same program a few hours later). Read
+[20](20-approved-features-program.md) first: it holds the dependency graph, the
+recommended execution order, and the parallel-track split.
+Its headline is that **plan 27 §1 (the KActionCollection refactor) should land before
+anything else in that set** — five of the seven clusters add actions, and every action
+born outside the collection has to be retrofitted later.
+
+**Status: 20–28 are planned, not started.** No code for them is in the tree; 19 is the
+last plan with an implementation. The source list is [IDEAS.md](../IDEAS.md), where each
+item carries its approval and, where the user gave one, a recorded decision that shapes
+the plan rather than being a preference on top of it:
+
+- **22** — the plugin catalogue must *subsume* the existing Skills feature rather than
+  sit beside it, and be granular per component and cross-engine. That is why the plan is
+  an "extension catalogue" and not a plugin panel.
+- **23** — checkpoints are the occasion to rework the worktree system, which today is
+  escapable and has confused agents. The recorded direction is to contain each agent
+  (a Linux container was the user's suggestion) so it cannot reach higher directories
+  without a deliberate path and hatch. Containment leads, the timeline sits on top.
+- **24** — agent-asks-the-user is wanted for *every* engine that can support it, not
+  just claude, which is what makes it an interaction channel rather than a claude
+  feature.
+- **26** — `kimi provider` routing is an *option*; first-class support for running
+  Claude Code against other providers stays.
+
+Three IDEAS items are on **hold** and deliberately have no plan doc: live workspace-diff
+from the CLI's VCS events (#5), cloud `claude ultrareview` as an action (#6), and the
+first-run tour with shared empty states (#14).
+
+## Landed 2026-08-01
+
+One day, six review rounds (an adversarially-verified fleet review of plan 19
+P1+P2, then fix rounds 2–6, each re-reviewed by a fresh fleet across five review
+workflows). It moved far more code than a plan-19 hardening pass suggests,
+because each round's review kept finding parity and citizenship gaps next to the
+bug it was sent after. What came out of it, so a future reader knows why one
+day's diff is this large:
+
+- **Token-by-token streaming.** `claude --include-partial-messages` is now on,
+  and `stream_event` deltas render into the live assistant card
+  (`flushStreamedText`) instead of arriving as one block at turn end. The core
+  batches a burst of deltas into a single notification, and stored transcripts
+  hold no `stream_event`s, so replay is unaffected.
+- **A real `system` event dispatch.** `system` subtypes used to fall through
+  as noise. They are now routed: `task_*` / `background_tasks_changed` drive
+  the jobs tray, `thinking_tokens` drives the working indicator's activity
+  line, `init` seeds slash commands and persists the session's discovered
+  config options, and everything else — model fallbacks, compaction
+  boundaries, API errors — goes through `renderSystemSubtype` rather than
+  being dropped.
+- **Rate-limit readout.** `rate_limit_event` folds into a header chip
+  (`applyRateLimit`): which window, when it resets, whether the account is on
+  overage — with a note added only on a status *transition*, so a steady
+  stream of ticks does not spam the feed.
+- **The claude control channel** (`core/internal/agent/control.go`). Probed
+  against 2.1.220: the CLI accepts `control_request` lines on the already-open
+  stdin of a running print-mode session. That gives mid-session
+  `set_max_thinking_tokens` (effort mapped onto Claude's own think-keyword
+  budgets, so a live change lands where a relaunch at that effort would),
+  `reload_skills`, `get_context_usage` with a per-category breakdown, and
+  `list_models` — the last of which reports each model's supported effort
+  tiers, now carried on `DiscoveredOptionValue.Efforts`. Empty means "the
+  harness said nothing", read as every tier, never as none.
+- **Kimi capability parity.** Hot compaction via `/compact` as prompt text
+  (`Compaction` true, `ColdCompact` false — the flag split is new), and a
+  context readout recovered from `/usage`, which kimi answers locally with
+  nothing billed. Both correct standing claims in
+  [plan 14](14-harness-abstraction-and-parity.md); see its Non-goals and the
+  P2 note for what was wrong and why.
+- **KDE shell citizenship.** `KDBusService` single-instance (with the second
+  process's command line forwarded and its positional path resolved against
+  *its* working directory, parsed by a parser built the same way startup's is
+  so `--desktopfile <name>` is not mistaken for a project), a pinned
+  `desktopFileName` tying the binary, the `.desktop` entry and the notifyrc
+  together, `Keywords=` for launcher search, a KNotification setup
+  (`ui/src/notify/`), and a metainfo `<developer>` block replacing the
+  deprecated `<developer_name>`.
+- **Attachments and jobs** — [plan 19](19-jobs-panel-and-attachment-durability.md)
+  itself, P1–P4: the Jobs panel filling the last `StubPanel`, a bounded chip
+  row, durable content-addressed attachment copies, a total send budget
+  enforced where frames are made, clipboard paste and raw-pixel drops, and
+  cache pruning with separate policies for derived and user data. The
+  frame-cap crash class is closed at four layers, and the UI now recovers from
+  a dropped core instead of ghost-running against one.
+- **Cowork hardening.** Every portal call is async (a wedged
+  `xdg-desktop-portal` can no longer stall the GUI thread), every response
+  waiter has a lifetime backstop, all four failure paths route through
+  `failPortalStep`, abandoned sessions are closed rather than orphaned, and
+  the desktop-wide a11y flip is crash-safe: originals are persisted before the
+  flip and replayed at a later startup, owned by exactly one PID.
 
 ## Architecture recap (why each item lands where it does)
 

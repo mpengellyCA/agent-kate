@@ -177,8 +177,9 @@ kill the core connection.
 
 - **P3 — stability hardening (fleet review, 2026-08-01).** ✅ **LANDED.** A
   6-slice adversarially-verified review of P1+P2 (every non-minor finding
-  independently re-derived by a skeptic before being acted on), then two fix
-  rounds, the second reviewed by a second fleet. What it changed:
+  independently re-derived by a skeptic before being acted on), then **fix
+  rounds 2–6** — each round re-reviewed by a fresh fleet, run across five
+  review workflows in one day. What it changed:
 
   **The frame-cap crash became a non-event at every layer.**
   - The core's IPC read loop (`core/internal/ipc/server.go`) no longer dies on
@@ -233,17 +234,64 @@ kill the core connection.
   missing-backend detected by D-Bus error *name*), and `failInjectQueue`
   closes the half-built session instead of leaking it.
 
-  **Deliberately deferred** (pre-existing, want their own pass): the blocking
-  `bus.call` on the GUI thread in `portalRequest`, and a11y flags restored
-  only in `~CoworkPortal`.
+  **Deferred at the end of round 2 — and closed by rounds 3–6.** Both were
+  written up here as pre-existing and wanting their own pass; the later rounds
+  gave them one:
+  - The blocking `bus.call` on the GUI thread is gone. Every portal method is
+    an `asyncCall` with a watcher, so a wedged or still-activating
+    `xdg-desktop-portal` cannot stall the UI. The single remaining synchronous
+    path is the restore-on-exit one (destructor / `aboutToQuit`), where an
+    async call would not outlive the process.
+  - A11y flags no longer depend on `~CoworkPortal`. `MainWindow` is
+    heap-allocated and never deleted, so the destructor does not run on a real
+    exit; `shutdownTeardown` (idempotent, reached from `aboutToQuit`) is the
+    path that does. And because the flip is desktop-wide state that outlives
+    the process, the pre-flip values are written to app config *before* the
+    flip and replayed shortly after a later startup — so a crash between flip
+    and restore no longer strands the user in screen-reader mode. The record
+    has exactly one owner (the PID it names): a second instance adopts the
+    parked originals without rewriting or deleting them, and a record whose
+    PID is a still-running foreign process is left alone.
+  - Alongside them, `PortalResponseWaiter` gained a lifetime backstop, so the
+    documented wedge — a portal that accepts the method call and then never
+    emits `Response` — resolves as "the portal will never answer" instead of
+    stranding a waiter and its signal match for the rest of the run.
+
+- **P4 — pixel input and cache lifetime** (the first two original non-goals).
+  ✅ **LANDED** during the rounds 2–6 sweep. Written up here rather than left
+  in Non-goals because the code shipped: the durability work made both cheap,
+  and having a durable image store with no sweep was the worse half of a fix.
+
+  - **Clipboard image paste.** The composer takes `Ctrl+V` with pixels on the
+    clipboard (`AgentPanel::handleComposerPaste`). File URLs win over pixels
+    when both are offered — a copy from a file manager keeps its name, origin
+    path and original encoding, and one image in the selection takes the whole
+    selection with it, since the mixed case is one intent.
+  - **Raw (non-file-URL) image drops.** `canAcceptDrop` now accepts pixels with
+    no file behind them — dragged out of a browser or straight off a capture
+    tool — and writes its own PNG for them.
+  - **`rawImageBeatsText` is the load-bearing part of both.** A selection
+    dragged or copied out of a spreadsheet or an editor carries a *rendered
+    bitmap* alongside its real text; taking the image would attach a picture of
+    the text the user meant to paste. So pixels only win when there is no
+    usable text form.
+  - **Pasted pixels are the only copy that exists**, so they do not go in the
+    cache: every attachment copy lives in one app-data store
+    (`attachmentStoreDir`), content-addressed, and `resolveAttachmentPath`
+    falls back to the legacy cache dir by basename for copies written before
+    the move.
+  - **Cache pruning** arrived with it: `pruneCacheDir` + a single delayed
+    startup sweep (`scheduleImageCachePrune`, armed from `MainWindow`). Two
+    storage classes, two policies — `PrunePolicy::Cache` for `tool-images`
+    (derived data; age alone may reclaim it, the tool can be re-run) and
+    `PrunePolicy::Durable` for the attachment store (user data; deleted only
+    when old *and* the dir is over its cap, so a screenshot pasted last year is
+    still the user's). Files touched in the last hour are never deleted —
+    they may be a chip about to be redrawn, or a `.tmp` another attach is
+    renaming into place.
 
 ## Non-goals
 
-- Clipboard image paste and raw (non-file-URL) image drops. Both are real gaps
-  — `canAcceptDrop` (`AgentPanel.cpp:3277-3294`) takes local-file URLs only and
-  there is no `QEvent::Paste` handler on the composer — but they are new input
-  features, not this fix.
-- Pruning the `tool-images` cache dir (nothing prunes it today either).
 - Surfacing orchestration workers in the Jobs panel: they are agents, and the
   roster already nests and badges them (plan 16 P5). Duplicating them here
   would blur "job" and "agent".
@@ -260,7 +308,11 @@ kill the core connection.
   deleted and is byte-identical; a truncated cache copy is repaired on
   re-attach; it never displaces `path` for a workspace file; text attachments
   get no copy; the total budget rejects with an actionable reason and
-  accumulates across calls; item excerpts are truncated and budgeted.
+  accumulates across calls; item excerpts are truncated and budgeted. P4 added:
+  pasted pixels land in the durable store and not the cache, identical pixels
+  pasted twice attach once, raw images share the same budget, and the four
+  prune cases (age sweep, size cap, the one-hour floor, and a durable dir
+  swept only when over cap).
 - `core/internal/ipc` — an oversize frame is survivable on the same
   connection (with and without a recoverable id), `frameID` refuses nested and
   probe-truncated ids, a 5 MiB frame round-trips byte-for-byte through the

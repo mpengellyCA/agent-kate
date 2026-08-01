@@ -120,7 +120,7 @@ Facts verified against the current tree; **bold** = phase that closes it.
 | Plan / todos | `TodoWrite` renders as generic tool row | ACP `plan` updates dropped | **P2** shared checklist card |
 | Subagents | `Task` tool = generic row (only `Workflow` got a monitor) | n/a | **P4** Task nesting à la WorkflowMonitor |
 | Background shells | `run_in_background` Bash / `BashOutput` = generic rows; no tray | n/a | **P4** background-jobs tray |
-| Turn stats | `result.num_turns`, final result text, `permission_denials`, per-model `modelUsage` dropped | ACP exposes no usage (verify against kimi ≥0.30) | **P2** |
+| Turn stats | `result.num_turns`, final result text, `permission_denials`, per-model `modelUsage` dropped | ACP exposes no usage — **superseded**, see the P2 note below: the 2026-08-01 sweep recovered it out of band | **P2** |
 | Init payload | `slash_commands`, `tools`, `agents`, `skills` from init event dropped | `available_commands_update` dropped | **P3** |
 | Non-text tool results | image blocks dropped by `toolResultText` | same path | **P4** |
 
@@ -202,9 +202,29 @@ Facts verified against the real binaries while implementing:
   This ANSWERS P3's "kimi approval-mode investigation": map "when to ask" to
   the `mode` config option. All three are persisted UI-side (KConfig
   `Agent/kimiOpt-<id>`) from the init event for P3 to consume.
-- kimi 0.30 exposes no usage accounting (prompt response carries only
-  stopReason) — the gap-list "verify against kimi ≥0.30" is settled: no
-  usage for kimi until upstream adds it.
+- kimi 0.30 exposes no usage accounting *in the protocol* (prompt response
+  carries only stopReason) — the gap-list "verify against kimi ≥0.30" is
+  settled for ACP.
+
+  **Corrected 2026-08-01 (rounds 2–6 sweep):** "no usage for kimi until
+  upstream adds it" was wrong about the *CLI*, only right about the protocol.
+  Kimi answers `/usage` locally — no inference, nothing billed — with a
+  human-readable block, and `core/internal/kimi/usage.go` recovers a context
+  readout from it by pattern. Every pattern is optional and independently
+  matched (a `used / window` fraction first, then a window line, a used/total
+  line, an output line, a bare percentage last), so an unrecognised layout
+  yields *no* usage rather than a wrong number and the context meter simply
+  stays empty. `refreshUsage` runs the probe silently after every completed
+  turn (and again right after a compaction, since the context just shrank),
+  gated on the CLI actually advertising `/usage` — a CLI without it would
+  treat the string as a prompt and burn a real turn. The readout is published
+  as a `_usage` event carrying the same `usage` + `modelUsage`
+  (with `contextWindow`) blocks the UI already reads off a claude `result`, so
+  P5's context-fill meter needed no second code path.
+
+  `Capabilities.UsageReporting` still reads false for kimi, and correctly: it
+  means "tokens/cost in result events", which ACP genuinely does not carry.
+  The readout arrives out of band.
 - claude result event: `modelUsage` is camelCase per model and includes
   `contextWindow` — the honest denominator for P5's context-fill meter;
   `num_turns`/`modelUsage` are session-cumulative snapshots (latest wins),
@@ -279,7 +299,10 @@ indicator.
 header/roster subtitle + a fuller line in the Agent Activity inspector; the
 denominator is modelUsage.contextWindow from the result event — the P2
 discovery — attributed to whichever model carries the main conversation;
-kimi reports no usage, so it honestly shows nothing there). Per-tool token
+kimi reported no usage at the time, so it honestly showed nothing there —
+**since the 2026-08-01 rounds 2–6 sweep it does**, from the `/usage` probe
+described in the P2 correction, through the same `modelUsage.contextWindow`
+denominator). Per-tool token
 spend in the inspector ("by tool: Read ×12 ~48k tok …"), computed
 client-side from the same events the core's toolMeter observes — no new RPC
 was needed; the core meters stay slog-only (P6 may expose them by RPC if
@@ -352,5 +375,26 @@ old branch as a third harness; else document what it's still missing.
   good parts.
 - A generic "any ACP agent" backend (Gemini CLI etc.) — the registry makes it
   *possible* later; certifying arbitrary agents is out of scope here.
-- Kimi compaction/fork — kimi has no session-fork or summary-seed primitive;
-  these stay honestly capability-gated rather than emulated.
+- Kimi fork — kimi has no session-fork primitive; it stays honestly
+  capability-gated rather than emulated.
+
+- ~~Kimi compaction~~ — **superseded by the 2026-08-01 rounds 2–6 sweep.**
+  This said kimi had no summary-seed primitive and so could not compact at
+  all. Half of that was right, and the split now lives in the capability
+  registry as two flags instead of one:
+  - `Compaction: true` for kimi. `/compact` sent as ordinary prompt text is
+    intercepted by the CLI and performs a real in-session compaction (probed
+    on 0.30.0). Hot compaction was always available; nobody had tried it.
+  - `ColdCompact: false`. There is no `kimi --resume --print` to run a dormant
+    pass with, and kimi's on-disk store is its own wire format rather than the
+    claude transcript `session.ReadTranscript` parses. A cold pass here would
+    read nothing, store a summary of nothing, and make the next resume seed a
+    fresh session from it — silently discarding the thread's history.
+  - The one outcome `Harness.Compact`'s signature cannot express — compaction
+    succeeded but produced no summary text to store — is reported as
+    `ErrCompactedInPlace`. The context really is smaller and survives resume;
+    there is simply nothing for the core to keep.
+
+  The registry change is mirrored in `ui/src/state/HarnessTraits` (the
+  LOCKSTEP pair), so the UI offers hot compaction on kimi and refuses the cold
+  path with a reason rather than a blanket "not supported".
