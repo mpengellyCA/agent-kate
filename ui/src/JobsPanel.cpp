@@ -56,13 +56,16 @@ QString kindLabel(AgentJob::Kind kind)
 }
 
 // elapsedText renders a duration coarsely — a background job's age is read at a
-// glance, and a ticking seconds counter would be noise.
-QString elapsedText(qint64 startedMs)
+// glance, and a ticking seconds counter would be noise. endedMs is the job's
+// finish stamp, or 0 for work still running (measure against now).
+QString elapsedText(qint64 startedMs, qint64 endedMs = 0)
 {
     if (startedMs <= 0) {
         return QString();
     }
-    const qint64 secs = (QDateTime::currentMSecsSinceEpoch() - startedMs) / 1000;
+    const qint64 until = endedMs > 0 ? endedMs : QDateTime::currentMSecsSinceEpoch();
+    // A clock step or an out-of-order stamp must not render as a negative age.
+    const qint64 secs = std::max<qint64>(0, until - startedMs) / 1000;
     if (secs < 60) {
         return i18nc("job age in seconds", "%1s", secs);
     }
@@ -263,7 +266,13 @@ void JobsPanel::rebuild()
             if (a.done != b.done) {
                 return !a.done;
             }
-            return a.startedMs > b.startedMs;
+            if (a.startedMs != b.startedMs) {
+                return a.startedMs > b.startedMs;
+            }
+            // Same-millisecond starts are common (a turn launching several
+            // shells at once) and std::sort is not stable, so without a total
+            // order those rows would swap places on every rebuild.
+            return a.id < b.id;
         });
 
         int groupRunning = 0;
@@ -300,10 +309,15 @@ void JobsPanel::rebuild()
                          job.failed ? i18nc("job state", "Failed")
                                     : (job.done ? i18nc("job state", "Done")
                                                 : i18nc("job state", "Running")));
-            // Elapsed is age-since-start, and no finish time is published — so
-            // for a done row it would keep growing after the job stopped and
-            // report a 4 s job as "2h 0m" on a panel left open.
-            row->setText(ColElapsed, job.done ? QString() : elapsedText(job.startedMs));
+            // A finished row shows the run's true duration; a running one its
+            // age so far. A terminal job with no end stamp (never observed
+            // finishing) draws nothing rather than an age that would keep
+            // growing after the work stopped — a 4 s job as "2h 0m".
+            row->setText(ColElapsed,
+                         job.done ? (job.endedMs > 0
+                                         ? elapsedText(job.startedMs, job.endedMs)
+                                         : QString())
+                                  : elapsedText(job.startedMs));
             row->setData(ColJob, kRoleThread, thread);
             row->setData(ColJob, kRoleJobId, job.id);
             row->setData(ColJob, kRoleKind, static_cast<int>(job.kind));

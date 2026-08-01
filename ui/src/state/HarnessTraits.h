@@ -25,7 +25,16 @@ struct HarnessTraits {
     QString badge; // roster subtitle prefix; empty = the unmarked default engine
 
     bool fork = false;
+    // Compaction splits in two, exactly as the core's Capabilities does (see
+    // core/internal/harness/harness.go). compaction: the thread can be
+    // compacted at all — it gates the strategy/status RPCs and the HOT
+    // (in-session) mechanism. coldCompact: the harness can also compact a
+    // DORMANT thread and hand back summary text. Kimi has the first and not
+    // the second, so every flow that produces a summary before the session is
+    // live — the pre-resume recovery prompt, the cold "Summarize now" entries —
+    // must gate on coldCompact, or it offers choices the core refuses.
     bool compaction = false;
+    bool coldCompact = false;
     bool promote = false;
     bool providerRouting = false;
     bool cowork = false;
@@ -47,6 +56,11 @@ struct HarnessTraits {
     bool fallbackModels = false;  // ordered model fallbacks
     bool disallowedTools = false; // per-session tool deny-list
     bool addDirs = false;         // extra reachable directories
+    // The control-channel sweep. strictMcpConfig: the thread can be isolated
+    // from the human's globally-configured MCP servers. costBudget: the engine
+    // enforces a per-session spend ceiling itself.
+    bool strictMcpConfig = false;
+    bool costBudget = false;
     // subagentTranscripts: the engine writes a per-subagent conversation file
     // the UI can tail (the panel's "Helpers" menu).
     bool subagentTranscripts = false;
@@ -57,6 +71,14 @@ struct HarnessTraits {
     // optionKey().
     QStringList permissionModes;
     QStringList efforts;
+
+    // The mode a picker lands on when nothing has been chosen yet.
+    // permissionModes is the engine's own wire vocabulary in the CLI's order,
+    // so its first entry is whatever that engine happens to list first — never
+    // a UI default. Prefers "acceptEdits", then "default", then the first
+    // listed, so a reordering upstream cannot silently re-arm a different
+    // supervision level for fresh profiles.
+    QString defaultPermissionMode() const;
 
     // Per-harness KConfig keys, [Agent] group. The default engine keeps its
     // historical key names so existing settings survive; other harnesses get
@@ -69,6 +91,11 @@ struct HarnessTraits {
     // but expose different models — so the model list can't share the
     // per-harness optionKey(). An empty providerId is the direct sentinel.
     QString modelCacheKey(const QString &providerId) const;
+    // Sibling of modelCacheKey holding each model's supported reasoning-effort
+    // tiers ("value|low,medium"), as reported by the engine's model discovery.
+    // Separate from the catalogue entry so the "value|name" picker format —
+    // which several callers split on — stays exactly as it was.
+    QString modelEffortsKey(const QString &providerId) const;
 };
 
 // HarnessRegistry holds the traits for every harness the core registered,
@@ -111,6 +138,11 @@ public:
     // Cached model choices for a harness + provider (providerId empty = direct),
     // recommended group first. Empty lists when nothing has been discovered yet.
     ModelChoices modelChoices(const QString &harnessId, const QString &providerId) const;
+    // The reasoning-effort tiers one model supports, as last discovered. An
+    // EMPTY list means the engine said nothing about this model and every tier
+    // in the harness vocabulary is offered — it never means "no tiers".
+    QStringList modelEfforts(const QString &harnessId, const QString &providerId,
+                             const QString &modelValue) const;
     // Persist a configOptions array (the init-event / agent.discoverOptions
     // shape) to the harness's per-option KConfig keys — the single writer for
     // the discovered "value|name" enumerations.

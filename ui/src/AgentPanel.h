@@ -29,6 +29,7 @@ class QDragLeaveEvent;
 class QDragMoveEvent;
 class QDropEvent;
 class QEvent;
+class QImage;
 class QMimeData;
 class QPaintEvent;
 class QFrame;
@@ -133,7 +134,9 @@ public:
     void refreshSubagentMenu(QMenu *menu);
     void preselectLaunchOptions(const QStringList &fallbackModels,
                                 const QStringList &disallowedTools,
-                                const QStringList &addDirs);
+                                const QStringList &addDirs,
+                                bool strictMcpConfig = false,
+                                double maxBudgetUsd = 0.0);
     // Pre-fill the composer with a first task (the user still presses Start/Send).
     void setComposerText(const QString &text);
 
@@ -167,6 +170,11 @@ public:
     // become a text excerpt named "file:start-end"; whole-file items defer to
     // attachPaths. Used by drops carrying line ranges from the search results.
     void attachItems(const QJsonArray &items);
+
+    // Attach raw images — pixels with no file behind them: a clipboard paste
+    // (Ctrl+V after a Spectacle capture) or a drag out of a browser. They are
+    // encoded to PNG and stored durably — that copy is the only copy there is.
+    void attachImages(const QList<QImage> &images);
 
     // Has a thread id but no live process — resumable (vs isRunning()).
     bool isDormant() const { return m_dormant; }
@@ -247,6 +255,10 @@ private:
     // True when a drag carries our custom attachment MIME or at least one
     // local-file URL — used to reject pure-text/remote drags.
     bool canAcceptDrop(const QMimeData *mime) const;
+    // Take over a composer paste/drop that carries an image (pixels, or image
+    // file URLs) and attach it instead of inserting text. Returns false for
+    // everything else, which the composer then pastes exactly as before.
+    bool handleComposerPaste(const QMimeData *source);
     // One clarifying question currently shown to the human.
     struct QuestionField {
         QString question;
@@ -287,6 +299,56 @@ private:
     void showAttachNotice(const QString &text);
     void onNotification(const QString &method, const QJsonObject &params);
     void renderEvent(const QJsonObject &event);
+    // --- claude stream channel (--include-partial-messages) ----------------
+    // One `stream_event`: the raw Anthropic SSE envelope the CLI forwards.
+    // Text deltas paint a provisional message row, thinking deltas drive the
+    // working indicator; the authoritative `assistant` event that follows
+    // REPLACES the provisional rows via takeStreamedTextKey().
+    void renderStreamEvent(const QJsonObject &inner);
+    // Push every pending block's accumulated text into its row. Called from a
+    // short coalescing timer so a fast token stream costs one repaint per tick
+    // per row rather than one per token.
+    void flushStreamedText();
+    // Render one finished text block's accumulated Markdown into its row — the
+    // single markdownToHtml call a streamed message pays, replacing the escaped
+    // plain text the flush ticks painted. Takes the SSE content-block index
+    // (m_streamBlocks' key); a no-op for an unknown one.
+    void settleStreamBlock(int blockIndex);
+    // The next provisional text row this turn opened, or -1 once they are all
+    // claimed. The assistant branch consumes them in block order so streamed
+    // text is overwritten in place instead of duplicated.
+    int takeStreamedTextKey();
+    // Drop all provisional-row state (turn ended, interrupted, thread rebound).
+    void resetStreamState();
+    // --- forwarded subagent text (--forward-subagent-text) -----------------
+    // Text an event carries under a parent_tool_use_id belongs to a helper, not
+    // to this agent: it streams into the Task tool row that launched it, which
+    // is where the subagent's work already lives in the feed. Returns true when
+    // the event was consumed and must not render as the agent's own message.
+    bool routeSubagentText(const QJsonObject &ev, const QString &parentToolUseId);
+    // Paint every helper whose forwarded text changed since the last tick. Runs
+    // off the same 50ms coalescer the agent's own text deltas use — a helper
+    // streams just as fast, and repainting its row per token cost one model
+    // mutation (and one row re-layout) per token.
+    void flushSubagentText();
+    // --- system-event subtypes ---------------------------------------------
+    // Dispatch one `system` event that is not init and not a task-lifecycle
+    // report. Every subtype is shown, folded into state, or deliberately
+    // silent — there is no "unhandled" outcome, hence no return value.
+    void renderSystemSubtype(const QString &subtype, const QJsonObject &ev);
+    // Replace the composer's autocomplete feed. Shared by the init event and by
+    // the `commands_changed` system event, which carries the same array.
+    void seedSlashCommands(const QJsonArray &commands);
+    // Point the model picker at what the CLI says it is now running (a fallback
+    // switched models under us). Never pushes the change back to the CLI.
+    void adoptModel(const QString &modelId);
+    // Fold one rate_limit_event into the header chip, noting only TRANSITIONS
+    // in the feed — the CLI emits one of these every turn.
+    void applyRateLimit(const QJsonObject &info);
+    // Drive the mode/model/thinking pickers to the values a kimi `_options`
+    // event reports, for each id it lists as changed.
+    void adoptDiscoveredOptions(const QJsonArray &configOptions,
+                                const QJsonArray &changed);
     void onPermissionRequested(const QJsonObject &params);
     // Desktop access, toggled while the agent exists: the core switches the
     // thread's Cowork tools on or off in place (or re-attaches the session on an
@@ -399,6 +461,12 @@ private:
     // options), restoring the per-backend sticky choice.
     void rebuildModeCombo();
     void rebuildEffortCombo();
+    // Grey out the thinking-effort tiers the selected model cannot run, from
+    // the per-model effort support the engine reported with its model catalogue.
+    void applyModelEffortSupport();
+    // The header's "ctx N%" tooltip: total fill plus, when the engine reported
+    // one, the per-category breakdown of where the window went.
+    QString contextTooltip() const;
     // Apply a model / effort / permission-mode change to the RUNNING agent via
     // agent.setOption (mid-session); a no-op before start or while dormant —
     // those apply at the next (re)start through the normal launch params.
@@ -470,6 +538,11 @@ private:
     // their chips after a resume. Cleared once replay finishes.
     QJsonArray m_replayAttachTurns;
     bool m_dragActive = false; // an acceptable drag is hovering the panel
+    // Reasons the attach builders refused something during the CURRENT paste or
+    // drop. Reset by that handler, added to by every attach* helper it calls, so
+    // "nothing was added" can be told apart from "nothing was offered" — a paste
+    // of a deleted file's URL adds nothing and must still say so.
+    int m_attachSkipped = 0;
 
     // Running per-session usage totals, accumulated from each `result` event's
     // top-level usage block. Surfaced as a compact suffix on the header
@@ -491,14 +564,61 @@ private:
     QToolButton *m_jumpBtn = nullptr;
     bool m_jumpUnread = false; // a card arrived while detached from the bottom
     QHash<QString, int> m_toolRows; // tool_use id -> stable transcript key
+    // --- token-by-token streaming state ------------------------------------
+    // One in-flight content block of the message currently streaming. Text
+    // blocks own a provisional transcript row; a thinking block owns none (its
+    // deltas drive the working indicator) and so keeps key == -1.
+    struct StreamBlock {
+        int key = -1;      // provisional message row, -1 for a non-text block
+        QString text;      // accumulated deltas
+        bool dirty = false; // text changed since the last flush
+        bool thinking = false;
+        // The row holds the real Markdown render, not the escaped plain text
+        // the flush ticks paint. Set by settleStreamBlock().
+        bool settled = false;
+    };
+    // Keyed by the SSE content-block index, which is unique within the message
+    // being streamed; message_start clears the map, so indices never collide
+    // across messages.
+    QHash<int, StreamBlock> m_streamBlocks;
+    // Provisional text-row keys in block order, and how many the authoritative
+    // `assistant` event has claimed so far.
+    QList<int> m_streamTextKeys;
+    int m_streamClaimed = 0;
+    QTimer *m_streamFlush = nullptr; // coalesces delta repaints
+    // Latest thinking text of the current block, shown on the working line.
+    QString m_streamThinking;
+    // --- forwarded subagent text -------------------------------------------
+    // One helper's forwarded output, accumulated so its Task tool row can show
+    // it growing. Bounded WITHOUT re-trimming per delta: the accumulation is
+    // allowed to run to twice the shown cap before it is cut back, so a token
+    // costs an append, not two copies of the whole tail.
+    struct SubagentText {
+        QString text;         // the tail kept in RAM (see kSubagentTrimAt)
+        bool trimmed = false; // earlier output was dropped → shown with a leading "…"
+        bool dirty = false;   // has unpainted text; painted by the flush tick
+        int rowKey = -1;      // the Task tool row it paints into (-1 = none visible)
+    };
+    // parent_tool_use_id -> that helper's forwarded text.
+    QHash<QString, SubagentText> m_subagent;
+    // --- rate limit readout -------------------------------------------------
+    QString m_rateLimitStatus;   // "allowed" / "allowed_warning" / "rejected" / …
+    QString m_rateLimitType;     // e.g. "five_hour"
+    QString m_rateLimitResets;   // pre-formatted local time, empty when unknown
+    bool m_rateLimitOverage = false;
     // Stable key of the plan checklist card (-1 = none yet). Each TodoWrite /
     // ACP plan update rewrites this one card in place, so the feed carries the
     // current plan rather than a trail of stale copies.
     int m_checklistKey = -1;
-    // The harness's slash commands (name, description) feeding the composer's
-    // autocomplete; descriptions are empty for claude (the init event lists
-    // names only).
-    QList<QPair<QString, QString>> m_slashCommands;
+    // One harness slash command feeding the composer's autocomplete. `hint` is
+    // the argument hint kimi reports ("<branch>"); claude's init event lists
+    // names only, so both other fields are empty there.
+    struct SlashCommand {
+        QString name;
+        QString description;
+        QString hint;
+    };
+    QList<SlashCommand> m_slashCommands;
     QListWidget *m_slashPopup = nullptr;
     // One background task (shell or async subagent) reported by the CLI. The
     // tray's chips are rebuilt from this map rather than stored on it: chips now
@@ -510,6 +630,7 @@ private:
         QString taskType;    // "local_bash" | agent kinds
         QString outputFile;  // parsed from the tool result / task_notification
         qint64 startedMs = 0;
+        qint64 endedMs = 0;  // stamped on the first terminal report; 0 = running
         bool done = false;
         bool failed = false; // done with a non-"completed" status, or killed with the agent
         bool noted = false;  // terminal summary already added to the feed (emit once)
@@ -546,6 +667,12 @@ private:
     // CLI-reported per-turn wall times, shown on the working indicator.
     qlonglong m_ctxPromptTokens = 0;
     qlonglong m_ctxWindow = 0;
+    // m_ctxExact: the fill above came from the engine's own context accounting
+    // (a `_context` event) rather than the result-event estimate, so the
+    // estimate must stop overwriting it. m_ctxBreakdown is that reading's
+    // per-category split ([{label, tokens}]), shown in the header tooltip.
+    bool m_ctxExact = false;
+    QJsonArray m_ctxBreakdown;
     qlonglong m_turnDurTotalMs = 0;
     int m_turnDurCount = 0;
     // Permission countdown: the broker denies after its timeout; the bar
@@ -567,6 +694,10 @@ private:
     // artifacts, which carry no start time, so the job row's Elapsed would
     // otherwise be blank for the longest-running job on the panel.
     qint64 m_workflowStartedMs = 0;
+    // When the monitor was FIRST seen in a terminal state. The artifacts carry
+    // no finish time either, so this is the only end stamp the row can have;
+    // observed rather than reported, hence latched once.
+    qint64 m_workflowEndedMs = 0;
     // "Clear finished" suppressing a terminal workflow row. The row is
     // synthesized from the monitor on every publish rather than stored in
     // m_bgJobs, so there is no record to erase — only a flag, cleared by the
@@ -615,6 +746,10 @@ private:
     QStringList m_fallbackModels;
     QStringList m_disallowedTools;
     QStringList m_addDirs;
+    // The control-channel launch sweep: isolate from the human's global MCP
+    // servers, and a CLI-enforced spend ceiling for the session (0 = uncapped).
+    bool m_strictMcpConfig = false;
+    double m_maxBudgetUsd = 0.0;
     QToolButton *m_subagentsBtn = nullptr; // "Helpers ▾" — subagent transcripts
     QCheckBox *m_coworkCheck = nullptr; // this agent's Cowork desktop tools (switchable mid-session)
     bool m_syncingCowork = false;       // guards the toggle handler while we mirror core state

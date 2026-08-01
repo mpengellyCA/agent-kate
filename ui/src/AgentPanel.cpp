@@ -2,6 +2,7 @@
 #include "AgentCardDelegate.h"
 #include "AgentChatHelpers.h"
 #include "AttachmentBuilder.h"
+#include "SafeContent.h"
 #include "ImageView.h"
 #include "ProviderConfig.h"
 #include "SubAgentTranscriptDialog.h"
@@ -22,7 +23,6 @@
 #include <QAbstractButton>
 #include <QClipboard>
 #include <QCryptographicHash>
-#include <QDesktopServices>
 #include <QGuiApplication>
 #include <QLineEdit>
 #include <QLocale>
@@ -51,6 +51,7 @@
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QIcon>
+#include <QImage>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonDocument>
@@ -70,15 +71,21 @@
 #include <QAbstractItemView>
 #include <QScrollBar>
 #include <QSignalBlocker>
+#include <QStandardItemModel>
 #include <QStyleOptionViewItem>
+#include <QStyledItemDelegate>
 #include <QMenu>
 #include <QMessageBox>
 #include <QPointer>
 #include <QTextDocument>
 #include <QTimer>
 #include <QToolButton>
+#include <QVariant>
 #include <QVBoxLayout>
 #include <QWidgetAction>
+
+#include <functional>
+#include <utility>
 
 namespace {
 // Custom drag MIME carrying per-hit line ranges, mirrored in SearchPanel.cpp.
@@ -124,6 +131,147 @@ bool isDark(const QWidget *w)
     return w->palette().color(QPalette::Base).lightness() < 128;
 }
 
+// The suffixes AttachmentBuilder recognises as images. Used only to decide
+// whether a pasted/dropped FILE is worth routing as an image attachment; the
+// builder still owns the media-type mapping and every size check.
+bool isImagePath(const QString &path)
+{
+    static const QSet<QString> exts{
+        QStringLiteral("png"),  QStringLiteral("jpg"), QStringLiteral("jpeg"),
+        QStringLiteral("gif"),  QStringLiteral("webp"), QStringLiteral("bmp")};
+    return exts.contains(QFileInfo(path).suffix().toLower());
+}
+
+// True when a paste/drag carries an image at all: pixels (a Spectacle capture,
+// an image dragged out of a browser — no file exists anywhere) or image files
+// by URL. Deliberately not "hasUrls", so pasting a text file's URL still pastes.
+bool mimeHasImagePayload(const QMimeData *mime)
+{
+    if (!mime) {
+        return false;
+    }
+    if (mime->hasImage()) {
+        return true;
+    }
+    const auto urls = mime->urls();
+    for (const QUrl &u : urls) {
+        if (u.isLocalFile() && isImagePath(u.toLocalFile())) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// rawImageBeatsText decides, for a clipboard offering BOTH pixels and text,
+// which one the user meant. Offering both is the norm, not the exception:
+// LibreOffice, most office suites and most drawing apps put a rendered bitmap of
+// the selection next to its real text form, so treating hasImage() as decisive
+// swallows the text — a copied cell range pastes as a picture of itself.
+//
+// The image wins only when the text cannot be the payload: empty, or the single
+// URL/path token a browser puts alongside a right-click-Copy-Image. Anything
+// with a line break or internal whitespace is real text and pastes as text.
+bool rawImageBeatsText(const QMimeData *mime)
+{
+    if (!mime->hasText()) {
+        return true;
+    }
+    const QString text = mime->text().trimmed();
+    if (text.isEmpty()) {
+        return true;
+    }
+    for (const QChar c : text) {
+        if (c.isSpace()) { // covers the line breaks of a multi-line copy too
+            return false;
+        }
+    }
+    if (text.startsWith(QLatin1Char('/'))) {
+        return true; // a bare absolute path, as a file manager offers alongside
+    }
+    // A known scheme only. "Any scheme longer than one character" made every
+    // colon-bearing token a URL, so a single spreadsheet cell holding "ratio:16"
+    // pasted as a picture of itself.
+    static const QSet<QString> kUrlSchemes{
+        QStringLiteral("http"),  QStringLiteral("https"), QStringLiteral("file"),
+        QStringLiteral("ftp"),   QStringLiteral("sftp"),  QStringLiteral("data")};
+    return kUrlSchemes.contains(QUrl(text).scheme());
+}
+
+// ComposerEdit is the chat input. QPlainTextEdit pastes an image as its text
+// form — which for pixels is nothing at all, and for an image file is a path
+// dumped into the message — so a paste carrying an image is handed to the panel
+// to attach instead. The handler returns false for everything it does not take,
+// and that falls through to the base class, so text paste is untouched.
+// No Q_OBJECT: it has no signals or slots, and this TU is not moc'd for it.
+class ComposerEdit : public QPlainTextEdit
+{
+public:
+    using QPlainTextEdit::QPlainTextEdit;
+
+    void setImageHandler(std::function<bool(const QMimeData *)> handler)
+    {
+        m_handler = std::move(handler);
+    }
+
+protected:
+    bool canInsertFromMimeData(const QMimeData *source) const override
+    {
+        return mimeHasImagePayload(source)
+            || QPlainTextEdit::canInsertFromMimeData(source);
+    }
+
+    void insertFromMimeData(const QMimeData *source) override
+    {
+        if (m_handler && m_handler(source)) {
+            return;
+        }
+        QPlainTextEdit::insertFromMimeData(source);
+    }
+
+private:
+    std::function<bool(const QMimeData *)> m_handler;
+};
+
+// Role carrying a slash command's argument hint on its popup item.
+constexpr int kSlashHintRole = Qt::UserRole + 1;
+
+// SlashItemDelegate paints the autocomplete row's argument hint ("<branch>")
+// after the command in the disabled text colour, so the part the user still has
+// to supply reads as a placeholder rather than as part of the command name.
+// QListWidget items are plain text — hence a delegate rather than rich text.
+class SlashItemDelegate : public QStyledItemDelegate
+{
+public:
+    using QStyledItemDelegate::QStyledItemDelegate;
+
+protected:
+    void paint(QPainter *painter, const QStyleOptionViewItem &option,
+               const QModelIndex &index) const override
+    {
+        const QString hint = index.data(kSlashHintRole).toString();
+        if (hint.isEmpty()) {
+            QStyledItemDelegate::paint(painter, option, index);
+            return;
+        }
+        // Draw the row normally, then the hint in the leftover width. The main
+        // text is elided to make room, so a long description never overpaints
+        // the hint or vice versa.
+        QStyleOptionViewItem opt = option;
+        initStyleOption(&opt, index);
+        const int hintW = opt.fontMetrics.horizontalAdvance(hint)
+            + opt.fontMetrics.horizontalAdvance(QLatin1Char(' '));
+        QStyleOptionViewItem main = opt;
+        main.rect.setRight(qMax(main.rect.left(), main.rect.right() - hintW));
+        QStyledItemDelegate::paint(painter, main, index);
+
+        painter->save();
+        painter->setPen(opt.palette.color(QPalette::Disabled, QPalette::Text));
+        painter->drawText(QRect(main.rect.right(), opt.rect.top(), hintW, opt.rect.height()),
+                          Qt::AlignVCenter | Qt::AlignRight, hint);
+        painter->restore();
+    }
+};
+
 // (Note colouring now lives in TranscriptDelegate, which paints the feed —
 // see noteColor() there.)
 //
@@ -140,6 +288,27 @@ void clearLayout(QLayout *layout)
         }
         delete item;
     }
+}
+
+// compactionOutcome renders an agent.compactNow reply as one line of feed text.
+// Every call site shares it so no future one drifts back into claiming a turn
+// count that does not exist: an engine that rewrites its own context in place
+// stores NO summary, so it has no turns and no body to report, and printing
+// "(0 turns, 0 bytes)" would read as a no-op rather than a success. The core's
+// `compactedInPlace` flag is what tells the two apart.
+QString compactionOutcome(const QJsonObject &res)
+{
+    if (res.value(QStringLiteral("compactedInPlace")).toBool()) {
+        return i18n("compacted in place — same session, no summary stored.");
+    }
+    const int turns = res.value(QStringLiteral("turns")).toInt();
+    const int bytes = res.value(QStringLiteral("bodyBytes")).toInt();
+    const QString strategy =
+        res.value(QStringLiteral("strategy")).toString().toHtmlEscaped();
+    if (strategy.isEmpty()) {
+        return i18n("compacted (%1 turns, %2 bytes).", turns, bytes);
+    }
+    return i18n("compacted via %1 (%2 turns, %3 bytes).", strategy, turns, bytes);
 }
 } // namespace
 
@@ -399,9 +568,12 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
                 editor->setFocus(Qt::MouseFocusReason);
             });
     connect(m_delegate, &TranscriptDelegate::anchorActivated, this,
-            [](const QString &href) {
+            [this](const QString &href) {
                 if (!href.isEmpty()) {
-                    QDesktopServices::openUrl(QUrl(href));
+                    // Model-authored href: scheme policy, not the OS handler
+                    // (audit F14). The link text the human clicked is not
+                    // evidence of where it goes.
+                    agentkate::openModelLink(this, QUrl(href));
                 }
             });
     // A click on an attachment chip under a You message opens that file.
@@ -513,7 +685,12 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     promoteLayout->addWidget(promoteLabel, 1);
     promoteLayout->addWidget(m_promoteBtn);
 
-    m_input = new QPlainTextEdit(this);
+    auto *composer = new ComposerEdit(this);
+    // Ctrl+V with a screenshot on the clipboard attaches it rather than pasting
+    // an empty string; text paste is unaffected (see ComposerEdit).
+    composer->setImageHandler(
+        [this](const QMimeData *source) { return handleComposerPaste(source); });
+    m_input = composer;
     m_input->setFixedHeight(94);
     m_input->installEventFilter(this); // for the configurable send key
     // QPlainTextEdit delivers drops to its viewport and would otherwise insert
@@ -527,6 +704,15 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     m_draftTimer->setSingleShot(true);
     m_draftTimer->setInterval(400);
     connect(m_draftTimer, &QTimer::timeout, this, &AgentPanel::saveDraft);
+
+    // Token-by-token text arrives one delta at a time; the feed is virtualized
+    // and each row change costs a re-measure, so deltas accumulate in
+    // m_streamBlocks and land on their rows on this tick. 50 ms reads as
+    // continuous typing while capping a fast stream at 20 repaints a second.
+    m_streamFlush = new QTimer(this);
+    m_streamFlush->setSingleShot(true);
+    m_streamFlush->setInterval(50);
+    connect(m_streamFlush, &QTimer::timeout, this, &AgentPanel::flushStreamedText);
     connect(m_input, &QPlainTextEdit::textChanged, this, [this] {
         m_draftTimer->start();
         updateSlashPopup();
@@ -541,6 +727,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     m_slashPopup->setSelectionMode(QAbstractItemView::SingleSelection);
     m_slashPopup->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     m_slashPopup->setFocusPolicy(Qt::NoFocus); // keys stay in the composer
+    m_slashPopup->setItemDelegate(new SlashItemDelegate(m_slashPopup));
     connect(m_slashPopup, &QListWidget::itemClicked, this,
             [this](QListWidgetItem *) { acceptSlashCompletion(); });
 
@@ -600,9 +787,10 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
         const QString mode = m_modeCombo->currentData().toString();
         // Sticky per harness: the last choice becomes the default for the next
         // agent — except the auto-approve-everything choices (claude's
-        // bypassPermissions, kimi's yolo), which are never re-armed
+        // bypassPermissions and dontAsk, kimi's yolo), which are never re-armed
         // accidentally on the next conversation.
-        if (mode != QLatin1String("bypassPermissions") && mode != QLatin1String("yolo")) {
+        if (mode != QLatin1String("bypassPermissions") && mode != QLatin1String("dontAsk")
+            && mode != QLatin1String("yolo")) {
             KSharedConfig::openConfig()
                 ->group(QStringLiteral("Agent"))
                 .writeEntry(currentTraits().stickyModeKey(), mode);
@@ -723,6 +911,8 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
                 .writeEntry("model", m_modelCombo->currentData().toString());
         }
         maybePushOption(QStringLiteral("model"), currentModel());
+        // A different model may support a different set of thinking efforts.
+        applyModelEffortSupport();
     });
     rebuildModelCombo();
 
@@ -1070,6 +1260,10 @@ AgentPanel::~AgentPanel()
 void AgentPanel::setWorkspace(const QString &path)
 {
     m_workspace = path;
+    // Rendered transcript content may show images from this project (plus the
+    // attachment store, which is always allowed) and from nowhere else — see
+    // SafeContent, audit F15.
+    agentkate::allowMediaRoot(path);
     restoreDraft(); // recover an unsent composer draft for this workspace/thread
     refresh();
 }
@@ -1216,7 +1410,8 @@ void AgentPanel::refreshSubagentMenu(QMenu *menu)
 
 void AgentPanel::preselectLaunchOptions(const QStringList &fallbackModels,
                                         const QStringList &disallowedTools,
-                                        const QStringList &addDirs)
+                                        const QStringList &addDirs,
+                                        bool strictMcpConfig, double maxBudgetUsd)
 {
     if (!m_threadId.isEmpty()) {
         return; // the CLI is already running; these are launch-time only
@@ -1224,6 +1419,8 @@ void AgentPanel::preselectLaunchOptions(const QStringList &fallbackModels,
     m_fallbackModels = fallbackModels;
     m_disallowedTools = disallowedTools;
     m_addDirs = addDirs;
+    m_strictMcpConfig = strictMcpConfig;
+    m_maxBudgetUsd = maxBudgetUsd;
 }
 
 void AgentPanel::preselectEffort(const QString &effort)
@@ -1264,14 +1461,17 @@ void AgentPanel::updateSlashPopup()
     const QString prefix = text.mid(1);
     m_slashPopup->clear();
     for (const auto &cmd : std::as_const(m_slashCommands)) {
-        if (!cmd.first.startsWith(prefix, Qt::CaseInsensitive)) {
+        if (!cmd.name.startsWith(prefix, Qt::CaseInsensitive)) {
             continue;
         }
-        const QString label = cmd.second.isEmpty()
-            ? QStringLiteral("/") + cmd.first
-            : QStringLiteral("/%1 — %2").arg(cmd.first, cmd.second);
+        const QString label = cmd.description.isEmpty()
+            ? QStringLiteral("/") + cmd.name
+            : QStringLiteral("/%1 — %2").arg(cmd.name, cmd.description);
         auto *item = new QListWidgetItem(label, m_slashPopup);
-        item->setData(Qt::UserRole, cmd.first);
+        item->setData(Qt::UserRole, cmd.name);
+        // The argument hint is painted separately, in the disabled colour —
+        // it is what the user must still type, not part of the command.
+        item->setData(kSlashHintRole, cmd.hint);
     }
     if (m_slashPopup->count() == 0) {
         hideSlashPopup();
@@ -1438,14 +1638,22 @@ void AgentPanel::rebuildModeCombo()
     QString saved = KSharedConfig::openConfig()
                         ->group(QStringLiteral("Agent"))
                         .readEntry(t.stickyModeKey(), QString());
-    if (saved == QLatin1String("bypassPermissions")) {
+    if (saved == QLatin1String("bypassPermissions")
+        || saved == QLatin1String("dontAsk")) {
         saved = QStringLiteral("auto");
     } else if (saved == QLatin1String("yolo")) {
         saved.clear();
     }
+    // Nothing sticky yet (or a value this harness no longer offers): land on
+    // the harness's named default. The list is the engine's own vocabulary in
+    // the CLI's order, so falling through to index 0 would hand a fresh profile
+    // whichever mode that engine happens to list first.
     const int idx = m_modeCombo->findData(saved);
+    const int fallback = m_modeCombo->findData(t.defaultPermissionMode());
     if (idx >= 0) {
         m_modeCombo->setCurrentIndex(idx);
+    } else if (fallback >= 0) {
+        m_modeCombo->setCurrentIndex(fallback);
     }
 }
 
@@ -1476,6 +1684,45 @@ void AgentPanel::rebuildEffortCombo()
     const int idx = m_effortCombo->findData(saved);
     if (idx >= 0) {
         m_effortCombo->setCurrentIndex(idx);
+    }
+    applyModelEffortSupport();
+}
+
+// applyModelEffortSupport greys out the tiers the SELECTED MODEL cannot run.
+// The engine reports per-model effort support alongside its live model
+// catalogue (claude's list_models); an empty claim means it said nothing, in
+// which case every tier stays selectable — never the reverse.
+void AgentPanel::applyModelEffortSupport()
+{
+    if (!m_effortCombo || !m_modelCombo) {
+        return;
+    }
+    const QStringList supported = HarnessRegistry::self()->modelEfforts(
+        currentTraits().id, selectedProviderId(), currentModel());
+    auto *model = qobject_cast<QStandardItemModel *>(m_effortCombo->model());
+    if (!model) {
+        return;
+    }
+    for (int i = 0; i < m_effortCombo->count(); ++i) {
+        const QString value = m_effortCombo->itemData(i).toString();
+        // "Default" (an empty value) always stays available: it asks the engine
+        // to keep whatever it is already configured with.
+        const bool ok = supported.isEmpty() || value.isEmpty()
+            || supported.contains(value, Qt::CaseInsensitive);
+        QStandardItem *item = model->item(i);
+        if (!item) {
+            continue;
+        }
+        item->setEnabled(ok);
+        item->setToolTip(ok ? QString()
+                            : i18n("%1 does not support this thinking effort.",
+                                   currentModel()));
+    }
+    // If the sticky choice landed on a tier this model cannot run, fall back to
+    // the engine default rather than starting on a value that would be refused.
+    const int cur = m_effortCombo->currentIndex();
+    if (cur >= 0 && model->item(cur) && !model->item(cur)->isEnabled()) {
+        m_effortCombo->setCurrentIndex(0);
     }
 }
 
@@ -1751,6 +1998,9 @@ void AgentPanel::setDormant(const QString &threadId, const QString &title, bool 
 {
     m_threadId = threadId;
     Q_EMIT threadIdChanged(m_threadId);
+    // Same rebind rule as bindStartedThread: the outgoing thread's provisional
+    // rows are not this one's to claim.
+    resetStreamState();
     m_dormant = true;
     m_isolated = isolated;
     m_backend = backend;
@@ -1827,6 +2077,10 @@ void AgentPanel::bindStartedThread(const QString &threadId, bool isolated,
 {
     m_threadId = threadId;
     Q_EMIT threadIdChanged(m_threadId);
+    // Whatever the previous thread was mid-stream belongs to that thread: its
+    // provisional rows must not be claimed by the new one's first assistant
+    // event, whose block order is unrelated.
+    resetStreamState();
     m_dormant = false;
     m_idle = true; // live, waiting for its first turn to stream in
     m_isolated = isolated;
@@ -1876,6 +2130,11 @@ void AgentPanel::loadTranscriptFrom(const QString &fromThreadId)
                      // named chips — the transcript keeps only inlined content.
                      m_replayAttachTurns =
                          result.value(QStringLiteral("attachments")).toArray();
+                     // A replay feeds authoritative `assistant` events through
+                     // the same branch that claims provisional stream rows, so
+                     // any left over from a live stream would be claimed — and
+                     // overwritten — by replayed text belonging to another turn.
+                     resetStreamState();
                      // Guard cumulative cost + live timestamps: replayed result
                      // events must not be counted, and replayed cards carry no
                      // synthetic send time.
@@ -1942,6 +2201,15 @@ void AgentPanel::runCompactNow(const QString &model)
                 QStringLiteral("err"));
         return;
     }
+    // Every non-hot backend re-reads the stored session; a hot-only harness has
+    // nothing to read, and the core refuses the call. Say so here rather than
+    // relaying "compact only inside a live session" from the wire.
+    if (model != QLatin1String("hot") && !t.coldCompact) {
+        addNote(i18n("%1 agents summarize only inside a live session — resume "
+                     "the agent and use the live option.", t.displayName),
+                QStringLiteral("err"));
+        return;
+    }
     addNote(QStringLiteral("summarizing with <b>%1</b>…").arg(model.toHtmlEscaped()),
             QStringLiteral("sys"));
     const QString tid = m_threadId;
@@ -1962,13 +2230,9 @@ void AgentPanel::runCompactNow(const QString &model)
                                  QStringLiteral("err"));
                          return;
                      }
-                     addNote(QStringLiteral("compacted via %1 (%2 turns, %3 bytes).")
-                                 .arg(res.value(QStringLiteral("strategy"))
-                                          .toString()
-                                          .toHtmlEscaped())
-                                 .arg(res.value(QStringLiteral("turns")).toInt())
-                                 .arg(res.value(QStringLiteral("bodyBytes")).toInt()),
-                             QStringLiteral("ok"));
+                     // Wording (in-place vs. stored summary) is decided once,
+                     // in compactionOutcome().
+                     addNote(compactionOutcome(res), QStringLiteral("ok"));
                  },
                  this);
 }
@@ -2025,9 +2289,11 @@ void AgentPanel::resume()
     if (!m_dormant || m_threadId.isEmpty()) {
         return;
     }
-    // Harnesses without compaction support resume straight away — there is no
-    // summary status to check or pre-resume compact to offer.
-    if (!currentTraits().compaction) {
+    // The recovery flow ends in a COLD compaction (the thread is dormant), so
+    // it gates on coldCompact, not compaction: a hot-only harness would reach
+    // the model prompt with no summary on disk and every choice refused by the
+    // core. Those resume straight away — there is nothing to offer.
+    if (!currentTraits().coldCompact) {
         doResume();
         return;
     }
@@ -2093,9 +2359,11 @@ void AgentPanel::resume()
                                                                .toHtmlEscaped()),
                                                   QStringLiteral("err"));
                                       } else {
-                                          addNote(QStringLiteral("compacted (%1 turns, %2 bytes).")
-                                                      .arg(res.value(QStringLiteral("turns")).toInt())
-                                                      .arg(res.value(QStringLiteral("bodyBytes")).toInt()),
+                                          // Same honest wording as the manual
+                                          // "Compact now" path: an in-place
+                                          // compaction has no turns or bytes to
+                                          // report and must not print zeros.
+                                          addNote(compactionOutcome(res),
                                                   QStringLiteral("dim"));
                                       }
                                       doResume();
@@ -2252,12 +2520,85 @@ void AgentPanel::refresh()
         text += i18nc("context-fill suffix, percent of context window used",
                       " · ctx %1%", int((m_ctxPromptTokens * 100) / m_ctxWindow));
     }
-    m_header->setText(QStringLiteral("<span style='color:%1'>&#9679;</span>&nbsp;&nbsp;%2")
-                          .arg(dot, text.toHtmlEscaped()));
+    // Usage-limit chip. Header-only, deliberately not folded into `text`: the
+    // roster subtitle is per-agent, while a rate limit is an account-wide fact
+    // that would then read as N separate problems across the roster.
+    QString limitChip;
+    if (!m_rateLimitStatus.isEmpty()) {
+        // rateLimitType is a token like "five_hour" — the window the limit
+        // applies to, spelled for a human.
+        QString window = m_rateLimitType;
+        window.replace(QLatin1Char('_'), QLatin1Char(' '));
+        QStringList parts;
+        if (!window.isEmpty()) {
+            parts << i18nc("rate-limit chip: the window a usage limit covers",
+                           "%1 window", window);
+        }
+        if (!m_rateLimitResets.isEmpty()) {
+            parts << i18nc("rate-limit chip: when the usage window resets",
+                           "resets %1", m_rateLimitResets);
+        }
+        if (m_rateLimitOverage) {
+            parts << i18nc("rate-limit chip: billing past the included quota",
+                           "on overage");
+        }
+        if (parts.isEmpty()) {
+            parts << m_rateLimitStatus;
+        }
+        // Amber for anything but a plain "allowed": approaching or past a limit
+        // is the only state worth pulling the eye.
+        // A literal hex, not palette(mid): this is QTextDocument rich text, not
+        // a Qt style sheet, so the palette() function does not resolve here —
+        // the same reason the status dot above is a literal.
+        const bool ok = m_rateLimitStatus == QLatin1String("allowed");
+        limitChip = QStringLiteral("&nbsp;&nbsp;<span style='color:%1'>&middot; %2</span>")
+                        .arg(ok ? (isDark(this) ? QStringLiteral("#8b91a0")
+                                                : QStringLiteral("#5d6471"))
+                                : QStringLiteral("#e0a030"),
+                             parts.join(QStringLiteral(" &middot; ")).toHtmlEscaped());
+    }
+    m_header->setText(QStringLiteral("<span style='color:%1'>&#9679;</span>&nbsp;&nbsp;%2%3")
+                          .arg(dot, text.toHtmlEscaped(), limitChip));
+    m_header->setToolTip(contextTooltip());
     emit statusChanged(int(st));
     emit subtitleChanged(text);
     // Roster card affordance, derived from the same state computed above.
     emit attentionChanged(running && !m_permQueue.isEmpty());
+}
+
+// contextTooltip explains the header's "ctx N%" suffix: where the context
+// window actually went. The category split comes from the engine's own
+// accounting (a `_context` event); without one the tooltip says the figure is
+// an estimate, so the number is never read as more authoritative than it is.
+QString AgentPanel::contextTooltip() const
+{
+    if (m_ctxPromptTokens <= 0 || m_ctxWindow <= 0) {
+        return QString();
+    }
+    const QLocale loc;
+    QStringList lines;
+    lines << (m_ctxExact
+                  ? i18n("Context: %1 of %2 tokens used",
+                         loc.toString(m_ctxPromptTokens), loc.toString(m_ctxWindow))
+                  : i18n("Context: about %1 of %2 tokens used (estimated from the "
+                         "last turn's usage)",
+                         loc.toString(m_ctxPromptTokens), loc.toString(m_ctxWindow)));
+    if (!m_ctxBreakdown.isEmpty()) {
+        lines << QString();
+        for (const QJsonValue &v : m_ctxBreakdown) {
+            const QJsonObject cat = v.toObject();
+            const qlonglong tokens =
+                cat.value(QStringLiteral("tokens")).toVariant().toLongLong();
+            const QString label = cat.value(QStringLiteral("label")).toString();
+            if (label.isEmpty() || tokens <= 0) {
+                continue;
+            }
+            lines << i18nc("context breakdown row: category, tokens, share",
+                           "%1: %2 (%3%)", label, loc.toString(tokens),
+                           int((tokens * 100) / m_ctxWindow));
+        }
+    }
+    return lines.join(QLatin1Char('\n'));
 }
 
 // --- conversation feed ------------------------------------------------------
@@ -2794,6 +3135,14 @@ void AgentPanel::onSendClicked()
         insertList("fallbackModels", m_fallbackModels);
         insertList("disallowedTools", m_disallowedTools);
         insertList("addDirs", m_addDirs);
+        // Same rule for the scalar half of the sweep: absent means "not
+        // requested". A budget of 0 is no budget, not a budget of nothing.
+        if (m_strictMcpConfig) {
+            startParams.insert(QStringLiteral("strictMcpConfig"), true);
+        }
+        if (m_maxBudgetUsd > 0.0) {
+            startParams.insert(QStringLiteral("maxBudgetUsd"), m_maxBudgetUsd);
+        }
         if (wouldOverflowFrame(startParams)) {
             return; // composer untouched — the human can drop an attachment and retry
         }
@@ -2805,6 +3154,8 @@ void AgentPanel::onSendClicked()
         m_sessionOutTokens = 0;
         m_ctxPromptTokens = 0;
         m_ctxWindow = 0;
+        m_ctxExact = false;
+        m_ctxBreakdown = QJsonArray();
         m_turnDurTotalMs = 0;
         m_turnDurCount = 0;
         m_working->setAverageTurnMs(0);
@@ -2916,25 +3267,22 @@ void AgentPanel::addYouCard(const QString &text, const QJsonArray &attachments)
 // deleted since it was attached) degrades to a friendly status note.
 void AgentPanel::openAttachment(const QJsonObject &att)
 {
-    QString path = att.value(QStringLiteral("path")).toString();
     const QString name = att.value(QStringLiteral("name")).toString();
     const bool image =
         att.value(QStringLiteral("kind")).toString() == QLatin1String("image");
 
-    // Prefer the origin: for a workspace file that is the copy worth opening,
-    // since edits there count. Fall back to our cached copy of an image's bytes
-    // so a reaped temp screenshot still previews instead of erroring.
-    if (path.isEmpty() || !QFileInfo::exists(path)) {
-        const QString cached = att.value(QStringLiteral("cachePath")).toString();
-        if (!cached.isEmpty() && QFileInfo::exists(cached)) {
-            path = cached;
-        } else {
-            emit statusMessage(
-                i18n("Can't open “%1” — the file has moved or been deleted since it was "
-                     "attached.",
-                     name.isEmpty() ? path : name));
-            return;
-        }
+    // resolveAttachmentPath prefers the origin — for a workspace file that is
+    // the copy worth opening, since edits there count — but falls back to our
+    // cached copy both when the origin is gone AND when it is still there
+    // holding different bytes, which is the normal fate of a fixed-name capture
+    // file. Opening the screenshot the user never sent is worse than erroring.
+    const QString path = agentkate::resolveAttachmentPath(att);
+    if (path.isEmpty()) {
+        emit statusMessage(
+            i18n("Can't open “%1” — the file has moved or been deleted since it was "
+                 "attached.",
+                 name.isEmpty() ? att.value(QStringLiteral("path")).toString() : name));
+        return;
     }
 
     if (image) {
@@ -2989,7 +3337,41 @@ void AgentPanel::handleTaskEvent(const QString &subtype, const QJsonObject &ev)
     }
     if (subtype == QLatin1String("task_started")) {
         const QString id = ev.value(QStringLiteral("task_id")).toString();
-        if (id.isEmpty() || m_bgJobs.contains(id)) {
+        if (id.isEmpty()) {
+            return;
+        }
+        if (auto it = m_bgJobs.find(id); it != m_bgJobs.end()) {
+            // A re-announce of a job we already latched terminal means the CLI
+            // reused the id for fresh work; leaving the row done/failed would
+            // strand it there forever. Restart it in place so it keeps its
+            // insertion order, and clear the end stamp or the revived row would
+            // inherit the previous run's duration. A re-announce of a RUNNING
+            // job is genuine chatter and stays a no-op.
+            if (it->done || it->failed) {
+                it->done = false;
+                it->failed = false;
+                it->noted = false;
+                it->endedMs = 0;
+                it->outputFile.clear();
+                it->startedMs = QDateTime::currentMSecsSinceEpoch();
+                const QString desc = ev.value(QStringLiteral("description")).toString();
+                if (!desc.isEmpty()) {
+                    it->description = desc;
+                }
+                // Refreshed like the description: the reused id can be fresh
+                // work of a different kind, and taskType is what decides whether
+                // the row is a terminal job or an agent (and so which icon and
+                // which open action it gets).
+                const QString reType = ev.value(QStringLiteral("task_type")).toString();
+                if (!reType.isEmpty()) {
+                    it->taskType = reType;
+                }
+                const QString reToolUseId = ev.value(QStringLiteral("tool_use_id")).toString();
+                if (!reToolUseId.isEmpty()) {
+                    m_taskByToolUse.insert(reToolUseId, id);
+                }
+                updateJobsBar();
+            }
             return;
         }
         BgJob job;
@@ -3031,6 +3413,11 @@ void AgentPanel::handleTaskEvent(const QString &subtype, const QJsonObject &ev)
             // and render a failed job as a tick, permanently. Only the addNote
             // below is one-shot.
             it->done = true;
+            // First terminal report wins the finish stamp: repeated
+            // notifications for the same task must not stretch its duration.
+            if (it->endedMs == 0) {
+                it->endedMs = QDateTime::currentMSecsSinceEpoch();
+            }
             // "completed" is the only success terminal state the CLI reports;
             // anything else (failed, cancelled) is a failure the Jobs panel has
             // to show as such rather than as a tick.
@@ -3056,9 +3443,13 @@ void AgentPanel::handleTaskEvent(const QString &subtype, const QJsonObject &ev)
         for (const QJsonValue &v : tasks) {
             live.insert(v.toObject().value(QStringLiteral("task_id")).toString());
         }
+        const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
         for (auto it = m_bgJobs.begin(); it != m_bgJobs.end(); ++it) {
             if (!live.contains(it.key())) {
                 it->done = true;
+                if (it->endedMs == 0) {
+                    it->endedMs = nowMs;
+                }
             }
         }
         updateJobsBar();
@@ -3174,7 +3565,19 @@ void AgentPanel::updateJobsBar()
 
     QVector<agentkate::AgentJob> jobs;
     jobs.reserve(m_bgJobs.size());
-    QList<const BgJob *> running;
+    // Copies, not pointers into m_bgJobs: the chips below are built AFTER
+    // publishJobs(), and a publish that ever touched the map (a re-entrant
+    // consumer, a future async hop) would leave those pointers dangling. Only
+    // the handful of fields a chip draws is copied.
+    struct ChipJob {
+        QString id;
+        QString description;
+        QString outputFile;
+        quint64 order = 0;
+        qint64 startedMs = 0;
+        bool agent = false; // sub-agent rather than a local shell
+    };
+    QList<ChipJob> running;
     int finishedCount = 0;
     bool anyRunning = false;
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
@@ -3188,6 +3591,7 @@ void AgentPanel::updateJobsBar()
         j.description = it->description;
         j.outputFile = it->outputFile;
         j.startedMs = it->startedMs;
+        j.endedMs = it->endedMs;
         j.done = it->done;
         j.failed = it->failed;
         jobs.append(j);
@@ -3195,7 +3599,9 @@ void AgentPanel::updateJobsBar()
         if (it->done) {
             ++finishedCount;
         } else {
-            running.append(&it.value());
+            running.append(ChipJob{it->id, it->description, it->outputFile, it->order,
+                                   it->startedMs,
+                                   it->taskType != QLatin1String("local_bash")});
             anyRunning = true;
         }
     }
@@ -3221,24 +3627,31 @@ void AgentPanel::updateJobsBar()
         j.done = snap.state == WorkflowMonitor::State::Completed
             || snap.state == WorkflowMonitor::State::Failed;
         j.failed = snap.state == WorkflowMonitor::State::Failed;
+        // Latched on the first terminal snapshot: the run's artifacts carry no
+        // finish time, so re-reading them later must not restamp the end and
+        // stretch the duration the Jobs panel shows.
+        if (j.done && m_workflowEndedMs == 0) {
+            m_workflowEndedMs = now;
+        }
+        j.endedMs = j.done ? m_workflowEndedMs : 0;
         jobs.append(j);
     }
 
     std::sort(running.begin(), running.end(),
-              [](const BgJob *a, const BgJob *b) { return a->order < b->order; });
+              [](const ChipJob &a, const ChipJob &b) { return a.order < b.order; });
 
     // chipLabel is shared by the build and the in-place refresh so the two can
     // never disagree about what a chip says.
-    const auto chipLabel = [&now](const BgJob *job) {
-        const bool agent = job->taskType != QLatin1String("local_bash");
-        QString label = job->description.simplified();
+    const auto chipLabel = [&now](const ChipJob &job) {
+        QString label = job.description.simplified();
         if (label.length() > 40) {
             label = label.left(39) + QChar(0x2026);
         }
-        QString text = (agent ? QStringLiteral("\U0001f916 ") : QStringLiteral("⚙ ")) + label;
+        QString text =
+            (job.agent ? QStringLiteral("\U0001f916 ") : QStringLiteral("⚙ ")) + label;
         // Elapsed suffix for long-running jobs — honest "still going" signal.
-        if (job->startedMs > 0) {
-            const qint64 mins = (now - job->startedMs) / 60000;
+        if (job.startedMs > 0) {
+            const qint64 mins = (now - job.startedMs) / 60000;
             if (mins >= 1) {
                 text += i18nc("background job elapsed minutes", " · %1m", mins);
             }
@@ -3261,14 +3674,14 @@ void AgentPanel::updateJobsBar()
     // (it draws its own bar) and its progress no longer needs to force a
     // rebuild just to reach the Jobs panel.
     QString fingerprint;
-    for (const BgJob *job : std::as_const(running)) {
-        fingerprint += job->id + QLatin1Char('|') + job->outputFile + QLatin1Char(';');
+    for (const ChipJob &job : std::as_const(running)) {
+        fingerprint += job.id + QLatin1Char('|') + job.outputFile + QLatin1Char(';');
     }
     fingerprint += QLatin1Char('#') + QString::number(finishedCount);
 
     if (fingerprint == m_jobsFingerprint) {
-        for (const BgJob *job : std::as_const(running)) {
-            if (QPushButton *chip = m_jobChips.value(job->id)) {
+        for (const ChipJob &job : std::as_const(running)) {
+            if (QPushButton *chip = m_jobChips.value(job.id)) {
                 chip->setText(chipLabel(job));
             }
         }
@@ -3283,14 +3696,14 @@ void AgentPanel::updateJobsBar()
         }
         m_jobChips.clear();
 
-        for (const BgJob *job : std::as_const(running)) {
+        for (const ChipJob &job : std::as_const(running)) {
             auto *chip = new QPushButton(chipLabel(job), m_jobsBar);
             chip->setCursor(Qt::PointingHandCursor);
             chip->setToolTip(i18n("Running in the background — click to watch its output")
-                             + (job->outputFile.isEmpty()
+                             + (job.outputFile.isEmpty()
                                     ? QString()
-                                    : QStringLiteral("\n") + job->outputFile));
-            const QString id = job->id;
+                                    : QStringLiteral("\n") + job.outputFile));
+            const QString id = job.id;
             connect(chip, &QPushButton::clicked, this, [this, id] { openBackgroundJob(id); });
             m_jobsFlow->addWidget(chip);
             m_jobChips.insert(id, chip);
@@ -3377,6 +3790,9 @@ void AgentPanel::noteWorkflowLaunch(const QString &inputJson, const QString &res
     // run may be days old, and stamping now would show a finished workflow as
     // having just started; 0 renders as no Elapsed at all.
     m_workflowStartedMs = m_replaying ? 0 : QDateTime::currentMSecsSinceEpoch();
+    // The end stamp latches on the first terminal snapshot, so a new run has to
+    // clear the previous one's or the fresh row inherits its duration.
+    m_workflowEndedMs = 0;
     // A new run outranks any "Clear finished" the human applied to the old one.
     m_workflowForgotten = false;
 
@@ -3648,6 +4064,7 @@ void AgentPanel::attachPaths(const QStringList &paths)
     // the chip UI and the rejection banner.
     const QStringList skipped =
         agentkate::buildPathAttachments(paths, m_workspace, m_attachments);
+    m_attachSkipped += int(skipped.size());
     if (!skipped.isEmpty()) {
         showAttachNotice(skipped.size() == 1
                              ? i18n("Couldn't attach %1", skipped.first())
@@ -3665,6 +4082,7 @@ void AgentPanel::attachItems(const QJsonArray &items)
     QStringList wholeFile;
     const QStringList skipped =
         agentkate::buildItemAttachments(items, m_attachments, wholeFile);
+    m_attachSkipped += int(skipped.size());
     for (const QString &reason : skipped) {
         showAttachNotice(i18n("Couldn't attach %1", reason));
     }
@@ -3674,12 +4092,90 @@ void AgentPanel::attachItems(const QJsonArray &items)
     }
 }
 
+void AgentPanel::attachImages(const QList<QImage> &images)
+{
+    if (images.isEmpty()) {
+        return;
+    }
+    if (m_attachNotice) {
+        m_attachNotice->hide(); // clear any stale rejection from a prior attempt
+    }
+    const QStringList skipped =
+        agentkate::buildImageAttachments(images, m_attachments);
+    m_attachSkipped += int(skipped.size());
+    if (!skipped.isEmpty()) {
+        showAttachNotice(skipped.size() == 1
+                             ? i18n("Couldn't attach %1", skipped.first())
+                             : i18n("Couldn't attach some images:\n• %1",
+                                    skipped.join(QStringLiteral("\n• "))));
+    }
+    rebuildAttachChips();
+}
+
+bool AgentPanel::handleComposerPaste(const QMimeData *source)
+{
+    if (!source) {
+        return false;
+    }
+    // Image FILES first. A copy from a file manager carries both urls and a
+    // rendered image, and the file is the better attachment: it keeps its own
+    // name, its origin path, and its original encoding. One image in the
+    // selection takes the whole selection with it — a paste of "screenshot.png
+    // and notes.txt" is one intent, and buildPathAttachments handles both kinds.
+    QStringList paths;
+    bool anyImageFile = false;
+    const auto urls = source->urls();
+    for (const QUrl &u : urls) {
+        if (!u.isLocalFile()) {
+            continue;
+        }
+        paths << u.toLocalFile();
+        anyImageFile = anyImageFile || isImagePath(u.toLocalFile());
+    }
+    const int before = m_attachments.size();
+    m_attachSkipped = 0;
+    if (anyImageFile) {
+        attachPaths(paths);
+    } else if (source->hasImage() && rawImageBeatsText(source)) {
+        const QImage image = qvariant_cast<QImage>(source->imageData());
+        if (image.isNull()) {
+            return false; // an image format we can't decode — paste as text
+        }
+        attachImages({image});
+    } else {
+        return false; // not an image paste; the composer inserts it as before
+    }
+    const int added = m_attachments.size() - before;
+    if (added > 0) {
+        emit statusMessage(i18np("Attached %1 item as context",
+                                 "Attached %1 items as context", added));
+    } else if (m_attachSkipped > 0) {
+        // Nothing landed, but the paste WAS consumed (see below), so without
+        // this the composer just sits there looking like the paste never
+        // happened — the banner alone is easy to miss.
+        emit statusMessage(i18n("Nothing attached"));
+    }
+    // Consumed either way: an image that was refused (too large, over budget)
+    // has already said so in the notice, and inserting its text form instead
+    // would be worse than nothing.
+    return true;
+}
+
 bool AgentPanel::canAcceptDrop(const QMimeData *mime) const
 {
     if (!mime) {
         return false;
     }
     if (mime->hasFormat(QLatin1String(kAttachMime))) {
+        return true;
+    }
+    // Pixels with no file behind them — an image dragged out of a browser, or
+    // straight off a capture tool. Attachable: we write our own PNG for it.
+    // Same test paste applies, and for the same reason: a drag out of a
+    // spreadsheet or an editor carries a rendered bitmap next to the real text,
+    // and taking the drop would attach a picture of the text the user dragged.
+    // Refusing it here lets the composer's ordinary text drop have it.
+    if (mime->hasImage() && rawImageBeatsText(mime)) {
         return true;
     }
     if (mime->hasUrls()) {
@@ -3727,6 +4223,7 @@ void AgentPanel::dropEvent(QDropEvent *event)
     }
 
     const int before = m_attachments.size();
+    m_attachSkipped = 0;
     if (mime->hasFormat(QLatin1String(kAttachMime))) {
         // Ranged payload from the search results — preserves line spans.
         const QJsonArray items =
@@ -3741,7 +4238,23 @@ void AgentPanel::dropEvent(QDropEvent *event)
                 paths << u.toLocalFile();
             }
         }
-        attachPaths(paths);
+        if (!paths.isEmpty()) {
+            attachPaths(paths);
+        } else if (mime->hasImage() && rawImageBeatsText(mime)) {
+            // No file anywhere — a browser image drag carries a remote URL and
+            // the decoded pixels. Attach the pixels; the builder writes the PNG.
+            const QImage image = qvariant_cast<QImage>(mime->imageData());
+            if (image.isNull()) {
+                // canAcceptDrop said yes on hasImage(), so the drop was already
+                // promised; a bare "Nothing attached" for a format Qt has no
+                // plugin for reads as a bug in the drop target.
+                ++m_attachSkipped;
+                showAttachNotice(
+                    i18n("Couldn't attach — couldn't decode dropped image"));
+            } else {
+                attachImages({image});
+            }
+        }
     }
     event->acceptProposedAction();
 
@@ -3749,7 +4262,11 @@ void AgentPanel::dropEvent(QDropEvent *event)
     if (added > 0) {
         emit statusMessage(i18np("Attached %1 item as context",
                                  "Attached %1 items as context", added));
-    } else {
+    } else if (m_attachSkipped > 0) {
+        // Only when something was actually refused. An unconditional message
+        // here claimed a failure for drops that legitimately added nothing —
+        // re-dropping files already attached, say — and drowned the notice that
+        // does carry a reason.
         emit statusMessage(i18n("Nothing attached"));
     }
 }
@@ -4329,6 +4846,572 @@ void AgentPanel::onQuestionSubmit()
     refresh();
 }
 
+// seedSlashCommands accepts both shapes the harnesses use: claude's init event
+// lists bare names, kimi's `_commands` lists {name, description, hint} objects.
+// One parser, so `commands_changed` can reuse whichever its engine sends.
+void AgentPanel::seedSlashCommands(const QJsonArray &commands)
+{
+    if (commands.isEmpty()) {
+        return; // an empty list is "nothing reported", not "no commands exist"
+    }
+    m_slashCommands.clear();
+    for (const QJsonValue &v : commands) {
+        if (v.isString()) {
+            const QString name = v.toString();
+            if (!name.isEmpty()) {
+                m_slashCommands.append({name, QString(), QString()});
+            }
+            continue;
+        }
+        const QJsonObject cmd = v.toObject();
+        const QString name = cmd.value(QStringLiteral("name")).toString();
+        if (name.isEmpty()) {
+            continue;
+        }
+        m_slashCommands.append({name,
+                                cmd.value(QStringLiteral("description")).toString(),
+                                cmd.value(QStringLiteral("hint")).toString()});
+    }
+    updateSlashPopup(); // an open popup must reflect the new list, not the old
+}
+
+// adoptModel points the picker at the model the CLI says it is running now.
+// Silent: no maybePushOption round-trip, because the CLI is reporting a change
+// it has ALREADY made — echoing it back would be a redundant setOption, and on
+// a refusal fallback it would try to re-select the model that just failed.
+void AgentPanel::adoptModel(const QString &modelId)
+{
+    if (modelId.isEmpty() || !m_modelCombo) {
+        return;
+    }
+    QSignalBlocker block(m_modelCombo);
+    const int idx = m_modelCombo->findData(modelId);
+    if (idx >= 0) {
+        m_modelCombo->setCurrentIndex(idx);
+    } else if (m_modelCombo->isEditable()) {
+        // A fallback can land on a model that is not in our catalogue; the
+        // editable combo can still show it verbatim, which beats leaving the
+        // picker naming a model the agent is no longer using.
+        m_modelCombo->setCurrentIndex(-1);
+        m_modelCombo->setEditText(modelId);
+    }
+}
+
+// renderSystemSubtype dispatches the `system` events that are neither init nor
+// the task lifecycle. Everything the CLI can emit here is either shown, folded
+// into panel state, or listed as a deliberate silence — a subtype nobody
+// recognises falls through to the ignore list rather than to a mystery row.
+// There is deliberately no "unhandled" outcome to report: every subtype ends in
+// one of those three, so the function returns nothing for a caller to check.
+void AgentPanel::renderSystemSubtype(const QString &subtype, const QJsonObject &ev)
+{
+    if (subtype == QLatin1String("compact_boundary")) {
+        // The conversation before this point was replaced by a summary. Drawn
+        // as a full-width rule so it reads as a break in the transcript rather
+        // than as one more status line.
+        const qlonglong preTokens =
+            ev.value(QStringLiteral("pre_tokens")).toVariant().toLongLong();
+        const QString what = preTokens > 0
+            ? i18nc("compaction separator, with the token count that was summarized",
+                    "context compacted — %1 tokens summarized",
+                    QLocale().toString(preTokens))
+            : i18n("context compacted");
+        addNote(QStringLiteral("<hr>") + what.toHtmlEscaped(), QStringLiteral("sys"));
+        return;
+    }
+    if (subtype == QLatin1String("model_fallback")
+        || subtype == QLatin1String("model_refusal_fallback")
+        || subtype == QLatin1String("model_consent_fallback")
+        || subtype == QLatin1String("model_refusal_no_fallback")) {
+        // The CLI switched models under us (capacity, a refusal, a consent
+        // gate). The picker has to follow or it names a model that is no longer
+        // answering — the stale-mode bug, in the model dimension.
+        const QString to = ev.value(QStringLiteral("model")).toString();
+        const QString reason = ev.value(QStringLiteral("reason")).toString();
+        if (subtype == QLatin1String("model_refusal_no_fallback")) {
+            // Nothing to switch TO: the turn is stuck on the current model.
+            addNote(i18n("the model declined and no fallback is configured%1",
+                         reason.isEmpty() ? QString()
+                                          : QStringLiteral(" (%1)").arg(reason))
+                        .toHtmlEscaped(),
+                    QStringLiteral("err"));
+            return;
+        }
+        adoptModel(to);
+        addNote(reason.isEmpty()
+                    ? i18n("switched to %1", to).toHtmlEscaped()
+                    : i18n("switched to %1 (%2)", to, reason).toHtmlEscaped(),
+                QStringLiteral("sys"));
+        refresh();
+        return;
+    }
+    if (subtype == QLatin1String("api_error")) {
+        // The API failed mid-turn. The CLI spells the cause differently
+        // depending on the failure, so take whichever field is populated rather
+        // than showing an empty error row.
+        QString text = ev.value(QStringLiteral("message")).toString();
+        if (text.isEmpty()) {
+            text = ev.value(QStringLiteral("error")).toString();
+        }
+        addNote(text.isEmpty() ? i18n("the API call failed") : text.toHtmlEscaped(),
+                QStringLiteral("err"));
+        return;
+    }
+    // State-only subtypes: real information the panel already sources
+    // elsewhere, so they update nothing here and must not add a row.
+    //   turn_duration        — the `result` event's duration_ms already feeds
+    //                          the average-turn readout.
+    //   status               — a liveness tick.
+    //   session_state_changed— the session id is tracked by the core (run.go),
+    //                          which persists it for resume.
+    //   post_turn_summary    — a recap of what the turn did; the feed just
+    //                          showed all of it.
+    if (subtype == QLatin1String("turn_duration") || subtype == QLatin1String("status")
+        || subtype == QLatin1String("session_state_changed")
+        || subtype == QLatin1String("post_turn_summary")) {
+        return;
+    }
+    if (subtype == QLatin1String("commands_changed")) {
+        // A skill or plugin appeared/disappeared mid-session. The event repeats
+        // the list in the same shape init seeds it from.
+        seedSlashCommands(ev.value(QStringLiteral("slash_commands")).toArray());
+        return;
+    }
+    // Deliberate silence for everything else. The CLI adds system subtypes
+    // between releases and an unknown one is not a user-facing event: showing
+    // it would put raw protocol chatter in the conversation. Add a case above
+    // when a new subtype turns out to be worth surfacing.
+}
+
+// applyRateLimit folds one rate_limit_event into the header chip. The CLI emits
+// one every turn, so the feed only ever hears about a status TRANSITION —
+// per-event rows would bury the conversation.
+void AgentPanel::applyRateLimit(const QJsonObject &info)
+{
+    if (info.isEmpty() || m_replaying) {
+        return;
+    }
+    const QString status = info.value(QStringLiteral("status")).toString();
+    const QString previous = m_rateLimitStatus;
+    m_rateLimitStatus = status;
+    m_rateLimitType = info.value(QStringLiteral("rateLimitType")).toString();
+    m_rateLimitOverage = info.value(QStringLiteral("isUsingOverage")).toBool();
+
+    // resetsAt is a unix timestamp on some builds and an ISO-8601 string on
+    // others; accept both and show nothing rather than a wrong time.
+    const QJsonValue resets = info.value(QStringLiteral("resetsAt"));
+    QDateTime when;
+    if (resets.isDouble()) {
+        when = QDateTime::fromSecsSinceEpoch(qint64(resets.toDouble()));
+    } else {
+        when = QDateTime::fromString(resets.toString(), Qt::ISODateWithMs);
+        if (!when.isValid()) {
+            when = QDateTime::fromString(resets.toString(), Qt::ISODate);
+        }
+    }
+    m_rateLimitResets = when.isValid()
+        ? QLocale().toString(when.toLocalTime().time(), QLocale::ShortFormat)
+        : QString();
+
+    if (!previous.isEmpty() && previous != status) {
+        const bool ok = status == QLatin1String("allowed");
+        addNote(m_rateLimitResets.isEmpty()
+                    ? i18n("usage limit status: %1", status).toHtmlEscaped()
+                    : i18n("usage limit status: %1 — resets at %2", status,
+                           m_rateLimitResets)
+                          .toHtmlEscaped(),
+                ok ? QStringLiteral("ok") : QStringLiteral("err"));
+    }
+    refresh();
+}
+
+// adoptDiscoveredOptions drives the pickers to what the CLI is actually running.
+// Only the ids the event lists as changed are touched: the array repeats the
+// FULL option set every time, and re-selecting an untouched picker would fight
+// a choice the user just made.
+void AgentPanel::adoptDiscoveredOptions(const QJsonArray &configOptions,
+                                        const QJsonArray &changed)
+{
+    if (configOptions.isEmpty() || changed.isEmpty()) {
+        return;
+    }
+    for (const QJsonValue &cv : changed) {
+        const QString id = cv.toString();
+        // Find this option's snapshot: currentValue is what the CLI is running.
+        QJsonObject option;
+        for (const QJsonValue &ov : configOptions) {
+            const QJsonObject o = ov.toObject();
+            if (o.value(QStringLiteral("id")).toString() == id) {
+                option = o;
+                break;
+            }
+        }
+        if (option.isEmpty()) {
+            continue;
+        }
+        const QString value = option.value(QStringLiteral("currentValue")).toString();
+        if (value.isEmpty()) {
+            continue;
+        }
+        if (id == QLatin1String("model")) {
+            adoptModel(value);
+            continue;
+        }
+        QComboBox *combo = nullptr;
+        if (id == QLatin1String("mode")) {
+            combo = m_modeCombo;
+        } else if (id == QLatin1String("thinking")) {
+            combo = m_effortCombo;
+        }
+        if (!combo) {
+            continue; // an option with no picker of its own — registry-only
+        }
+        QSignalBlocker block(combo);
+        int idx = combo->findData(value);
+        if (idx < 0) {
+            // The combos are frozen once a thread exists (they are not rebuilt
+            // from the registry mid-session), so a value discovered only now
+            // has no item yet. Add it under its own reported label rather than
+            // leaving the picker showing the previous value.
+            QString label = value;
+            const QJsonArray values = option.value(QStringLiteral("options")).toArray();
+            for (const QJsonValue &vv : values) {
+                const QJsonObject vo = vv.toObject();
+                if (vo.value(QStringLiteral("value")).toString() == value) {
+                    label = vo.value(QStringLiteral("name")).toString();
+                    break;
+                }
+            }
+            combo->addItem(label.isEmpty() ? value : label, value);
+            idx = combo->count() - 1;
+        }
+        combo->setCurrentIndex(idx);
+    }
+}
+
+// --- claude stream channel ---------------------------------------------------
+
+void AgentPanel::resetStreamState()
+{
+    if (m_streamFlush) {
+        // Helpers share the coalescer, so anything they left dirty must be
+        // painted before the timer is stopped or that text is simply lost.
+        flushSubagentText();
+        m_streamFlush->stop();
+    }
+    // A stream that ends without its content_block_stop — an interrupt, a CLI
+    // crash, a thread rebind — leaves its row holding the escaped plain text
+    // the flush ticks painted. Render it properly before dropping the state,
+    // or that message stays raw for the rest of the session. Blocks that
+    // already settled (the normal path) cost nothing here.
+    const QList<int> indices = m_streamBlocks.keys();
+    for (int index : indices) {
+        const auto it = m_streamBlocks.constFind(index);
+        if (it != m_streamBlocks.constEnd() && !it->settled) {
+            settleStreamBlock(index);
+        }
+    }
+    m_streamBlocks.clear();
+    m_streamTextKeys.clear();
+    m_streamClaimed = 0;
+    m_streamThinking.clear();
+}
+
+int AgentPanel::takeStreamedTextKey()
+{
+    if (m_streamClaimed >= m_streamTextKeys.size()) {
+        return -1;
+    }
+    return m_streamTextKeys.at(m_streamClaimed++);
+}
+
+// streamingHtml renders in-flight text as-is: HTML-escaped, with hard newlines
+// kept (QTextDocument collapses them otherwise). No Markdown parse — see
+// flushStreamedText for why a partial block must not be parsed.
+static QString streamingHtml(const QString &text)
+{
+    QString html = text.toHtmlEscaped();
+    html.replace(QLatin1Char('\n'), QLatin1String("<br>"));
+    return html;
+}
+
+// Shown tail of a helper's forwarded output, and the size the accumulation is
+// allowed to reach before it is cut back to that tail. Trimming at 2x means the
+// cut is amortised over ~kMaxSubagentChars characters of stream instead of
+// running on every single delta.
+constexpr int kMaxSubagentChars = 4000;
+constexpr int kSubagentTrimAt = 2 * kMaxSubagentChars;
+
+// subagentShown renders the bounded accumulation the way the row displays it:
+// the last kMaxSubagentChars characters, marked with a leading "…" when
+// anything before them was dropped.
+static QString subagentShown(const QString &text, bool trimmed)
+{
+    if (text.size() > kMaxSubagentChars) {
+        return QStringLiteral("…") + text.right(kMaxSubagentChars);
+    }
+    return trimmed ? QStringLiteral("…") + text : text;
+}
+
+void AgentPanel::flushSubagentText()
+{
+    for (auto it = m_subagent.begin(); it != m_subagent.end(); ++it) {
+        if (!it->dirty) {
+            continue;
+        }
+        if (it->rowKey < 0) {
+            // Re-resolve: rowKey is only ever assigned in routeSubagentText, so
+            // an entry buffered BEFORE its Task row existed would have kept a
+            // stale -1 forever and the "hold it dirty until the row appears"
+            // recovery below could never fire. The lookup is what makes it fire.
+            it->rowKey = m_toolRows.value(it.key(), -1);
+        }
+        if (it->rowKey < 0) {
+            // Still no Task row to paint into (the tool_use row may still be
+            // coming, or tools are hidden / the row was evicted). Leave `dirty`
+            // set and keep the buffered text: clearing it here would claim the
+            // text was painted and drop it for good. It lands on the first tick
+            // after the row resolves.
+            continue;
+        }
+        m_model->setToolProgress(it->rowKey, subagentShown(it->text, it->trimmed));
+        it->dirty = false; // cleared only once the text is actually on a row
+    }
+}
+
+void AgentPanel::flushStreamedText()
+{
+    // Helpers first: their rows are part of the same repaint this tick pays for.
+    flushSubagentText();
+    bool painted = false;
+    for (auto it = m_streamBlocks.begin(); it != m_streamBlocks.end(); ++it) {
+        if (!it->dirty) {
+            continue;
+        }
+        it->dirty = false;
+        if (it->thinking) {
+            // Reasoning gets no row of its own while it streams — its tail
+            // rides the working line, on this same tick so a fast thinking
+            // stream costs one label update per 50ms instead of one per token.
+            const QString tail = it->text.right(120).simplified();
+            if (tail != m_streamThinking) {
+                m_streamThinking = tail;
+                m_working->setActivity(i18n("thinking… %1", tail));
+            }
+            continue;
+        }
+        if (it->key < 0) {
+            continue;
+        }
+        // A still-streaming block renders as escaped plain text, NOT Markdown:
+        // markdownToHtml re-parses the whole accumulated message on every tick,
+        // which is the dominant cost of a long stream, and a partial delta is
+        // not valid Markdown anyway (a delta can split "**bo" / "ld**"), so the
+        // parse would be paid for a half-rendered result. settleStreamBlock()
+        // runs the real render once the block stops.
+        m_model->setMessageBody(it->key, streamingHtml(it->text), it->text);
+        painted = true;
+    }
+    if (painted && m_stickBottom) {
+        scrollFeedToBottom();
+    }
+}
+
+// settleStreamBlock renders a finished text block properly — the one
+// markdownToHtml call a streamed message pays, replacing the escaped plain text
+// the flush ticks painted. Idempotent: the authoritative `assistant` event
+// re-renders the same row with its own (identical) text.
+void AgentPanel::settleStreamBlock(int blockIndex)
+{
+    auto it = m_streamBlocks.find(blockIndex);
+    if (it == m_streamBlocks.end()) {
+        return;
+    }
+    it->dirty = false;
+    if (it->key < 0 || it->thinking || it->text.isEmpty()) {
+        return;
+    }
+    it->settled = true;
+    m_model->setMessageBody(it->key, agentkate::markdownToHtml(it->text), it->text);
+    if (m_stickBottom) {
+        scrollFeedToBottom();
+    }
+}
+
+void AgentPanel::renderStreamEvent(const QJsonObject &inner)
+{
+    // Stored transcripts hold no stream_events, so this never runs during
+    // replay; the guard keeps that true if a future transcript format changes.
+    if (m_replaying || inner.isEmpty()) {
+        return;
+    }
+    const QString type = inner.value(QStringLiteral("type")).toString();
+    const int index = inner.value(QStringLiteral("index")).toInt(-1);
+
+    if (type == QLatin1String("message_start")) {
+        // A new assistant message: whatever the previous one left behind is
+        // finished with (its authoritative event has already claimed its rows).
+        resetStreamState();
+        return;
+    }
+    if (type == QLatin1String("content_block_start")) {
+        if (index < 0) {
+            return;
+        }
+        const QString blockType = inner.value(QStringLiteral("content_block"))
+                                      .toObject()
+                                      .value(QStringLiteral("type"))
+                                      .toString();
+        StreamBlock block;
+        if (blockType == QLatin1String("text")) {
+            // Open the provisional row empty; deltas fill it in place.
+            block.key = m_model->appendMessage(
+                QStringLiteral("Agent Kate"),
+                isDark(this) ? QStringLiteral("#5fd3bf") : QStringLiteral("#1a7f6b"),
+                QString(), QString(), false,
+                QLocale().toString(QTime::currentTime(), QLocale::ShortFormat));
+            m_streamTextKeys.append(block.key);
+            // Same unread bookkeeping addMessageCard does: a message arriving
+            // while the reader is scrolled up flags the jump button, and it
+            // should flag on the FIRST token, not when the turn finishes.
+            if (!m_stickBottom) {
+                m_jumpUnread = true;
+                updateJumpButton();
+            }
+        } else if (blockType == QLatin1String("thinking")) {
+            block.thinking = true;
+        } else {
+            // tool_use and friends: their input arrives as partial JSON, which
+            // is unrenderable until complete. The authoritative `assistant`
+            // event draws the tool card.
+            return;
+        }
+        m_streamBlocks.insert(index, block);
+        return;
+    }
+    if (type == QLatin1String("content_block_delta")) {
+        auto it = m_streamBlocks.find(index);
+        if (it == m_streamBlocks.end()) {
+            return;
+        }
+        const QJsonObject delta = inner.value(QStringLiteral("delta")).toObject();
+        const QString deltaType = delta.value(QStringLiteral("type")).toString();
+        if (deltaType == QLatin1String("text_delta")) {
+            it->text += delta.value(QStringLiteral("text")).toString();
+        } else if (deltaType == QLatin1String("thinking_delta")) {
+            // Reasoning gets no row of its own while it streams — the
+            // authoritative event appends the collapsed thinking card. Its tail
+            // rides the working line, which is where "what is it doing right
+            // now" already lives.
+            it->text += delta.value(QStringLiteral("thinking")).toString();
+        } else {
+            return; // input_json_delta and friends: nothing renderable yet
+        }
+        // Both kinds go through the coalescing tick: a thinking delta repainting
+        // the working line per token is the same cost the text path pays.
+        it->dirty = true;
+        if (!m_streamFlush->isActive()) {
+            m_streamFlush->start();
+        }
+        return;
+    }
+    if (type == QLatin1String("content_block_stop")) {
+        // The block is complete: swap the escaped plain text the flush ticks
+        // painted for the real Markdown render. Unconditional (not gated on
+        // `dirty`), because the last tick may have cleared the flag while the
+        // row still holds plain text.
+        settleStreamBlock(index);
+        return;
+    }
+    // message_delta (stop_reason / usage) and message_stop carry nothing the
+    // feed shows: the `result` event owns the turn's usage and its end.
+}
+
+// routeSubagentText shows a helper's forwarded output on the Task tool row that
+// launched it, growing as it arrives, instead of leaving that row at "⋯" until
+// the helper finishes. The row is the transcript's existing subagent surface —
+// the Helpers menu still opens the full stored transcript afterwards.
+bool AgentPanel::routeSubagentText(const QJsonObject &ev, const QString &parentToolUseId)
+{
+    if (m_replaying) {
+        return false; // a stored transcript is replayed exactly as it was written
+    }
+    const QString type = ev.value(QStringLiteral("type")).toString();
+    QString text;
+    if (type == QLatin1String("stream_event")) {
+        const QJsonObject inner = ev.value(QStringLiteral("event")).toObject();
+        if (inner.value(QStringLiteral("type")).toString()
+            != QLatin1String("content_block_delta")) {
+            return true; // consumed: a helper's block boundaries are not ours
+        }
+        const QJsonObject delta = inner.value(QStringLiteral("delta")).toObject();
+        if (delta.value(QStringLiteral("type")).toString() != QLatin1String("text_delta")) {
+            return true;
+        }
+        text = delta.value(QStringLiteral("text")).toString();
+    } else if (type == QLatin1String("assistant")) {
+        // The helper's authoritative message. It repeats text its own deltas
+        // already delivered, so it REPLACES the accumulation for this helper
+        // rather than adding to it.
+        QString whole;
+        const QJsonArray content =
+            ev.value(QStringLiteral("message")).toObject().value(QStringLiteral("content")).toArray();
+        for (const QJsonValue &bv : content) {
+            const QJsonObject b = bv.toObject();
+            if (b.value(QStringLiteral("type")).toString() == QLatin1String("text")) {
+                whole += b.value(QStringLiteral("text")).toString();
+            }
+        }
+        if (whole.isEmpty()) {
+            return true;
+        }
+        SubagentText &entry = m_subagent[parentToolUseId];
+        entry.text = whole;
+        entry.trimmed = false;
+        // The authoritative message is the end of this helper's stream and may
+        // be followed immediately by its tool_result, so it paints NOW rather
+        // than waiting for a tick that could land after the final result.
+        entry.rowKey = m_toolRows.value(parentToolUseId, -1);
+        if (entry.rowKey >= 0) {
+            m_model->setToolProgress(entry.rowKey,
+                                     subagentShown(entry.text, entry.trimmed));
+            entry.dirty = false;
+        } else {
+            // No row yet: hold the text dirty so the flush paints it when the
+            // Task row appears, instead of losing the helper's final message.
+            entry.dirty = true;
+        }
+        return true;
+    } else {
+        // A helper's user/tool_result echoes, its own result event: consumed so
+        // they are never attributed to this agent, but not shown — the helper's
+        // stored transcript is the place for that detail.
+        return true;
+    }
+    if (text.isEmpty()) {
+        return true;
+    }
+    SubagentText &entry = m_subagent[parentToolUseId];
+    entry.text += text;
+    // Bounded: the tool row shows the tail of a helper's output, and the full
+    // conversation is in the helper's own transcript. Without this a long
+    // subagent run would grow one transcript row without limit. Cutting back
+    // only at twice the cap keeps the per-delta cost O(delta) — the old code
+    // re-trimmed once past the cap, i.e. built two ~4000-char strings per token.
+    if (entry.text.size() > kSubagentTrimAt) {
+        entry.text = entry.text.right(kMaxSubagentChars);
+        entry.trimmed = true;
+    }
+    entry.rowKey = m_toolRows.value(parentToolUseId, -1);
+    // Coalesced exactly like the agent's own text deltas: one repaint per tick
+    // per row, not one per token.
+    entry.dirty = true;
+    if (m_streamFlush && !m_streamFlush->isActive()) {
+        m_streamFlush->start();
+    }
+    return true;
+}
+
 void AgentPanel::renderEvent(const QJsonObject &ev)
 {
     const QString type = ev.value(QStringLiteral("type")).toString();
@@ -4342,6 +5425,16 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             iso.isEmpty() ? QDateTime()
                           : QDateTime::fromString(iso, Qt::ISODateWithMs);
         m_replayEventEpoch = when.isValid() ? when.toSecsSinceEpoch() : 0;
+    }
+
+    // Anything tagged with a parent tool-use id was produced by a HELPER this
+    // agent launched (--forward-subagent-text), not by the agent itself.
+    // Rendering it as an "Agent Kate" card would attribute a subagent's words
+    // to the agent; it belongs on the Task tool row that started it.
+    const QString parentToolUse =
+        ev.value(QStringLiteral("parent_tool_use_id")).toString();
+    if (!parentToolUse.isEmpty() && routeSubagentText(ev, parentToolUse)) {
+        return;
     }
 
     if (type == QLatin1String("system")) {
@@ -4369,8 +5462,10 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             }
             return;
         }
-        // Beyond those, only the init system event is worth showing in the feed.
+        // Everything else the CLI reports as a `system` event — model
+        // fallbacks, compaction boundaries, API errors, rate/status ticks.
         if (subtype != QLatin1String("init")) {
+            renderSystemSubtype(subtype, ev);
             return;
         }
         // A discovered-options init event carries the session's config options
@@ -4396,16 +5491,7 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
         }
         // The claude init event lists the session's slash commands (names
         // only) — the composer's autocomplete feed.
-        const QJsonArray slashCmds = ev.value(QStringLiteral("slash_commands")).toArray();
-        if (!slashCmds.isEmpty()) {
-            m_slashCommands.clear();
-            for (const QJsonValue &v : slashCmds) {
-                const QString name = v.toString();
-                if (!name.isEmpty()) {
-                    m_slashCommands.append({name, QString()});
-                }
-            }
-        }
+        seedSlashCommands(ev.value(QStringLiteral("slash_commands")).toArray());
         QStringList mcp;
         const QJsonArray servers = ev.value(QStringLiteral("mcp_servers")).toArray();
         for (const QJsonValue &v : servers) {
@@ -4419,6 +5505,12 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
         }
         addNote(line, QStringLiteral("sys"));
 
+    } else if (type == QLatin1String("stream_event")) {
+        // Token-by-token deltas. Deliberately before the assistant branch: the
+        // provisional rows they paint are what the authoritative `assistant`
+        // event then overwrites.
+        renderStreamEvent(ev.value(QStringLiteral("event")).toObject());
+
     } else if (type == QLatin1String("assistant")) {
         const QJsonArray content =
             ev.value(QStringLiteral("message")).toObject().value(QStringLiteral("content")).toArray();
@@ -4427,11 +5519,32 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             const QString bt = b.value(QStringLiteral("type")).toString();
             if (bt == QLatin1String("text")) {
                 const QString t = b.value(QStringLiteral("text")).toString().trimmed();
+                // Claim one provisional row for EVERY text block this event
+                // covers, empty or not: the stream opened a row per text
+                // content_block_start, so skipping the claim for an empty block
+                // would shift every later claim onto the wrong row and make the
+                // next message replace a card it doesn't own. Only the
+                // row-replacement below is conditional on there being text.
+                // takeStreamedTextKey() returns -1 during replay and on any
+                // turn that produced no stream_events, so a stored transcript
+                // replays exactly as before.
+                const int streamedKey = takeStreamedTextKey();
                 if (!t.isEmpty()) {
-                    addMessageCard(QStringLiteral("Agent Kate"),
-                                   isDark(this) ? QStringLiteral("#5fd3bf")
-                                                : QStringLiteral("#1a7f6b"),
-                                   agentkate::markdownToHtml(t), t, m_replaying);
+                    // This event is authoritative. If the same text already
+                    // streamed into a provisional row, overwrite that row —
+                    // appending here would show every streamed message twice.
+                    if (streamedKey < 0
+                        || !m_model->setMessageBody(streamedKey,
+                                                    agentkate::markdownToHtml(t), t)) {
+                        addMessageCard(QStringLiteral("Agent Kate"),
+                                       isDark(this) ? QStringLiteral("#5fd3bf")
+                                                    : QStringLiteral("#1a7f6b"),
+                                       agentkate::markdownToHtml(t), t, m_replaying);
+                    } else if (!m_replaying) {
+                        // addMessageCard's roster side-effect, which the
+                        // in-place path skips along with the row insert.
+                        emit previewChanged(t.simplified());
+                    }
                     m_working->setActivity(QString()); // text → generic reasoning
                 }
             } else if (bt == QLatin1String("thinking")) {
@@ -4473,6 +5586,15 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
                 const QString id = b.value(QStringLiteral("id")).toString();
                 if (!id.isEmpty()) {
                     m_toolRows.insert(id, key);
+                    // A helper's text can arrive before its Task row exists;
+                    // flushSubagentText keeps that text buffered and dirty
+                    // rather than dropping it. The row now exists, so kick a
+                    // tick — otherwise the buffered text waits for a delta
+                    // that may never come.
+                    if (m_streamFlush && m_subagent.contains(id)
+                        && m_subagent.value(id).dirty && !m_streamFlush->isActive()) {
+                        m_streamFlush->start();
+                    }
                 }
                 // Remember a Workflow launch by its row key so the paired
                 // tool_result (which carries the run anchors) can be captured.
@@ -4636,6 +5758,10 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
                     // once applied. Dropping it bounds m_toolRows and lets the key
                     // fall away with the row when it is eventually evicted.
                     m_toolRows.remove(id);
+                    // If this was a Task row, the helper's forwarded text is
+                    // finished with — and a still-pending coalesced paint would
+                    // now overwrite the real result with a progress tail.
+                    m_subagent.remove(id);
                 }
             }
         }
@@ -4656,6 +5782,16 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
         const qlonglong durationMs =
             ev.value(QStringLiteral("duration_ms")).toVariant().toLongLong();
         const bool haveUsage = inTok || outTok || cacheRead || cacheCreate || costUsd > 0.0;
+        // Whether these numbers are a TURN's spend or a running context
+        // snapshot. Only an engine with usageReporting bills per turn; kimi's
+        // result usage is its `/usage` readout — a cumulative context fill that
+        // repeats most of itself every turn. Summing it produced session totals
+        // that grew quadratically and a per-turn line that read as billing that
+        // never happened (audit F19b). Note the registry answers an UNKNOWN
+        // engine id with claude-shaped defaults, so "unknown" means billed —
+        // only a harness that positively declares no usage reporting is
+        // excluded, which is exactly the case this guards.
+        const bool billed = currentTraits().usageReporting;
 
         QString head = err ? i18n("turn ended with an error") : i18n("turn complete");
         // Tools the human declined this turn — worth a visible trace, since a
@@ -4667,10 +5803,17 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             const int cacheHitPct =
                 promptTotal > 0 ? int((cacheRead * 100) / promptTotal) : 0;
             // e.g. "turn complete · 1,204 in / 318 out · 86% cache hit · $0.0042 · 3.1s"
-            QString line = i18nc("turn-usage summary",
-                                 "%1 · %2 in / %3 out · %4% cache hit",
-                                 head, loc.toString(inTok), loc.toString(outTok),
-                                 cacheHitPct);
+            QString line =
+                billed ? i18nc("turn-usage summary",
+                               "%1 · %2 in / %3 out · %4% cache hit",
+                               head, loc.toString(inTok), loc.toString(outTok),
+                               cacheHitPct)
+                       // Not a per-turn spend: say what the number IS. The
+                       // engine reported how full the context is, and calling
+                       // that "in / out" would invent a bill.
+                       : i18nc("turn context summary",
+                               "%1 · context %2 tokens", head,
+                               loc.toString(promptTotal));
             if (costUsd > 0.0) {
                 line += i18nc("turn cost suffix", " · $%1", loc.toString(costUsd, 'f', 4));
             }
@@ -4685,7 +5828,9 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             addNote(line.toHtmlEscaped(), err ? QStringLiteral("err") : QStringLiteral("dim"));
             // Accumulate session totals — but never while replaying the
             // transcript, or historical turns would be double-counted.
-            if (!m_replaying) {
+            // Accumulate only where the engine reports per-turn spend; a
+            // cumulative readout must never be summed (see `billed` above).
+            if (!m_replaying && billed) {
                 m_sessionCostUsd += costUsd;
                 m_sessionInTokens += inTok;
                 m_sessionOutTokens += outTok;
@@ -4695,7 +5840,9 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             // entry doing the main conversation — the one with the most
             // prompt-side tokens). This is the number that predicts
             // auto-compaction.
-            if (promptTotal > 0) {
+            // Estimate only — a `_context` event from the engine's own
+            // accounting supersedes it and must not be clobbered here.
+            if (promptTotal > 0 && !m_ctxExact) {
                 m_ctxPromptTokens = promptTotal;
             }
             const QJsonObject perModel = ev.value(QStringLiteral("modelUsage")).toObject();
@@ -4712,7 +5859,9 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
                     u.value(QStringLiteral("contextWindow")).toVariant().toLongLong();
                 if (window > 0 && promptSide > best) {
                     best = promptSide;
-                    m_ctxWindow = window;
+                    if (m_ctxWindow <= 0 || !m_ctxExact) {
+                        m_ctxWindow = window;
+                    }
                 }
             }
         } else {
@@ -4727,6 +5876,16 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             if (!why.isEmpty()) {
                 addNote(why.toHtmlEscaped(), QStringLiteral("err"));
             }
+            // A tripped cost budget ends the turn through the same error result,
+            // and its `subtype` is the only field that names the cause. Without
+            // this the panel would show a bare "turn ended with an error" for a
+            // ceiling the human set themselves.
+            const QString subtype = ev.value(QStringLiteral("subtype")).toString();
+            if (subtype.contains(QLatin1String("budget"), Qt::CaseInsensitive)) {
+                addNote(i18n("The cost budget for this agent is used up. Start a "
+                             "new agent, or raise the budget and start again."),
+                        QStringLiteral("err"));
+            }
         }
         // Turn timing: fold this turn into the session's average and stop the
         // elapsed readout. duration_ms is the CLI's own wall time; fall back
@@ -4738,24 +5897,68 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
         }
         m_working->setTurnStart(0);
         m_idle = true;
+        // The turn is over: any provisional streamed row has been replaced by
+        // its authoritative event (or was orphaned by an interrupt), and the
+        // block indices restart at 0 on the next turn.
+        resetStreamState();
+        m_subagent.clear();
         refresh();
         // The turn boundary is the moment a queued follow-up can fire.
         drainSendQueue();
+
+    } else if (type == QLatin1String("rate_limit_event")) {
+        // Emitted every turn, so it is header state — never a feed row except
+        // on a status transition (see applyRateLimit).
+        applyRateLimit(ev.value(QStringLiteral("rate_limit_info")).toObject());
 
     } else if (type == QLatin1String("_commands")) {
         // The kimi CLI's command list (translated from ACP
         // available_commands_update) — replaces the autocomplete feed. Not a
         // feed row; purely composer state.
-        m_slashCommands.clear();
-        const QJsonArray cmds = ev.value(QStringLiteral("commands")).toArray();
-        for (const QJsonValue &v : cmds) {
-            const QJsonObject cmd = v.toObject();
-            const QString name = cmd.value(QStringLiteral("name")).toString();
-            if (!name.isEmpty()) {
-                m_slashCommands.append(
-                    {name, cmd.value(QStringLiteral("description")).toString()});
+        seedSlashCommands(ev.value(QStringLiteral("commands")).toArray());
+
+    } else if (type == QLatin1String("_options")) {
+        // kimi's live config snapshot: the same `configOptions` array the init
+        // event carries, re-sent whenever an option's value changes — including
+        // changes the CLI made on its own (its ExitPlanMode mode switch), which
+        // is exactly the case that used to leave our pickers lying.
+        const QJsonArray configOptions =
+            ev.value(QStringLiteral("configOptions")).toArray();
+        if (!configOptions.isEmpty()) {
+            if (m_replaying) {
+                HarnessRegistry::persistDiscoveredOptions(currentTraits().id,
+                                                          configOptions);
+            } else {
+                HarnessRegistry::self()->applyDiscoveredOptions(currentTraits().id,
+                                                                configOptions);
             }
         }
+        if (!m_replaying) {
+            adoptDiscoveredOptions(configOptions,
+                                   ev.value(QStringLiteral("changed")).toArray());
+        }
+
+    } else if (type == QLatin1String("_context")) {
+        // The core asked the running CLI what its context ACTUALLY holds
+        // (claude's get_context_usage control request) after the last turn.
+        // This outranks the estimate the result branch derives from prompt-side
+        // token sums: those count what was sent, while the window also carries
+        // the system prompt, tool schemas, memory files and the autocompact
+        // buffer. Engines without the control channel send no such event and
+        // the estimate stands.
+        const qlonglong used =
+            ev.value(QStringLiteral("usedTokens")).toVariant().toLongLong();
+        const qlonglong max =
+            ev.value(QStringLiteral("maxTokens")).toVariant().toLongLong();
+        if (used > 0) {
+            m_ctxPromptTokens = used;
+            m_ctxExact = true;
+        }
+        if (max > 0) {
+            m_ctxWindow = max;
+        }
+        m_ctxBreakdown = ev.value(QStringLiteral("breakdown")).toArray();
+        refresh();
 
     } else if (type == QLatin1String("_stderr")) {
         addNote(ev.value(QStringLiteral("text")).toString().toHtmlEscaped(),
@@ -4787,6 +5990,8 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             m_sessionOutTokens = 0;
             m_ctxPromptTokens = 0;
             m_ctxWindow = 0;
+            m_ctxExact = false;
+            m_ctxBreakdown = QJsonArray();
             m_turnDurTotalMs = 0;
             m_turnDurCount = 0;
             m_working->setAverageTurnMs(0);
@@ -4798,6 +6003,11 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             if (!m_input->toPlainText().trimmed().isEmpty() || !m_attachments.isEmpty()) {
                 onSendClicked();
             }
+        } else if (phase == QLatin1String("notice")) {
+            // A core-side event this thread should know about but that changes
+            // no panel state (today: skills reloaded mid-session after a
+            // catalogue install). Reusing _lifecycle keeps one wire contract.
+            addNote(detail, QStringLiteral("sys"));
         } else if (phase == QLatin1String("promoted")) {
             m_isolated = true;
             m_branch = ev.value(QStringLiteral("branch")).toString();
@@ -4818,11 +6028,18 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             m_permQueue.clear();
             m_permBar->setVisible(false);
             m_questionBox->setVisible(false);
+            // No `result` event closes an aborted turn, so this is the only
+            // place its half-streamed blocks get settled and their unclaimed
+            // row keys dropped — the next turn's blocks start at index 0.
+            resetStreamState();
             refresh();
             // A follow-up queued during the interrupt can fire now.
             drainSendQueue();
         } else if (phase == QLatin1String("error")) {
             addNote(QStringLiteral("agent failed: %1").arg(detail), QStringLiteral("err"));
+            // The turn died without a `result`: settle whatever streamed and
+            // drop the state, so a later start doesn't claim these rows.
+            resetStreamState();
             m_idle = false;
             m_promoting = false;
             m_errored = true; // roster card shows Error until the next send/resume
@@ -4846,10 +6063,12 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             // with it. Their output files persist, so chips stay clickable.
             // Still-running ones died with the process: that is a failure, not
             // a completion, and the Jobs panel must not tick them.
+            const qint64 diedMs = QDateTime::currentMSecsSinceEpoch();
             for (auto it = m_bgJobs.begin(); it != m_bgJobs.end(); ++it) {
                 if (!it->done) {
                     it->done = true;
                     it->failed = true;
+                    it->endedMs = diedMs;
                 }
             }
             updateJobsBar();
@@ -4862,6 +6081,10 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             m_permQueue.clear();
             m_permBar->setVisible(false);
             m_questionBox->setVisible(false);
+            // The process is gone mid-stream (stopped, crashed): no `result`
+            // and no authoritative `assistant` will arrive, so settle the
+            // partial rows here rather than leaving them raw and claimable.
+            resetStreamState();
             // The session stopped before the queued follow-ups could fire.
             // Don't discard the human's text — put it back in the composer so
             // it can be re-sent (into a resumed session) with one keystroke.

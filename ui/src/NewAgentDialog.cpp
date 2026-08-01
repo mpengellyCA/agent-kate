@@ -11,6 +11,7 @@
 #include <KSharedConfig>
 
 #include <QCheckBox>
+#include <QDoubleSpinBox>
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QFormLayout>
@@ -175,15 +176,32 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, CoreClient *core,
             if (idx >= 0) {
                 combo->setCurrentIndex(idx);
             }
+            return idx >= 0;
         };
         restore(m_model, prevModel);
-        restore(m_permission, prevPerm);
+        // The mode list is the engine's own vocabulary in the CLI's order, so
+        // index 0 is arbitrary: on the first build (nothing previously picked)
+        // or after switching to an engine without the previous mode, land on
+        // the harness's named default instead of whatever it lists first.
+        if (!restore(m_permission, prevPerm)) {
+            restore(m_permission, t.defaultPermissionMode());
+        }
         restore(m_effort, prevEffort);
-        // Only offer the sweep options this engine can actually apply.
+        // Only offer the sweep options this engine can actually apply. The same
+        // flags are remembered for choices(), which must decide "was this row
+        // offered?" from the capability and never from widget visibility —
+        // collapsing Advanced hides every row without withdrawing any option.
+        m_sweepSupport.fallbackModels = t.fallbackModels;
+        m_sweepSupport.disallowedTools = t.disallowedTools;
+        m_sweepSupport.addDirs = t.addDirs;
+        m_sweepSupport.strictMcpConfig = t.strictMcpConfig;
+        m_sweepSupport.costBudget = t.costBudget;
         if (m_advancedForm) {
             m_advancedForm->setRowVisible(m_fallbackModels, t.fallbackModels);
             m_advancedForm->setRowVisible(m_disallowedTools, t.disallowedTools);
             m_advancedForm->setRowVisible(m_addDirs, t.addDirs);
+            m_advancedForm->setRowVisible(m_strictMcp, t.strictMcpConfig);
+            m_advancedForm->setRowVisible(m_budget, t.costBudget);
         }
     };
     // Selecting a discovered-model engine (e.g. Kimi) with no cached option
@@ -242,6 +260,26 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, CoreClient *core,
         i18n("Extra directories this agent's tools may read, beyond its own "
              "working copy. Comma-separated."));
     advForm->addRow(i18n("Also allow access to"), m_addDirs);
+    m_strictMcp = new QCheckBox(
+        i18n("Isolate from global MCP servers"), m_advanced);
+    m_strictMcp->setToolTip(
+        i18n("Run this agent with only the tool servers Agent Kate wires in, "
+             "ignoring the MCP servers configured globally for the CLI. Off by "
+             "default — the global servers are usually the point."));
+    advForm->addRow(QString(), m_strictMcp);
+    m_budget = new QDoubleSpinBox(m_advanced);
+    m_budget->setDecimals(2);
+    m_budget->setRange(0.0, 10000.0);
+    m_budget->setSingleStep(1.0);
+    m_budget->setPrefix(QStringLiteral("$"));
+    // 0 is "no ceiling", spelled out rather than shown as a $0.00 budget that
+    // would read as "spend nothing".
+    m_budget->setSpecialValueText(i18n("No limit"));
+    m_budget->setToolTip(
+        i18n("A hard spend ceiling for this agent's whole session, enforced by "
+             "the engine itself: once it trips, the turn ends with an error "
+             "instead of billing further."));
+    advForm->addRow(i18n("Cost budget (USD)"), m_budget);
     m_advanced->setVisible(false);
     root->addWidget(m_advanced);
     connect(advToggle, &QCheckBox::toggled, m_advanced, &QWidget::setVisible);
@@ -311,11 +349,14 @@ NewAgentChoices NewAgentDialog::choices() const
                                          : QStringLiteral("workspace");
     c.permissionMode = m_permission->currentData().toString();
     c.effort = m_effort->currentData().toString();
-    // A hidden row is an option this engine cannot express — read nothing from
-    // it, so a value typed before switching engines cannot leak into the launch.
-    const auto listFrom = [](const QLineEdit *edit) {
+    // An unsupported row is an option this engine cannot express — read nothing
+    // from it, so a value typed before switching engines cannot leak into the
+    // launch. The test is the engine's capability, NOT the widget's visibility:
+    // the Advanced section is collapsible, and a collapsed section makes every
+    // row invisible while withdrawing nothing the user chose.
+    const auto listFrom = [](const QLineEdit *edit, bool supported) {
         QStringList out;
-        if (!edit || !edit->isVisibleTo(edit->window())) {
+        if (!edit || !supported) {
             return out;
         }
         const QStringList parts = edit->text().split(QLatin1Char(','), Qt::SkipEmptyParts);
@@ -327,8 +368,14 @@ NewAgentChoices NewAgentDialog::choices() const
         }
         return out;
     };
-    c.fallbackModels = listFrom(m_fallbackModels);
-    c.disallowedTools = listFrom(m_disallowedTools);
-    c.addDirs = listFrom(m_addDirs);
+    c.fallbackModels = listFrom(m_fallbackModels, m_sweepSupport.fallbackModels);
+    c.disallowedTools = listFrom(m_disallowedTools, m_sweepSupport.disallowedTools);
+    c.addDirs = listFrom(m_addDirs, m_sweepSupport.addDirs);
+    // Same capability rule as the list fields: a row this engine cannot express
+    // was never really offered, so it must not be reported as a request.
+    c.strictMcpConfig = m_strictMcp && m_sweepSupport.strictMcpConfig
+        && m_strictMcp->isChecked();
+    c.maxBudgetUsd =
+        (m_budget && m_sweepSupport.costBudget) ? m_budget->value() : 0.0;
     return c;
 }

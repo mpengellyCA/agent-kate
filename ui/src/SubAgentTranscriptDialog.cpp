@@ -4,13 +4,13 @@
 #include "SubAgentTranscriptDialog.h"
 
 #include "AgentChatHelpers.h"
+#include "SafeContent.h"
 #include "theme/ThemeManager.h"
 
 #include <KConfigGroup>
 #include <KLocalizedString>
 #include <KSharedConfig>
 
-#include <QFile>
 #include <QFileInfo>
 #include <QFileSystemWatcher>
 #include <QHBoxLayout>
@@ -20,6 +20,8 @@
 #include <QPushButton>
 #include <QScrollBar>
 #include <QTextBrowser>
+#include <QTextCursor>
+#include <QTextDocument>
 #include <QTimer>
 #include <QVBoxLayout>
 
@@ -30,6 +32,37 @@ namespace {
 constexpr int kResultClip = 800;
 // Poll cadence — a backstop for the file watcher while the transcript grows.
 constexpr int kPollMs = 1200;
+
+// --- Bounds. This dialog tails a file a SUB-AGENT writes, so its size, its line
+// lengths and its growth rate are all attacker-influenced (repo content shapes
+// what the agent does, and a runaway loop needs no attacker at all). Each of the
+// four ways that could exhaust the GUI process gets its own cap: one read, one
+// held fragment, and the document along both of its axes.
+//
+// How much of the file one pull may read. The first pull starts at offset 0, so
+// without this a 2 GB transcript is a 2 GB allocation in the GUI process before
+// a single line is rendered.
+constexpr qint64 kMaxTailBytes = 1 * 1024 * 1024;
+// The longest incomplete trailing line held between pulls. A file with no
+// newlines is otherwise an unbounded accumulator: every pull appends its window
+// to m_partial and none of it ever renders.
+constexpr int kMaxPartialBytes = 256 * 1024;
+// The document is a live tail, not an archive: old blocks are dropped off the
+// front so a sub-agent that keeps writing cannot grow the QTextDocument without
+// bound. (Probed: Qt trims from the front safely with tables/lists/pre in the
+// tail.)
+//
+// TWO caps, because a block count bounds the wrong thing on its own. Blocks are
+// PARAGRAPHS, and nothing bounds how long one paragraph is: 4000 blocks of one
+// 900 KB message each is 3.6 GB of QTextDocument that never trips
+// maximumBlockCount, and the sub-agent picks both how many messages it writes
+// and how long each one is. So: MANY-and-small is bounded by the block count,
+// FEW-and-huge by the character count. Both bind at roughly the same scale for
+// ordinary output (4000 blocks of ~50 characters), and trimming either one
+// drops the OLDEST blocks — this is a live tail, and the file on disk stays the
+// complete record.
+constexpr int kMaxDocBlocks = 4000;
+constexpr int kMaxDocChars = 200000;
 
 // The role blocks of one message, appended to `html`.
 void renderBlocks(const QJsonValue &content, const QString &role, QString &html,
@@ -221,8 +254,22 @@ SubAgentTranscriptDialog::SubAgentTranscriptDialog(const QString &jsonlPath,
         label.isEmpty() ? QFileInfo(jsonlPath).fileName() : label;
     setWindowTitle(i18nc("@title:window", "Sub-agent transcript — %1", name));
 
-    m_browser = new QTextBrowser(this);
+    // Guarded: every byte in this dialog is a helper agent's own output, and a
+    // bare QTextBrowser resolves an image name to an unbounded synchronous read
+    // of any local path — `![x](/dev/zero)` hangs the GUI thread, and a
+    // file:///…/private.png renders someone's picture into the transcript
+    // (audit F15). Links are handled by the caller's policy, never navigated.
+    m_browser = new agentkate::GuardedTextBrowser(this);
+    // Bounded document: this view follows a file that grows for as long as the
+    // sub-agent runs, so it keeps a tail rather than the whole history (audit
+    // F11 class — the same "bound what is READ, not just what is admitted"
+    // rule the attachment path now follows). maximumBlockCount is only half of
+    // it; trimDocument() enforces the character cap that bounds block SIZE.
+    m_browser->document()->setMaximumBlockCount(kMaxDocBlocks);
     m_browser->setOpenExternalLinks(false);
+    m_browser->setOpenLinks(false);
+    connect(m_browser, &QTextBrowser::anchorClicked, this,
+            [this](const QUrl &url) { agentkate::openModelLink(this, url); });
 
     auto *close = new QPushButton(i18n("Close"), this);
     connect(close, &QPushButton::clicked, this, &QDialog::accept);
@@ -262,33 +309,54 @@ SubAgentTranscriptDialog::~SubAgentTranscriptDialog()
 
 void SubAgentTranscriptDialog::pullNew()
 {
-    QFile f(m_path);
-    if (!f.open(QIODevice::ReadOnly)) {
-        return;
-    }
     // Some file watchers drop the path after a change; re-arm it.
-    if (m_watcher && !m_watcher->files().contains(m_path)) {
+    if (m_watcher && QFileInfo::exists(m_path) && !m_watcher->files().contains(m_path)) {
         m_watcher->addPath(m_path);
     }
 
-    const qint64 size = f.size();
-    if (size < m_offset) {
+    // Bounded read: never more than kMaxTailBytes per pull, regular files only,
+    // and a file that outran the cap is skipped forward rather than swallowed.
+    const agentkate::TailRead tail =
+        agentkate::readBoundedTail(m_path, m_offset, kMaxTailBytes);
+    if (tail.restarted) {
         // Truncated / rewritten — start over so we don't render garbage.
-        m_offset = 0;
         m_partial.clear();
+        m_resync = false;
         m_browser->clear();
     }
-    if (size == m_offset && m_partial.isEmpty()) {
+    if (tail.gap) {
+        // We jumped over bytes, so whatever we hold is no longer contiguous and
+        // the new window almost certainly begins mid-line.
+        m_partial.clear();
+        m_resync = true;
+        m_skipped = true;
+    }
+    if (tail.bytes.isEmpty() && m_partial.isEmpty()) {
         return; // nothing new
     }
 
-    f.seek(m_offset);
-    QByteArray data = m_partial + f.readAll();
-    m_offset = f.pos();
-    f.close();
+    QByteArray data = m_partial + tail.bytes;
+    m_partial.clear();
+    if (m_resync) {
+        // Drop the fragment up to the first line boundary: a partial JSON line
+        // is not renderable, and guessing at one is how garbage gets rendered.
+        const int nl = data.indexOf('\n');
+        if (nl < 0) {
+            return; // still inside the over-long line; keep discarding
+        }
+        data = data.mid(nl + 1);
+        m_resync = false;
+    }
 
     const AkColors &c = ThemeManager::palette();
     QString html;
+    if (m_skipped) {
+        m_skipped = false;
+        html += QStringLiteral("<div style=\"margin:8px 0;color:%1\"><i>%2</i></div>")
+                    .arg(c.neutral.name(),
+                         i18n("… earlier output skipped (the sub-agent wrote faster "
+                              "than this view reads)"));
+    }
     int start = 0;
     for (int i = 0; i < data.size(); ++i) {
         if (data.at(i) == '\n') {
@@ -296,8 +364,15 @@ void SubAgentTranscriptDialog::pullNew()
             start = i + 1;
         }
     }
-    // Bytes past the last newline are an incomplete line — hold them for next time.
-    m_partial = data.mid(start);
+    // Bytes past the last newline are an incomplete line — hold them for next
+    // time, unless the "line" has grown past anything a transcript record could
+    // be, in which case hold nothing and resync at the next newline.
+    if (data.size() - start > kMaxPartialBytes) {
+        m_resync = true;
+        m_skipped = true;
+    } else {
+        m_partial = data.mid(start);
+    }
 
     if (html.isEmpty()) {
         return;
@@ -312,5 +387,38 @@ void SubAgentTranscriptDialog::pullNew()
     // block structure. insertHtml() at the end cursor merges block-level markup
     // into the previous paragraph, running successive events together.
     m_browser->append(html);
+    trimDocument();
     sb->setValue(atBottom ? sb->maximum() : prev);
+}
+
+void SubAgentTranscriptDialog::trimDocument()
+{
+    QTextDocument *doc = m_browser->document();
+    if (doc->characterCount() <= kMaxDocChars) {
+        return; // the common case: nothing to do, and no cursor allocated
+    }
+    QTextCursor cur(doc);
+    cur.beginEditBlock();
+    // Delete whole blocks off the front — the oldest output — until the tail
+    // fits. Selecting to the start of the NEXT block takes the block separator
+    // with it, so the document does not accumulate empty paragraphs.
+    while (doc->characterCount() > kMaxDocChars && doc->blockCount() > 1) {
+        cur.movePosition(QTextCursor::Start);
+        if (!cur.movePosition(QTextCursor::NextBlock, QTextCursor::KeepAnchor)) {
+            break; // cannot advance: stop rather than spin
+        }
+        cur.removeSelectedText();
+    }
+    cur.endEditBlock();
+    if (doc->characterCount() > kMaxDocChars) {
+        // One single block is over the whole budget — a sub-agent that emitted
+        // a megabytes-long line. There is nothing left to drop off the front, so
+        // drop the document: the file on disk is still the record.
+        m_browser->clear();
+        // The held fragment belongs to the text we just threw away, and it
+        // starts mid-line, so resync at the next newline rather than parse it.
+        m_partial.clear();
+        m_resync = true;
+        m_skipped = true; // the next pull tells the reader output was dropped
+    }
 }

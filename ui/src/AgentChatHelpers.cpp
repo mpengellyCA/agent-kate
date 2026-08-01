@@ -189,8 +189,8 @@ namespace agentkate
 QString markdownToHtml(const QString &md)
 {
     QTextDocument doc;
-    doc.setMarkdown(agentkate::neutralizeMarkdownRawHtml(md),
-                    QTextDocument::MarkdownDialectGitHub);
+    // Model-authored: parsed with raw HTML disabled at the parser (MarkdownUtil.h).
+    agentkate::setMarkdownSafe(doc, md);
     const QString html = doc.toHtml();
     const int bodyOpen = html.indexOf(QLatin1String("<body"));
     const int bodyStart = bodyOpen >= 0 ? html.indexOf(QLatin1Char('>'), bodyOpen) + 1 : -1;

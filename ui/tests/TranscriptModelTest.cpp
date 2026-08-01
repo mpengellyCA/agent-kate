@@ -3,17 +3,24 @@
 //  * append-only growth + row count,
 //  * a tool row's result mutating in place (done flag, dataChanged for one row),
 //  * the delegate's per-(row,width) height cache: same width is cached, a width
-//    change re-measures, and a model mutation (stableId bump) busts the entry —
-//    which is what makes window-edge resize O(visible rows).
+//    change re-measures, and a model mutation busts the entry (via
+//    heightInvalidated) — which is what makes window-edge resize O(visible rows),
+//  * a mutation keeps the row's stableId: identity is stable, invalidation is
+//    explicit, so a streamed message no longer strands one dead cache entry per
+//    flush tick.
 
 #include "AgentChatHelpers.h"
 #include "TranscriptDelegate.h"
 #include "TranscriptModel.h"
+#include "state/HarnessTraits.h"
 
+#include <QApplication>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QListView>
 #include <QSignalSpy>
 #include <QStyleOptionViewItem>
+#include <QTextDocument>
 #include <QtTest>
 
 class TranscriptModelTest : public QObject
@@ -25,14 +32,65 @@ private Q_SLOTS:
     void toolsVisibilityToggles();
     void findStatePropagates();
     void widthChangeEstimatesThenMeasuresExact();
+    void sizeHintMeasuresAtViewportWidth();
+    void themeChangeRelaysCachedDocuments();
     void heightCacheInvalidatesOnMutation();
+    void stableIdSurvivesInPlaceUpdates();
     void evictionBoundsRamAndKeysResolve();
     void attachmentsRoleRoundTrips();
     void thinkingRowExpands();
     void checklistUpdatesInPlace();
     void toolAttachmentsAddChips();
     void mcpToolsSummarizeTheirArguments();
+    void compactionCapabilitySplitsHotFromCold();
+    void permissionModeDefaultIsNamedNotPositional();
+    void expandedToolDocsAreCachedPerRow();
 };
+
+// Audit F18: an expanded tool row used to build (and destroy) two whole
+// QTextDocuments on every paint, so scrolling past one big expanded row paid
+// two full text layouts per frame. They now come from the same per-row cache
+// the body documents use — and, like those, are dropped when the row mutates.
+void TranscriptModelTest::expandedToolDocsAreCachedPerRow()
+{
+    TranscriptModel m;
+    const int row = m.appendTool(QStringLiteral("Bash"), QStringLiteral("ls"),
+                                 QStringLiteral("{\"command\":\"ls\"}"), true);
+    m.setToolResult(row, QStringLiteral("a\nb\nc"), QStringLiteral("a\nb\nc"),
+                    false);
+    m.setExpanded(0, true);
+
+    TranscriptDelegate d;
+    QFont mono;
+    mono.setFamily(QStringLiteral("monospace"));
+    const QModelIndex idx = m.index(0);
+    QTextDocument *first =
+        d.toolDoc(idx, TranscriptDelegate::ToolSlot::Detail, QStringLiteral("{}"), mono, 300);
+    QVERIFY(first);
+    // Same row, same content, same width: the very same laid-out document.
+    QCOMPARE(d.toolDoc(idx, TranscriptDelegate::ToolSlot::Detail, QStringLiteral("{}"),
+                       mono, 300),
+             first);
+    // The result slot is its own document — never the detail one.
+    QVERIFY(d.toolDoc(idx, TranscriptDelegate::ToolSlot::Result, QStringLiteral("out"),
+                      mono, 300)
+            != first);
+    // New content re-lays the SAME document rather than leaking a new one, and
+    // the new text is what it holds.
+    QTextDocument *relaid =
+        d.toolDoc(idx, TranscriptDelegate::ToolSlot::Detail,
+                  QStringLiteral("{\"a\":1}"), mono, 300);
+    QCOMPARE(relaid, first);
+    QCOMPARE(relaid->toPlainText(), QStringLiteral("{\"a\":1}"));
+    // A row mutation drops the cached documents (invalidateRow), so the next
+    // fetch cannot paint stale text.
+    const quintptr id = idx.data(TranscriptModel::StableIdRole).value<quintptr>();
+    d.invalidateRow(id);
+    QCOMPARE(d.toolDoc(idx, TranscriptDelegate::ToolSlot::Detail, QStringLiteral("{}"),
+                       mono, 300)
+                 ->toPlainText(),
+             QStringLiteral("{}"));
+}
 
 void TranscriptModelTest::appendsGrowRowCount()
 {
@@ -144,6 +202,91 @@ void TranscriptModelTest::widthChangeEstimatesThenMeasuresExact()
     QVERIFY(!d.hasStaleHeights());
 }
 
+// The width trap: QListView hands sizeHint() an option whose rect can be EMPTY,
+// and the old fallback then used the view's own width — which includes the
+// vertical scrollbar. paint() always gets the viewport width, so measure and
+// paint missed each other by the scrollbar's width and the shared body document
+// was laid out twice per streaming tick. sizeHint must report viewport width.
+void TranscriptModelTest::sizeHintMeasuresAtViewportWidth()
+{
+    TranscriptModel m;
+    QString body;
+    for (int i = 0; i < 60; ++i) {
+        body += QStringLiteral("word%1 ").arg(i);
+    }
+    m.appendMessage(QStringLiteral("Agent Kate"), QStringLiteral("#1a7f6b"), body, body,
+                    false, QStringLiteral("10:00"));
+
+    QListView view;
+    TranscriptDelegate d;
+    view.setModel(&m);
+    view.setItemDelegate(&d);
+    // Always-on keeps the viewport strictly narrower than the view, which is the
+    // situation a streaming transcript is permanently in.
+    view.setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOn);
+    view.resize(600, 400);
+    // The viewport only takes its real geometry once the resize event is
+    // delivered, which for a hidden widget never happens.
+    view.show();
+    qApp->processEvents();
+
+    QVERIFY2(view.viewport()->width() < view.width(),
+             "test needs a visible scrollbar to tell the two widths apart");
+
+    QStyleOptionViewItem opt;
+    opt.widget = &view;
+    opt.font = view.font();
+    opt.palette = view.palette();
+    opt.rect = QRect(); // what QListView's layout pass actually passes
+    QCOMPARE(d.sizeHint(opt, m.index(0)).width(), view.viewport()->width());
+
+    // And the height it cached must be the one paint() (viewport width) needs:
+    // asking again at the viewport width is a cache hit, not a stale estimate.
+    d.clearStaleFlag();
+    opt.rect = QRect(0, 0, view.viewport()->width(), 0);
+    const int h = d.sizeHint(opt, m.index(0)).height();
+    QVERIFY(h > 0);
+    QVERIFY2(!d.hasStaleHeights(),
+             "measure and paint widths disagree — the row was measured twice");
+}
+
+// The body HTML carries inline palette(...) CSS that Qt resolves to concrete
+// colours at setHtml() time, so a cached document keeps painting the previous
+// theme's colours unless the cache key notices the palette moved.
+void TranscriptModelTest::themeChangeRelaysCachedDocuments()
+{
+    TranscriptModel m;
+    m.appendMessage(QStringLiteral("Agent Kate"), QStringLiteral("#1a7f6b"),
+                    QStringLiteral("hello <b>world</b>"), QStringLiteral("hello world"),
+                    false, QStringLiteral("10:00"));
+
+    QListView view;
+    TranscriptDelegate d;
+    view.setModel(&m);
+    view.setItemDelegate(&d);
+    view.resize(600, 400);
+
+    QStyleOptionViewItem opt;
+    opt.widget = &view;
+    opt.font = view.font();
+    opt.palette = view.palette();
+    opt.rect = QRect(0, 0, 400, 0);
+
+    QTextDocument *doc = d.bodyDoc(m.index(0), 360, opt);
+    QVERIFY(doc);
+    const int rev = doc->revision();
+    // Same row, width, html and font: a cache hit, no re-layout.
+    QCOMPARE(d.bodyDoc(m.index(0), 360, opt)->revision(), rev);
+
+    QPalette p = qApp->palette();
+    p.setColor(QPalette::Highlight, QColor(255, 0, 128));
+    qApp->setPalette(p);
+    qApp->processEvents();
+
+    QVERIFY2(d.bodyDoc(m.index(0), 360, opt)->revision() > rev,
+             "a theme change must re-lay the cached body document, not repaint it stale");
+}
+
 void TranscriptModelTest::heightCacheInvalidatesOnMutation()
 {
     TranscriptModel m;
@@ -156,12 +299,44 @@ void TranscriptModelTest::heightCacheInvalidatesOnMutation()
     opt.rect = QRect(0, 0, 500, 0);
 
     const int collapsed = d.sizeHint(opt, m.index(row)).height();
-    // Expanding the tool row must grow it — proves the stableId bump on mutation
-    // busts the cached collapsed height.
+    // Expanding the tool row must grow it — proves the mutation's
+    // heightInvalidated busts the cached collapsed height.
     m.setExpanded(row, true);
     m.setToolResult(row, QStringLiteral("a\nb\nc\nd"), QStringLiteral("a\nb\nc\nd"), false);
     const int expanded = d.sizeHint(opt, m.index(row)).height();
     QVERIFY2(expanded > collapsed, "expanded tool row must be taller than collapsed");
+}
+
+// A row's stable id is an identity, not a change counter: streaming rewrites a
+// message body every 50ms flush tick, and minting a fresh id each time left the
+// delegate's (id -> height) cache holding a dead entry per tick. The model now
+// keeps the id and emits heightInvalidated for exactly that row instead.
+void TranscriptModelTest::stableIdSurvivesInPlaceUpdates()
+{
+    TranscriptModel m;
+    const int key = m.appendMessage(QStringLiteral("Agent Kate"),
+                                    QStringLiteral("#1a7f6b"), QStringLiteral("a"),
+                                    QStringLiteral("a"), false, QString());
+    const quintptr id0 =
+        m.data(m.index(key), TranscriptModel::StableIdRole).value<quintptr>();
+    QVERIFY(id0 != 0);
+
+    QSignalSpy invalidated(&m, &TranscriptModel::heightInvalidated);
+    for (int i = 0; i < 5; ++i) {
+        m.setMessageBody(key, QStringLiteral("a<b>%1</b>").arg(i),
+                         QStringLiteral("a%1").arg(i));
+    }
+    // Every in-place update invalidates the row...
+    QCOMPARE(invalidated.count(), 5);
+    QCOMPARE(invalidated.takeFirst().at(0).value<quintptr>(), id0);
+    // ...and none of them changes its identity.
+    QCOMPARE(m.data(m.index(key), TranscriptModel::StableIdRole).value<quintptr>(), id0);
+
+    // A NEW row still gets a distinct id.
+    const int other = m.appendMessage(QStringLiteral("You"), QStringLiteral("#888"),
+                                      QStringLiteral("b"), QStringLiteral("b"), false,
+                                      QString());
+    QVERIFY(m.data(m.index(other), TranscriptModel::StableIdRole).value<quintptr>() != id0);
 }
 
 // The in-RAM feed is capped (kMaxRows = 5000) so a long session can't grow the
@@ -479,6 +654,49 @@ void TranscriptModelTest::mcpToolsSummarizeTheirArguments()
              QStringLiteral("Agent Kate is coordinating with the team…"));
     QCOMPARE(agentkate::activityFor(QStringLiteral("mcp__cowork__desktop_click")),
              QStringLiteral("Agent Kate is working at the desktop…"));
+}
+
+// The built-in traits must mirror the core's two-field compaction capability
+// (harness.Capabilities Compaction/ColdCompact). Kimi compacts HOT only, and
+// the panel's pre-resume summary-recovery prompt ends in a COLD compaction — so
+// a UI that gates that prompt on `compaction` offers a dormant kimi thread a
+// modal whose every choice the core refuses.
+void TranscriptModelTest::compactionCapabilitySplitsHotFromCold()
+{
+    const HarnessTraits claude = HarnessRegistry::self()->traits(QStringLiteral("claude"));
+    QVERIFY(claude.compaction);
+    QVERIFY(claude.coldCompact);
+
+    const HarnessTraits kimi = HarnessRegistry::self()->traits(QStringLiteral("kimi"));
+    QVERIFY(kimi.compaction);
+    QVERIFY(!kimi.coldCompact);
+}
+
+// permissionModes is the engine's own vocabulary in the CLI's order, so the
+// default mode must be named, never "whatever is at index 0" — reordering the
+// list upstream must not change what a fresh profile starts on.
+void TranscriptModelTest::permissionModeDefaultIsNamedNotPositional()
+{
+    QCOMPARE(HarnessRegistry::self()->traits(QStringLiteral("claude")).defaultPermissionMode(),
+             QStringLiteral("acceptEdits"));
+
+    HarnessTraits reordered;
+    reordered.permissionModes = {QStringLiteral("bypassPermissions"),
+                                 QStringLiteral("manual"),
+                                 QStringLiteral("acceptEdits")};
+    QCOMPARE(reordered.defaultPermissionMode(), QStringLiteral("acceptEdits"));
+
+    // No acceptEdits in the vocabulary: fall to "default", then to the first
+    // entry, then to an empty string for a discovered-vocabulary harness.
+    HarnessTraits noAccept;
+    noAccept.permissionModes = {QStringLiteral("plan"), QStringLiteral("default")};
+    QCOMPARE(noAccept.defaultPermissionMode(), QStringLiteral("default"));
+
+    HarnessTraits foreign;
+    foreign.permissionModes = {QStringLiteral("careful"), QStringLiteral("bold")};
+    QCOMPARE(foreign.defaultPermissionMode(), QStringLiteral("careful"));
+
+    QCOMPARE(HarnessTraits().defaultPermissionMode(), QString());
 }
 
 QTEST_MAIN(TranscriptModelTest)

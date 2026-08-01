@@ -36,6 +36,22 @@ QString HarnessTraits::modelCacheKey(const QString &providerId) const
     return id + QLatin1Char('@') + provider + QStringLiteral("Opt-model");
 }
 
+QString HarnessTraits::modelEffortsKey(const QString &providerId) const
+{
+    return modelCacheKey(providerId) + QStringLiteral("-efforts");
+}
+
+QString HarnessTraits::defaultPermissionMode() const
+{
+    for (const QString &preferred :
+         {QStringLiteral("acceptEdits"), QStringLiteral("default")}) {
+        if (permissionModes.contains(preferred)) {
+            return preferred;
+        }
+    }
+    return permissionModes.value(0);
+}
+
 namespace {
 // Built-in fallbacks mirroring the core adapters (cmd/akcore/harness_*.go),
 // served until agent.capabilities answers. Keeping them in lockstep is what
@@ -46,6 +62,10 @@ HarnessTraits claudeDefaults()
     t.id = QStringLiteral("claude");
     t.displayName = QStringLiteral("Claude Code");
     t.fork = t.compaction = t.promote = true;
+    // `claude --print --resume` runs a pass over a dormant session and
+    // session.ReadTranscript reads its on-disk transcript, so the cold path is
+    // real here. LOCKSTEP with harness_claude.go Capabilities().ColdCompact.
+    t.coldCompact = true;
     t.providerRouting = t.cowork = true;
     t.usageReporting = t.sessionBrowse = true;
     t.transcriptPreview = true; // claude keeps the on-disk session store
@@ -53,12 +73,32 @@ HarnessTraits claudeDefaults()
     t.systemPrompt = t.customSubagents = true;
     // --fallback-model / --disallowedTools / --add-dir, verified on 2.1.220.
     t.fallbackModels = t.disallowedTools = t.addDirs = true;
+    // --strict-mcp-config / --max-budget-usd, verified in `claude -p --help`.
+    t.strictMcpConfig = t.costBudget = true;
+    // set_max_thinking_tokens is accepted mid-session and the effort tiers are
+    // thinking-token budgets underneath, so the quick menu changes effort on a
+    // running thread instead of asking for a relaunch. LOCKSTEP with
+    // core/cmd/akcore/harness_claude.go Capabilities().EffortLive.
+    t.effortLive = true;
     t.subagentTranscripts = true; // subagents/agent-<id>.jsonl beside the session
     // Models are discovered live (`claude -p /model`, or a routed provider's
     // /v1/models); mode/effort stay static vocabularies below.
     t.modelPicker = QStringLiteral("discovered");
+    // The modes claude 2.1.220 accepts AND HONORS in print mode, in the
+    // engine's own order. LOCKSTEP with harness_claude.go
+    // Capabilities().PermissionModes, which replaces this list once
+    // agent.capabilities answers — a fallback ordered differently would
+    // reshuffle the picker on connect. ORDER IS LOAD-BEARING there
+    // (permissiveModes() takes the LAST entry as the unattended end), so
+    // bypassPermissions stays last with dontAsk just short of it. `manual` is
+    // deliberately absent: the flag is accepted and then silently downgraded to
+    // "default" in the init event, so offering it would promise supervision the
+    // session does not have (see the Go comment for the re-probe recipe). No
+    // picker may treat position 0 as the default: defaultPermissionMode() names
+    // it instead, which is what keeps acceptEdits this app's default.
     t.permissionModes = {QStringLiteral("acceptEdits"), QStringLiteral("default"),
                          QStringLiteral("plan"), QStringLiteral("auto"),
+                         QStringLiteral("dontAsk"),
                          QStringLiteral("bypassPermissions")};
     t.efforts = {QStringLiteral("low"), QStringLiteral("medium"), QStringLiteral("high"),
                  QStringLiteral("xhigh"), QStringLiteral("max")};
@@ -73,6 +113,12 @@ HarnessTraits kimiDefaults()
     t.badge = QStringLiteral("Kimi");
     t.effortLive = true;
     t.sessionBrowse = true; // session/list via a one-shot probe (mirrors the Go adapter)
+    // `/compact` sent as prompt text really compacts the live session (probed
+    // on 0.30.0), so the compaction affordances belong on kimi too. It is
+    // HOT-ONLY — coldCompact stays false (LOCKSTEP with harness_kimi.go), so
+    // the dormant-thread flows skip the summary-recovery prompt entirely
+    // instead of offering cold models the core refuses.
+    t.compaction = true;
     // One wire log per subagent under <session-dir>/agents/<id>/ (probed on 0.30.0).
     t.subagentTranscripts = true;
     // transcriptPreview stays false: kimi's transcript is the core's event log,
@@ -93,6 +139,7 @@ HarnessTraits fromJson(const QJsonObject &o)
     t.badge = o.value(QStringLiteral("badge")).toString();
     t.fork = o.value(QStringLiteral("fork")).toBool();
     t.compaction = o.value(QStringLiteral("compaction")).toBool();
+    t.coldCompact = o.value(QStringLiteral("coldCompact")).toBool();
     t.promote = o.value(QStringLiteral("promote")).toBool();
     t.providerRouting = o.value(QStringLiteral("providerRouting")).toBool();
     t.cowork = o.value(QStringLiteral("cowork")).toBool();
@@ -105,6 +152,8 @@ HarnessTraits fromJson(const QJsonObject &o)
     t.fallbackModels = o.value(QStringLiteral("fallbackModels")).toBool();
     t.disallowedTools = o.value(QStringLiteral("disallowedTools")).toBool();
     t.addDirs = o.value(QStringLiteral("addDirs")).toBool();
+    t.strictMcpConfig = o.value(QStringLiteral("strictMcpConfig")).toBool();
+    t.costBudget = o.value(QStringLiteral("costBudget")).toBool();
     t.subagentTranscripts = o.value(QStringLiteral("subagentTranscripts")).toBool();
     t.modelPicker = o.value(QStringLiteral("modelPicker")).toString();
     t.permissionModes.clear();
@@ -305,13 +354,15 @@ void HarnessRegistry::discoverModels(CoreClient *core, const QString &harnessId,
     }
     m_discoveringModels.insert(flight);
     const QString cacheKey = traits(harnessId).modelCacheKey(providerId);
+    const QString effortsKey = traits(harnessId).modelEffortsKey(providerId);
     QJsonObject params{{QStringLiteral("backend"), harnessId}};
     if (!provider.isEmpty()) {
         params.insert(QStringLiteral("provider"), provider);
     }
     core->call(
         QStringLiteral("agent.discoverModels"), params,
-        [this, flight, cacheKey](const QJsonObject &result, const QJsonObject &error) {
+        [this, flight, cacheKey, effortsKey](const QJsonObject &result,
+                                             const QJsonObject &error) {
             m_discoveringModels.remove(flight);
             if (!error.isEmpty()) {
                 return; // best-effort — keep the last cache
@@ -321,6 +372,7 @@ void HarnessRegistry::discoverModels(CoreClient *core, const QString &harnessId,
                 return; // never blank a populated picker (throttled/offline/no key)
             }
             QStringList entries;
+            QStringList effortEntries;
             for (const QJsonValue &mv : models) {
                 const QJsonObject m = mv.toObject();
                 const QString value = m.value(QStringLiteral("value")).toString();
@@ -329,13 +381,31 @@ void HarnessRegistry::discoverModels(CoreClient *core, const QString &harnessId,
                 }
                 QString name = m.value(QStringLiteral("name")).toString();
                 entries << value + QLatin1Char('|') + (name.isEmpty() ? value : name);
+                // Per-model effort support, when the engine reported any. A
+                // model the engine said nothing about contributes no row, which
+                // modelEfforts() reads as "every tier".
+                QStringList efforts;
+                const QJsonArray ea = m.value(QStringLiteral("efforts")).toArray();
+                for (const QJsonValue &ev : ea) {
+                    const QString e = ev.toString();
+                    if (!e.isEmpty()) {
+                        efforts << e;
+                    }
+                }
+                if (!efforts.isEmpty()) {
+                    effortEntries << value + QLatin1Char('|')
+                            + efforts.join(QLatin1Char(','));
+                }
             }
             if (entries.isEmpty()) {
                 return;
             }
-            KSharedConfig::openConfig()
-                ->group(QStringLiteral("Agent"))
-                .writeEntry(cacheKey, entries);
+            KConfigGroup cfg = KSharedConfig::openConfig()->group(QStringLiteral("Agent"));
+            cfg.writeEntry(cacheKey, entries);
+            // Rewritten (not merged) with every catalogue: a model that lost its
+            // effort claim must lose the stale one too, or the picker would keep
+            // greying tiers on evidence the engine has withdrawn.
+            cfg.writeEntry(effortsKey, effortEntries);
             emit changed();
         },
         this);
@@ -383,6 +453,26 @@ HarnessRegistry::modelChoices(const QString &harnessId, const QString &providerI
     return out;
 }
 
+QStringList HarnessRegistry::modelEfforts(const QString &harnessId,
+                                          const QString &providerId,
+                                          const QString &modelValue) const
+{
+    if (modelValue.isEmpty()) {
+        return {};
+    }
+    const QStringList rows = KSharedConfig::openConfig()
+                                 ->group(QStringLiteral("Agent"))
+                                 .readEntry(traits(harnessId).modelEffortsKey(providerId),
+                                            QStringList());
+    for (const QString &row : rows) {
+        const int bar = row.indexOf(QLatin1Char('|'));
+        if (bar > 0 && row.left(bar) == modelValue) {
+            return row.mid(bar + 1).split(QLatin1Char(','), Qt::SkipEmptyParts);
+        }
+    }
+    return {}; // no claim for this model — every tier stays offered
+}
+
 HarnessTraits HarnessRegistry::traits(const QString &id) const
 {
     // The empty id is the legacy record spelling of the default engine.
@@ -422,6 +512,12 @@ QString HarnessRegistry::modeLabel(const QString &value)
     }
     if (value == QLatin1String("auto")) {
         return i18n("Work freely");
+    }
+    if (value == QLatin1String("manual")) {
+        return i18n("Manual — confirm every action");
+    }
+    if (value == QLatin1String("dontAsk")) {
+        return i18n("Don't ask — proceed without prompts");
     }
     if (value == QLatin1String("bypassPermissions")) {
         return i18n("Expert — never ask");

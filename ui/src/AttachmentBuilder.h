@@ -3,9 +3,12 @@
 
 #pragma once
 
+#include <QList>
 #include <QStringList>
 
+class QImage;
 class QJsonArray;
+class QJsonObject;
 
 // Attachment-building helpers split out of AgentPanel: the file-reading, binary
 // sniffing, image base64-encoding and ranged-excerpt extraction that turn local
@@ -20,7 +23,8 @@ namespace agentkate
 // `paths` to `attachments`, de-duplicating against entries already present.
 // `workspace` (may be empty) is used only to flag paths outside the project root
 // with an "outside" marker. Returns the human-readable reasons any files were
-// skipped (binary, too large, unreadable, a folder), for the caller's banner.
+// skipped (binary, too large, unreadable, a folder, gone), for the caller's
+// banner.
 QStringList buildPathAttachments(const QStringList &paths, const QString &workspace,
                                  QJsonArray &attachments);
 
@@ -34,4 +38,70 @@ QStringList buildPathAttachments(const QStringList &paths, const QString &worksp
 // banner.
 QStringList buildItemAttachments(const QJsonArray &items, QJsonArray &attachments,
                                  QStringList &wholeFile);
+
+// buildImageAttachments appends an image attachment for each raw QImage in
+// `images` — pixels off the clipboard (Ctrl+V) or a drag that carries an image
+// but no file URL (a browser image, a Spectacle drag). Each is encoded as PNG
+// and then travels the identical path a dropped image file takes: same
+// per-image cap, same shared wire budget, same content-addressed copy in durable
+// app data, so the chip thumbnail and chip-open behave the same. There is no
+// origin file, so `path` points at that copy — it is the only file there is.
+// Returns the human-readable reasons any images were skipped.
+QStringList buildImageAttachments(const QList<QImage> &images, QJsonArray &attachments);
+
+// resolveAttachmentPath returns the file that actually holds the bytes this
+// attachment was sent with — the file to draw a thumbnail from and the file a
+// chip click should open — or an empty string if neither copy survives.
+//
+// The origin path is preferred, because for a workspace file that is the copy
+// worth opening (edits there count). But "the origin path exists" is not "the
+// origin path still holds those bytes": capture tools reuse fixed names
+// (/tmp/screenshot.png), so the next screenshot silently replaces the pixels
+// behind an old chip. So the cached copy wins whenever it exists AND the origin
+// is missing or a different size than the copy. Being outside the project is not
+// on its own a reason to distrust it: an untouched ~/Downloads image is still
+// the file the user recognises, and the copy is opaque.
+//
+// The recorded cachePath is resolved rather than trusted: copies used to be
+// written to the cache dir and now live in app data, so when the recorded dir
+// has nothing, the content-addressed basename is looked up in the other one.
+QString resolveAttachmentPath(const QJsonObject &att);
+
+// PrunePolicy is how the age rule and the size rule combine, which is a property
+// of what the directory holds rather than of the numbers.
+enum class PrunePolicy {
+    // Derived data: either rule alone may delete a file. Losing one costs a
+    // re-run or a thumbnail, so age is reason enough.
+    Cache,
+    // User data: a file is deleted only when the directory is over `maxBytes`
+    // AND that file is past `maxAgeSecs` — age alone never takes anything,
+    // because for these files there is nothing else to fall back on.
+    Durable,
+};
+
+// pruneCacheDir deletes files in `dir` older than `maxAgeSecs`, then, if the
+// directory still exceeds `maxBytes`, deletes oldest-first until it fits (under
+// PrunePolicy::Durable the age sweep is skipped and the oldest-first pass stops
+// at the age line, so both rules must agree). Files modified within the last
+// hour are never deleted (they may be a chip a card is about to redraw, or a
+// .tmp another attach is renaming into place), though their bytes still count
+// against the cap. Returns files deleted.
+int pruneCacheDir(const QString &dir, qint64 maxAgeSecs, qint64 maxBytes,
+                  PrunePolicy policy = PrunePolicy::Cache);
+
+// scheduleImageCachePrune arms a single delayed sweep of the image dirs a few
+// seconds after startup, so it never competes with launch. Only the first call
+// per process does anything.
+//
+// The two dirs are swept under different policies because they are different
+// storage classes. Tool-result images are derived data (the tool can be re-run)
+// and get the ordinary cache policy. Attachment copies are user data — the copy
+// is what makes an attachment outlive its origin, and for pasted pixels it is
+// the only copy in existence — so their sweep is a backstop against an unbounded
+// dir, not a reclaim: very old AND only once the dir has grown past a gigabyte.
+//
+// GUI thread only: the sweep itself runs on the thread pool, but the target dirs
+// are resolved here, because QStandardPaths needs a live QCoreApplication and the
+// global pool outlives it.
+void scheduleImageCachePrune();
 } // namespace agentkate

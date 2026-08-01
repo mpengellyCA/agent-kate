@@ -12,6 +12,7 @@ class QComboBox;
 class QCheckBox;
 class QLabel;
 class QLineEdit;
+class QDoubleSpinBox;
 class QFormLayout;
 class QWidget;
 class CoreClient;
@@ -35,6 +36,11 @@ struct NewAgentChoices {
     QStringList fallbackModels;  // models to fall back to, in order
     QStringList disallowedTools; // tool names this agent may not use
     QStringList addDirs;         // extra directories its tools may reach
+    // The control-channel sweep. strictMcpConfig runs the agent with only the
+    // MCP servers Agent Kate wires in, ignoring the user's global ones;
+    // maxBudgetUsd is a hard spend ceiling the engine enforces (0 = uncapped).
+    bool strictMcpConfig = false;
+    double maxBudgetUsd = 0.0;
 };
 
 // NewAgentDialog — a friendly front door for starting an agent: describe the
@@ -71,5 +77,21 @@ private:
     QLineEdit *m_fallbackModels = nullptr;
     QLineEdit *m_disallowedTools = nullptr;
     QLineEdit *m_addDirs = nullptr;
+    QCheckBox *m_strictMcp = nullptr;
+    QDoubleSpinBox *m_budget = nullptr;
     QFormLayout *m_advancedForm = nullptr;
+    // Which sweep options the CURRENTLY selected engine can express — the same
+    // capabilities that drive setRowVisible above, remembered so choices() can
+    // ask "was this offered?" without asking the widget. Widget visibility is
+    // NOT a stand-in: the whole Advanced section hides on the collapse toggle,
+    // so reading isVisibleTo() there would silently drop a budget or isolation
+    // flag the user set and then collapsed.
+    struct SweepSupport {
+        bool fallbackModels = false;
+        bool disallowedTools = false;
+        bool addDirs = false;
+        bool strictMcpConfig = false;
+        bool costBudget = false;
+    };
+    SweepSupport m_sweepSupport;
 };

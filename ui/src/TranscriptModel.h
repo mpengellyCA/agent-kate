@@ -92,8 +92,11 @@ public:
         // Checklist items ({content, status} objects, status one of
         // pending / in_progress / completed). Empty for every other row.
         QJsonArray checklist;
-        // Monotonic identity, bumped on every mutation so the delegate's
-        // (id → height) cache misses and re-measures exactly this row.
+        // Per-row identity, assigned once at append and STABLE for the life of
+        // the row. A mutation does not mint a new one: it emits
+        // heightInvalidated(stableId) instead, so the delegate drops exactly
+        // this row's measurement/layout entry rather than leaving a dead one
+        // behind on every streaming tick.
         quintptr stableId = 0;
     };
 
@@ -122,6 +125,18 @@ public:
     // false if the row was evicted — append a fresh card instead.
     bool setChecklist(int key, const QJsonArray &items);
 
+    // Replace a message row's body in place. Two callers, both from the
+    // token-by-token stream: each coalesced batch of text deltas re-renders the
+    // provisional row, and the authoritative `assistant` event overwrites it
+    // with the final text rather than appending a duplicate card. Returns false
+    // if the row was evicted — the caller appends a fresh card instead.
+    bool setMessageBody(int key, const QString &bodyHtml, const QString &plain);
+
+    // Show partial result text on a tool row WITHOUT marking it done: live
+    // subagent text forwarded under a Task tool's parent_tool_use_id, which
+    // keeps arriving until the real tool_result lands and calls setToolResult.
+    void setToolProgress(int key, const QString &shown);
+
     // Fill in a tool row's result once its tool_result event arrives. `key` is
     // the stable key from appendTool (a tool_result arrives after a round-trip,
     // by which time eviction may have shifted positions); a no-op if that row
@@ -149,12 +164,22 @@ public:
     const Item &itemAt(int row) const { return m_items.at(row); }
     int count() const { return m_items.size(); }
 
+Q_SIGNALS:
+    // A row's content changed in a way that can change its measured height or
+    // its laid-out body: the delegate must drop whatever it cached for this
+    // stable id. Emitted alongside (just before) the dataChanged that makes the
+    // view re-query sizeHint. The delegate binds to this itself the first time
+    // it measures a row of this model, so no external wiring is required.
+    void heightInvalidated(quintptr stableId);
+
+public:
     // QAbstractListModel
     int rowCount(const QModelIndex &parent = {}) const override;
     QVariant data(const QModelIndex &idx, int role = Qt::DisplayRole) const override;
 
 private:
-    // Bump a row's stable id and emit dataChanged so the delegate re-measures it.
+    // Invalidate a row's cached measurement and emit dataChanged so the delegate
+    // re-measures it. The row's stable id does NOT change.
     void touched(int row);
 
     // Translate a stable key (from append*) to the item's current position, or

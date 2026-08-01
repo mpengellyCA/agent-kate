@@ -137,6 +137,34 @@ bool TranscriptModel::setChecklist(int key, const QJsonArray &items)
     return true;
 }
 
+bool TranscriptModel::setMessageBody(int key, const QString &bodyHtml,
+                                     const QString &plain)
+{
+    const int row = rowForKey(key);
+    if (row < 0 || m_items.at(row).kind != Message) {
+        return false; // evicted (or the key is stale) — caller appends anew
+    }
+    Item &it = m_items[row];
+    it.html = bodyHtml;
+    it.plain = plain;
+    touched(row);
+    return true;
+}
+
+void TranscriptModel::setToolProgress(int key, const QString &shown)
+{
+    const int row = rowForKey(key);
+    if (row < 0 || m_items.at(row).kind != Tool) {
+        return;
+    }
+    Item &it = m_items[row];
+    it.toolResult = shown;
+    // Deliberately NOT toolDone: the tool is still running, and the real
+    // tool_result has not arrived. toolFullResult stays empty so the
+    // "show full output" affordance only appears once there is a full output.
+    touched(row);
+}
+
 void TranscriptModel::setToolResult(int key, const QString &shown,
                                     const QString &fullResult, bool truncated)
 {
@@ -189,8 +217,8 @@ void TranscriptModel::setToolsVisible(bool on)
         Item &it = m_items[i];
         if (it.kind == Tool && it.toolVisible != on) {
             it.toolVisible = on;
-            // Bump id so the delegate re-measures (collapsed-to-0 height).
-            it.stableId = m_nextId++;
+            // Drop the delegate's entry so it re-measures (collapsed-to-0 height).
+            emit heightInvalidated(it.stableId);
             any = true;
         }
     }
@@ -213,7 +241,7 @@ void TranscriptModel::setFind(const QString &needle, int currentRow)
     // A Message row whose plain text matches the needle is rendered as highlighted
     // PLAIN text rather than its rendered-markdown HTML, and the two have different
     // heights. So a row whose match state flips between the old and new needle must
-    // be re-measured: bump its stable id to evict the delegate's height-cache entry.
+    // be re-measured: invalidate the delegate's height-cache entry for it.
     // (Rows that match both needles, or non-Message rows, keep the same height —
     // a pure highlight/currentRow change is paint-only.)
     bool geometryChanged = false;
@@ -226,7 +254,7 @@ void TranscriptModel::setFind(const QString &needle, int currentRow)
                 continue;
             }
             if (matches(m_items[i].plain, oldNeedle) != matches(m_items[i].plain, needle)) {
-                m_items[i].stableId = m_nextId++;
+                emit heightInvalidated(m_items.at(i).stableId);
                 geometryChanged = true;
             }
         }
@@ -241,9 +269,14 @@ void TranscriptModel::setFind(const QString &needle, int currentRow)
     }
 }
 
+// touched invalidates one row's cached geometry. It deliberately does NOT mint a
+// new stable id: a streamed message is touched every 50ms flush tick, and a fresh
+// id each time left the delegate's (id → height) cache holding one dead entry per
+// tick — a slow leak evicted only by wiping the whole cache. Telling the delegate
+// "this exact row changed" costs one signal and keeps the id a real identity.
 void TranscriptModel::touched(int row)
 {
-    m_items[row].stableId = m_nextId++;
+    emit heightInvalidated(m_items.at(row).stableId);
     const QModelIndex idx = index(row);
     emit dataChanged(idx, idx);
 }

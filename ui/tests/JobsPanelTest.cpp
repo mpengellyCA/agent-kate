@@ -16,6 +16,7 @@
 #include "JobsPanel.h"
 
 #include <QComboBox>
+#include <QDateTime>
 #include <QLineEdit>
 #include <QPushButton>
 #include <QTreeWidget>
@@ -55,6 +56,8 @@ private Q_SLOTS:
     void openDispatchesByRowKind();
     void groupRowIsNotOpenable();
     void jobWithNoIdIsStillAJobRow();
+    void terminalRowShowsFinalDuration();
+    void runningRowShowsLiveElapsed();
 
 private:
     QTreeWidget *tree() const { return m_panel->findChild<QTreeWidget *>(); }
@@ -274,6 +277,52 @@ void JobsPanelTest::jobWithNoIdIsStillAJobRow()
     button(QStringLiteral("Open"))->click();
     QCOMPARE(files.count(), 1);
     QCOMPARE(files.at(0).at(0).toString(), QStringLiteral("t1"));
+}
+
+// A finished job's Elapsed is its RUN duration, measured start→end. Drawing it
+// as age-since-start instead makes a 4 s job read "2h 0m" on a panel left open,
+// and blanking it (what this panel did before an end stamp existed) throws the
+// one number that says whether the work was quick or ground for an hour.
+void JobsPanelTest::terminalRowShowsFinalDuration()
+{
+    AgentJob quick = job(QStringLiteral("a"), QStringLiteral("build"), true);
+    quick.startedMs = 1000;
+    quick.endedMs = 1000 + 4000;
+    AgentJob slow = job(QStringLiteral("b"), QStringLiteral("test"), true);
+    slow.startedMs = 1000;
+    slow.endedMs = 1000 + 90 * 1000;
+    // Terminal, but its finish was never observed — the duration is unknowable,
+    // and an age that keeps growing would be a lie, so the cell stays empty.
+    AgentJob unknown = job(QStringLiteral("c"), QStringLiteral("lint"), true);
+    unknown.startedMs = 1000;
+    unknown.endedMs = 0;
+    // Fed in REVERSE id order on purpose. All three share a startedMs and a
+    // done flag, so nothing but the id tie-break can order them; handing them
+    // over already sorted would let the assertions below pass on the accidental
+    // stability of the underlying sort rather than on the comparator.
+    m_panel->setAgentJobs(QStringLiteral("t1"), {unknown, slow, quick});
+
+    QTreeWidgetItem *group = groupFor(QStringLiteral("Builder"));
+    QVERIFY(group != nullptr);
+    QCOMPARE(group->childCount(), 3);
+    // Same startedMs on all three, so the id tie-break fixes the order: a, b, c.
+    QCOMPARE(group->child(0)->text(0), QStringLiteral("build"));
+    QCOMPARE(group->child(0)->text(3), QStringLiteral("4s"));
+    QCOMPARE(group->child(1)->text(3), QStringLiteral("1m"));
+    QCOMPARE(group->child(2)->text(3), QString());
+}
+
+// A running job has no end stamp, so its Elapsed is measured against now — and
+// must keep being drawn, not blanked by the same branch that handles terminal
+// rows.
+void JobsPanelTest::runningRowShowsLiveElapsed()
+{
+    AgentJob live = job(QStringLiteral("a"), QStringLiteral("build"), false);
+    live.startedMs = QDateTime::currentMSecsSinceEpoch() - 90 * 1000;
+    live.endedMs = 0;
+    m_panel->setAgentJobs(QStringLiteral("t1"), {live});
+
+    QCOMPARE(groupFor(QStringLiteral("Builder"))->child(0)->text(3), QStringLiteral("1m"));
 }
 
 QTEST_MAIN(JobsPanelTest)

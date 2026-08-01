@@ -3,12 +3,13 @@
 
 #include "TranscriptDelegate.h"
 #include "TranscriptModel.h"
+#include "AttachmentBuilder.h"
+#include "SafeContent.h"
 #include "theme/ThemeManager.h"
 
 #include <QAbstractItemView>
 #include <QAbstractTextDocumentLayout>
 #include <QApplication>
-#include <QDesktopServices>
 #include <QGuiApplication>
 #include <QClipboard>
 #include <QFontMetrics>
@@ -17,8 +18,12 @@
 #include <KLocalizedString>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QDateTime>
+#include <QFileInfo>
+#include <QImageReader>
 #include <QMouseEvent>
 #include <QPixmap>
+#include <QPixmapCache>
 #include <QPainter>
 #include <QTextBrowser>
 #include <QTextDocument>
@@ -49,11 +54,120 @@ constexpr int kToolCopyW = 26;    // copy hit zone on the right of the header
 constexpr int kToolInspectW = 26; // "open in inspector" glyph, left of the copy glyph
 constexpr int kDetailPadX = 10;
 
-// The height cache is keyed by the model's per-row stableId, which the model
-// bumps on every mutation (so the old entry is never looked up again) — left
-// unchecked it grows for the life of the panel. Cap it; when full we drop the
-// whole cache and the currently-visible rows re-measure lazily (cheap).
+// The height cache is keyed by the model's per-row stableId. A mutation drops
+// that row's entry (TranscriptModel::heightInvalidated → invalidateRow), so the
+// cache no longer accumulates a dead entry per streaming tick; what it still
+// accumulates is one entry per row EVICTED off the front of the feed, whose id
+// is never queried again. Cap it as the backstop; when full we drop the whole
+// cache and the currently-visible rows re-measure lazily (cheap).
 constexpr int kHeightCacheCap = 16384;
+
+// Laid-out body documents kept for reuse between sizeHint() and paint(). Only
+// the rows the view is currently showing are asked for repeatedly, so a cap a
+// little above a viewport's worth covers the working set. It is kept small on
+// purpose: a laid-out document of a 128KB row is not cheap in RAM, and this
+// cache exists to save layouts, not to hold the transcript. Full means "drop
+// them all" — they rebuild lazily, at most one layout each. (Safe because a
+// document is used within the single call that fetched it, never across one.)
+constexpr int kDocCacheCap = 32;
+
+// Attachment path resolutions kept between paints, and how long one is trusted
+// before the file is stat'ed again. A second of staleness is invisible (the
+// thumbnail of a file rewritten under us refreshes on the next paint after the
+// TTL) and it takes the syscalls out of the paint path entirely.
+constexpr int kAttCacheCap = 512;
+constexpr qint64 kAttStatTtlMs = 1000;
+
+// chipThumbnail returns an attachment's preview icon, decoded AT icon size and
+// kept in QPixmapCache.
+//
+// Chips repaint on every scroll tick, and this used to construct a QPixmap from
+// the path each time: a 4K screenshot was fully decoded, then scaled to 16px,
+// then thrown away, per chip per paint. QImageReader::setScaledSize lets the
+// decoder do the downscale, and the cache means a still transcript decodes once.
+//
+// The key carries size + mtime so a fixed-name capture file that changed bytes
+// re-decodes instead of redrawing the previous screenshot; eviction is
+// QPixmapCache's business. Returns a null pixmap for anything unreadable, which
+// the caller draws as the generic glyph.
+//
+// `size`/`mtime` are supplied by the caller (see
+// TranscriptDelegate::resolveAttachmentCached) rather than stat'ed here: this
+// runs once per image chip per paint, and the stat it used to do was pure
+// overhead on every scroll tick of an unchanged file.
+//
+// Failures are cached too, under a sibling key. A truncated or non-image file
+// otherwise re-ran the full decode on every paint of every scroll tick, forever
+// — the one case where the cache bought nothing. The entry is a 1x1 pixmap
+// because QPixmapCache cannot store a null one, and it is kept under its own key
+// so a genuinely 1x1 image is not mistaken for it. Since the key carries size
+// and mtime, repairing the file retries the decode.
+QPixmap chipThumbnail(const TranscriptDelegate::ResolvedAttachment &att, int edge,
+                      qreal dpr)
+{
+    const QString &path = att.path;
+    if (path.isEmpty() || att.size < 0 || edge <= 0) {
+        return {};
+    }
+    const QString key = QStringLiteral("ak:chip:%1|%2|%3|%4|%5")
+                            .arg(path)
+                            .arg(att.size)
+                            .arg(att.mtime)
+                            .arg(edge)
+                            .arg(qRound(dpr * 100));
+    const QString failKey = key + QStringLiteral("|!");
+    const auto cacheFailure = [&failKey] {
+        QPixmap sentinel(1, 1);
+        sentinel.fill(Qt::transparent);
+        QPixmapCache::insert(failKey, sentinel);
+        return QPixmap();
+    };
+    QPixmap pm;
+    if (QPixmapCache::find(key, &pm)) {
+        return pm;
+    }
+    if (QPixmapCache::find(failKey, &pm)) {
+        return {}; // decoded before and failed; don't pay for it again
+    }
+    const int target = qMax(1, qRound(edge * dpr));
+    QImageReader reader(path);
+    reader.setAutoTransform(true);
+    QSize src = reader.size();
+    if (src.isValid() && !src.isEmpty()) {
+        src.scale(target, target, Qt::KeepAspectRatio);
+        reader.setScaledSize(src.expandedTo(QSize(1, 1)));
+    }
+    QImage img = reader.read();
+    if (img.isNull()) {
+        return cacheFailure();
+    }
+    // reader.size() is invalid for any format whose header the plugin cannot
+    // pre-parse, so setScaledSize above never ran and this decoded at full size.
+    // Without the fallback a 4K screenshot is cached and painted 3840px wide.
+    if (img.width() > target || img.height() > target) {
+        img = img.scaled(target, target, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    }
+    pm = QPixmap::fromImage(img);
+    pm.setDevicePixelRatio(dpr);
+    QPixmapCache::insert(key, pm);
+    return pm;
+}
+
+// drawChipThumbnail centres an already-sized thumbnail in the chip's icon box,
+// so a non-square image keeps its aspect ratio instead of being stretched.
+void drawChipThumbnail(QPainter *painter, const QRect &iconR, const QPixmap &pm)
+{
+    QSizeF sz = pm.deviceIndependentSize();
+    // Clamped regardless of how the pixmap was sized: a thumbnail wider than its
+    // box would paint straight over the chip's label and its neighbours.
+    if (sz.width() > iconR.width() || sz.height() > iconR.height()) {
+        sz.scale(QSizeF(iconR.size()), Qt::KeepAspectRatio);
+    }
+    const QRect fit(iconR.left() + (iconR.width() - qRound(sz.width())) / 2,
+                    iconR.top() + (iconR.height() - qRound(sz.height())) / 2,
+                    qRound(sz.width()), qRound(sz.height()));
+    painter->drawPixmap(fit, pm);
+}
 
 // noteColor maps a note's kind to the active theme's semantic colours.
 QColor noteColor(const QString &kind, bool dark)
@@ -119,7 +233,7 @@ QString resolveBodyHtml(const QModelIndex &idx)
 }
 
 // The single source of a body document's metrics — font, zero margin, HTML and
-// wrap width. paint()/measure use it through buildBodyDoc(); the selection
+// wrap width. paint()/measure use it through bodyDoc(); the selection
 // overlay (a QTextBrowser) applies the same setup to its own document so the
 // overlay's glyph positions line up with the painted row exactly.
 void configureBodyDoc(QTextDocument *doc, const QFont &font, int contentWidth,
@@ -178,22 +292,269 @@ QList<ChipLayout> layoutAttachmentChips(const QJsonArray &atts, const QFont &fon
     outHeight = (y - origin.y()) + rowH;
     return chips;
 }
+
+// THE WIDTH TRAP: sizeHint() and paint() must measure at the SAME width, or the
+// shared body document is laid out twice per streaming tick and the cached row
+// height is subtly wrong.
+//
+// QAbstractItemView::initViewItemOption() clears option->rect, so the option
+// sizeHint() gets carries an EMPTY rect and the old fallback used
+// opt.widget->width() — the QListView's own width, which includes the vertical
+// scrollbar (~14px with Breeze). paint(), by contrast, gets a real opt.rect
+// spanning the VIEWPORT. Measure at W, paint at W-14: bodyDoc()'s width key
+// misses on every paint and re-lays the whole accumulated text, exactly the
+// double layout the document cache exists to remove.
+//
+// So: always prefer the viewport width, which is also what AgentPanel's
+// settle-time pass hands measureExact(). Falls back to opt.rect (paint's own
+// geometry), then the widget, then a constant for a delegate with no view.
+int rowMeasureWidth(const QStyleOptionViewItem &opt)
+{
+    if (const auto *view = qobject_cast<const QAbstractItemView *>(opt.widget)) {
+        const int vw = view->viewport()->width();
+        if (vw > 0) {
+            return vw;
+        }
+    }
+    if (opt.rect.width() > 0) {
+        return opt.rect.width();
+    }
+    return opt.widget && opt.widget->width() > 0 ? opt.widget->width() : 400;
+}
 } // namespace
 
 TranscriptDelegate::TranscriptDelegate(QObject *parent)
     : QStyledItemDelegate(parent)
 {
+    // No ThemeManager::changed hookup here on purpose: ThemeManager::applyTheme
+    // ends in qApp->setPalette(), which Qt delivers to every widget as
+    // ApplicationPaletteChange — the view's event filter below catches that, and
+    // a system colour-scheme change that never goes through ThemeManager too.
+    // Touching ThemeManager::instance() from a constructor would also drag the
+    // singleton (and its KColorScheme/config read) into every delegate.
 }
 
-TranscriptDelegate::~TranscriptDelegate() = default;
-
-QTextDocument *TranscriptDelegate::buildBodyDoc(const QModelIndex &idx,
-                                                int contentWidth,
-                                                const QStyleOptionViewItem &opt) const
+// Watch the view for palette changes. Installed lazily (like bindModel) from the
+// first measure/paint, so the delegate needs no wiring from the panel.
+// QEvent::ApplicationPaletteChange is delivered to every widget, so filtering the
+// view catches both an app-wide theme switch and a palette set on the view alone.
+void TranscriptDelegate::watchPalette(const QStyleOptionViewItem &opt) const
 {
-    auto *doc = new QTextDocument;
-    configureBodyDoc(doc, opt.font, contentWidth, resolveBodyHtml(idx));
+    auto *w = const_cast<QWidget *>(opt.widget);
+    if (!w || m_paletteWatched == w) {
+        return;
+    }
+    if (m_paletteWatched) {
+        m_paletteWatched->removeEventFilter(const_cast<TranscriptDelegate *>(this));
+    }
+    w->installEventFilter(const_cast<TranscriptDelegate *>(this));
+    m_paletteWatched = w;
+}
+
+bool TranscriptDelegate::eventFilter(QObject *watched, QEvent *event)
+{
+    if (watched && watched == m_paletteWatched) {
+        switch (event->type()) {
+        case QEvent::PaletteChange:
+        case QEvent::ApplicationPaletteChange:
+        case QEvent::StyleChange:
+            ++m_paletteGen;
+            break;
+        default:
+            break;
+        }
+        // Deliberately NOT chained to QStyledItemDelegate::eventFilter: that one
+        // assumes every watched QWidget is an open editor and would emit
+        // commitData/closeEditor for the VIEW on Tab/Esc/FocusOut.
+        return QObject::eventFilter(watched, event);
+    }
+    return QStyledItemDelegate::eventFilter(watched, event);
+}
+
+TranscriptDelegate::~TranscriptDelegate()
+{
+    for (auto &e : m_docCache) {
+        delete e.doc;
+    }
+    for (auto &e : m_detailCache) {
+        delete e.doc;
+    }
+    for (auto &e : m_resultCache) {
+        delete e.doc;
+    }
+}
+
+// bodyDoc hands back the row's laid-out body document from the cache, laying it
+// out only when the row's HTML or wrap width actually changed. sizeHint() and
+// paint() both go through here: they used to build a QTextDocument each, so one
+// 50ms flush tick of a streaming message re-laid the whole accumulated text
+// TWICE. The document is owned by the cache — callers must not delete it.
+//
+// GuardedTextDocument, not QTextDocument: this HTML comes from an assistant
+// message, `![x](/home/you/.ssh/id_rsa)` is ordinary markdown, and the row that
+// PAINTS it resolves that image through the same loader a QTextBrowser would
+// (audit F15). Being widget-less buys nothing — see SafeContent.h.
+QTextDocument *TranscriptDelegate::bodyDoc(const QModelIndex &idx, int contentWidth,
+                                           const QStyleOptionViewItem &opt) const
+{
+    const quintptr id = idx.data(TranscriptModel::StableIdRole).value<quintptr>();
+    const QString html = resolveBodyHtml(idx);
+    watchPalette(opt);
+    auto it = m_docCache.find(id);
+    if (it != m_docCache.end() && it->doc) {
+        if (it->width == contentWidth && it->html == html && it->font == opt.font
+            && it->paletteGen == m_paletteGen) {
+            return it->doc; // already laid out for exactly this
+        }
+        // Same row, new content / width / theme: re-set this document rather than
+        // allocating another (QTextDocument reuses its internal structures).
+        configureBodyDoc(it->doc, opt.font, contentWidth, html);
+        it->width = contentWidth;
+        it->html = html;
+        it->font = opt.font;
+        it->paletteGen = m_paletteGen;
+        return it->doc;
+    }
+    if (m_docCache.size() >= kDocCacheCap) {
+        for (auto &e : m_docCache) {
+            delete e.doc;
+        }
+        m_docCache.clear();
+    }
+    auto *doc = new agentkate::GuardedTextDocument;
+    configureBodyDoc(doc, opt.font, contentWidth, html);
+    m_docCache.insert(id, DocEntry{contentWidth, html, opt.font, m_paletteGen, doc});
     return doc;
+}
+
+// toolDoc is bodyDoc for the expanded tool row's two mono documents: same cache
+// shape, same invalidation, but the content is PLAIN text (an input JSON blob, a
+// command's output) so it is set with setPlainText and needs no palette
+// generation in the key. Still a GuardedTextDocument: setPlainText cannot make
+// an <img> today, but "the delegate builds no unguarded document" is a property
+// worth keeping true by construction rather than by reading this function.
+QTextDocument *TranscriptDelegate::toolDoc(const QModelIndex &idx, ToolSlot slot,
+                                           const QString &plain, const QFont &mono,
+                                           int contentWidth) const
+{
+    QHash<quintptr, DocEntry> &cache =
+        slot == ToolSlot::Detail ? m_detailCache : m_resultCache;
+    const quintptr id = idx.data(TranscriptModel::StableIdRole).value<quintptr>();
+    const auto configure = [&](QTextDocument *doc) {
+        doc->setDefaultFont(mono);
+        doc->setDocumentMargin(0);
+        doc->setPlainText(plain);
+        doc->setTextWidth(qMax(1, contentWidth));
+    };
+    auto it = cache.find(id);
+    if (it != cache.end() && it->doc) {
+        if (it->width == contentWidth && it->html == plain && it->font == mono) {
+            return it->doc; // already laid out for exactly this
+        }
+        configure(it->doc);
+        it->width = contentWidth;
+        it->html = plain;
+        it->font = mono;
+        return it->doc;
+    }
+    if (cache.size() >= kDocCacheCap) {
+        for (auto &e : cache) {
+            delete e.doc;
+        }
+        cache.clear();
+    }
+    auto *doc = new agentkate::GuardedTextDocument;
+    configure(doc);
+    cache.insert(id, DocEntry{contentWidth, plain, mono, 0, doc});
+    return doc;
+}
+
+void TranscriptDelegate::invalidateRow(quintptr stableId) const
+{
+    m_heightCache.remove(stableId);
+    for (QHash<quintptr, DocEntry> *cache : {&m_docCache, &m_detailCache, &m_resultCache}) {
+        const auto it = cache->constFind(stableId);
+        if (it != cache->constEnd()) {
+            delete it->doc;
+            cache->erase(it);
+        }
+    }
+}
+
+void TranscriptDelegate::bindModel(const QModelIndex &idx) const
+{
+    const auto *model = qobject_cast<const TranscriptModel *>(idx.model());
+    if (!model) {
+        return;
+    }
+    // UniqueConnection makes this idempotent, so it can run on every measure
+    // without bookkeeping; the connection dies with either object.
+    connect(model, &TranscriptModel::heightInvalidated, this,
+            &TranscriptDelegate::invalidateRow, Qt::UniqueConnection);
+}
+
+TranscriptDelegate::ResolvedAttachment
+TranscriptDelegate::resolveAttachmentCached(const QJsonObject &att) const
+{
+    // The chip's identity is the pair of paths it was recorded with; the
+    // resolution between them is what costs syscalls.
+    const QString key = att.value(QStringLiteral("path")).toString()
+                        + QLatin1Char('\x1f')
+                        + att.value(QStringLiteral("cachePath")).toString();
+    return attEntry(key, att).r;
+}
+
+// The cache entry behind resolveAttachmentCached, re-stat'ed when its TTL has
+// run out. Returned by reference so the thumbnail can be memoised INTO it (see
+// chipPixmap); the reference is used before any further insertion, so a rehash
+// cannot invalidate it.
+TranscriptDelegate::AttEntry &TranscriptDelegate::attEntry(const QString &key,
+                                                          const QJsonObject &att) const
+{
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    const auto hit = m_attCache.find(key);
+    if (hit != m_attCache.end() && now - hit->checkedMs < kAttStatTtlMs) {
+        return *hit;
+    }
+    AttEntry entry;
+    entry.checkedMs = now;
+    entry.r.path = agentkate::resolveAttachmentPath(att);
+    if (!entry.r.path.isEmpty()) {
+        const QFileInfo fi(entry.r.path);
+        if (fi.isFile()) {
+            entry.r.size = fi.size();
+            entry.r.mtime = fi.lastModified().toMSecsSinceEpoch();
+        } else {
+            entry.r.path.clear();
+        }
+    }
+    if (m_attCache.size() >= kAttCacheCap) {
+        m_attCache.clear();
+    }
+    // A re-stat drops the memoised thumbnail with it: the file may be the next
+    // screenshot written over the same name.
+    return *m_attCache.insert(key, entry);
+}
+
+// chipPixmap is chipThumbnail memoised in the attachment entry. chipThumbnail
+// itself is cheap only in the QPixmapCache-hit case, and that hit costs ~6
+// QString allocations to build the key plus a global-mutex lookup — per image
+// chip, per paint, per scroll tick (audit F18). Here a still transcript pays
+// one hash lookup.
+QPixmap TranscriptDelegate::chipPixmap(const QJsonObject &att, int edge, qreal dpr) const
+{
+    const QString key = att.value(QStringLiteral("path")).toString()
+                        + QLatin1Char('\x1f')
+                        + att.value(QStringLiteral("cachePath")).toString();
+    AttEntry &e = attEntry(key, att);
+    if (e.thumbValid && e.thumbEdge == edge && qFuzzyCompare(e.thumbDpr, dpr)) {
+        return e.thumb;
+    }
+    e.thumb = chipThumbnail(e.r, edge, dpr);
+    e.thumbEdge = edge;
+    e.thumbDpr = dpr;
+    e.thumbValid = true;
+    return e.thumb;
 }
 
 // Measure / paint share this: returns the total row height for `width` and, when
@@ -201,9 +562,7 @@ QTextDocument *TranscriptDelegate::buildBodyDoc(const QModelIndex &idx,
 // both guarantees the height cache and the painting never disagree.
 namespace {
 int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt,
-              QPainter *painter, const QRect &rowRect, const TranscriptDelegate *self,
-              QTextDocument *(TranscriptDelegate::*buildDoc)(const QModelIndex &, int,
-                                                             const QStyleOptionViewItem &) const)
+              QPainter *painter, const QRect &rowRect, const TranscriptDelegate *self)
 {
     const auto kind = TranscriptModel::Kind(idx.data(TranscriptModel::KindRole).toInt());
     const bool dark = opt.palette.color(QPalette::Base).lightness() < 128;
@@ -224,7 +583,7 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
 
     if (kind == TranscriptModel::Note) {
         const int textW = contentWidth - 2 * kNotePadX;
-        auto *doc = (self->*buildDoc)(idx, qMax(1, textW), opt);
+        QTextDocument *doc = self->bodyDoc(idx, qMax(1, textW), opt);
         const int h = int(doc->size().height()) + 2 * kNotePadY;
         if (painter) {
             painter->save();
@@ -238,21 +597,25 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
             doc->documentLayout()->draw(painter, ctx);
             painter->restore();
         }
-        delete doc;
         return h;
     }
 
     if (kind == TranscriptModel::Message) {
         const int innerW = contentWidth - 2 * kCardPadX;
-        auto *doc = (self->*buildDoc)(idx, qMax(1, innerW), opt);
+        QTextDocument *doc = self->bodyDoc(idx, qMax(1, innerW), opt);
         const int bodyH = int(doc->size().height());
         // Attachment chip block under the body (You messages with attachments).
         const QJsonArray atts =
             idx.data(TranscriptModel::AttachmentsRole).toJsonArray();
         int chipsH = 0;
+        // Laid out once per row pass, at the origin-relative coordinates, and
+        // translated when painting — this used to run twice per paint (once to
+        // measure, once to place), rebuilding every elided label string (audit
+        // F18).
+        QList<ChipLayout> chips;
         if (!atts.isEmpty()) {
-            layoutAttachmentChips(atts, opt.font, QPoint(0, 0), qMax(1, innerW),
-                                  chipsH);
+            chips = layoutAttachmentChips(atts, opt.font, QPoint(0, 0), qMax(1, innerW),
+                                          chipsH);
         }
         const int chipsBlock = chipsH > 0 ? kChipGapTop + chipsH : 0;
         const int total =
@@ -304,14 +667,12 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
             if (chipsH > 0) {
                 const QPoint origin(card.left() + kCardPadX,
                                     bodyTop + bodyH + kChipGapTop);
-                int dummy = 0;
-                const QList<ChipLayout> laid = layoutAttachmentChips(
-                    atts, opt.font, origin, qMax(1, innerW), dummy);
                 painter->save();
                 painter->setRenderHint(QPainter::Antialiasing, true);
                 QFont chipFont = opt.font;
-                for (int i = 0; i < laid.size(); ++i) {
-                    const ChipLayout &c = laid.at(i);
+                for (int i = 0; i < chips.size(); ++i) {
+                    ChipLayout c = chips.at(i);
+                    c.rect.translate(origin);
                     const QJsonObject att = atts.at(i).toObject();
                     // Chip background + border (palette-only).
                     painter->setPen(opt.palette.color(QPalette::Mid));
@@ -319,29 +680,16 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
                     painter->drawRoundedRect(c.rect.adjusted(0, 0, -1, -1), 6, 6);
                     int textLeft = c.rect.left() + kChipPadX;
                     if (c.image) {
-                        // Decode the stored path into a small thumbnail. Chips on
-                        // replayed cards have only a path (no dataB64), so load
-                        // from the file; a moved file just falls back to no icon.
-                        // cachePath is our own durable copy, tried when the
-                        // origin is gone — a temp screenshot is usually reaped
-                        // long before the card stops being drawn.
-                        const QString path =
-                            att.value(QStringLiteral("path")).toString();
-                        QPixmap pm(path);
-                        if (pm.isNull()) {
-                            const QString cached =
-                                att.value(QStringLiteral("cachePath")).toString();
-                            if (!cached.isEmpty()) {
-                                pm.load(cached);
-                            }
-                        }
+                        // Chips on replayed cards have only a path (no dataB64),
+                        // so the thumbnail comes from a file. Which file is
+                        // resolveAttachmentPath's call: the origin unless our
+                        // cached copy is the one still holding the sent bytes.
+                        const QPixmap pm = self->chipPixmap(
+                            att, kChipIcon, painter->device()->devicePixelRatioF());
                         const QRect iconR(textLeft, c.rect.top() + (kChipH - kChipIcon) / 2,
                                           kChipIcon, kChipIcon);
                         if (!pm.isNull()) {
-                            painter->drawPixmap(
-                                iconR,
-                                pm.scaled(kChipIcon, kChipIcon, Qt::KeepAspectRatio,
-                                          Qt::SmoothTransformation));
+                            drawChipThumbnail(painter, iconR, pm);
                         } else {
                             painter->setPen(opt.palette.color(QPalette::Mid));
                             painter->drawText(iconR, Qt::AlignCenter,
@@ -362,7 +710,6 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
                 painter->restore();
             }
         }
-        delete doc;
         return total;
     }
 
@@ -371,12 +718,12 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
         // line ("▸ 💭 Thinking · preview") that expands to the dim body.
         const bool expanded = idx.data(TranscriptModel::ToolExpandedRole).toBool();
         int total = kToolHeaderH;
-        QTextDocument *bodyDoc = nullptr;
+        QTextDocument *thinkDoc = nullptr;
         int bodyH = 0;
         const int bodyW = contentWidth - 2 * kDetailPadX;
         if (expanded) {
-            bodyDoc = (self->*buildDoc)(idx, qMax(1, bodyW), opt);
-            bodyH = int(bodyDoc->size().height());
+            thinkDoc = self->bodyDoc(idx, qMax(1, bodyW), opt);
+            bodyH = int(thinkDoc->size().height());
             total += kToolPad + bodyH + kToolPad;
         }
         if (painter) {
@@ -391,18 +738,17 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
             painter->drawText(hdr, Qt::AlignLeft | Qt::AlignVCenter,
                               fm.elidedText(header, Qt::ElideRight, hdr.width()));
             painter->restore();
-            if (bodyDoc) {
+            if (thinkDoc) {
                 painter->save();
                 painter->translate(rowRect.left() + contentLeft + kDetailPadX,
                                    rowRect.top() + kToolHeaderH + kToolPad);
                 QAbstractTextDocumentLayout::PaintContext ctx;
                 ctx.palette = opt.palette;
                 ctx.palette.setColor(QPalette::Text, ThemeManager::palette().agentIdle);
-                bodyDoc->documentLayout()->draw(painter, ctx);
+                thinkDoc->documentLayout()->draw(painter, ctx);
                 painter->restore();
             }
         }
-        delete bodyDoc;
         return total;
     }
 
@@ -491,9 +837,11 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
     const QJsonArray toolAtts =
         idx.data(TranscriptModel::AttachmentsRole).toJsonArray();
     int toolChipsH = 0;
+    QList<ChipLayout> toolChips; // laid out once; translated at paint time (F18)
     if (!toolAtts.isEmpty()) {
-        layoutAttachmentChips(toolAtts, opt.font, QPoint(0, 0),
-                              qMax(1, contentWidth - 2 * kDetailPadX), toolChipsH);
+        toolChips = layoutAttachmentChips(toolAtts, opt.font, QPoint(0, 0),
+                                          qMax(1, contentWidth - 2 * kDetailPadX),
+                                          toolChipsH);
         total += toolChipsH + kToolPad;
     }
     // Detail (input JSON + result) measured with the mono document only when open.
@@ -507,13 +855,13 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
         QFont mono = opt.font;
         mono.setFamily(QStringLiteral("monospace"));
         mono.setPointSizeF(opt.font.pointSizeF() * 0.9);
+        // Cached per row (audit F18): measure and paint now share one layout,
+        // and a repaint of an unchanged row costs a hash lookup instead of two
+        // fresh QTextDocuments over up to the whole output.
         const QString detail = idx.data(TranscriptModel::ToolDetailRole).toString();
         if (!detail.isEmpty()) {
-            detailDoc = new QTextDocument;
-            detailDoc->setDefaultFont(mono);
-            detailDoc->setDocumentMargin(0);
-            detailDoc->setPlainText(detail);
-            detailDoc->setTextWidth(qMax(1, detailW));
+            detailDoc = self->toolDoc(idx, TranscriptDelegate::ToolSlot::Detail, detail,
+                                      mono, detailW);
             detailH = int(detailDoc->size().height());
         }
         QString result = idx.data(TranscriptModel::ToolResultRole).toString();
@@ -521,11 +869,8 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
             if (result.isEmpty()) {
                 result = QStringLiteral("(no output)");
             }
-            resultDoc = new QTextDocument;
-            resultDoc->setDefaultFont(mono);
-            resultDoc->setDocumentMargin(0);
-            resultDoc->setPlainText(result);
-            resultDoc->setTextWidth(qMax(1, detailW));
+            resultDoc = self->toolDoc(idx, TranscriptDelegate::ToolSlot::Result, result,
+                                      mono, detailW);
             resultH = int(resultDoc->size().height());
         }
         if (idx.data(TranscriptModel::ToolTruncatedRole).toBool()) {
@@ -574,29 +919,23 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
 
         if (toolChipsH > 0) {
             const QPoint origin(card.left() + kDetailPadX, card.top() + kToolHeaderH);
-            int dummy = 0;
-            const QList<ChipLayout> laid = layoutAttachmentChips(
-                toolAtts, opt.font, origin,
-                qMax(1, contentWidth - 2 * kDetailPadX), dummy);
             painter->save();
             painter->setRenderHint(QPainter::Antialiasing, true);
-            for (int i = 0; i < laid.size(); ++i) {
-                const ChipLayout &c = laid.at(i);
+            for (int i = 0; i < toolChips.size(); ++i) {
+                ChipLayout c = toolChips.at(i);
+                c.rect.translate(origin);
                 const QJsonObject att = toolAtts.at(i).toObject();
                 painter->setPen(opt.palette.color(QPalette::Mid));
                 painter->setBrush(opt.palette.color(QPalette::Base));
                 painter->drawRoundedRect(c.rect.adjusted(0, 0, -1, -1), 6, 6);
                 int textLeft = c.rect.left() + kChipPadX;
                 if (c.image) {
-                    const QString path = att.value(QStringLiteral("path")).toString();
-                    QPixmap pm(path);
+                    const QPixmap pm = self->chipPixmap(
+                        att, kChipIcon, painter->device()->devicePixelRatioF());
                     const QRect iconR(textLeft, c.rect.top() + (kChipH - kChipIcon) / 2,
                                       kChipIcon, kChipIcon);
                     if (!pm.isNull()) {
-                        painter->drawPixmap(iconR,
-                                            pm.scaled(kChipIcon, kChipIcon,
-                                                      Qt::KeepAspectRatio,
-                                                      Qt::SmoothTransformation));
+                        drawChipThumbnail(painter, iconR, pm);
                     } else {
                         painter->setPen(opt.palette.color(QPalette::Mid));
                         painter->drawText(iconR, Qt::AlignCenter,
@@ -650,8 +989,7 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
         }
     }
 
-    delete detailDoc;
-    delete resultDoc;
+    // detailDoc/resultDoc are owned by the delegate's cache — nothing to free.
     return total;
 }
 } // namespace
@@ -659,8 +997,12 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
 QSize TranscriptDelegate::sizeHint(const QStyleOptionViewItem &opt,
                                    const QModelIndex &idx) const
 {
-    const int width = opt.rect.width() > 0 ? opt.rect.width()
-                                           : (opt.widget ? opt.widget->width() : 400);
+    // Same width source as paint() — see rowMeasureWidth's "WIDTH TRAP" note.
+    const int width = rowMeasureWidth(opt);
+    watchPalette(opt);
+    // Cheap and idempotent: the model's per-row invalidation is what keeps this
+    // cache honest, and this is the first place we see the model.
+    bindModel(idx);
     const quintptr id = idx.data(TranscriptModel::StableIdRole).value<quintptr>();
     auto cit = m_heightCache.constFind(id);
     if (cit != m_heightCache.constEnd()) {
@@ -676,8 +1018,7 @@ QSize TranscriptDelegate::sizeHint(const QStyleOptionViewItem &opt,
     }
     // First sight of this row — measure it exactly (this is O(visible rows): the
     // view only asks for rows it is about to show).
-    const int h = layoutRow(idx, width, opt, nullptr, QRect(), this,
-                            &TranscriptDelegate::buildBodyDoc);
+    const int h = layoutRow(idx, width, opt, nullptr, QRect(), this);
     if (m_heightCache.size() >= kHeightCacheCap) {
         m_heightCache.clear();
     }
@@ -688,8 +1029,7 @@ QSize TranscriptDelegate::sizeHint(const QStyleOptionViewItem &opt,
 int TranscriptDelegate::measureExact(const QModelIndex &idx, int width,
                                      const QStyleOptionViewItem &opt) const
 {
-    const int h = layoutRow(idx, width, opt, nullptr, QRect(), this,
-                            &TranscriptDelegate::buildBodyDoc);
+    const int h = layoutRow(idx, width, opt, nullptr, QRect(), this);
     const quintptr id = idx.data(TranscriptModel::StableIdRole).value<quintptr>();
     if (m_heightCache.size() >= kHeightCacheCap) {
         m_heightCache.clear();
@@ -703,8 +1043,7 @@ void TranscriptDelegate::paint(QPainter *painter, const QStyleOptionViewItem &op
 {
     painter->save();
     painter->setClipRect(opt.rect);
-    layoutRow(idx, opt.rect.width(), opt, painter, opt.rect, this,
-              &TranscriptDelegate::buildBodyDoc);
+    layoutRow(idx, opt.rect.width(), opt, painter, opt.rect, this);
     painter->restore();
 }
 
@@ -795,7 +1134,18 @@ QWidget *TranscriptDelegate::createEditor(QWidget *parent,
     // A frameless, read-only text browser laid over the row's body. It shares the
     // exact document setup of the painted body (font, margin, wrap width, HTML) so
     // opening it causes no visual jump — it just makes the same glyphs selectable.
-    auto *browser = new QTextBrowser(parent);
+    // GuardedTextBrowser, not a bare QTextBrowser: this document holds the same
+    // model-authored HTML the row paints, and a QTextBrowser resolves image
+    // names through an unbounded synchronous QFile read of ANY local path
+    // (audit F15).
+    //
+    // This comment used to claim the PAINTED rows were safe because their
+    // documents are parentless. They were not: a parentless QTextDocument reads
+    // arbitrary local paths too (probed — `![x](file:///…/secret.png)` in an
+    // assistant message rendered the file), so bodyDoc/toolDoc build
+    // GuardedTextDocuments and the guard covers every document in this class,
+    // not just this one.
+    auto *browser = new agentkate::GuardedTextBrowser(parent);
     browser->setFrameShape(QFrame::NoFrame);
     browser->setReadOnly(true);
     browser->setContextMenuPolicy(Qt::DefaultContextMenu); // native copy menu
@@ -952,15 +1302,18 @@ bool TranscriptDelegate::editorEvent(QEvent *event, QAbstractItemModel *model,
             // first click). Otherwise a click on the body asks the panel to open
             // the persistent selection overlay so the text becomes selectable.
             const int innerW = opt.rect.width() - 2 * kOuterMarginX - 2 * kCardPadX;
-            QTextDocument *doc = buildBodyDoc(idx, qMax(1, innerW), opt);
+            QTextDocument *doc = bodyDoc(idx, qMax(1, innerW), opt);
             const QFontMetrics fm(opt.font);
             const QPointF rel(pos.x() - (opt.rect.left() + kOuterMarginX + kCardPadX),
                               pos.y() - (opt.rect.top() + kCardPadTop + fm.height()
                                          + kRoleRowGap));
             const QString anchor = doc->documentLayout()->anchorAt(rel);
-            delete doc;
             if (!anchor.isEmpty()) {
-                QDesktopServices::openUrl(QUrl(anchor));
+                // A link in an assistant message is model-authored: its text
+                // says nothing about its target, so it goes through the scheme
+                // policy rather than straight to the OS handler (audit F14).
+                agentkate::openModelLink(const_cast<QWidget *>(opt.widget),
+                                         QUrl(anchor));
                 return true;
             }
             if (messageBodyRect(opt.rect, opt, idx).contains(pos)) {

@@ -30,6 +30,11 @@ struct AgentJob {
     QString description; // human label ("Build and test", the workflow summary)
     QString outputFile;  // transcript / log path; empty until the CLI reports it
     qint64 startedMs = 0;
+    // Wall-clock stamp of the transition into done/failed; 0 while the job is
+    // still running (and for a terminal job whose end was never observed, e.g. a
+    // record restored without one). Without it a finished row can only be drawn
+    // as age-since-start, which keeps growing after the work stopped.
+    qint64 endedMs = 0;
     bool done = false;
     bool failed = false;
 
@@ -41,7 +46,7 @@ struct AgentJob {
     {
         return a.id == b.id && a.kind == b.kind && a.description == b.description
             && a.outputFile == b.outputFile && a.startedMs == b.startedMs
-            && a.done == b.done && a.failed == b.failed;
+            && a.endedMs == b.endedMs && a.done == b.done && a.failed == b.failed;
     }
 };
 } // namespace agentkate
