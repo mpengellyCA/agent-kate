@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -27,6 +28,28 @@ const (
 	AuditKill   AuditKind = "kill"   // kill-switch engaged
 	AuditRearm  AuditKind = "rearm"  // kill-switch re-armed
 	AuditTamper AuditKind = "tamper" // chain verification failed on load
+	AuditRotate AuditKind = "rotate" // log rotated; genesis of the new chain
+)
+
+// Audit-log retention (audit F10). The log is append-only and nothing ever
+// pruned it, so a long-lived install grew it without bound — a disk-fill DoS on
+// the user, and a load-time verification pass that got slower forever.
+//
+// Rotation cannot simply keep the tail: the chain is verified from a genesis
+// whose PrevHash is empty, so a truncated head would read as TAMPERING and fail
+// the Authority closed — a retention policy that trips the alarm it is meant to
+// keep quiet. Instead the whole segment is copied aside and the live file
+// restarts with an AuditRotate entry that RECORDS the rotation in-chain: the
+// archived segment's name, its entry count, its last seq, its chain head, and a
+// sha256 of the segment itself. The archive is therefore still cryptographically
+// anchored from the live chain, and the live chain verifies cleanly from its
+// own genesis.
+//
+// One archived segment is retained (overwritten by the next rotation), so the
+// pair is bounded at ~2× maxAuditBytes rather than growing forever.
+const (
+	maxAuditBytes      = 8 << 20
+	auditArchiveSuffix = ".1"
 )
 
 // AuditEntry is one append-only, hash-chained record. Hash =
@@ -136,6 +159,14 @@ func (a *Audit) Append(e AuditEntry) error {
 	}
 	defer func() { _ = unix.Flock(int(f.Fd()), unix.LOCK_UN) }()
 
+	// Retention runs INSIDE the flock, before the head is re-synced, so the
+	// rotation entry it writes is the tail this append then links onto.
+	// Deliberately not fatal: a rotation we could not complete must never cost
+	// us the entry we were asked to record.
+	if rerr := a.rotateIfNeededLocked(f); rerr != nil {
+		slog.Warn("cowork: audit rotation skipped", "path", a.path, "err", rerr)
+	}
+
 	// Re-sync the head/seq to the on-disk tail (another process may have appended
 	// since we loaded). An unreadable/empty tail is a clean genesis (head="").
 	if head, seq, ok, rerr := lastChainState(f); rerr != nil {
@@ -161,6 +192,91 @@ func (a *Audit) Append(e AuditEntry) error {
 		return err
 	}
 	a.head = e.Hash
+	return nil
+}
+
+// rotateIfNeededLocked copies the log aside and restarts it when it has grown
+// past maxAuditBytes. The caller holds a.mu AND the flock on f, and f is open
+// O_APPEND on the live path.
+//
+// Deliberately copy + truncate IN PLACE rather than rename: another process may
+// already be blocked on the flock holding an fd to this inode, and a rename
+// would send its append to the archived segment — a fork in the chain that the
+// next load would report as tampering. Truncating the inode everyone is queued
+// on keeps them all writing to the same, now-empty, file.
+//
+// The archive is written BEFORE the live file is truncated, so a failure at any
+// step leaves the log exactly as it was.
+func (a *Audit) rotateIfNeededLocked(f *os.File) error {
+	st, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	size := st.Size()
+	if size < maxAuditBytes {
+		return nil
+	}
+
+	// Read the outgoing segment's identity first: its chain head (what the new
+	// genesis will point back at) and a hash of its bytes (what makes the
+	// archive verifiable from the live chain).
+	head, lastSeq, _, err := lastChainState(f)
+	if err != nil {
+		return err
+	}
+
+	archive := a.path + auditArchiveSuffix
+	tmp := archive + ".tmp"
+	dst, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	sum := sha256.New()
+	entries, cerr := io.Copy(io.MultiWriter(dst, sum), io.NewSectionReader(f, 0, size))
+	closeErr := dst.Close()
+	if cerr != nil || closeErr != nil {
+		_ = os.Remove(tmp)
+		if cerr != nil {
+			return cerr
+		}
+		return closeErr
+	}
+	if entries != size {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("cowork: audit archive short write (%d of %d bytes)", entries, size)
+	}
+	if err := os.Rename(tmp, archive); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+
+	// Point of no return: the segment is safely on disk, so the live file may
+	// now be emptied. O_APPEND means every subsequent write still lands at the
+	// end, whatever any other process's file offset happens to be.
+	if err := f.Truncate(0); err != nil {
+		return err
+	}
+	a.head, a.seq = "", 0
+
+	rot := AuditEntry{
+		Seq:  1,
+		At:   time.Now(),
+		Kind: AuditRotate,
+		Detail: fmt.Sprintf(
+			"audit log rotated at %d bytes; entries 1..%d moved to %s (previous chain head %s)",
+			size, lastSeq, filepath.Base(archive), head),
+		ArtifactHash: hex.EncodeToString(sum.Sum(nil)),
+		PrevHash:     "", // genesis of the new chain — see maxAuditBytes
+	}
+	rot.Hash = hashEntry(rot)
+	line, err := json.Marshal(rot)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(append(line, '\n')); err != nil {
+		return err
+	}
+	a.head, a.seq = rot.Hash, rot.Seq
 	return nil
 }
 

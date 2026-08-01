@@ -11,9 +11,19 @@ import (
 
 var errKilled = errors.New("cowork: desktop access disabled (kill-switch engaged)")
 
-// Notifier pushes events to the UI (wired to ipc.Server.Notify in main).
+// Notifier pushes events to the UI. Wired to ipc.Server in main; the two
+// methods differ in WHO receives the frame:
+//
+//   - Notify reaches every connection, agent bridges included. Correct only for
+//     payload-free state changes that any client may safely learn.
+//   - NotifyUI reaches connections that identified as the UI and nobody else.
+//     Required for anything carrying a request id or the CONTENT of an action —
+//     a broadcast consent prompt hands every other agent in the arena the id to
+//     race the human on, plus a description of what the asking agent is doing
+//     (audit F6, third site).
 type Notifier interface {
 	Notify(method string, params any)
+	NotifyUI(method string, params any)
 }
 
 // ActionDescriptor is the concrete, literal action shown to the user for R2
@@ -120,17 +130,17 @@ func newAuthority(store *Store, audit *Audit, policy *Policy, notify Notifier, l
 		log = slog.Default()
 	}
 	return &Authority{
-		store:             store,
-		audit:             audit,
-		policy:            policy,
-		broker:            newGrantBroker(),
-		notify:            notify,
-		log:               log,
+		store:     store,
+		audit:     audit,
+		policy:    policy,
+		broker:    newGrantBroker(),
+		notify:    notify,
+		log:       log,
 		teardowns: map[string]func(){},
 		// Both spellings: KWin reports the Wayland app_id as either the reverse-DNS
 		// desktop name or the bare component name depending on how the app set it.
-		selfClasses: map[string]bool{"org.kde.agentkate": true, "agentkate": true},
-		selfPIDs:    map[int]bool{},
+		selfClasses:       map[string]bool{"org.kde.agentkate": true, "agentkate": true},
+		selfPIDs:          map[int]bool{},
 		promptTimeoutR0R1: 5 * time.Minute,
 		promptTimeoutR2:   3 * time.Minute,
 	}
@@ -188,7 +198,12 @@ func (a *Authority) Authorize(ctx context.Context, req AuthRequest) (Decision, e
 
 	reqID, ch := a.broker.Open()
 	defer a.broker.Close(reqID)
-	a.notify.Notify("cowork.grantRequested", a.grantRequestPayload(reqID, req, tier))
+	// UI-only, deliberately (audit F6): the payload carries the broker request
+	// id and the literal action being asked about — the window, the element,
+	// the text destined for a field. Broadcast, it would let any other agent's
+	// bridge read one agent's desktop activity and answer the human's prompt
+	// before they can. The consent dialog is the human's, so the frame is too.
+	a.notify.NotifyUI("cowork.grantRequested", a.grantRequestPayload(reqID, req, tier))
 
 	timeout := a.promptTimeoutR0R1
 	if tier == TierR2 {
@@ -311,7 +326,18 @@ func (a *Authority) Kill(reason string) []string {
 	}
 	_ = a.audit.Append(AuditEntry{Kind: AuditKill, Detail: reason})
 	if a.notify != nil {
-		a.notify.Notify("cowork.killSwitch", map[string]any{"on": true, "reason": reason, "at": time.Now()})
+		// restoreDesktopFlags is the kill-switch's contract with the UI: "stop ALL desktop
+		// access" must also put the desktop-wide org.a11y.Status flags (IsEnabled /
+		// ScreenReaderEnabled) that Cowork flipped back the way the user had them — not
+		// only tear down the RemoteDesktop session. Anything less leaves the whole session's
+		// accessibility bus switched on after the human hit the panic button.
+		// The UI half lives in ui/src/cowork/CoworkPortal.cpp (restoreAtspiStatus).
+		a.notify.NotifyUI("cowork.killSwitch", map[string]any{
+			"on":                  true,
+			"reason":              reason,
+			"at":                  time.Now(),
+			"restoreDesktopFlags": true,
+		})
 	}
 	return ids
 }
@@ -361,7 +387,7 @@ func (a *Authority) Rearm(reason string) {
 	a.mu.Unlock()
 	_ = a.audit.Append(AuditEntry{Kind: AuditRearm, Detail: reason})
 	if a.notify != nil {
-		a.notify.Notify("cowork.killSwitch", map[string]any{"on": false, "reason": reason, "at": time.Now()})
+		a.notify.NotifyUI("cowork.killSwitch", map[string]any{"on": false, "reason": reason, "at": time.Now()})
 	}
 }
 
@@ -435,6 +461,12 @@ func (a *Authority) SetSelfIdentity(classes []string, pids []int) {
 
 // IsSelfTarget reports whether t points at Agent Kate's own UI (by resourceClass or
 // label). Window-target callers must populate ResourceClass for this to apply.
+//
+// A Target carries no PID, so this check alone is NOT sufficient for any caller that
+// can obtain the owning process: a window whose resourceClass we failed to read looks
+// innocent here. Such callers must ALSO run IsSelfPID / IsSelfWindow and fail closed
+// when neither piece of evidence can be gathered (see the R2 keyboard and AT-SPI guards
+// in package main).
 func (a *Authority) IsSelfTarget(t Target) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -445,6 +477,37 @@ func (a *Authority) IsSelfTarget(t Target) bool {
 		return true
 	}
 	return false
+}
+
+// IsSelfPID reports whether pid is one of Agent Kate's own processes (as registered by
+// SetSelfIdentity). PID evidence is stronger than the window class: it comes straight
+// from the AT-SPI element context or the KWin record and survives a failed / partial
+// class lookup, which is exactly the case that used to let a self-target through.
+// A non-positive pid is "unknown", never "not us" — callers must treat an unknown PID
+// as unverified and fail closed themselves.
+func (a *Authority) IsSelfPID(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.selfPIDs[pid]
+}
+
+// IsSelfWindow reports whether a window identified by (pid, resourceClass) belongs to
+// Agent Kate. It is the non-geometric sibling of IsSelfPoint: either piece of evidence
+// is decisive on its own. Callers that cannot obtain EITHER must refuse the action —
+// this function returning false only means "no evidence of self", not "verified safe".
+func (a *Authority) IsSelfWindow(pid int, resourceClass string) bool {
+	if a.IsSelfPID(pid) {
+		return true
+	}
+	if resourceClass == "" {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.selfClasses[strings.ToLower(resourceClass)]
 }
 
 // WindowRect is a live KWin window rectangle in absolute desktop pixels, with the

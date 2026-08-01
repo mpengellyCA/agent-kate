@@ -3,9 +3,6 @@
 #include <KConfigGroup>
 #include <KSharedConfig>
 
-#include <QDBusConnection>
-#include <QDBusInterface>
-#include <QDBusVariant>
 #include <QFileInfo>
 #include <QProcess>
 #include <QStandardPaths>
@@ -48,26 +45,6 @@ const Candidate kCandidates[] = {
 KConfigGroup configGroup()
 {
     return KSharedConfig::openConfig()->group(QStringLiteral("Cowork"));
-}
-
-// Chromium checks org.a11y.Status at launch to decide whether to export an AT-SPI
-// tree; the --force-renderer-accessibility flag alone is NOT sufficient (some
-// forks, e.g. Helium, gate the AX tree on this). Enable it on the session bus
-// before launching a Chromium browser so agents can actually read the page. We
-// leave it enabled afterwards (harmless); the agent control path manages its own
-// capture/restore of this status separately.
-void enableAtspiStatus()
-{
-    QDBusInterface props(QStringLiteral("org.a11y.Bus"), QStringLiteral("/org/a11y/bus"),
-                         QStringLiteral("org.freedesktop.DBus.Properties"),
-                         QDBusConnection::sessionBus());
-    if (!props.isValid()) {
-        return;
-    }
-    props.call(QStringLiteral("Set"), QStringLiteral("org.a11y.Status"),
-               QStringLiteral("IsEnabled"), QVariant::fromValue(QDBusVariant(true)));
-    props.call(QStringLiteral("Set"), QStringLiteral("org.a11y.Status"),
-               QStringLiteral("ScreenReaderEnabled"), QVariant::fromValue(QDBusVariant(true)));
 }
 
 // Custom browsers are stored as "name\x1fcommand\x1ffamily" strings.
@@ -231,10 +208,11 @@ bool launch(const Browser &b, QString *error)
     }
     args << program;
     if (b.family == kChromium) {
-        // org.a11y.Status must be on at launch, and =complete forces the full AX
-        // tree explicitly. Some Chromium builds/forks (e.g. Helium) gate the bare
-        // flag behind activation heuristics, so set both.
-        enableAtspiStatus();
+        // Only the per-process flag is set here. The DESKTOP-WIDE org.a11y.Status
+        // flip that Chromium also needs is deliberately NOT done in this function
+        // — see the header. Doing it here silently defeated CoworkPortal's gate
+        // (audit F8) and blocked the GUI thread on a synchronous D-Bus
+        // introspection (audit F12).
         args << QStringLiteral("--force-renderer-accessibility=complete");
     }
 

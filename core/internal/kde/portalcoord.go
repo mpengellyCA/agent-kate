@@ -28,6 +28,23 @@ type PortalResult struct {
 
 	Browser  string   `json:"browser,omitempty"`  // launchBrowser: the browser that was opened
 	Browsers []string `json:"browsers,omitempty"` // launchBrowser: names the user has configured
+
+	// --- inject: per-batch playback outcome (audit F3, absolute half) ----------------
+	// The UI cannot always play what it was handed: an absolute move whose point lies
+	// inside no captured screen has no stream node to address and is DROPPED. Silently
+	// swallowing that desynced the core's pointer mirror from the true cursor — the core
+	// recorded the requested point while the cursor never moved — which is the same
+	// bypass class as stale relative motion. So the UI reports what actually happened and
+	// the core believes THIS, not its own request:
+	//   OpsApplied/OpsDropped — ops that provably ran / provably did not.
+	//   PtrKnown + PtrX/PtrY  — the last absolute move that actually landed.
+	// A reply with no outcome fields (an older UI, or a non-inject kind) reads as
+	// PtrKnown=false, which fails closed: the mirror is destroyed rather than trusted.
+	OpsApplied int  `json:"opsApplied,omitempty"`
+	OpsDropped int  `json:"opsDropped,omitempty"`
+	PtrKnown   bool `json:"ptrKnown,omitempty"`
+	PtrX       int  `json:"ptrX,omitempty"`
+	PtrY       int  `json:"ptrY,omitempty"`
 }
 
 func NewPortalBroker() *PortalBroker {

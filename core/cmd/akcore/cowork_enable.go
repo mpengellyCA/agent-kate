@@ -175,6 +175,17 @@ func setCoworkEnabled(d handlerDeps, threadID string, enabled bool) (map[string]
 			_, _ = coworkPreflight(context.Background(), d, threadID, true)
 		})
 	}
+	// SECURITY / honesty (audit F8): the enable dialog promises the desktop-wide
+	// accessibility flip lasts "until desktop access is turned off — then your
+	// original setting is restored". Only the kill-switch and app exit used to
+	// honour that, so switching the last agent off left the whole session
+	// exporting its AT-SPI tree with the UI claiming otherwise. Turning the LAST
+	// cowork thread off now restores the flags for real.
+	if changed && !enabled && noCoworkThreadsLeft(d) {
+		d.srv.NotifyUI("cowork.restoreDesktopFlags", map[string]any{
+			"reason": "the last agent with desktop access was switched off",
+		})
+	}
 
 	return map[string]any{
 		"ok": true, "enabled": enabled, "changed": changed, "applied": applied,
@@ -184,6 +195,23 @@ func setCoworkEnabled(d handlerDeps, threadID string, enabled bool) (map[string]
 		// when we gave up waiting — it still will, just perhaps a turn later.
 		"revealed": revealed,
 	}, nil
+}
+
+// noCoworkThreadsLeft reports whether NO thread still has Cowork enabled. It reads the
+// store rather than a counter so a record changed by any path (start, resume, discard)
+// is accounted for. On a read failure it returns false — leaving the desktop flags in
+// place is the conservative answer, because restoring them mid-session would silently
+// break a live agent's element reads.
+func noCoworkThreadsLeft(d handlerDeps) bool {
+	if d.sessions == nil {
+		return false
+	}
+	for _, r := range d.sessions.List("") {
+		if r.CoworkEnabled {
+			return false
+		}
+	}
+	return true
 }
 
 // reattachForCowork restarts a running thread on its own session so a harness
@@ -328,7 +356,7 @@ func registerCoworkEnableHandlers(d handlerDeps) {
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
-		if ok, _ := d.srv.BindBridge(ctx, p.ThreadID); ok {
+		if ok, _ := d.srv.RequireBridge(ctx, p.ThreadID); ok {
 			coworkReveal.signal(p.ThreadID)
 		}
 		return map[string]any{"ok": true}, nil
@@ -363,7 +391,7 @@ func registerCoworkEnableHandlers(d handlerDeps) {
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
-		if ok, reason := d.srv.BindBridge(ctx, p.FromThreadID); !ok {
+		if ok, reason := d.srv.RequireBridge(ctx, p.FromThreadID); !ok {
 			return nil, ipc.Errorf(codeCoworkDenied, reason)
 		}
 		target := p.ThreadID
@@ -411,9 +439,14 @@ func registerCoworkEnableHandlers(d handlerDeps) {
 	})
 }
 
-// requireUIOrOwnBridge allows the UI, or an agent bridge bound to this very
-// thread. Used by the read-only state RPC a bridge needs before it is allowed
-// to do anything else — it must work precisely when Cowork is still off.
+// requireUIOrOwnBridge allows the UI, or the agent bridge already identified
+// for this very thread. Used by the read-only state RPC a bridge needs before
+// it is allowed to do anything else — it must work precisely when Cowork is
+// still off.
+//
+// It asserts an existing identity rather than creating one (audit F13): a
+// connection that never proved it is this thread's bridge is refused here, so
+// this handler cannot be used as a way around bridge.identify's secret.
 func requireUIOrOwnBridge(d handlerDeps, ctx context.Context, threadID string) error {
 	if threadID == "" {
 		return ipc.Errorf(ipc.CodeInvalidParams, "threadId is required")
@@ -421,7 +454,7 @@ func requireUIOrOwnBridge(d handlerDeps, ctx context.Context, threadID string) e
 	if d.srv.RequireUI(ctx) {
 		return nil
 	}
-	if ok, reason := d.srv.BindBridge(ctx, threadID); !ok {
+	if ok, reason := d.srv.RequireBridge(ctx, threadID); !ok {
 		return ipc.Errorf(codeCoworkDenied, reason)
 	}
 	return nil

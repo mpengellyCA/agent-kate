@@ -6,6 +6,8 @@ import (
 	"math/rand"
 	"sort"
 	"strings"
+
+	"agentkate/internal/kde"
 )
 
 // --- choreographed input: the timeline compiler (cowork plan 10) ----------------
@@ -31,7 +33,8 @@ type timelineEvent struct {
 	//   key|key_down|key_up         — keyboard tap / half-events (hold across other events)
 	//   button|button_down|button_up — pointer button at the CURRENT cursor (bare)
 	//   move                         — positioned absolute motion (no side effect, not guarded)
-	//   move_rel                     — raw relative dx/dy delta (mouse-look; not guarded/mirrored)
+	//   move_rel                     — raw relative dx/dy delta (mouse-look; no guard point,
+	//                                  but it DOES carry the position mirror — see below)
 	//   click                        — positioned click (move→press→release ×Count)
 	//   scroll                       — wheel, optionally positioned (X,Y) else at the cursor
 	//   wait                         — pure delay (advances the cursor, emits nothing)
@@ -60,6 +63,13 @@ type timelineEvent struct {
 type timelineScript struct {
 	Events []timelineEvent
 	FPS    float64
+	// Bounds is the SCREEN LAYOUT the compositor clamps the pointer into, used to decide
+	// whether a move_rel's accumulated position is still knowable (audit F3 — see
+	// pointerState.applyRelative). Containment is per screen, not against the union box:
+	// a staggered multi-monitor union contains dead space the cursor can never occupy. An
+	// invalid/zero layout means "unknown", and every relative event then INVALIDATES the
+	// mirror instead of advancing it.
+	Bounds kde.DesktopLayout
 }
 
 // timelinePlan is the compiled result: the flat op list for the UI plus everything the
@@ -72,6 +82,10 @@ type timelinePlan struct {
 	HasPointer bool             // any move/click/scroll/button present → needs pointer_control
 	FinalPos   point            // last commanded pointer position (for the handler to setLast)
 	HaveFinal  bool
+	// RelLost means a move_rel left the pointer somewhere this compiler could not
+	// account for. The handler must then DESTROY the thread's mirror rather than leave
+	// the pre-script position standing (audit F3).
+	RelLost bool
 }
 
 // Duration caps. A tap's dwell is a pure duration → safe to CLAMP. But an explicit
@@ -322,6 +336,9 @@ func buildTimelineOps(
 			}
 			plan.HasPointer = true
 			if !haveLast {
+				if plan.RelLost {
+					return plan, fmt.Errorf("%s at the current pointer, but an earlier relative nudge left the cursor where this script can no longer verify it (the compositor may have clamped it at a screen edge) — use a positioned click, or a `move` event to re-establish a known position", strings.ToLower(ev.Type))
+				}
 				return plan, fmt.Errorf("%s at the current pointer, but no position is known yet — move first or pass a positioned click", strings.ToLower(ev.Type))
 			}
 			plan.GuardPts = append(plan.GuardPts, lastPos)
@@ -374,10 +391,30 @@ func buildTimelineOps(
 		case "move_rel":
 			plan.HasPointer = true
 			// Raw relative delta (dx,dy) — mouse-look for a pointer-grabbing game. It has no
-			// absolute landing point, so it is NOT a guard point, needs no screencast, and
-			// deliberately leaves lastPos/haveLast untouched (a grab makes the true cursor
-			// position unknowable). Sequence several with afterMs/atMs/frame for a turn.
+			// absolute landing point, so it is NOT a guard point and needs no screencast.
+			//
+			// SECURITY (audit F3): it DOES move the mirror. Leaving lastPos standing let a
+			// script nudge the real cursor onto an Agent Kate window and then fire a bare
+			// `button` event whose guard point was the position the cursor had before the
+			// nudge. The delta is accumulated while the result provably stays inside the
+			// desktop; anything else (unknown bounds, or a walk into the compositor's edge
+			// clamp) invalidates the position, and the bare button/scroll cases below then
+			// refuse the whole script.
 			sub = []map[string]any{relMoveOp(float64(ev.DX), float64(ev.DY))}
+			if haveLast {
+				to := point{
+					X: lastPos.X + int(math.Round(clampRelDelta(float64(ev.DX)))),
+					Y: lastPos.Y + int(math.Round(clampRelDelta(float64(ev.DY)))),
+				}
+				if script.Bounds.Contains(to.X, to.Y) {
+					lastPos = to
+				} else {
+					haveLast = false
+					plan.RelLost = true
+				}
+			} else {
+				plan.RelLost = true
+			}
 			descParts = append(descParts, fmt.Sprintf("nudge(%+d,%+d)", ev.DX, ev.DY))
 
 		case "click":
@@ -409,6 +446,9 @@ func buildTimelineOps(
 				// Scroll at the current cursor — fail closed if we can't verify where it lands
 				// (mirror the bare-click rule).
 				if !haveLast {
+					if plan.RelLost {
+						return plan, fmt.Errorf("scroll at the current pointer, but an earlier relative nudge left the cursor where this script can no longer verify it — pass x,y, or re-establish a known position with a `move` event")
+					}
 					return plan, fmt.Errorf("scroll at the current pointer, but no position is known yet — pass x,y or move first")
 				}
 				plan.GuardPts = append(plan.GuardPts, lastPos)

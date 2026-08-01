@@ -12,17 +12,21 @@ import (
 	"agentkate/internal/cowork"
 	"agentkate/internal/ipc"
 	"agentkate/internal/kde"
+	"agentkate/internal/safe"
 )
 
 // codeCoworkDenied is returned when a Cowork action is refused (no consent, wrong
 // origin, not enabled, kill-switch). The MCP bridge surfaces the message to the agent.
 const codeCoworkDenied = -32010
 
-// coworkNotifier adapts ipc.Server.Notify to the cowork.Notifier interface so the
-// consent authority can push grant prompts / changes to the UI.
+// coworkNotifier adapts ipc.Server to the cowork.Notifier interface so the
+// consent authority can push grant prompts / changes to the UI. Both directions
+// are exposed because the authority decides per event whether it may be
+// broadcast at all — see cowork.Notifier.
 type coworkNotifier struct{ srv *ipc.Server }
 
-func (n coworkNotifier) Notify(method string, params any) { n.srv.Notify(method, params) }
+func (n coworkNotifier) Notify(method string, params any)   { n.srv.Notify(method, params) }
+func (n coworkNotifier) NotifyUI(method string, params any) { n.srv.NotifyUI(method, params) }
 
 // screenshotMaxDim caps the longest edge of a returned still (plan 02 §3): keeps the
 // base64 image well under the 16 MiB IPC frame cap and within model vision limits.
@@ -341,9 +345,7 @@ func registerCoworkHandlers(d handlerDeps) {
 				cw.AuditRefusal(p.ThreadID, cowork.CapInputInject,
 					cowork.Target{Kind: cowork.TargetScreen, Label: "bare click at an unverified pointer position"},
 					"refused: cannot verify where a bare click would land")
-				return nil, ipc.Errorf(codeCoworkDenied,
-					"refused: a bare click fires at the cursor's current position, which can't be verified safe — "+
-						"use desktop_click(x,y) (it targets and guards an exact point), or move the pointer first with desktop_move_pointer")
+				return nil, ipc.Errorf(codeCoworkDenied, bareClickRefusal(pstate.mirrorLoss(p.ThreadID)))
 			}
 			if err := guardPointerTargets(cw, []point{last}); err != nil {
 				cw.AuditRefusal(p.ThreadID, cowork.CapInputInject,
@@ -352,21 +354,17 @@ func registerCoworkHandlers(d handlerDeps) {
 			}
 		}
 
-		// Resolve the target window's class/title so the self-target guard can refuse
-		// Agent Kate's own UI and the consent prompt can name the window.
-		target := cowork.Target{Kind: cowork.TargetWindow, WindowID: p.TargetWindowID, Label: "the focused window"}
-		if p.TargetWindowID != "" {
-			if wins, err := cw.KDE().ListWindows(4 * time.Second); err == nil {
-				for _, w := range wins {
-					if w.InternalID == p.TargetWindowID {
-						target.ResourceClass = w.ResourceClass
-						if w.Caption != "" {
-							target.Label = w.Caption
-						}
-						break
-					}
-				}
-			}
+		// Resolve — and VERIFY — the window the keystrokes will land on. This is the
+		// keyboard analogue of guardPointerTargets and it fails CLOSED: with no
+		// targetWindowId the events go to whatever is focused, which may be Agent Kate's
+		// own typed-phrase consent dialog, so "the focused window" is resolved for real
+		// and refused when it is ours or cannot be identified.
+		target, gerr := resolveInjectTarget(cw, p.TargetWindowID)
+		if gerr != nil {
+			cw.AuditRefusal(p.ThreadID, cowork.CapInputInject,
+				cowork.Target{Kind: cowork.TargetWindow, WindowID: p.TargetWindowID, Label: "the focused window"},
+				gerr.Error())
+			return nil, ipc.Errorf(codeCoworkDenied, gerr.Error())
 		}
 
 		dec, err := cw.Authorize(ctx, cowork.AuthRequest{
@@ -387,17 +385,50 @@ func registerCoworkHandlers(d handlerDeps) {
 			return nil, ipc.Errorf(codeCoworkDenied, dec.Reason)
 		}
 
-		// Focus the target window first so the keystrokes land on it.
-		if p.TargetWindowID != "" {
-			if err := cw.KDE().ActivateWindow(p.TargetWindowID, 4*time.Second); err != nil {
-				d.log.Warn("cowork: could not focus target window", "id", p.TargetWindowID, "err", err)
+		// Re-assert focus on the VERIFIED window (target.WindowID, which resolveInjectTarget
+		// filled in even when the caller passed none) AFTER the consent wait, and refuse the
+		// batch outright if that cannot be proven — the authorize above may have blocked on a
+		// human for minutes, and typing into "whatever is focused now" is the whole attack.
+		// A batch that types nothing keeps the best-effort focus hint: its real guard is the
+		// bare-click check above, which is geometric and does not depend on focus at all.
+		typing := opsHaveKey(ops)
+		if typing {
+			if err := focusVerifiedInjectTarget(cw, target); err != nil {
+				cw.AuditRefusal(p.ThreadID, cowork.CapInputInject, target, err.Error())
+				return nil, ipc.Errorf(codeCoworkDenied, err.Error())
+			}
+		} else if target.WindowID != "" {
+			if err := cw.KDE().ActivateWindow(target.WindowID, 4*time.Second); err != nil {
+				d.log.Warn("cowork: could not focus target window", "id", target.WindowID, "err", err)
 			}
 		}
 
-		if _, err := runPortal(d, ctx, "inject", map[string]any{
+		// A batch with delays plays over wall-clock time, so the point-in-time checks above
+		// do not cover it: supervise the focused window for the whole span and abort the
+		// remainder the moment it changes (audit F3). Establishing the watch is a
+		// precondition — if KWin cannot be watched, the timed batch is refused.
+		var abort <-chan string
+		if typing && opsSpanMs(ops) > 0 {
+			watch, ch, werr := startInjectFocusWatch(cw, target)
+			if werr != nil {
+				cw.AuditRefusal(p.ThreadID, cowork.CapInputInject, target, werr.Error())
+				return nil, ipc.Errorf(codeCoworkDenied, werr.Error())
+			}
+			defer watch.Stop()
+			abort = ch
+		}
+
+		// No pointer-mirror bookkeeping here, deliberately: buildInjectOps emits only key
+		// and button events (this path fires at the CURRENT cursor by definition), so
+		// nothing in this batch — landed, dropped, or abandoned half-way — can move the
+		// pointer. The mirror still describes the cursor afterwards.
+		if _, err := runPortalAbortable(d, ctx, "inject", map[string]any{
 			"threadId": p.ThreadID,
 			"ops":      ops,
-		}, 35*time.Second); err != nil {
+		}, 35*time.Second, abort); err != nil {
+			if abort != nil {
+				cw.AuditRefusal(p.ThreadID, cowork.CapInputInject, target, err.Error())
+			}
 			return nil, err
 		}
 		cw.AuditCapture(p.ThreadID, cowork.CapInputInject, target, dec.GrantID, hashString(desc))
@@ -442,7 +473,12 @@ func registerCoworkHandlers(d handlerDeps) {
 			}
 			return pstate.resolve(p.ThreadID, patch)
 		}
-		plan, err := buildTimelineOps(timelineScript{Events: p.Events, FPS: p.FPS}, start, haveStart, resolveProfile, newPointerRNG())
+		// The desktop box the compositor clamps the pointer into, so a move_rel event can
+		// carry the mirror instead of stranding it (audit F3). Unknown bounds are not a
+		// guess: the compiler invalidates the position and any bare button/scroll after a
+		// nudge is refused.
+		script := timelineScript{Events: p.Events, FPS: p.FPS, Bounds: pstate.desktopBounds(cw)}
+		plan, err := buildTimelineOps(script, start, haveStart, resolveProfile, newPointerRNG())
 		if err != nil {
 			// Script-construction / fail-closed errors (bad schedule, unreleased hold,
 			// span overrun, unverifiable bare click) are the caller's mistake.
@@ -451,19 +487,25 @@ func registerCoworkHandlers(d handlerDeps) {
 
 		// Resolve the target window's class/title so the self-target guard can refuse
 		// Agent Kate's own UI and the consent prompt(s) can name the window.
-		target := cowork.Target{Kind: cowork.TargetWindow, WindowID: p.TargetWindowID, Label: "the focused window"}
-		if p.TargetWindowID != "" {
-			if wins, err := cw.KDE().ListWindows(4 * time.Second); err == nil {
-				for _, w := range wins {
-					if w.InternalID == p.TargetWindowID {
-						target.ResourceClass = w.ResourceClass
-						if w.Caption != "" {
-							target.Label = w.Caption
-						}
-						break
-					}
-				}
+		//
+		// A script that types anything gets the same fail-closed keyboard guard as
+		// injectInput: keystrokes follow focus, so the focused window must be identified
+		// and cleared before any of it is scheduled. A pointer-only script keeps the
+		// best-effort lookup — every one of its action points is checked geometrically by
+		// guardPointerTargets below, which is the stronger check for that case and does
+		// not need a focused window at all.
+		var target cowork.Target
+		if plan.HasKey {
+			var gerr error
+			target, gerr = resolveInjectTarget(cw, p.TargetWindowID)
+			if gerr != nil {
+				cw.AuditRefusal(p.ThreadID, cowork.CapInputInject,
+					cowork.Target{Kind: cowork.TargetWindow, WindowID: p.TargetWindowID, Label: "the focused window"},
+					gerr.Error())
+				return nil, ipc.Errorf(codeCoworkDenied, gerr.Error())
 			}
+		} else {
+			target = bestEffortWindowTarget(cw, p.TargetWindowID)
 		}
 
 		// Authorize each capability the compiled script actually exercises, surfacing the
@@ -523,25 +565,73 @@ func registerCoworkHandlers(d handlerDeps) {
 			}
 		}
 
-		// Focus the target window first so the keystrokes/clicks land on it.
-		if p.TargetWindowID != "" {
-			if err := cw.KDE().ActivateWindow(p.TargetWindowID, 4*time.Second); err != nil {
-				d.log.Warn("cowork: could not focus target window", "id", p.TargetWindowID, "err", err)
+		// Focus the VERIFIED window first so the keystrokes/clicks land on it.
+		//
+		// A typing script gets the fail-closed re-verification: target.WindowID is the
+		// window resolveInjectTarget cleared, the authorize above may have blocked on a
+		// human for minutes, and a focus change since then would send the keys elsewhere —
+		// so an unprovable focus refuses the batch rather than warning. A pointer-only
+		// script has no keyboard target (target.WindowID may be empty, and every action
+		// point is geometrically guarded), so its focus hint stays best-effort.
+		if plan.HasKey {
+			if err := focusVerifiedInjectTarget(cw, target); err != nil {
+				cw.AuditRefusal(p.ThreadID, primaryCap, target, err.Error())
+				return nil, ipc.Errorf(codeCoworkDenied, err.Error())
 			}
+		} else if target.WindowID != "" {
+			if err := cw.KDE().ActivateWindow(target.WindowID, 4*time.Second); err != nil {
+				d.log.Warn("cowork: could not focus target window", "id", target.WindowID, "err", err)
+			}
+		}
+
+		// Supervise the focused window for the whole span of a timed TYPING script and
+		// abort the remainder on any change (audit F3). A timeline is exactly the case the
+		// submit-time checks cannot cover: up to 30s of wall clock with RemoteDesktop
+		// injecting throughout. Establishing the watch is a precondition — refuse if KWin
+		// cannot be watched.
+		var abort <-chan string
+		if plan.HasKey && opsSpanMs(plan.Ops) > 0 {
+			watch, ch, werr := startInjectFocusWatch(cw, target)
+			if werr != nil {
+				cw.AuditRefusal(p.ThreadID, primaryCap, target, werr.Error())
+				return nil, ipc.Errorf(codeCoworkDenied, werr.Error())
+			}
+			defer watch.Stop()
+			abort = ch
 		}
 
 		// 60s: a timeline may legitimately span up to 30s of playback and the UI replies
 		// only once the whole stream has drained.
-		if _, err := runPortal(d, ctx, "inject", map[string]any{
+		res, err := runPortalAbortable(d, ctx, "inject", map[string]any{
 			"threadId": p.ThreadID,
 			"ops":      plan.Ops,
-		}, 60*time.Second); err != nil {
+		}, 60*time.Second, abort)
+		if err != nil {
+			if abort != nil {
+				cw.AuditRefusal(p.ThreadID, primaryCap, target, err.Error())
+			}
+			// The ops reached the portal, so a pointer script may have played in PART: an
+			// aborted or failed timeline strands the cursor mid-path (and an interpolated
+			// path is allowed to cross Agent Kate's windows). Leaving the pre-script mirror
+			// standing is the same bypass as a stale relative nudge — destroy it.
+			if plan.HasPointer {
+				pstate.invalidate(p.ThreadID, mirrorLostUnproven)
+			}
 			return nil, err
 		}
-		// Commit the pointer mirror only after a successful play (mirror move/click), so a
-		// later bare click in another call can be verified against where we left the cursor.
-		if plan.HaveFinal {
+		// Commit the pointer mirror only when the UI PROVED the batch's last absolute move
+		// landed where it was aimed, so a later bare click in another call is verified
+		// against where the cursor really is. A script whose relative nudges outran what we
+		// can account for — or whose absolute move the desktop could not apply — DESTROYS
+		// the mirror instead: leaving the pre-script position standing is the F3 bypass.
+		landed := opsLandedAsAimed(plan.Ops, res)
+		switch {
+		case plan.HaveFinal && landed:
 			pstate.setLast(p.ThreadID, plan.FinalPos)
+		case plan.HaveFinal:
+			pstate.invalidate(p.ThreadID, mirrorLostUnproven)
+		case plan.RelLost:
+			pstate.invalidate(p.ThreadID, mirrorLostRelative)
 		}
 		cw.AuditCapture(p.ThreadID, primaryCap, target, primaryGrant, hashString(plan.Desc))
 		return map[string]any{"ok": true, "actions": plan.Desc}, nil
@@ -574,18 +664,26 @@ func registerCoworkHandlers(d handlerDeps) {
 		desc := fmt.Sprintf("move pointer to (%d,%d)%s", pt.X, pt.Y, frame)
 		// Move-only may pass over Agent Kate's windows (motion has no side effect); only
 		// a click/scroll on them is refused — so no geometric guard here.
-		res, err := runPointerAction(d, ctx, p.ThreadID, pointerTarget(desc), desc, ops, nil)
-		if err == nil {
-			pstate.setLast(p.ThreadID, pt)
-		}
+		res, play, err := runPointerAction(d, ctx, p.ThreadID, pointerTarget(desc), desc, ops, nil)
+		// The mirror records where the cursor PROVABLY is, never where we asked it to go: a
+		// move to a point no captured screen contains is dropped by the UI, and a failed
+		// play can strand the cursor mid-path — both leave it somewhere unverified, which
+		// must refuse the next bare click rather than clear it against a fiction.
+		pstate.commitPointer(p.ThreadID, play, pt, true)
 		return res, err
 	})
 
 	// Relative pointer motion: raw dx/dy deltas, the input a pointer-grabbing game (mouse-
 	// look) reads. Distinct from cowork.movePointer (absolute targeting): no screencast
-	// stream, no self-target guard (no landing point), and the position mirror is left
-	// unchanged — a grab makes the true cursor position unknowable. steps>1 splits the
-	// delta into smooth, timed sub-nudges.
+	// stream and no landing point to self-target-guard. steps>1 splits the delta into
+	// smooth, timed sub-nudges.
+	//
+	// SECURITY (audit F3): the mirror is carried ACROSS the move (applyRelative) rather
+	// than left standing. A stale mirror let an agent walk the real cursor onto Agent
+	// Kate's own window with move_rel and then fire a bare click the geometric guard
+	// cleared against where the cursor used to be. Deltas that cannot be accounted for
+	// (unknown desktop bounds, or a walk into the compositor's clamp at a screen edge)
+	// destroy the mirror instead, and every guarded bare action then refuses.
 	d.srv.Handle("cowork.movePointerRelative", func(ctx context.Context, raw json.RawMessage) (any, error) {
 		var p struct {
 			ThreadID string  `json:"threadId"`
@@ -602,8 +700,32 @@ func registerCoworkHandlers(d handlerDeps) {
 		dx, dy := clampRelDelta(p.DX), clampRelDelta(p.DY)
 		ops := relMoveOps(dx, dy, p.Steps)
 		desc := fmt.Sprintf("relative pointer move (%+.0f,%+.0f)", dx, dy)
-		// No guard (no absolute target); mirror deliberately NOT committed (see relMoveOp).
-		return runPointerAction(d, ctx, p.ThreadID, pointerTarget(desc), desc, ops, nil)
+		// No guard point (there is no absolute landing point to check), but the mirror MUST
+		// move with the cursor — see applyRelative. Read the desktop bounds BEFORE playing,
+		// so the fail-closed decision does not depend on a KWin round trip taken after the
+		// pointer has already moved.
+		bounds := pstate.desktopBounds(cw)
+		res, play, err := runPointerAction(d, ctx, p.ThreadID, pointerTarget(desc), desc, ops, nil)
+		if err != nil {
+			// A refusal BEFORE the portal ran moved nothing, so the mirror still describes
+			// the cursor; once the ops are in the UI's hands a failure may have played part
+			// of the stream, and we cannot tell how far it got — so the mirror goes.
+			if play.played {
+				pstate.invalidate(p.ThreadID, mirrorLostRelative)
+			}
+			return nil, err
+		}
+		if !play.landed {
+			// The UI could not apply every op, so the delta that actually reached the
+			// compositor is not the one we are about to account for. Fail closed.
+			pstate.invalidate(p.ThreadID, mirrorLostRelative)
+			return res, nil
+		}
+		if _, known := pstate.applyRelative(p.ThreadID, dx, dy, bounds); !known {
+			d.log.Debug("cowork: relative move left the pointer position unverifiable",
+				"thread", p.ThreadID, "boundsKnown", bounds.Valid())
+		}
+		return res, nil
 	})
 
 	d.srv.Handle("cowork.pointerClick", func(ctx context.Context, raw json.RawMessage) (any, error) {
@@ -646,10 +768,8 @@ func registerCoworkHandlers(d handlerDeps) {
 			click = fmt.Sprintf("%d× %s", count, click)
 		}
 		desc := fmt.Sprintf("%s at (%d,%d)%s", click, pt.X, pt.Y, frame)
-		res, err := runPointerAction(d, ctx, p.ThreadID, pointerTarget(desc), desc, ops, []point{pt})
-		if err == nil {
-			pstate.setLast(p.ThreadID, pt)
-		}
+		res, play, err := runPointerAction(d, ctx, p.ThreadID, pointerTarget(desc), desc, ops, []point{pt})
+		pstate.commitPointer(p.ThreadID, play, pt, true)
 		return res, err
 	})
 
@@ -714,10 +834,15 @@ func registerCoworkHandlers(d handlerDeps) {
 			cw.AuditRefusal(p.ThreadID, cowork.CapPointerControl, target, err.Error())
 			return nil, ipc.Errorf(codeCoworkDenied, err.Error())
 		}
-		if _, err := runPortal(d, ctx, "inject", map[string]any{"threadId": p.ThreadID, "ops": ops}, 45*time.Second); err != nil {
+		res, err := runPortal(d, ctx, "inject", map[string]any{"threadId": p.ThreadID, "ops": ops}, 45*time.Second)
+		if err != nil {
+			// Played (or half-played) and failed: the cursor is somewhere we cannot name.
+			pstate.invalidate(p.ThreadID, mirrorLostUnproven)
 			return nil, err
 		}
-		pstate.setLast(p.ThreadID, point{cx, cy})
+		// Same rule as every other absolute action: commit only what the UI proved landed.
+		pstate.commitPointer(p.ThreadID, pointerPlay{played: true, landed: opsLandedAsAimed(ops, res)},
+			point{cx, cy}, true)
 		cw.AuditCapture(p.ThreadID, cowork.CapPointerControl, target, dec.GrantID, hashString(desc))
 		return map[string]any{"ok": true, "action": desc, "element": elemLabel}, nil
 	})
@@ -753,9 +878,14 @@ func registerCoworkHandlers(d handlerDeps) {
 			ops = append(ops, pstate.moveOps(p.ThreadID, at.X, at.Y, prof, newPointerRNG())...)
 		default:
 			// Scroll lands at the current pointer position; we must know it to run the
-			// geometric guard (a scroll on Agent Kate's UI is refused). Fail closed.
+			// geometric guard (a scroll on Agent Kate's UI is refused). Fail closed —
+			// including when a relative nudge, or an absolute move the desktop could not
+			// apply, is what made the position unverifiable.
 			last, ok := pstate.last(p.ThreadID)
 			if !ok {
+				if why := pstate.mirrorLoss(p.ThreadID); why != "" {
+					return nil, ipc.Errorf(ipc.CodeInvalidParams, bareClickRefusal(why))
+				}
 				return nil, ipc.Errorf(ipc.CodeInvalidParams,
 					"pass x,y (or move the pointer first) so the scroll location can be verified")
 			}
@@ -768,10 +898,8 @@ func registerCoworkHandlers(d handlerDeps) {
 			ops = append(ops, scrollOp(1, p.DX))
 		}
 		desc := fmt.Sprintf("scroll vertical %d / horizontal %d notches at (%d,%d)", p.DY, p.DX, at.X, at.Y)
-		res, err := runPointerAction(d, ctx, p.ThreadID, pointerTarget(desc), desc, ops, []point{at})
-		if err == nil {
-			pstate.setLast(p.ThreadID, at)
-		}
+		res, play, err := runPointerAction(d, ctx, p.ThreadID, pointerTarget(desc), desc, ops, []point{at})
+		pstate.commitPointer(p.ThreadID, play, at, true)
 		return res, err
 	})
 
@@ -802,10 +930,10 @@ func registerCoworkHandlers(d handlerDeps) {
 		prof := pstate.resolve(p.ThreadID, p.Profile)
 		ops := pstate.dragOps(p.ThreadID, from, to, prof, newPointerRNG())
 		desc := fmt.Sprintf("drag from (%d,%d) to (%d,%d)%s", from.X, from.Y, to.X, to.Y, frame)
-		res, err := runPointerAction(d, ctx, p.ThreadID, pointerTarget(desc), desc, ops, []point{from, to})
-		if err == nil {
-			pstate.setLast(p.ThreadID, to)
-		}
+		res, play, err := runPointerAction(d, ctx, p.ThreadID, pointerTarget(desc), desc, ops, []point{from, to})
+		// A drag that fails mid-play is the worst case for a stale mirror: the button may be
+		// down and the cursor anywhere between the endpoints. commitPointer destroys it.
+		pstate.commitPointer(p.ThreadID, play, to, true)
 		return res, err
 	})
 
@@ -942,7 +1070,13 @@ func registerCoworkHandlers(d handlerDeps) {
 		if err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
-		target, elemLabel := elementTarget(cw, info)
+		target, elemLabel, ownWin, haveWin, listErr := elementTargetWindowErr(cw, info)
+		// Fail-closed self-target guard BEFORE the prompt: never even offer the human a
+		// consent dialog for an action aimed at Agent Kate's own controls.
+		if gerr := guardA11yTarget(cw.Authority, info, ownWin, haveWin, listErr); gerr != nil {
+			cw.AuditRefusal(p.ThreadID, cowork.CapA11yAction, target, gerr.Error())
+			return nil, ipc.Errorf(codeCoworkDenied, gerr.Error())
+		}
 		act := p.Action
 		if act == "" {
 			act = "activate (default action)"
@@ -988,7 +1122,13 @@ func registerCoworkHandlers(d handlerDeps) {
 		if err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
-		target, elemLabel := elementTarget(cw, info)
+		target, elemLabel, ownWin, haveWin, listErr := elementTargetWindowErr(cw, info)
+		// Same fail-closed self-target guard as activateElement: setting text into Agent
+		// Kate's own typed-phrase consent field is the whole attack this refuses.
+		if gerr := guardA11yTarget(cw.Authority, info, ownWin, haveWin, listErr); gerr != nil {
+			cw.AuditRefusal(p.ThreadID, cowork.CapA11yAction, target, gerr.Error())
+			return nil, ipc.Errorf(codeCoworkDenied, gerr.Error())
+		}
 		detail := fmt.Sprintf("set text (%d chars)", len([]rune(p.Text)))
 		dec, err := cw.Authorize(ctx, cowork.AuthRequest{
 			ThreadID: p.ThreadID, Capability: cowork.CapA11yAction,
@@ -1080,6 +1220,266 @@ func resolveTargetWindow(cw *cowork.Service, windowID string) (kde.Window, bool)
 	return kde.Window{}, false
 }
 
+// bestEffortWindowTarget builds the consent Target for a named window, filling in the
+// class/title when KWin can be read. It is NOT a guard: an unreadable window list or an
+// unknown id yields a bare, unverified Target. Only paths whose real safety check is
+// somewhere else (the geometric guardPointerTargets) may use it; anything that follows
+// keyboard focus must use resolveInjectTarget.
+func bestEffortWindowTarget(cw *cowork.Service, windowID string) cowork.Target {
+	t := cowork.Target{Kind: cowork.TargetWindow, WindowID: windowID, Label: "the focused window"}
+	if windowID == "" {
+		return t
+	}
+	wins, err := cw.KDE().ListWindows(4 * time.Second)
+	if err != nil {
+		return t
+	}
+	for _, w := range wins {
+		if w.InternalID == windowID {
+			t.ResourceClass = w.ResourceClass
+			if w.Caption != "" {
+				t.Label = w.Caption
+			}
+			break
+		}
+	}
+	return t
+}
+
+// focusVerifiedInjectTarget re-establishes — and PROVES — keyboard focus on the window a
+// batch was authorized against, immediately before the ops are handed to the UI.
+//
+// SECURITY (audit F3, residual): resolveInjectTarget runs BEFORE cw.Authorize, which may
+// block for up to three minutes waiting on a human. Anything can take focus in that
+// window, so the verified target has to be re-asserted afterwards — and a failure to
+// re-assert it is FATAL, not a warning. Warning and injecting anyway is precisely the
+// "types into whatever is actually focused" hole the guard exists to close.
+//
+// ActivateWindow only reports that KWin accepted the request, so the focus is then read
+// BACK: the active window must be the approved one, and resolveInjectTarget re-runs the
+// full self-target check on it. Every failure mode refuses.
+func focusVerifiedInjectTarget(cw *cowork.Service, target cowork.Target) error {
+	if target.WindowID == "" {
+		return fmt.Errorf("refused: the keyboard target could not be identified, so focus cannot be verified before typing")
+	}
+	if err := cw.KDE().ActivateWindow(target.WindowID, 4*time.Second); err != nil {
+		return fmt.Errorf("refused: the approved target window could not be focused (%v) — nothing was typed, because the keystrokes would have gone to whatever is focused instead", err)
+	}
+	now, err := resolveInjectTarget(cw, "")
+	if err != nil {
+		return err
+	}
+	if now.WindowID != target.WindowID {
+		return fmt.Errorf("refused: focus is on %q, not the window this action was approved for — nothing was typed", now.Label)
+	}
+	return nil
+}
+
+// startInjectFocusWatch subscribes to KWin's window-activation signal for the duration of
+// a TIMED injection and returns a channel carrying the reason the batch must be aborted.
+//
+// SECURITY (audit F3, main): resolveInjectTarget + focusVerifiedInjectTarget are still
+// point-in-time checks, and a script may span up to 30 s (injectMaxSpanMs /
+// timelineMaxSpanMs) with RemoteDesktop injecting the whole way. Without this, an agent
+// holding the input_inject toggle schedules a delayed phrase + activation, raises a
+// consent prompt in parallel, and the playback types into the prompt that stole focus.
+//
+// It FAILS CLOSED in both directions: the watch must be established before the ops are
+// released (the caller denies if this returns an error), and any activation that is not
+// the granted window — most sharply, an Agent Kate window — aborts the remainder.
+func startInjectFocusWatch(cw *cowork.Service, target cowork.Target) (*kde.ActiveWindowWatch, <-chan string, error) {
+	if cw.Authority == nil {
+		return nil, nil, fmt.Errorf("refused: the self-target guard is unavailable, so a timed script cannot be supervised")
+	}
+	w, err := cw.KDE().WatchActiveWindow(4 * time.Second)
+	if err != nil {
+		return nil, nil, fmt.Errorf("refused: the focused window cannot be watched for the duration of this timed script (%v) — send it without delays, or retry", err)
+	}
+	auth := cw.Authority
+	abort := make(chan string, 1)
+	safe.Go("cowork.injectFocusWatch", func() {
+		for ev := range w.C {
+			reason := injectFocusAbortReason(auth, target, ev)
+			if reason == "" {
+				continue
+			}
+			select {
+			case abort <- reason:
+			default:
+			}
+			return
+		}
+	})
+	return w, abort, nil
+}
+
+// injectFocusAbortReason decides whether one activation event invalidates a running
+// script. Pure, so the fail-closed matrix is testable without KWin. "" means carry on.
+func injectFocusAbortReason(auth *cowork.Authority, target cowork.Target, ev kde.ActiveWindowEvent) string {
+	if auth == nil {
+		return "aborted: the self-target guard became unavailable while a timed script was playing"
+	}
+	if ev.Error != "" {
+		return "aborted: the focused window could no longer be verified while a timed script was playing"
+	}
+	// The sharpest case first, and with its own message: our own window taking focus is
+	// the self-approval attack, not an ordinary focus change.
+	if auth.IsSelfWindow(ev.PID, ev.ResourceClass) {
+		return "aborted: an Agent Kate window took focus while a timed script was playing — the agent may not type into its own interface, including its consent prompts"
+	}
+	if ev.InternalID == "" {
+		return "aborted: focus moved to a window that could not be identified while a timed script was playing"
+	}
+	if ev.InternalID != target.WindowID {
+		who := ev.Caption
+		if who == "" {
+			who = ev.ResourceClass
+		}
+		if who == "" {
+			who = "another window"
+		}
+		return fmt.Sprintf("aborted: focus moved to %q while a timed script was playing — this action was approved for a different window", who)
+	}
+	return ""
+}
+
+// opsSpanMs is the wall-clock the UI will take to play an op list. op[0]'s delay is
+// excluded because the player ignores it (its timer starts at 0). A span of 0 means the
+// UI runs the batch synchronously, leaving no window in which focus can move — which is
+// why only a non-zero span needs the activation watch.
+func opsSpanMs(ops []map[string]any) int {
+	total := 0
+	for i, op := range ops {
+		if i == 0 {
+			continue
+		}
+		total += intOf(op["delayMs"])
+	}
+	return total
+}
+
+// opsHaveKey reports whether an op list types anything. Keystrokes follow focus; pointer
+// ops are pinned to coordinates and are covered by guardPointerTargets instead.
+func opsHaveKey(ops []map[string]any) bool {
+	for _, op := range ops {
+		if s, _ := op["t"].(string); s == "key" {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveInjectTarget is the keyboard analogue of guardPointerTargets: it identifies the
+// window synthetic key events will actually reach and refuses when that window is Agent
+// Kate's own UI. It exists because keystrokes follow FOCUS, not coordinates — with the
+// input_inject toggle pre-authorized, an agent that could type into "whatever is focused"
+// could type the typed-phrase consent dialog's phrase and approve its own R2 request.
+func resolveInjectTarget(cw *cowork.Service, windowID string) (cowork.Target, error) {
+	wins, err := cw.KDE().ListWindows(4 * time.Second)
+	return resolveInjectTargetFrom(cw.Authority, wins, err, windowID)
+}
+
+// resolveInjectTargetFrom is resolveInjectTarget's pure core (testable without KWin).
+// Every failure mode returns an error: this guard FAILS CLOSED, because "we could not
+// tell whose window this is" and "it is Agent Kate's consent dialog" are indistinguishable
+// from here, and typing blind is precisely the escalation being defended against.
+func resolveInjectTargetFrom(auth *cowork.Authority, wins []kde.Window, listErr error, windowID string) (cowork.Target, error) {
+	// FAIL CLOSED: no authority object means no self-identity to compare against.
+	if auth == nil {
+		return cowork.Target{}, fmt.Errorf("refused: the self-target guard is unavailable, so the keyboard target cannot be verified")
+	}
+	// FAIL CLOSED: without the live window list we cannot tell whether the keystrokes
+	// would land in Agent Kate's own consent prompt.
+	if listErr != nil {
+		return cowork.Target{}, fmt.Errorf("refused: cannot read the window list to verify the keyboard target is not Agent Kate's own UI")
+	}
+	var win kde.Window
+	found := false
+	if windowID != "" {
+		for _, w := range wins {
+			if w.InternalID == windowID {
+				win, found = w, true
+				break
+			}
+		}
+		if !found {
+			return cowork.Target{}, fmt.Errorf("refused: the target window no longer exists — re-list windows with desktop_list_windows")
+		}
+	} else {
+		for _, w := range wins {
+			if w.Active && !w.Minimized {
+				win, found = w, true
+				break
+			}
+		}
+		// FAIL CLOSED: "type into whatever is focused" with no identifiable focused window
+		// is exactly the case where a just-raised Agent Kate dialog could swallow the keys.
+		if !found {
+			return cowork.Target{}, fmt.Errorf("refused: no active window could be identified, so the keyboard target cannot be verified — pass targetWindowId from desktop_list_windows")
+		}
+	}
+	t := cowork.Target{
+		Kind:          cowork.TargetWindow,
+		WindowID:      win.InternalID,
+		ResourceClass: win.ResourceClass,
+		Label:         orDefault(win.Caption, "the focused window"),
+	}
+	// Both kinds of evidence: the PID (decisive even when KWin reports no class) and the
+	// class/label the central Authorize gate would use.
+	if auth.IsSelfWindow(win.PID, win.ResourceClass) || auth.IsSelfTarget(t) {
+		return cowork.Target{}, fmt.Errorf("refused: the keyboard target is an Agent Kate window — the agent may not type into its own interface, including its consent prompts")
+	}
+	// FAIL CLOSED on NO evidence (audit F3, residual). IsSelfWindow returning false means
+	// "no evidence of self", not "verified other" — it is documented that way in
+	// consent.go, and guardA11yTarget already refuses its equivalent case. A window KWin
+	// reports with neither an owning pid nor a resource class is exactly the shape an
+	// unidentifiable Agent Kate dialog would take, so it is not a keyboard target.
+	if win.PID <= 0 && win.ResourceClass == "" {
+		return cowork.Target{}, fmt.Errorf("refused: the keyboard target window reports neither an owning process nor an application class, so it cannot be verified as not Agent Kate's own UI — re-list windows with desktop_list_windows and name one")
+	}
+	// A window id is what focusVerifiedInjectTarget re-asserts and proves focus against
+	// after consent; without one there is nothing to prove, so refuse here rather than
+	// letting the keystrokes fall through to "whatever is focused".
+	if t.WindowID == "" {
+		return cowork.Target{}, fmt.Errorf("refused: the keyboard target has no window id, so focus cannot be verified before typing — re-list windows with desktop_list_windows")
+	}
+	return t, nil
+}
+
+// guardA11yTarget is the AT-SPI analogue of guardPointerTargets, for the R2 actions
+// (activate an element, set its text). Those act on an element id with no coordinate and
+// no focus, so neither existing guard covers them: the only identity available is the
+// element's owning process plus the KWin window that process owns.
+//
+// It FAILS CLOSED. Previously the owning class was learned only via a secondary KWin
+// lookup, and any failure there left ResourceClass empty — IsSelfTarget then returned
+// false and the action proceeded against an unidentified window. Here an unresolvable
+// owner is a refusal, and a PID match against Agent Kate's own processes is decisive
+// before KWin is consulted at all.
+func guardA11yTarget(auth *cowork.Authority, info kde.ElementContext, win kde.Window, haveWin bool, listErr error) error {
+	const selfMsg = "refused: that element belongs to Agent Kate — the agent may not drive its own interface, including its consent prompts"
+	if auth == nil {
+		return fmt.Errorf("refused: the self-target guard is unavailable, so the element's owner cannot be verified")
+	}
+	// PID first: it comes straight from the AT-SPI context and survives a KWin failure.
+	if auth.IsSelfPID(info.PID) {
+		return fmt.Errorf("%s", selfMsg)
+	}
+	if info.PID <= 0 {
+		return fmt.Errorf("refused: that element reports no owning process, so it cannot be verified as not part of Agent Kate's own UI")
+	}
+	if listErr != nil {
+		return fmt.Errorf("refused: cannot read the window list to verify that element is not part of Agent Kate's own UI")
+	}
+	if !haveWin {
+		return fmt.Errorf("refused: the window owning that element could not be identified, so it cannot be verified as not Agent Kate's own UI")
+	}
+	if auth.IsSelfWindow(win.PID, win.ResourceClass) {
+		return fmt.Errorf("%s", selfMsg)
+	}
+	return nil
+}
+
 // elementTarget maps an AT-SPI element's owning pid back to a KWin window so the
 // self-target guard (refuse Agent Kate's own UI) and the R2 consent prompt have a
 // resourceClass + title. Returns the consent Target and a human label for the element.
@@ -1091,12 +1491,28 @@ func elementTarget(cw *cowork.Service, info kde.ElementContext) (cowork.Target, 
 // elementTargetWindow is elementTarget plus the resolved owning KWin window (and whether
 // one was found) — the pointer-click path needs the window's global origin to translate
 // AT-SPI's surface-relative element bounds into global desktop pixels.
+//
+// It is deliberately lossy about failure (a missing window just means "no offset"), so it
+// is NOT a guard. R2 callers must use elementTargetWindowErr + guardA11yTarget, which can
+// tell "no such window" apart from "KWin unreadable" and refuse both.
 func elementTargetWindow(cw *cowork.Service, info kde.ElementContext) (cowork.Target, string, kde.Window, bool) {
+	t, label, win, found, _ := elementTargetWindowErr(cw, info)
+	return t, label, win, found
+}
+
+// elementTargetWindowErr is elementTargetWindow that also reports why the owning window
+// could not be resolved: a nil error with found==false means "KWin answered and no window
+// owns that pid", a non-nil error means "KWin could not be read at all". The R2 a11y guard
+// refuses on either, but the distinction belongs in the refusal message.
+func elementTargetWindowErr(cw *cowork.Service, info kde.ElementContext) (cowork.Target, string, kde.Window, bool, error) {
 	t := cowork.Target{Kind: cowork.TargetApp, Label: "the focused window"}
 	var win kde.Window
 	found := false
+	var listErr error
 	if info.PID > 0 {
-		if wins, err := cw.KDE().ListWindows(4 * time.Second); err == nil {
+		var wins []kde.Window
+		wins, listErr = cw.KDE().ListWindows(4 * time.Second)
+		if listErr == nil {
 			for _, w := range wins {
 				if w.PID == info.PID {
 					t.ResourceClass = w.ResourceClass
@@ -1116,7 +1532,7 @@ func elementTargetWindow(cw *cowork.Service, info kde.ElementContext) (cowork.Ta
 	if label == "" {
 		label = "element"
 	}
-	return t, label, win, found
+	return t, label, win, found, listErr
 }
 
 // elementGlobalOffset returns the (ox,oy) to add to an element's AT-SPI coords to get
@@ -1212,13 +1628,14 @@ func resolveGlobalPoint(cw *cowork.Service, x, y int, ref *pointerRef) (point, s
 	return point{w.X + x, w.Y + y}, " (rel. to window)", nil
 }
 
-// requireCoworkBridge enforces: the caller is an agent bridge (not the UI), bound to
-// this thread, and the thread has opted into Cowork (08 §B/§C).
+// requireCoworkBridge enforces: the caller is an agent bridge (not the UI) that has
+// already identified for this thread, and the thread has opted into Cowork (08 §B/§C).
+// The identity must pre-exist — a desktop call is not a place to acquire one (F13).
 func requireCoworkBridge(d handlerDeps, ctx context.Context, threadID string) error {
 	if threadID == "" {
 		return ipc.Errorf(ipc.CodeInvalidParams, "threadId is required")
 	}
-	if ok, reason := d.srv.BindBridge(ctx, threadID); !ok {
+	if ok, reason := d.srv.RequireBridge(ctx, threadID); !ok {
 		return ipc.Errorf(codeCoworkDenied, reason)
 	}
 	rec, ok := d.sessions.Get(threadID)
@@ -1260,7 +1677,13 @@ func pointerTarget(label string) cowork.Target {
 // guard against LIVE geometry for each action point, plays the ops through the UI portal,
 // and audits the literal target. guardPts is nil for a pure move (which may pass over
 // Agent Kate's windows — only a click/scroll on them is dangerous).
-func runPointerAction(d handlerDeps, ctx context.Context, threadID string, target cowork.Target, desc string, ops []map[string]any, guardPts []point) (any, error) {
+//
+// It also reports what became of the ops (pointerPlay), which the caller feeds to
+// commitPointer: a refusal before the portal ran leaves the mirror alone, a play that did
+// not provably land destroys it, and only a proven landing commits it. The distinction is
+// load-bearing — see the "playback evidence" block in cowork_pointer.go.
+func runPointerAction(d handlerDeps, ctx context.Context, threadID string, target cowork.Target, desc string, ops []map[string]any, guardPts []point) (any, pointerPlay, error) {
+	var play pointerPlay
 	cw := d.cowork
 	dec, err := cw.Authorize(ctx, cowork.AuthRequest{
 		ThreadID:       threadID,
@@ -1274,26 +1697,41 @@ func runPointerAction(d handlerDeps, ctx context.Context, threadID string, targe
 		},
 	})
 	if err != nil {
-		return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		return nil, play, ipc.Errorf(ipc.CodeInternalError, err.Error())
 	}
 	if !dec.Allow {
-		return nil, ipc.Errorf(codeCoworkDenied, dec.Reason)
+		return nil, play, ipc.Errorf(codeCoworkDenied, dec.Reason)
 	}
 	if len(guardPts) > 0 {
 		if err := guardPointerTargets(cw, guardPts); err != nil {
 			cw.AuditRefusal(threadID, cowork.CapPointerControl, target, err.Error())
-			return nil, ipc.Errorf(codeCoworkDenied, err.Error())
+			return nil, play, ipc.Errorf(codeCoworkDenied, err.Error())
 		}
 	}
-	if _, err := runPortal(d, ctx, "inject", map[string]any{"threadId": threadID, "ops": ops}, 45*time.Second); err != nil {
-		return nil, err
+	// From here the ops are in the UI's hands: whatever comes back, the cursor may have
+	// moved (a failure can strand it part-way along an interpolated path).
+	play.played = true
+	res, err := runPortal(d, ctx, "inject", map[string]any{"threadId": threadID, "ops": ops}, 45*time.Second)
+	if err != nil {
+		return nil, play, err
 	}
+	play.landed = opsLandedAsAimed(ops, res)
 	cw.AuditCapture(threadID, cowork.CapPointerControl, target, dec.GrantID, hashString(desc))
-	return map[string]any{"ok": true, "action": desc}, nil
+	return map[string]any{"ok": true, "action": desc}, play, nil
 }
 
 // runPortal runs the core↔UI portal round-trip and returns the UI's result.
 func runPortal(d handlerDeps, ctx context.Context, kind string, payload map[string]any, timeout time.Duration) (kde.PortalResult, error) {
+	return runPortalAbortable(d, ctx, kind, payload, timeout, nil)
+}
+
+// runPortalAbortable is runPortal plus a supervisor channel. When abort fires, the UI is
+// told to cancel the running injection (releasing anything held down and failing every
+// batch queued behind it) and the call returns a REFUSAL immediately — it does not wait
+// for the UI to confirm, because "we could not reach the player" and "the player kept
+// typing" must resolve the same way. Used by the timed-injection focus watch (audit F3).
+func runPortalAbortable(d handlerDeps, ctx context.Context, kind string, payload map[string]any,
+	timeout time.Duration, abort <-chan string) (kde.PortalResult, error) {
 	pb := d.cowork.Portal()
 	corrID, ch := pb.Open()
 	defer pb.Close(corrID)
@@ -1308,6 +1746,13 @@ func runPortal(d handlerDeps, ctx context.Context, kind string, payload map[stri
 			return r, ipc.Errorf(ipc.CodeInternalError, "desktop portal failed: "+r.Error)
 		}
 		return r, nil
+	case reason := <-abort:
+		d.srv.NotifyPrimaryUI("cowork.portalRequest", map[string]any{
+			"kind":   "abortInject",
+			"corrId": "",
+			"reason": reason,
+		})
+		return kde.PortalResult{}, ipc.Errorf(codeCoworkDenied, reason)
 	case <-ctx.Done():
 		return kde.PortalResult{}, ctx.Err()
 	case <-time.After(timeout):

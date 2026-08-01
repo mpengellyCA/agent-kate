@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"agentkate/internal/cowork"
+	"agentkate/internal/kde"
 )
 
 // point is an absolute desktop pixel coordinate (same space as desktop_list_elements
@@ -74,18 +75,53 @@ func clampProfile(p, bounds PointerProfile) PointerProfile {
 // pointerState holds the per-thread session-default profiles, the user-set bounds, and
 // the last commanded pointer position per thread (the m_ptr mirror — the UI tracks its
 // own, but the core needs a start point to expand a path). All access is mutex-guarded.
+//
+// SECURITY (audit F3, pointer half): the mirror is not bookkeeping, it is the ONLY
+// evidence the bare-click / bare-scroll guards have about where a button will fire. A
+// mirror that says "safe spot" while the true cursor sits on Agent Kate's Allow button
+// is worse than no mirror at all, so every path that moves the pointer must either
+// commit an exact position (setLast) or destroy the mirror (invalidate). Relative motion
+// goes through applyRelative, which does one or the other.
 type pointerState struct {
 	mu        sync.Mutex
 	bounds    PointerProfile
 	perThread map[string]PointerProfile
 	lastPos   map[string]point
+	// lostWhy records WHY a thread's mirror was DESTROYED (one of the mirrorLost*
+	// constants), so the refusal can say what happened — and steer the agent to the fix —
+	// instead of claiming the pointer was never moved. Absent = never established.
+	lostWhy map[string]string
+
+	// Cached desktop layout (the screens the compositor clamps the pointer into). Short
+	// TTL: screens change rarely, and a stale answer only ever costs an extra invalidation.
+	deskBounds  kde.DesktopLayout
+	deskAt      time.Time
+	deskFetched bool
 }
+
+// desktopBoundsTTL is how long a KWin desktop-geometry answer is reused. Short enough
+// that unplugging a monitor is picked up within a couple of relative moves, long enough
+// that a mouse-look burst does not load a KWin script per nudge.
+const desktopBoundsTTL = 3 * time.Second
+
+// The two ways a mirror is destroyed rather than merely unset. Both refuse the same
+// actions; they differ only in what the agent is told to do next.
+const (
+	// mirrorLostRelative: a relative nudge moved the cursor somewhere we cannot account
+	// for (unknown screen layout, or a walk into the compositor's edge clamp).
+	mirrorLostRelative = "relative"
+	// mirrorLostUnproven: an ABSOLUTE action did not provably land where it was aimed —
+	// the UI dropped the move (no captured screen contains the point) or the playback
+	// failed part-way, stranding the cursor somewhere along the path.
+	mirrorLostUnproven = "unproven"
+)
 
 func newPointerState() *pointerState {
 	return &pointerState{
 		bounds:    defaultPointerProfile(),
 		perThread: map[string]PointerProfile{},
 		lastPos:   map[string]point{},
+		lostWhy:   map[string]string{},
 	}
 }
 
@@ -156,10 +192,103 @@ func (s *pointerState) last(thread string) (point, bool) {
 	return p, ok
 }
 
+// setLast records an EXACT commanded position (absolute move/click/drag/scroll). It also
+// clears the relative-drift mark: an absolute move re-establishes a known position, which
+// is the documented way back from a mirror that relative motion invalidated.
 func (s *pointerState) setLast(thread string, p point) {
 	s.mu.Lock()
 	s.lastPos[thread] = p
+	delete(s.lostWhy, thread)
 	s.mu.Unlock()
+}
+
+// invalidate destroys the mirror for a thread: after this, every guard that depends on
+// knowing where the cursor is refuses until an absolute move re-establishes it. why is one
+// of the mirrorLost* constants and only shapes the refusal wording.
+func (s *pointerState) invalidate(thread, why string) {
+	s.mu.Lock()
+	delete(s.lastPos, thread)
+	s.lostWhy[thread] = why
+	s.mu.Unlock()
+}
+
+// mirrorLoss reports why the mirror is missing: one of the mirrorLost* constants, or ""
+// when it was simply never established (no positioned action this session).
+func (s *pointerState) mirrorLoss(thread string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lostWhy[thread]
+}
+
+// applyRelative folds a relative delta into the mirror.
+//
+// SECURITY (audit F3): relative motion USED to leave the mirror untouched, on the theory
+// that a pointer grab makes the true position unknowable. That was a bypass, not a
+// caveat: the stale position stayed valid, so an agent could walk the real cursor onto an
+// Agent Kate window with move_rel and then fire a bare click that the geometric guard
+// cleared against the position the cursor left minutes ago.
+//
+// So: accumulate (a), and fail closed (b) the moment accumulation stops being sound.
+// The compositor applies dx/dy exactly while the result stays inside the desktop; at the
+// edge it CLAMPS, and past that point the accumulated value is fiction. Anything we cannot
+// prove landed inside the known desktop box — unknown bounds included — destroys the
+// mirror instead of updating it. Returns the resulting position and whether it is known.
+// bounds is the SCREEN LAYOUT, not a single box: containment is proven per screen, because
+// the union of a staggered/L-shaped multi-monitor layout contains dead space the cursor can
+// never occupy, and accepting a point there would be the very "mirror points where the
+// cursor is not" state this guards against (round 11, MED).
+func (s *pointerState) applyRelative(thread string, dx, dy float64, bounds kde.DesktopLayout) (point, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	from, ok := s.lastPos[thread]
+	if !ok {
+		// Nothing to drift: the mirror was already unknown, and a relative move cannot
+		// establish one. Mark it as relative loss anyway so the refusal names the cause.
+		s.lostWhy[thread] = mirrorLostRelative
+		return point{}, false
+	}
+	to := point{
+		X: from.X + int(math.Round(clampRelDelta(dx))),
+		Y: from.Y + int(math.Round(clampRelDelta(dy))),
+	}
+	if !bounds.Contains(to.X, to.Y) {
+		// Either we never learned the desktop's extent, or the cursor ran into an edge (a
+		// screen edge, or the dead space between mis-aligned screens) and the compositor
+		// clamped it. Both mean the accumulated point is not where the cursor is.
+		delete(s.lastPos, thread)
+		s.lostWhy[thread] = mirrorLostRelative
+		return point{}, false
+	}
+	s.lastPos[thread] = to
+	delete(s.lostWhy, thread)
+	return to, true
+}
+
+// desktopBounds returns the compositor's screen layout, cached for desktopBoundsTTL.
+// A failure is reported as an invalid layout — never a guess — so applyRelative fails
+// closed rather than trusting an accumulation it cannot bound.
+func (s *pointerState) desktopBounds(cw *cowork.Service) kde.DesktopLayout {
+	s.mu.Lock()
+	if s.deskFetched && time.Since(s.deskAt) < desktopBoundsTTL {
+		r := s.deskBounds
+		s.mu.Unlock()
+		return r
+	}
+	s.mu.Unlock()
+
+	// Off-lock: this is a KWin round trip and must never block profile/mirror readers.
+	var r kde.DesktopLayout
+	if cw != nil {
+		if got, err := cw.KDE().DesktopBounds(4 * time.Second); err == nil {
+			r = got
+		}
+	}
+	s.mu.Lock()
+	s.deskBounds = r
+	s.deskAt = time.Now()
+	s.deskFetched = true
+	s.mu.Unlock()
+	return r
 }
 
 func newPointerRNG() *rand.Rand {
@@ -282,9 +411,9 @@ func clampRelDelta(v float64) float64 {
 
 // relMoveOp builds one RELATIVE pointer-motion op: a raw dx/dy delta with no absolute
 // target. Pointer-grabbing games read these as mouse-look. Unlike absolute "move" it needs
-// no screencast stream, is never self-target-guarded (it has no landing point), and does
-// NOT update the position mirror — a grab makes the true cursor position unknowable, so we
-// leave the last KNOWN absolute position standing for the next guarded click.
+// no screencast stream and is not itself a guard point (it has no landing point) — but it
+// DOES move the mirror, via applyRelative, because a relative move that left the mirror
+// standing was a self-target bypass (audit F3; see applyRelative).
 func relMoveOp(dx, dy float64) map[string]any {
 	return map[string]any{"t": "move_rel", "dx": clampRelDelta(dx), "dy": clampRelDelta(dy)}
 }
@@ -327,6 +456,100 @@ func (s *pointerState) dragOps(thread string, from, to point, prof PointerProfil
 	ops = append(ops, expandMove(from, true, to, prof, rng)...)
 	ops = append(ops, btnOp(0x110, 0))
 	return ops
+}
+
+// --- playback evidence: did the batch actually land where it was aimed? ---------------
+//
+// SECURITY (audit F3, absolute half): the mirror used to be committed on "the portal call
+// returned without an error", which is not the same claim. The UI DROPS an absolute move
+// whose point lies inside no captured screen (there is no stream node to address it to),
+// and it can fail MID-PLAY, stranding the cursor somewhere along an interpolated path that
+// is allowed to cross Agent Kate's own windows. Both leave the true cursor somewhere other
+// than the commanded point while the mirror records the commanded point — the same bypass
+// as stale relative motion, reachable with no relative motion at all.
+//
+// So the UI now reports what it actually played (kde.PortalResult.OpsDropped / PtrKnown /
+// PtrX / PtrY) and the core believes THAT. Anything short of proof destroys the mirror.
+
+// lastAbsMove returns the target of the last absolute "move" op in a batch — the position
+// the cursor is supposed to end up at. Every expansion (expandMove, clickOps, dragOps, the
+// timeline compiler) ends its motion with an EXACT, un-jittered move to the target, so this
+// is the point the UI's report must match. Ops with no absolute move (bare clicks, scrolls
+// at the cursor, keystrokes, pure relative motion) return false: there is nothing to prove.
+func lastAbsMove(ops []map[string]any) (point, bool) {
+	for i := len(ops) - 1; i >= 0; i-- {
+		if t, _ := ops[i]["t"].(string); t == "move" {
+			x, okx := ops[i]["x"].(int)
+			y, oky := ops[i]["y"].(int)
+			if !okx || !oky {
+				return point{}, false // unreadable target — treat as unproven
+			}
+			return point{x, y}, true
+		}
+	}
+	return point{}, false
+}
+
+// opsLandedAsAimed reports whether the UI's reply PROVES the batch reached the position it
+// aimed for. Fails closed: a dropped op, an unproven pointer, or a landing point that is
+// not the one requested all read as "no".
+func opsLandedAsAimed(ops []map[string]any, res kde.PortalResult) bool {
+	if res.OpsDropped > 0 {
+		return false
+	}
+	want, ok := lastAbsMove(ops)
+	if !ok {
+		return true // the batch never claimed to move the pointer to a point
+	}
+	return res.PtrKnown && res.PtrX == want.X && res.PtrY == want.Y
+}
+
+// pointerPlay is what actually became of one batch of pointer ops, as far as the core can
+// prove it: `played` means the ops were handed to the UI portal (so the cursor MAY have
+// moved, including part-way), `landed` means the UI proved they finished on the requested
+// point.
+type pointerPlay struct {
+	played bool
+	landed bool
+}
+
+// commitPointer updates the mirror after an action that aimed to leave the cursor at want.
+// The three outcomes are deliberately distinct:
+//   - proven landing        → commit the exact point (the mirror is evidence, and this is it)
+//   - played but unproven   → DESTROY the mirror; a guess is exactly what the self-target
+//     guard may not run on, and the stranded cursor may be sitting
+//     on an Agent Kate window
+//   - never played (refused before the portal ran) → nothing moved, the mirror stands
+func (s *pointerState) commitPointer(thread string, play pointerPlay, want point, haveWant bool) {
+	switch {
+	case play.landed && haveWant:
+		s.setLast(thread, want)
+	case play.played:
+		s.invalidate(thread, mirrorLostUnproven)
+	}
+}
+
+// bareClickRefusal is the message for a bare button/scroll whose landing point cannot be
+// verified. `why` (a mirrorLost* constant, or "" for "never established") distinguishes the
+// ways that happens, because "you never moved the pointer", "the pointer moved somewhere I
+// can no longer account for" and "the move you asked for did not land" need different next
+// steps from the agent — and none of them must read like a bug.
+func bareClickRefusal(why string) string {
+	switch why {
+	case mirrorLostRelative:
+		return "refused: the pointer was last moved by a RELATIVE nudge, so where a bare click would " +
+			"land can no longer be verified (the compositor may have clamped it at a screen edge). " +
+			"Use desktop_click(x,y), which targets and guards an exact point, or re-establish a known " +
+			"position with desktop_move_pointer(x,y) first"
+	case mirrorLostUnproven:
+		return "refused: the last pointer action did not provably land where it was aimed (the desktop " +
+			"could not apply the move — a point off every screen — or the playback stopped part-way), " +
+			"so where a bare click would land can no longer be verified. Use desktop_click(x,y), which " +
+			"targets and guards an exact point, or re-establish a known position with " +
+			"desktop_move_pointer(x,y) to an on-screen point first"
+	}
+	return "refused: a bare click fires at the cursor's current position, which can't be verified safe — " +
+		"use desktop_click(x,y) (it targets and guards an exact point), or move the pointer first with desktop_move_pointer"
 }
 
 // guardPointerTargets is the geometric self-target guard (plan 09 §7): it refuses if any

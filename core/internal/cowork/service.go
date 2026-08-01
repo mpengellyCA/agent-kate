@@ -57,12 +57,12 @@ func New(grantsPath, auditPath, policyPath string, kdeClient *kde.Client, notify
 	auth := newAuthority(store, audit, policy, notify, log)
 	store.SetOnChange(func() {
 		if notify != nil {
-			notify.Notify("cowork.grantsChanged", map[string]any{})
+			notify.NotifyUI("cowork.grantsChanged", map[string]any{})
 		}
 	})
 	policy.SetOnChange(func() {
 		if notify != nil {
-			notify.Notify("cowork.policyChanged", map[string]any{})
+			notify.NotifyUI("cowork.policyChanged", map[string]any{})
 		}
 	})
 

@@ -3,10 +3,12 @@
 #include <QHash>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QPointer>
 #include <QString>
 #include <QWidget>
 
 class CoreClient;
+class CoworkPortal;
 class CapabilityTile;
 class KMessageWidget;
 class QPlainTextEdit;
@@ -35,6 +37,19 @@ class CoworkPanel : public QWidget
 public:
     explicit CoworkPanel(CoreClient *core, QWidget *parent = nullptr);
 
+    // The portal owns the ONLY correct implementation of the desktop-wide
+    // org.a11y.Status flip: it parks the pre-flip values on disk first, so a crash
+    // or a kill-switch can put them back (see CoworkPortal::enableAtspiForUserLaunch).
+    // A Chromium browser launched without it cannot export its page over AT-SPI, so
+    // the panel needs the portal to make its own launch button do anything useful —
+    // but it must NOT re-implement the flip, which is how it ended up happening
+    // ungated inside BrowserLaunch::launch (audit F8/F12).
+    //
+    // QPointer, not a raw pointer: MainWindow builds the panel before the portal and
+    // both are its children, so their destruction order is not this class's to assume.
+    // A null portal degrades to a launch with an honest message, never a crash.
+    void setPortal(CoworkPortal *portal);
+
 public Q_SLOTS:
     // Told by MainWindow which agent thread is active, so "Enable Cowork" targets it.
     void setActiveThread(const QString &threadId, const QString &title);
@@ -52,7 +67,12 @@ private:
     // An agent asked (via the enable_cowork MCP tool) for desktop access — for
     // itself or for a worker it launched. The human decides here; nothing is
     // switched on until they do.
+    // handleEnableRequested reads the live capability policy first (cowork.getPolicy) and
+    // then raises the dialog, so the "what still asks for permission" sentence describes
+    // the standing grants that are actually set rather than an assumption.
     void handleEnableRequested(const QJsonObject &params);
+    void showEnableRequestDialog(const QJsonObject &params, const QStringList &standing,
+                                 bool anyR2, bool policyKnown);
     void revokeGrant(const QString &id);
     void toggleKill();
     void enableForActiveThread();
@@ -61,6 +81,16 @@ private:
     // in the middle of an agent's work. Fired automatically when Cowork is
     // switched on; this is the manual re-run after a kill-switch or a decline.
     void requestPreflight();
+    // SECURITY / honesty (audit F8): three panel buttons — Enable, "Grant desktop access
+    // now", and the Chromium browser launcher — end in a DESKTOP-WIDE org.a11y.Status
+    // flip: every application on the session starts exporting its accessibility tree to
+    // any local process. That is a real global permission change, so the click that
+    // causes it has to be an informed one. This raises the disclosure and returns whether
+    // the human agreed; it returns true WITHOUT asking when the flip is already in effect
+    // (they have already been told, and nothing new happens) or when the path cannot flip
+    // anything. `what` names the action in the human's terms, e.g. "Enable desktop access
+    // for this agent?".
+    bool confirmDesktopAccessibilityFlip(const QString &what);
     void rebuildBrowserMenu();
     void pickCustomBrowser();
     void launchBrowserAndReport(const QString &name, const QString &command, const QString &family);
@@ -74,6 +104,7 @@ private:
     void showBrowserTools();
 
     CoreClient *m_core = nullptr;
+    QPointer<CoworkPortal> m_portal; // see setPortal
     QString m_activeThread;
     QString m_activeTitle;
     bool m_killed = false;

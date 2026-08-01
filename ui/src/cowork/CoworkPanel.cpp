@@ -4,6 +4,7 @@
 #include "CapabilityTile.h"
 #include "ConsentDialog.h"
 #include "ControlConsentDialog.h"
+#include "CoworkPortal.h"
 #include "ipc/CoreClient.h"
 #include "shell/ElidingLabel.h"
 #include "shell/FlowLayout.h"
@@ -198,7 +199,9 @@ CoworkPanel::CoworkPanel(CoreClient *core, QWidget *parent)
     m_preflightBtn = new QPushButton(i18n("Grant desktop access now"), this);
     m_preflightBtn->setIcon(QIcon::fromTheme(QStringLiteral("preferences-desktop-accessibility")));
     m_preflightBtn->setToolTip(i18n("Ask the desktop for screen and input permission now, so "
-                                    "agents never stall on the system dialog mid-task."));
+                                    "agents never stall on the system dialog mid-task. Granting "
+                                    "it also switches your session's accessibility service on, "
+                                    "desktop-wide, until desktop access is turned off."));
     m_preflightBtn->setEnabled(false);
     connect(m_preflightBtn, &QPushButton::clicked, this, &CoworkPanel::requestPreflight);
     enableRow->addWidget(m_activeLabel);
@@ -628,9 +631,39 @@ void CoworkPanel::toggleKill()
     }
 }
 
+bool CoworkPanel::confirmDesktopAccessibilityFlip(const QString &what)
+{
+    // Already flipped by us: the human consented to it earlier in this run and nothing
+    // new happens here, so do not nag. Also the honest answer when there is no portal to
+    // flip anything through.
+    if (!m_portal || m_portal->desktopAccessibilityFlipped()) {
+        return true;
+    }
+    const auto answer = KMessageBox::questionTwoActions(
+        this,
+        i18n("<p>To do this, Agent Kate switches your session's accessibility service on "
+             "(<tt>org.a11y.Status</tt>) so applications expose their windows and controls.</p>"
+             "<p><b>That is a desktop-wide change.</b> While it is on, every application in "
+             "this session exports its contents and controls to <i>any</i> program running as "
+             "you — not only to Agent Kate — and assistive technologies may start themselves.</p>"
+             "<p>Your original setting is put back when the last agent's desktop access is "
+             "switched off, when you hit the kill-switch, and when Agent Kate exits "
+             "(including after a crash).</p>"),
+        what,
+        KGuiItem(i18n("Turn it on and continue"), QStringLiteral("preferences-desktop-accessibility")),
+        KGuiItem(i18n("Cancel"), QStringLiteral("dialog-cancel")));
+    return answer == KMessageBox::PrimaryAction;
+}
+
 void CoworkPanel::enableForActiveThread()
 {
     if (m_activeThread.isEmpty()) {
+        return;
+    }
+    // Enabling runs the OS preflight, which ends in the desktop-wide accessibility flip
+    // once the portal grant lands — so this click is where that has to be disclosed
+    // (audit F8). Declining changes nothing: no flip, no enable, nothing to restore.
+    if (!confirmDesktopAccessibilityFlip(i18n("Give this agent desktop access?"))) {
         return;
     }
     QPointer<CoworkPanel> self(this);
@@ -657,6 +690,12 @@ void CoworkPanel::enableForActiveThread()
 
 void CoworkPanel::requestPreflight()
 {
+    // Same disclosure as the enable button: a granted preflight is what flips the
+    // desktop-wide accessibility flags (CoworkPortal::becomeReady). Declining here asks
+    // the portal for nothing at all, so the desktop is untouched (audit F8).
+    if (!confirmDesktopAccessibilityFlip(i18n("Grant desktop access now?"))) {
+        return;
+    }
     QPointer<CoworkPanel> self(this);
     m_status->setMessageType(KMessageWidget::Information);
     m_status->setText(i18n("Asking the desktop for screen and input permission — answer the "
@@ -678,23 +717,88 @@ void CoworkPanel::requestPreflight()
 
 void CoworkPanel::handleEnableRequested(const QJsonObject &params)
 {
+    // SECURITY (audit F3/F8/quality): the dialog used to promise "Every individual action
+    // still asks for its own permission" unconditionally. That is FALSE for any capability
+    // whose standing toggle is on — and input_inject being pre-authorized is precisely the
+    // precondition of the injection self-approval attack. An approval the human cannot
+    // understand is not a control, so the live policy is read HERE, at dialog time, and the
+    // sentence is built from what is actually true right now.
+    QPointer<CoworkPanel> self(this);
+    m_core->call(QStringLiteral("cowork.getPolicy"), {},
+                 [this, self, params](const QJsonObject &res, const QJsonObject &err) {
+        if (!self) {
+            return;
+        }
+        QStringList standing;
+        bool anyR2 = false;
+        // FAIL CLOSED on a policy read error: say we could not determine the standing
+        // grants rather than implying there are none.
+        const bool policyKnown = err.isEmpty();
+        const QJsonArray caps = res.value(QStringLiteral("capabilities")).toArray();
+        for (const QJsonValue &cv : caps) {
+            const QJsonObject c = cv.toObject();
+            if (!c.value(QStringLiteral("enabled")).toBool()) {
+                continue;
+            }
+            const QString key = c.value(QStringLiteral("key")).toString();
+            standing << capVerb(key).toHtmlEscaped();
+            if (c.value(QStringLiteral("tier")).toString() == QLatin1String("R2")) {
+                anyR2 = true;
+            }
+        }
+        showEnableRequestDialog(params, standing, anyR2, policyKnown);
+    }, this);
+}
+
+void CoworkPanel::showEnableRequestDialog(const QJsonObject &params, const QStringList &standing,
+                                          bool anyR2, bool policyKnown)
+{
     const QString requestId = params.value(QStringLiteral("requestId")).toString();
     const QString title = params.value(QStringLiteral("title")).toString();
     const QString reason = params.value(QStringLiteral("reason")).toString();
-    const bool self = params.value(QStringLiteral("self")).toBool();
+    const bool selfAsk = params.value(QStringLiteral("self")).toBool();
 
     const QString who = title.isEmpty() ? i18n("An agent") : title;
-    const QString what = self
+    const QString what = selfAsk
         ? i18n("<b>%1</b> is asking for access to your desktop.", who.toHtmlEscaped())
         : i18n("An agent is asking for desktop access on behalf of <b>%1</b>.", who.toHtmlEscaped());
+
+    // What the per-action prompting really is, given the toggles that are on right now.
+    QString gating;
+    if (!policyKnown) {
+        gating = i18n("<p><b>Your standing permissions could not be read just now</b>, so this "
+                      "dialog cannot tell you which actions would run without asking. Check the "
+                      "Cowork panel's switches before allowing.</p>");
+    } else if (standing.isEmpty()) {
+        gating = i18n("<p>Every individual action still asks for its own permission, and the "
+                      "kill-switch stops everything at once.</p>");
+    } else {
+        gating = i18n("<p><b>These actions are already switched on and will NOT ask again</b> "
+                      "for this or any agent: %1. Everything else still asks for its own "
+                      "permission, and the kill-switch stops all of it at once.</p>",
+                      standing.join(i18nc("list separator", ", ")));
+        if (anyR2) {
+            gating += i18n("<p>That includes acting as you — typing, clicking or moving the "
+                           "pointer without a prompt. You can turn those switches off in the "
+                           "Cowork panel before allowing this.</p>");
+        }
+    }
+
+    // Disclose the desktop-wide side effect (audit F8): the same text the per-action
+    // control prompt carries, because this is where most users say yes for the first time.
+    const QString a11y = i18n("<p>While desktop access is on, Agent Kate switches your session's "
+                              "accessibility service on so applications expose their windows and "
+                              "controls. Every app on this desktop becomes readable that way, by "
+                              "any program in your session. Your original setting is put back when "
+                              "the last agent's desktop access is switched off, when you hit the "
+                              "kill-switch, and when Agent Kate exits.</p>");
 
     const auto answer = KMessageBox::questionTwoActions(
         this,
         i18n("<p>%1</p><p>Its reason: <i>%2</i></p><p>If you allow this, that agent can see "
-             "your screen, read window contents, and move the pointer, type and click as you. "
-             "Every individual action still asks for its own permission, and the "
-             "kill-switch stops everything at once.</p>",
-             what, reason.toHtmlEscaped()),
+             "your screen, read window contents, and move the pointer, type and click as you.</p>"
+             "%3%4",
+             what, reason.toHtmlEscaped(), gating, a11y),
         i18n("Give an agent desktop access?"),
         KGuiItem(i18n("Allow desktop access"), QStringLiteral("preferences-desktop-accessibility")),
         KGuiItem(i18n("Keep it off"), QStringLiteral("process-stop")));
@@ -957,16 +1061,53 @@ void CoworkPanel::refreshBrowserPrefCombo()
     }
 }
 
+void CoworkPanel::setPortal(CoworkPortal *portal)
+{
+    m_portal = portal;
+}
+
 void CoworkPanel::launchBrowserAndReport(const QString &name, const QString &command,
                                          const QString &family)
 {
+    // A Chromium browser reads org.a11y.Status ONCE, at launch, to decide whether to
+    // export its page over AT-SPI — so the desktop-wide flag has to be on before the
+    // process starts. BrowserLaunch::launch deliberately no longer does this itself
+    // (audit F8/F12): the flip is a global permission change that must be parked
+    // before it happens and undone on teardown, and the portal is where that lives.
+    //
+    // This path is the HUMAN pressing the panel's own launch button — unlike the
+    // agent-facing path in CoworkPortal::handleLaunchBrowser, which may only re-assert a
+    // flip the human already granted. But a button press is only consent if the human
+    // knows what it does: this one used to flip the whole desktop into accessibility mode
+    // silently, and it can do so with Cowork never having been enabled at all (audit F8).
+    // So it is disclosed here, and declining launches nothing and flips nothing.
+    bool a11yFlipped = true;
+    if (family == QLatin1String("chromium")) {
+        if (m_portal) {
+            if (!confirmDesktopAccessibilityFlip(i18n("Launch %1 with accessibility on?", name))) {
+                return;
+            }
+            m_portal->enableAtspiForUserLaunch();
+        } else {
+            // No portal to park-and-flip through. Say so rather than launching a
+            // browser and claiming accessibility is on when it is not.
+            a11yFlipped = false;
+        }
+    }
+
     QString err;
-    if (BrowserLaunch::launch({name, command, family}, &err)) {
+    if (!BrowserLaunch::launch({name, command, family}, &err)) {
+        m_status->setMessageType(KMessageWidget::Error);
+        m_status->setText(i18n("Could not launch %1: %2", name, err));
+        return;
+    }
+    if (a11yFlipped) {
         m_status->setMessageType(KMessageWidget::Positive);
         m_status->setText(i18n("Launched %1 with accessibility enabled. If it was already running, "
                                "fully quit it and launch again so the setting takes effect.", name));
     } else {
-        m_status->setMessageType(KMessageWidget::Error);
-        m_status->setText(i18n("Could not launch %1: %2", name, err));
+        m_status->setMessageType(KMessageWidget::Warning);
+        m_status->setText(i18n("Launched %1, but desktop accessibility could not be switched on, "
+                               "so agents will not be able to read its pages.", name));
     }
 }

@@ -3,27 +3,31 @@
 #include "BrowserLaunch.h"
 #include "ipc/CoreClient.h"
 
+#include <KConfigGroup>
 #include <KLocalizedString>
+#include <KSharedConfig>
 
 #include <QBuffer>
+#include <QCoreApplication>
 #include <QDBusArgument>
 #include <QDBusConnection>
 #include <QDBusConnectionInterface>
-#include <QDBusInterface>
 #include <QDBusMessage>
 #include <QDBusObjectPath>
 #include <QDBusPendingCallWatcher>
 #include <QDBusPendingReply>
-#include <QDBusReply>
 #include <QDBusUnixFileDescriptor>
 #include <QDBusVariant>
 #include <QFile>
+#include <QGuiApplication>
 #include <QImage>
 #include <QJsonValue>
+#include <QPointer>
 #include <QRandomGenerator>
 #include <QSocketNotifier>
 #include <QUrl>
 #include <QWidget>
+#include <QWindow>
 
 #include <cerrno>
 #include <fcntl.h>
@@ -38,6 +42,22 @@
 namespace {
 constexpr auto kPortalService = "org.freedesktop.portal.Desktop";
 constexpr auto kPortalPath = "/org/freedesktop/portal/desktop";
+
+// Where the pre-flip org.a11y.Status values are parked while they are flipped, so a
+// process that dies mid-session can still be undone by the next one.
+constexpr auto kA11yGroup = "CoworkA11y";
+constexpr auto kA11yPending = "Pending";
+constexpr auto kA11yOrigIsEnabled = "OrigIsEnabled";
+constexpr auto kA11yOrigScreenReader = "OrigScreenReaderEnabled";
+// PID of the process that parked the record. s_a11yRecoveryDone only guards a SECOND
+// CoworkPortal inside one process; a second AgentKate process would otherwise restore
+// (and delete) the record while the first still holds the flags flipped for a live
+// session. The PID makes the record self-describing across processes.
+constexpr auto kA11yPid = "Pid";
+
+// Only the first CoworkPortal in a process may replay a parked record: a second instance
+// built while the first holds the flags flipped would "restore" over a live session.
+bool s_a11yRecoveryDone = false;
 
 // KWin's native screenshot interface (no portal dialog). Capture methods take a unix
 // pipe write-fd; KWin streams the raw image into it and returns a {width,height,stride,
@@ -106,44 +126,208 @@ void kwinCaptureCall(const QJsonObject &req, QString &method, QVariantList &lead
 // org.a11y.Status lives on the session bus and reports whether accessibility is
 // enabled; toolkits read it to decide whether to export an AT-SPI tree. Chromium
 // checks it at launch, so we set it before launching a Chromium browser.
-QDBusInterface a11yStatusProps()
+//
+// Built as a raw QDBusMessage, never a QDBusInterface: constructing a QDBusInterface
+// introspects the remote object SYNCHRONOUSLY, so a wedged a11y bus would stall
+// whoever built it — including the startup path that replays a parked record.
+QDBusMessage a11yStatusCall(const QString &method)
 {
-    return QDBusInterface(QStringLiteral("org.a11y.Bus"), QStringLiteral("/org/a11y/bus"),
-                          QStringLiteral("org.freedesktop.DBus.Properties"),
-                          QDBusConnection::sessionBus());
+    return QDBusMessage::createMethodCall(QStringLiteral("org.a11y.Bus"),
+                                          QStringLiteral("/org/a11y/bus"),
+                                          QStringLiteral("org.freedesktop.DBus.Properties"), method);
+}
+
+// Short timeout: this only runs on user-driven enable, and an unresponsive a11y bus
+// must cost a moment, not the default 25 s D-Bus timeout.
+constexpr int kA11yCallTimeoutMs = 2000;
+
+// Hand-shake watchdog budgets. The non-interactive steps raise no dialog, so a portal that
+// has not answered them in kRdHandshakeTimeoutMs is not going to. Start DOES raise the
+// approval dialog, and a human may sit on it for a while, so that step gets a budget long
+// enough not to cut a real decision short while still bounding a wedged portal.
+constexpr int kRdHandshakeTimeoutMs = 25000;
+constexpr int kRdDialogTimeoutMs = 120000;
+
+// Last-resort lifetime for a single PortalResponseWaiter. The watchdogs above are what
+// react promptly to a wedged portal; this only exists so that no waiter can outlive the
+// request it was created for, on ANY path (including the screenshot portal, which has no
+// watchdog of its own). Comfortably longer than the longest legitimate wait — a human
+// sitting on the approval dialog or picking a window in the interactive screenshot flow —
+// so it never cuts a real decision short.
+constexpr int kPortalWaiterLifetimeMs = 300000; // 5 min
+
+// Lifetime a waiter gets once its session attempt has been ABANDONED. It is not
+// destroyed on the spot: its continuation is the only code that knows how to release what
+// a late Response hands back (an orphaned CreateSession session handle), so it has to stay
+// subscribed long enough to run, bail on the generation check, and self-destruct. Generous
+// next to the non-interactive step it covers (CreateSession raises no dialog and answers in
+// milliseconds), yet far short of the 5-minute backstop, so an abandoned attempt cannot
+// hold a QObject + D-Bus match for the rest of the run.
+constexpr int kPortalCancelledGraceMs = 45000; // 45 s
+
+// How long a KWin ScreenShot2 capture may take before it is abandoned in favour of the
+// XDG portal fallback. Generous next to a real capture (milliseconds — no dialog, no
+// user interaction) and comfortably inside akcore's own ~125 s portal-request timeout,
+// so the agent gets a real answer instead of a timeout with nothing tried after it.
+constexpr int kKWinShotLifetimeMs = 30000; // 30 s
+
+// portalHandlePath builds the object path the portal will use for a handle WE name with a
+// token: kind "request" for a Request, "session" for a Session. Both follow the same
+// documented convention — the unique bus name with its leading ':' dropped and every '.'
+// mangled to '_' — which is what lets a Response be subscribed BEFORE the method call
+// returns, and what lets an abandoned CreateSession's session be closed even if its reply
+// never arrives.
+QString portalHandlePath(const QString &kind, const QString &token)
+{
+    QString sender = QDBusConnection::sessionBus().baseService();
+    if (sender.startsWith(QLatin1Char(':'))) {
+        sender.remove(0, 1);
+    }
+    sender.replace(QLatin1Char('.'), QLatin1Char('_'));
+    return QStringLiteral("%1/%2/%3/%4")
+        .arg(QString::fromLatin1(kPortalPath), kind, sender, token);
 }
 
 bool readA11yStatus(const QString &prop, bool fallback)
 {
-    QDBusInterface props = a11yStatusProps();
-    if (!props.isValid()) {
+    QDBusMessage m = a11yStatusCall(QStringLiteral("Get"));
+    m.setArguments({QStringLiteral("org.a11y.Status"), prop});
+    const QDBusMessage r = QDBusConnection::sessionBus().call(m, QDBus::Block, kA11yCallTimeoutMs);
+    if (r.type() != QDBusMessage::ReplyMessage || r.arguments().isEmpty()) {
         return fallback;
     }
-    QDBusReply<QDBusVariant> r = props.call(QStringLiteral("Get"), QStringLiteral("org.a11y.Status"), prop);
-    return r.isValid() ? r.value().variant().toBool() : fallback;
+    const QVariant v = r.arguments().constFirst();
+    return v.canConvert<QDBusVariant>() ? v.value<QDBusVariant>().variant().toBool() : v.toBool();
 }
 
-void writeA11yStatus(const QString &prop, bool value)
+// blocking=true is for the restore paths only (destructor / aboutToQuit): an asyncCall
+// issued as the app tears down may never make it onto the wire, which would strand the
+// desktop in screen-reader mode. Every other caller stays non-blocking.
+void writeA11yStatus(const QString &prop, bool value, bool blocking = false)
 {
-    QDBusInterface props = a11yStatusProps();
-    if (props.isValid()) {
-        props.call(QStringLiteral("Set"), QStringLiteral("org.a11y.Status"), prop,
-                   QVariant::fromValue(QDBusVariant(value)));
+    QDBusMessage m = a11yStatusCall(QStringLiteral("Set"));
+    m.setArguments({QStringLiteral("org.a11y.Status"), prop, QVariant::fromValue(QDBusVariant(value))});
+    if (blocking) {
+        QDBusConnection::sessionBus().call(m, QDBus::Block, kA11yCallTimeoutMs);
+    } else {
+        QDBusConnection::sessionBus().asyncCall(m);
     }
+}
+
+// /proc/<pid>/comm, trimmed ("" when the pid is gone or unreadable). The kernel truncates
+// comm to 15 chars, so callers must compare it against a comm — never against a full name.
+QString procComm(qint64 pid)
+{
+    QFile f(QStringLiteral("/proc/%1/comm").arg(pid));
+    if (!f.open(QIODevice::ReadOnly)) {
+        return QString();
+    }
+    return QString::fromLocal8Bit(f.readAll()).trimmed();
+}
+
+// Our own comm, with a name-derived fallback for a system without procfs.
+QString ownComm()
+{
+    QString c = procComm(QCoreApplication::applicationPid());
+    if (!c.isEmpty()) {
+        return c;
+    }
+    c = QCoreApplication::applicationName();
+    if (c.isEmpty()) {
+        c = QStringLiteral("agentkate");
+    }
+    c.truncate(15); // the kernel's comm length
+    return c;
+}
+
+// Who owns the parked org.a11y.Status record. The record has exactly one owner — the
+// process it names — and only that owner may rewrite or delete it.
+enum class A11yRecordHolder {
+    None,    // no record parked
+    Ours,    // this process wrote it
+    Foreign, // another process that is still alive and looks like us
+    Stale,   // the writer is gone (or its pid was recycled by something else)
+};
+
+A11yRecordHolder a11yRecordHolder(const KConfigGroup &g)
+{
+    if (!g.readEntry(QLatin1String(kA11yPending), false)) {
+        return A11yRecordHolder::None;
+    }
+    const qint64 pid = g.readEntry(QLatin1String(kA11yPid), qint64(0));
+    if (pid == QCoreApplication::applicationPid()) {
+        return A11yRecordHolder::Ours;
+    }
+    if (pid <= 0) {
+        return A11yRecordHolder::Stale; // pre-PID record: nobody claims it
+    }
+    // Liveness alone is not identity: pids recycle, and a stranded record is exactly what a
+    // crash or a reboot leaves behind — when the recorded pid is most likely to have been
+    // handed to some unrelated process. So the holder must also LOOK like us.
+    if (!QFile::exists(QStringLiteral("/proc/%1").arg(pid))) {
+        return A11yRecordHolder::Stale; // no such process
+    }
+    const QString comm = procComm(pid);
+    if (comm.isEmpty()) {
+        // The process EXISTS but we cannot read its comm (a different uid, a hardened
+        // procfs). Fail CLOSED: treating an unidentifiable live process as dead would
+        // restore the desktop out from under a session that may still be using it.
+        return A11yRecordHolder::Foreign;
+    }
+    return comm == ownComm() ? A11yRecordHolder::Foreign : A11yRecordHolder::Stale;
 }
 } // namespace
 
-PortalResponseWaiter::PortalResponseWaiter(const QString &requestPath, QObject *parent)
-    : QObject(parent)
+PortalResponseWaiter::PortalResponseWaiter(const QString &requestPath, int timeoutMs,
+                                           QObject *parent)
+    : QObject(parent), m_requestPath(requestPath)
 {
     QDBusConnection::sessionBus().connect(
         QString::fromLatin1(kPortalService), requestPath,
         QStringLiteral("org.freedesktop.portal.Request"), QStringLiteral("Response"),
         this, SLOT(onResponse(uint, QVariantMap)));
+    // Backstop: a portal that accepts the call and never emits Response must not strand
+    // this object (and its signal match) for the rest of the run.
+    m_lifetime.setSingleShot(true);
+    connect(&m_lifetime, &QTimer::timeout, this, [this, requestPath] {
+        qWarning("cowork: no portal Response on %s within the waiter lifetime; giving up",
+                 qUtf8Printable(requestPath));
+        finish(2, QVariantMap()); // 2 = the portal will not answer (same code as a method failure)
+    });
+    m_lifetime.start(timeoutMs);
+}
+
+void PortalResponseWaiter::cancel(int graceMs)
+{
+    if (m_done) {
+        return; // already answered and self-destructing
+    }
+    // Only ever shortens: a waiter cancelled twice, or cancelled late in its life, must not
+    // have its deadline pushed back out.
+    const int remaining = m_lifetime.remainingTime();
+    if (remaining < 0 || remaining > graceMs) {
+        m_lifetime.start(graceMs);
+    }
 }
 
 void PortalResponseWaiter::onResponse(uint code, const QVariantMap &results)
 {
+    finish(code, results);
+}
+
+void PortalResponseWaiter::finish(uint code, const QVariantMap &results)
+{
+    if (m_done) {
+        return; // deleteLater is deferred; answer exactly once
+    }
+    m_done = true;
+    m_lifetime.stop();
+    // Drop the D-Bus match before the callback runs: the callback may tear the attempt
+    // down (and delete us), and a late Response must find nothing subscribed.
+    QDBusConnection::sessionBus().disconnect(
+        QString::fromLatin1(kPortalService), m_requestPath,
+        QStringLiteral("org.freedesktop.portal.Request"), QStringLiteral("Response"),
+        this, SLOT(onResponse(uint, QVariantMap)));
     Q_EMIT responded(code, results);
     deleteLater();
 }
@@ -292,26 +476,119 @@ CoworkPortal::CoworkPortal(CoreClient *core, QWidget *topLevel, QObject *parent)
     // Timed (profiled-motion) playback: one op per tick, never blocking the event loop.
     m_playTimer.setSingleShot(true);
     connect(&m_playTimer, &QTimer::timeout, this, &CoworkPortal::playbackTick);
+    // Hand-shake watchdog: a portal that accepts a step and never answers it would
+    // otherwise leave m_rdStarting true forever, and every later request queued behind a
+    // session that can never come up.
+    m_rdWatchdog.setSingleShot(true);
+    connect(&m_rdWatchdog, &QTimer::timeout, this, [this] {
+        if (!m_rdStarting || m_rdWatchdogGen != m_rdGeneration) {
+            return; // the attempt this timer was armed for is over
+        }
+        qWarning("cowork: the desktop portal never answered the remote-control hand-shake");
+        failPortalStep(i18n("the desktop portal accepted the remote-control request but "
+                            "never answered it. Restart it with:  systemctl --user restart "
+                            "xdg-desktop-portal.service"));
+    });
+    // Put the desktop back if a previous run died with the a11y flags flipped — but off
+    // the constructor: this runs inside MainWindow's constructor, before the event loop,
+    // and recovery talks to the a11y bus. Deferred to the first event-loop pass so a
+    // wedged (or activating) org.a11y.Bus can never delay the window coming up.
+    QTimer::singleShot(0, this, [this] { recoverStaleA11yStatus(); });
+    // SECURITY (audit F3): the last line of defence for a timed injection. A script may
+    // play for up to 30 s, and keystrokes follow FOCUS — so the moment any Agent Kate
+    // window becomes the focus window mid-playback, the rest of the script is aborted.
+    // focusWindowChanged fires with a non-null QWindow only for OUR windows, which makes
+    // this both exact and free: no compositor round-trip, no window list, no race with the
+    // core's activation watch (they are independent and either one is sufficient). It is
+    // what makes the consent prompt un-typeable by the very playback that raised it.
+    //
+    // Scoped to a LIVE timed playback (m_playCorrId): a synchronous batch runs inside a
+    // single event-loop callback, so no focus change can interleave with it, and a batch
+    // merely queued behind an unfinished portal hand-shake has not injected anything yet.
+    // Aborting those would turn "the human clicked back into Agent Kate" into a failure
+    // for work that was never at risk.
+    connect(qApp, &QGuiApplication::focusWindowChanged, this, [this](QWindow *w) {
+        if (w != nullptr && !m_playCorrId.isEmpty()) {
+            abortInjection(i18n("an Agent Kate window took focus while a timed script was "
+                                "playing — a script may never type into Agent Kate's own "
+                                "interface, including its consent prompts"));
+        }
+    });
+    // aboutToQuit is the teardown path that actually runs: the window that owns us is
+    // heap-allocated and never deleted, so ~CoworkPortal does not fire on a real exit.
+    connect(qApp, &QCoreApplication::aboutToQuit, this, [this] { shutdownTeardown(); });
+}
+
+void CoworkPortal::shutdownTeardown()
+{
+    if (m_shutdownDone) {
+        return;
+    }
+    m_shutdownDone = true;
+    // Release the screencast/PipeWire resources and cancel any playback timer (closeSessionOnly
+    // does all of this and is safe with no live session), then put the desktop back.
+    closeSessionOnly();
+    restoreAtspiStatus();
 }
 
 CoworkPortal::~CoworkPortal()
 {
-    // Release the screencast/PipeWire resources and cancel any playback timer before we
-    // go (closeSessionOnly does all of this and is safe with no live session).
-    closeSessionOnly();
-    restoreAtspiStatus();
+    // Normally a no-op: aboutToQuit has already run shutdownTeardown(). If we ARE destroyed
+    // (a test, or a future owner that deletes us), everything it touches is either local or
+    // reached through a QPointer — m_core is a sibling child of the same parent and may
+    // already be gone.
+    shutdownTeardown();
 }
 
 void CoworkPortal::enableAtspiStatusForLaunch()
 {
     // Record the user's original state once, so we can put it back on teardown.
     if (!m_a11yStatusCaptured) {
-        m_origIsEnabled = readA11yStatus(QStringLiteral("IsEnabled"), false);
-        m_origScreenReader = readA11yStatus(QStringLiteral("ScreenReaderEnabled"), false);
-        m_a11yStatusCaptured = true;
+        const KConfigGroup g = KSharedConfig::openConfig()->group(QLatin1String(kA11yGroup));
+        const A11yRecordHolder holder = a11yRecordHolder(g);
+        if (holder == A11yRecordHolder::Foreign || holder == A11yRecordHolder::Ours) {
+            // Someone has already flipped the flags and parked the pre-flip values. Reading
+            // the bus now would capture the FLIPPED state as "the user's originals" and the
+            // restore would leave the desktop in screen-reader mode forever. Adopt the
+            // parked originals instead, and leave the record where it is: rewriting it with
+            // our pid would let our exit delete the owner's crash safety net.
+            m_origIsEnabled = g.readEntry(QLatin1String(kA11yOrigIsEnabled), false);
+            m_origScreenReader = g.readEntry(QLatin1String(kA11yOrigScreenReader), false);
+            m_a11yStatusCaptured = true;
+        } else {
+            m_origIsEnabled = readA11yStatus(QStringLiteral("IsEnabled"), false);
+            m_origScreenReader = readA11yStatus(QStringLiteral("ScreenReaderEnabled"), false);
+            m_a11yStatusCaptured = true;
+            // Park the originals on disk BEFORE the flip: everything between this line and
+            // restoreAtspiStatus() is the window in which a crash would otherwise strand the
+            // user's desktop in screen-reader mode with no record of what it used to be.
+            persistA11yOriginals(m_origIsEnabled, m_origScreenReader);
+        }
     }
     writeA11yStatus(QStringLiteral("IsEnabled"), true);
     writeA11yStatus(QStringLiteral("ScreenReaderEnabled"), true);
+    verifyAtspiEnabled();
+}
+
+void CoworkPortal::enableAtspiForUserLaunch()
+{
+    // The human clicked "launch browser" in the Cowork panel. That IS the consent for
+    // the flip — but it must still go through the parking machinery above, or the
+    // desktop is left in accessibility mode with nothing recorded to restore from.
+    enableAtspiStatusForLaunch();
+}
+
+void CoworkPortal::verifyAtspiEnabled()
+{
+    // The writes above are async fire-and-forget, so they succeed even with no a11y bus at
+    // all. Read the flag back — the session bus delivers our Set before this Get, so a bus
+    // that is actually there answers true — and report THAT, never the intent. A wedged bus
+    // costs kA11yCallTimeoutMs, not the 25 s D-Bus default.
+    m_a11yEnabled = readA11yStatus(QStringLiteral("IsEnabled"), false);
+    if (!m_a11yEnabled) {
+        qWarning("cowork: org.a11y.Status did not come up enabled — reading windows and "
+                 "clicking named elements will not work");
+    }
 }
 
 void CoworkPortal::restoreAtspiStatus()
@@ -319,9 +596,75 @@ void CoworkPortal::restoreAtspiStatus()
     if (!m_a11yStatusCaptured) {
         return;
     }
-    writeA11yStatus(QStringLiteral("ScreenReaderEnabled"), m_origScreenReader);
-    writeA11yStatus(QStringLiteral("IsEnabled"), m_origIsEnabled);
+    writeA11yStatus(QStringLiteral("ScreenReaderEnabled"), m_origScreenReader, /*blocking=*/true);
+    writeA11yStatus(QStringLiteral("IsEnabled"), m_origIsEnabled, /*blocking=*/true);
     m_a11yStatusCaptured = false;
+    m_a11yEnabled = false;
+    // Only now: the record exists to survive a failure to reach this point.
+    clearPersistedA11yOriginals();
+}
+
+void CoworkPortal::persistA11yOriginals(bool isEnabled, bool screenReader)
+{
+    KConfigGroup g = KSharedConfig::openConfig()->group(QLatin1String(kA11yGroup));
+    g.writeEntry(QLatin1String(kA11yOrigIsEnabled), isEnabled);
+    g.writeEntry(QLatin1String(kA11yOrigScreenReader), screenReader);
+    g.writeEntry(QLatin1String(kA11yPid), qint64(QCoreApplication::applicationPid()));
+    g.writeEntry(QLatin1String(kA11yPending), true);
+    g.sync(); // must be on disk before the flip, not at the next config flush
+}
+
+void CoworkPortal::clearPersistedA11yOriginals()
+{
+    KConfigGroup g = KSharedConfig::openConfig()->group(QLatin1String(kA11yGroup));
+    // Only the owner may delete the record. If a live foreign instance parked it (we merely
+    // adopted its originals), deleting it here would strip the crash protection of a process
+    // that is still holding the flags flipped.
+    if (a11yRecordHolder(g) == A11yRecordHolder::Foreign) {
+        return;
+    }
+    g.deleteGroup();
+    g.sync();
+}
+
+void CoworkPortal::recoverStaleA11yStatus()
+{
+    if (s_a11yRecoveryDone) {
+        return;
+    }
+    s_a11yRecoveryDone = true;
+    // If THIS process already holds the flags flipped, the parked record is our own live
+    // safety net: restoring from it would undo a flip a running session depends on, and
+    // clearing it would strip the crash protection. Today the singleShot(0) deferral makes
+    // that ordering impossible; nothing enforces it, so the invariant is stated here.
+    if (m_a11yStatusCaptured) {
+        return;
+    }
+    const KConfigGroup g = KSharedConfig::openConfig()->group(QLatin1String(kA11yGroup));
+    // The record names the process that wrote it. If that process is still alive (or is not
+    // identifiable, which we treat the same way), it is a second AgentKate instance that may
+    // be holding the flags flipped for a LIVE Cowork session — restoring would break it, and
+    // clearing the record would rob it of its own safety net. Leave both alone; its own
+    // restore path will run.
+    const A11yRecordHolder holder = a11yRecordHolder(g);
+    if (holder == A11yRecordHolder::None) {
+        return;
+    }
+    if (holder == A11yRecordHolder::Foreign) {
+        qInfo("cowork: leaving the parked org.a11y.Status record alone — pid %lld still runs",
+              g.readEntry(QLatin1String(kA11yPid), qint64(0)));
+        return;
+    }
+    // Otherwise the writer is gone (or is us): the flags were flipped and never put back,
+    // and no Cowork session exists yet in this process, so nothing relies on them.
+    const bool origIsEnabled = g.readEntry(QLatin1String(kA11yOrigIsEnabled), false);
+    const bool origScreenReader = g.readEntry(QLatin1String(kA11yOrigScreenReader), false);
+    qInfo("cowork: restoring org.a11y.Status left flipped by a previous run "
+          "(IsEnabled=%d ScreenReaderEnabled=%d)",
+          int(origIsEnabled), int(origScreenReader));
+    writeA11yStatus(QStringLiteral("ScreenReaderEnabled"), origScreenReader);
+    writeA11yStatus(QStringLiteral("IsEnabled"), origIsEnabled);
+    clearPersistedA11yOriginals();
 }
 
 void CoworkPortal::onNotification(const QString &method, const QJsonObject &params)
@@ -330,7 +673,26 @@ void CoworkPortal::onNotification(const QString &method, const QJsonObject &para
     if (method == QLatin1String("cowork.killSwitch")) {
         if (params.value(QStringLiteral("on")).toBool()) {
             teardownRemoteDesktop();
+            // "Stop ALL desktop access" has to include the desktop-wide accessibility flags
+            // Cowork flipped (audit F8) — tearing down only the RemoteDesktop session would
+            // leave every application on this session exporting its AT-SPI tree to any local
+            // process after the human hit the panic button. The core asks for this
+            // explicitly (cowork/consent.go Kill → restoreDesktopFlags) so the two halves of
+            // the contract are visible from both sides.
+            if (params.value(QStringLiteral("restoreDesktopFlags")).toBool()) {
+                restoreAtspiStatus();
+            }
         }
+        return;
+    }
+    // The last agent with desktop access was switched off. The enable dialog promises the
+    // accessibility flip lasts only "until desktop access is turned off — then your
+    // original setting is restored", and until this existed only the kill-switch and app
+    // exit honoured that, so the promise was false for the ordinary way people stop
+    // (audit F8). No live thread can be relying on the flip at this point: the core only
+    // sends it when NO record still has Cowork enabled.
+    if (method == QLatin1String("cowork.restoreDesktopFlags")) {
+        restoreAtspiStatus();
         return;
     }
     if (method != QLatin1String("cowork.portalRequest")) {
@@ -351,6 +713,15 @@ void CoworkPortal::onNotification(const QString &method, const QJsonObject &para
     }
     if (kind == QLatin1String("killInject")) {
         handleKillInject(params);
+        return;
+    }
+    if (kind == QLatin1String("abortInject")) {
+        // The core's activation watch saw focus leave the window the running script was
+        // approved for. It has already refused the call on its side and is not waiting for
+        // an answer here — this is the stop order, not a round-trip.
+        const QString reason = params.value(QStringLiteral("reason")).toString();
+        abortInjection(reason.isEmpty() ? i18n("the focused window changed while a timed script was playing")
+                                        : reason);
         return;
     }
     if (kind == QLatin1String("preflight")) {
@@ -514,6 +885,30 @@ bool CoworkPortal::startKWinScreenshot(const QJsonObject &req)
                 finalize();
             });
 
+    // Lifetime backstop (audit F24). Neither signal above is guaranteed to arrive in
+    // the one case that matters: KWin answers the call SUCCESSFULLY and then stalls
+    // without ever closing its end of the pipe. finalize() then keeps returning early
+    // ("still streaming a valid capture") and this capture never ends — the read fd,
+    // the notifier and the watcher live until the process does, and the agent's
+    // request only resolves when akcore gives up 125 s later, with no fallback tried.
+    // PortalResponseWaiter has carried the same guard from the start
+    // (kPortalWaiterLifetimeMs); this path was the one without it.
+    //
+    // Marked as an error so finalize stops waiting for pixels and takes the portal
+    // fallback, which is the right answer for a KWin that is not going to deliver.
+    // `this` is the context object, so a destroyed portal simply drops the timer.
+    QTimer::singleShot(kKWinShotLifetimeMs, this, [ctx, finalize] {
+        if (ctx->done) {
+            return; // finished normally; nothing to force
+        }
+        qWarning("cowork: KWin ScreenShot2 did not complete within %d ms → portal fallback",
+                 kKWinShotLifetimeMs);
+        ctx->error = true;
+        ctx->gotResults = true;
+        ctx->gotEof = true;
+        finalize();
+    });
+
     return true;
 }
 
@@ -533,36 +928,42 @@ void CoworkPortal::startPortalScreenshot(const QJsonObject &req)
     // race where Response fires before we connect). Path =
     // /…/request/<sender-with-dots-as-underscores>/<handle_token>.
     const QString token = QStringLiteral("ak%1").arg(QRandomGenerator::global()->generate());
-    QString sender = bus.baseService();
-    if (sender.startsWith(QLatin1Char(':'))) {
-        sender.remove(0, 1);
-    }
-    sender.replace(QLatin1Char('.'), QLatin1Char('_'));
-    const QString requestPath =
-        QStringLiteral("%1/request/%2/%3").arg(QString::fromLatin1(kPortalPath), sender, token);
+    const QString requestPath = portalHandlePath(QStringLiteral("request"), token);
 
-    auto *waiter = new PortalResponseWaiter(requestPath, this);
+    auto *waiter = new PortalResponseWaiter(requestPath, kPortalWaiterLifetimeMs, this);
     connect(waiter, &PortalResponseWaiter::responded, this,
             [this, corrId, maxDim, format](uint code, const QVariantMap &results) {
                 finishScreenshot(corrId, maxDim, format, code, results);
             });
 
-    QDBusInterface portal(QString::fromLatin1(kPortalService), QString::fromLatin1(kPortalPath),
-                          QStringLiteral("org.freedesktop.portal.Screenshot"), bus);
     QVariantMap opts;
     opts.insert(QStringLiteral("handle_token"), token);
     // interactive=true lets the user pick a specific window/region in KDE's native
     // picker (a "share this window" flow); false captures the screen directly.
     opts.insert(QStringLiteral("interactive"), req.value(QStringLiteral("interactive")).toBool());
 
-    QDBusReply<QDBusObjectPath> reply = portal.call(QStringLiteral("Screenshot"),
-                                                    parentWindowHandle(), opts);
-    if (!reply.isValid()) {
-        waiter->deleteLater();
-        replyResult(corrId, QStringLiteral("screenshot"), false,
-                    QStringLiteral("portal call failed: %1").arg(reply.error().message()));
-    }
-    // Otherwise the waiter delivers the result asynchronously.
+    // asyncCall: the Screenshot portal is the same service that can be wedged or still
+    // activating, and a blocking call here would freeze the GUI thread for the D-Bus
+    // timeout. (A QDBusInterface would also introspect synchronously on construction.)
+    QDBusMessage msg = QDBusMessage::createMethodCall(
+        QString::fromLatin1(kPortalService), QString::fromLatin1(kPortalPath),
+        QStringLiteral("org.freedesktop.portal.Screenshot"), QStringLiteral("Screenshot"));
+    msg.setArguments({parentWindowHandle(), opts});
+    auto *watcher = new QDBusPendingCallWatcher(bus.asyncCall(msg), this);
+    connect(watcher, &QDBusPendingCallWatcher::finished, this,
+            [this, corrId, waiter = QPointer<PortalResponseWaiter>(waiter)](
+                QDBusPendingCallWatcher *w) {
+                w->deleteLater();
+                QDBusPendingReply<QDBusObjectPath> reply = *w;
+                if (!reply.isError()) {
+                    return; // the waiter delivers the result asynchronously
+                }
+                if (waiter) {
+                    waiter->deleteLater();
+                }
+                replyResult(corrId, QStringLiteral("screenshot"), false,
+                            QStringLiteral("portal call failed: %1").arg(reply.error().message()));
+            });
 }
 
 void CoworkPortal::finishScreenshot(const QString &corrId, int maxDim, const QString &format,
@@ -646,8 +1047,21 @@ void CoworkPortal::handleLaunchBrowser(const QJsonObject &req)
 
     // Chromium browsers only export their a11y tree if accessibility is enabled at
     // launch — announce ourselves as an AT first (Firefox doesn't need this).
+    //
+    // SECURITY (audit F8): this is an AGENT-triggered action, so it may only RE-ASSERT a
+    // flip the human already consented to (m_a11yStatusCaptured means we own the parked
+    // originals, i.e. the portal grant landed and becomeReady flipped them). It must never
+    // be the thing that first switches the whole desktop into accessibility mode — that
+    // would let an agent make a global permission change out of a declined preflight, or
+    // after the kill-switch put the flags back.
     if (b.family == QLatin1String("chromium")) {
-        enableAtspiStatusForLaunch();
+        if (m_a11yStatusCaptured) {
+            enableAtspiStatusForLaunch();
+        } else {
+            qWarning("cowork: launching %s without switching accessibility on — desktop "
+                     "access was never granted (or was stopped), so its page contents will "
+                     "not be readable", qPrintable(b.name));
+        }
     }
 
     QString launchErr;
@@ -662,6 +1076,9 @@ void CoworkPortal::handleLaunchBrowser(const QJsonObject &req)
 void CoworkPortal::replyResult(const QString &corrId, const QString &kind, bool ok,
                                const QString &error, const QJsonObject &extra)
 {
+    if (!m_core) {
+        return; // destroyed sibling — nothing to reply to (teardown ordering)
+    }
     QJsonObject params{
         {QStringLiteral("corrId"), corrId},
         {QStringLiteral("kind"), kind},
@@ -695,17 +1112,17 @@ void CoworkPortal::portalRequest(const QString &iface, const QString &method,
     const QString token = QStringLiteral("ak%1").arg(QRandomGenerator::global()->generate());
     options.insert(QStringLiteral("handle_token"), token);
 
-    QString sender = bus.baseService();
-    if (sender.startsWith(QLatin1Char(':'))) {
-        sender.remove(0, 1);
-    }
-    sender.replace(QLatin1Char('.'), QLatin1Char('_'));
-    const QString reqPath =
-        QStringLiteral("%1/request/%2/%3").arg(QString::fromLatin1(kPortalPath), sender, token);
+    const QString reqPath = portalHandlePath(QStringLiteral("request"), token);
 
-    auto *waiter = new PortalResponseWaiter(reqPath, this);
+    auto *waiter = new PortalResponseWaiter(reqPath, kPortalWaiterLifetimeMs, this);
     connect(waiter, &PortalResponseWaiter::responded, this,
             [cb](uint code, const QVariantMap &results) { cb(code, results); });
+    // Every portalRequest belongs to the current session attempt (this is the RemoteDesktop
+    // / ScreenCast hand-shake path). Track it so the attempt ending frees it — the generation
+    // guards make a late continuation a no-op but cannot free what is waiting to run it.
+    // Prune first: waiters that already answered have destroyed themselves.
+    m_rdWaiters.removeIf([](const QPointer<PortalResponseWaiter> &w) { return w.isNull(); });
+    m_rdWaiters.append(QPointer<PortalResponseWaiter>(waiter));
 
     QDBusMessage msg = QDBusMessage::createMethodCall(
         QString::fromLatin1(kPortalService), QString::fromLatin1(kPortalPath), iface, method);
@@ -713,25 +1130,44 @@ void CoworkPortal::portalRequest(const QString &iface, const QString &method,
     full.append(options);
     msg.setArguments(full);
 
-    QDBusMessage reply = bus.call(msg);
-    if (reply.type() == QDBusMessage::ErrorMessage) {
-        // Log the concrete D-Bus error: a method-level rejection (e.g. an invalid option)
-        // never reaches the Response signal, so without this it reads as a silent
-        // "declined" with no clue why.
-        qWarning("cowork: portal %s.%s failed: %s", qUtf8Printable(iface), qUtf8Printable(method),
-                 qUtf8Printable(reply.errorMessage()));
-        // Keep the reason for the failure path to quote. A generic "the session could
-        // not be created" sends the user looking for a permission they never denied.
-        // The message can be empty (some errors carry only a name), which would leave
-        // the failure unexplained — fall back to the name.
-        m_lastPortalErrorName = reply.errorName();
-        m_lastPortalError = reply.errorMessage().isEmpty() ? m_lastPortalErrorName : reply.errorMessage();
-        waiter->deleteLater();
-        cb(2, QVariantMap()); // no Response will arrive; surface the failure now
-    } else {
-        m_lastPortalError.clear();
-        m_lastPortalErrorName.clear();
-    }
+    // asyncCall, never call(): a wedged or still-activating xdg-desktop-portal would
+    // otherwise freeze the GUI thread — and with it the core IPC pump — for the 25 s
+    // D-Bus timeout, on a path plan 18's auto-preflight reaches on ordinary session
+    // starts. The watcher is parented to `this`, so a destroyed portal takes its
+    // continuations with it (the async-callback crash class).
+    //
+    // Ordering is what makes this a drop-in: the portal sends the method reply BEFORE it
+    // emits Response on the Request path, both arrive on this connection from the same
+    // service, and Qt dispatches them in arrival order — so m_lastPortalError is settled
+    // before any Response-driven cb can read it through portalFailureDetail().
+    auto *watcher = new QDBusPendingCallWatcher(bus.asyncCall(msg), this);
+    connect(watcher, &QDBusPendingCallWatcher::finished, this,
+            [this, iface, method, cb, waiter = QPointer<PortalResponseWaiter>(waiter)](
+                QDBusPendingCallWatcher *w) {
+                w->deleteLater();
+                const QDBusMessage reply = w->reply();
+                if (reply.type() != QDBusMessage::ErrorMessage) {
+                    m_lastPortalError.clear();
+                    m_lastPortalErrorName.clear();
+                    return;
+                }
+                // Log the concrete D-Bus error: a method-level rejection (e.g. an invalid
+                // option) never reaches the Response signal, so without this it reads as a
+                // silent "declined" with no clue why.
+                qWarning("cowork: portal %s.%s failed: %s", qUtf8Printable(iface),
+                         qUtf8Printable(method), qUtf8Printable(reply.errorMessage()));
+                // Keep the reason for the failure path to quote. A generic "the session
+                // could not be created" sends the user looking for a permission they never
+                // denied. The message can be empty (some errors carry only a name), which
+                // would leave the failure unexplained — fall back to the name.
+                m_lastPortalErrorName = reply.errorName();
+                m_lastPortalError =
+                    reply.errorMessage().isEmpty() ? m_lastPortalErrorName : reply.errorMessage();
+                if (waiter) {
+                    waiter->deleteLater();
+                }
+                cb(2, QVariantMap()); // no Response will arrive; surface the failure now
+            });
 }
 
 QString CoworkPortal::portalFailureDetail() const
@@ -793,16 +1229,20 @@ void CoworkPortal::handleInject(const QJsonObject &req)
     const QJsonArray ops = req.value(QStringLiteral("ops")).toArray();
 
     if (m_rdReady && !m_rdSession.isEmpty()) {
+        // A timed playback in flight owns the session: queue this batch behind it so ops do
+        // not interleave and the active playback's corrId is never clobbered; the queue is
+        // re-flushed when playback drains (playbackTick → flushInjectQueue). This guard sits
+        // AHEAD of the device check, because the widening path below tears the session down
+        // — which would kill the live playback and answer it "desktop control was stopped".
+        // flushInjectQueue re-checks the device set, so a queued batch that needs a wider
+        // one still triggers the rebuild, just after the playback has finished.
+        if (!m_playCorrId.isEmpty()) {
+            m_injectQueue.append({corrId, ops});
+            return;
+        }
         const uint needed = deviceTypesFor(ops);
         const bool needSc = needsScreencastFor(ops);
         if ((needed & ~m_rdTypes) == 0 && (!needSc || m_scReady)) {
-            // If a timed playback is in flight, queue this batch behind it so ops do not
-            // interleave and the active playback's corrId is never clobbered; the queue is
-            // re-flushed when playback drains (playbackTick → flushInjectQueue).
-            if (!m_playCorrId.isEmpty()) {
-                m_injectQueue.append({corrId, ops});
-                return;
-            }
             // The live session already owns every device these ops use AND has the
             // screencast stream a move needs (if any).
             runInjectOps(corrId, ops);
@@ -810,7 +1250,10 @@ void CoworkPortal::handleInject(const QJsonObject &req)
             // otherwise (synchronous fast path) it returns having done nothing async, so
             // we reply here. It signals that by leaving m_playCorrId == corrId.
             if (m_playCorrId != corrId) {
-                replyResult(corrId, QStringLiteral("inject"), true, QString());
+                // m_batchError non-empty = the batch was abandoned mid-way; report the
+                // failure rather than an "ok" the core would commit its mirror on.
+                replyResult(corrId, QStringLiteral("inject"), m_batchError.isEmpty(),
+                            m_batchError, injectOutcome());
             }
             return;
         }
@@ -829,17 +1272,20 @@ void CoworkPortal::handlePreflight(const QJsonObject &req)
 {
     const QString corrId = req.value(QStringLiteral("corrId")).toString();
 
-    // The accessibility bus first: it is what reading windows and clicking named
-    // elements ride on, it needs no dialog, and Chromium-family browsers only export
-    // their tree when it was already on AT THEIR LAUNCH — so switching it on at
-    // enable time (rather than at first use) is what makes a browser the agent opens
-    // afterwards readable at all.
-    enableAtspiStatusForLaunch();
+    // NOTE (audit F8): the desktop-wide org.a11y.Status flip used to happen HERE, before
+    // the portal's remote-control dialog was even raised — so declining it still left the
+    // whole session in accessibility mode until app exit, a real global permission change
+    // the human never agreed to. The flip now happens in becomeReady(), i.e. only once the
+    // portal grant has actually landed, and the consent text discloses it. Everything the
+    // flip is needed for (reading windows, clicking named elements, and Chromium-family
+    // browsers, which only export their tree when accessibility was on AT THEIR LAUNCH)
+    // still gets it at enable time, because enabling Cowork runs this preflight.
 
     if (m_rdReady && !m_rdSession.isEmpty()) {
         // Already approved earlier in this run; the grant is reused as-is.
         replyResult(corrId, QStringLiteral("preflight"), true, QString(),
-                    {{QStringLiteral("remoteDesktop"), true}, {QStringLiteral("accessibility"), true}});
+                    {{QStringLiteral("remoteDesktop"), true},
+                     {QStringLiteral("accessibility"), m_a11yEnabled}});
         return;
     }
     m_preflightCorrIds.append(corrId);
@@ -851,6 +1297,20 @@ void CoworkPortal::handlePreflight(const QJsonObject &req)
 void CoworkPortal::startRemoteDesktop()
 {
     m_rdStarting = true;
+    // A new attempt: every continuation armed by an earlier one is now stale. Anything still
+    // waiting for the previous attempt belongs to nobody now — abandon it before bumping, or
+    // the generation guard silently keeps it alive. (Callers only reach here with no
+    // hand-shake in flight, so this is normally empty; it is the backstop for any path that
+    // is not.) abandonPortalWaiters never emits, so nothing can observe the half-bumped state
+    // between it and the increment below.
+    abandonPortalWaiters();
+    const int gen = ++m_rdGeneration;
+    // Arm the hand-shake watchdog for the NON-interactive steps (CreateSession /
+    // SelectDevices / SelectSources): these raise no dialog, so anything past a few seconds
+    // is the portal frontend having dropped the interface rather than a human deciding.
+    // doStart() re-arms it with the far longer dialog budget.
+    m_rdWatchdogGen = gen;
+    m_rdWatchdog.start(kRdHandshakeTimeoutMs);
     const QString sessToken = QStringLiteral("aks%1").arg(QRandomGenerator::global()->generate());
 
     // Stand up the FULL session up-front — keyboard | pointer + screencast — so the user
@@ -867,9 +1327,28 @@ void CoworkPortal::startRemoteDesktop()
 
     QVariantMap createOpts;
     createOpts.insert(QStringLiteral("session_handle_token"), sessToken);
+    // We named the session, so we know the path it will appear at before the portal tells
+    // us — the escape hatch for closing it if this attempt is abandoned and CreateSession's
+    // reply never lands (see abandonPortalWaiters()).
+    m_rdPendingSessionPath = portalHandlePath(QStringLiteral("session"), sessToken);
 
     portalRequest(QStringLiteral("org.freedesktop.portal.RemoteDesktop"), QStringLiteral("CreateSession"),
-                  {}, createOpts, [this, startTypes, wantScreencast](uint code, const QVariantMap &results) {
+                  {}, createOpts, [this, gen, startTypes, wantScreencast](uint code, const QVariantMap &results) {
+        if (gen != m_rdGeneration) {
+            // This attempt was abandoned while CreateSession was in flight. The portal may
+            // still have created a session for it — close it here or it is orphaned, since
+            // nothing else knows its path. Reachable precisely BECAUSE abandonPortalWaiters
+            // cancels waiters instead of destroying them; do not "simplify" that back.
+            // m_rdPendingSessionPath is NOT touched: it was cleared when this attempt was
+            // abandoned, and any value in it now belongs to the attempt that replaced us.
+            closePortalSessionPath(results.value(QStringLiteral("session_handle")).toString());
+            return;
+        }
+        // The reply for the LIVE attempt landed: the predicted path has served its purpose,
+        // and from here the session's fate is m_rdSession's (closeSessionOnly closes it).
+        // Leaving it set would let a later abandonment close a session twice — harmless on
+        // the bus, but it would also outlive the attempt it describes.
+        m_rdPendingSessionPath.clear();
         if (code != 0) {
             failPortalStep(i18n("the remote-control session could not be created"));
             return;
@@ -884,7 +1363,10 @@ void CoworkPortal::startRemoteDesktop()
         selOpts.insert(QStringLiteral("types"), startTypes);
         portalRequest(QStringLiteral("org.freedesktop.portal.RemoteDesktop"), QStringLiteral("SelectDevices"),
                       {QVariant::fromValue(QDBusObjectPath(m_rdSession))}, selOpts,
-                      [this, startTypes, wantScreencast](uint code2, const QVariantMap &) {
+                      [this, gen, startTypes, wantScreencast](uint code2, const QVariantMap &) {
+            if (gen != m_rdGeneration) {
+                return; // abandoned attempt; its session was closed by whoever bumped gen
+            }
             if (code2 != 0) {
                 failPortalStep(i18n("input devices were not granted"),
                                i18n("input devices could not be requested"));
@@ -892,45 +1374,96 @@ void CoworkPortal::startRemoteDesktop()
             }
             // The Start step is shared by both paths; capture it so SelectSources can
             // chain into it (screencast path) or we can call it directly (input-only).
-            auto doStart = [this, startTypes, wantScreencast]() {
+            auto doStart = [this, gen, startTypes, wantScreencast]() {
+                // Start is the step that raises the portal's approval dialog, so the
+                // watchdog now has to outlast a human reading it — but still bound the
+                // wedge case, or m_rdStarting is stuck true for the rest of the run.
+                m_rdWatchdogGen = gen;
+                m_rdWatchdog.start(kRdDialogTimeoutMs);
                 portalRequest(QStringLiteral("org.freedesktop.portal.RemoteDesktop"), QStringLiteral("Start"),
                               {QVariant::fromValue(QDBusObjectPath(m_rdSession)), parentWindowHandle()},
                               QVariantMap(),
-                              [this, startTypes, wantScreencast](uint code3, const QVariantMap &startResults) {
-                    m_rdStarting = false;
-                    // The session may have been torn down while the user sat on the portal
-                    // dialog (idle-timeout / kill-switch). Don't parse streams or stand up a
-                    // PipeWire consumer against a dead session — that would leak an fd and a
-                    // consumer thread bound to nothing.
-                    if (m_rdSession.isEmpty()) {
-                        failInjectQueue(i18n("desktop control was stopped"));
+                              [this, gen, startTypes, wantScreencast](uint code3, const QVariantMap &startResults) {
+                    // The attempt may have been torn down — and a NEW one started — while
+                    // the user sat on the portal dialog (kill-switch / failure). Bailing on
+                    // generation rather than on "no session" is what keeps this reply from
+                    // marking a different attempt's session ready, or failing a queue that
+                    // the new attempt now owns.
+                    if (gen != m_rdGeneration) {
                         return;
                     }
                     if (code3 != 0) {
+                        m_rdStarting = false;
                         failPortalStep(i18n("remote control was declined"),
                                        i18n("remote control could not be started"));
                         return;
                     }
-                    m_rdReady = true;
-                    m_rdTypes = startTypes;
-                    if (wantScreencast) {
-                        // Parse the captured monitor streams (a(ua{sv})) — our coordinate
-                        // map. No restore_token to stash: remote-desktop sessions can't
-                        // persist (see SelectSources above), so each session is fresh.
-                        parseStreams(startResults.value(QStringLiteral("streams")));
-                        m_scReady = !m_streams.isEmpty();
-                        if (m_scReady) {
-                            // Open the PipeWire remote and (SPIKE-1) keep one stream
-                            // consumed so KWin honours absolute motion.
-                            m_pwFd = openPipeWireRemote();
-#ifdef AK_HAVE_PIPEWIRE
-                            if (m_pwFd >= 0) {
-                                startPwConsumer(m_streams.first().nodeId);
-                            }
-#endif
-                        }
+                    // Readiness is flipped in ONE place, at the very end of the hand-shake.
+                    // handleInject's fast path gates only on m_rdReady/m_rdTypes/m_scReady,
+                    // so flipping them while the OpenPipeWireRemote round trip is still in
+                    // flight would advertise a session whose screencast side is half-built
+                    // (streams mapped, no PipeWire consumer) and let a move op run against
+                    // it. m_rdStarting also stays true until here, so a request arriving
+                    // meanwhile queues instead of starting a second session.
+                    auto becomeReady = [this, startTypes](bool screencastUsable) {
+                        m_rdWatchdog.stop(); // the hand-shake landed
+                        m_rdStarting = false;
+                        m_rdReady = true;
+                        m_rdTypes = startTypes;
+                        m_scReady = screencastUsable;
+                        // Only NOW switch the session's accessibility service on (audit F8):
+                        // the human has answered the portal's remote-control dialog and said
+                        // yes. Declining takes the code3 != 0 branch above and never reaches
+                        // here, so a refusal leaves the desktop exactly as it was. It has to
+                        // precede flushInjectQueue, which reports m_a11yEnabled back to the
+                        // preflight caller.
+                        enableAtspiStatusForLaunch();
+                        flushInjectQueue(); // the single drain of everything queued behind us
+                    };
+                    if (!wantScreencast) {
+                        becomeReady(false);
+                        return;
                     }
-                    flushInjectQueue();
+                    // Parse the captured monitor streams (a(ua{sv})) — our coordinate
+                    // map. No restore_token to stash: remote-desktop sessions can't
+                    // persist (see SelectSources above), so each session is fresh.
+                    parseStreams(startResults.value(QStringLiteral("streams")));
+                    if (m_streams.isEmpty()) {
+                        becomeReady(false); // no coordinate map → absolute motion stays off
+                        return;
+                    }
+                    // Open the PipeWire remote and (SPIKE-1) keep one stream consumed so
+                    // KWin honours absolute motion. Failing to get the fd is TOLERATED:
+                    // the consumer is an unverified defence, the coordinate map is already
+                    // built, and refusing the whole session over it would cost the user
+                    // keyboard and click too. So we come up screencast-ready either way —
+                    // but only once this round trip has landed.
+                    openPipeWireRemote([this, gen, becomeReady](int fd) {
+                        if (gen != m_rdGeneration || m_streams.isEmpty()) {
+                            // Torn down — or already rebuilt as a different session — while
+                            // the fd was in flight. The fd belongs to a session that is no
+                            // longer the live one, and whoever replaced it owns the queue.
+                            if (fd >= 0) {
+                                ::close(fd);
+                            }
+                            return;
+                        }
+                        if (m_pwFd >= 0) {
+                            ::close(m_pwFd); // never overwrite a live fd
+                            m_pwFd = -1;
+                        }
+                        m_pwFd = fd;
+#ifdef AK_HAVE_PIPEWIRE
+                        if (m_pwFd >= 0) {
+                            startPwConsumer(m_streams.first().nodeId);
+                        }
+#endif
+                        if (m_pwFd < 0) {
+                            qWarning("cowork: no PipeWire remote fd; absolute motion runs "
+                                     "without a stream consumer");
+                        }
+                        becomeReady(true);
+                    });
                 });
             };
 
@@ -958,7 +1491,10 @@ void CoworkPortal::startRemoteDesktop()
             // reaped mid-script.
             portalRequest(QStringLiteral("org.freedesktop.portal.ScreenCast"), QStringLiteral("SelectSources"),
                           {QVariant::fromValue(QDBusObjectPath(m_rdSession))}, scOpts,
-                          [this, doStart](uint codeSc, const QVariantMap &) {
+                          [this, gen, doStart](uint codeSc, const QVariantMap &) {
+                if (gen != m_rdGeneration) {
+                    return; // abandoned attempt; its session was closed by whoever bumped gen
+                }
                 if (codeSc != 0) {
                     failPortalStep(i18n("screen capture for cursor control was declined"),
                                    i18n("screen capture for cursor control could not be started"));
@@ -1126,20 +1662,28 @@ void CoworkPortal::parseStreams(const QVariant &v)
     arg.endArray();
 }
 
-int CoworkPortal::openPipeWireRemote()
+void CoworkPortal::openPipeWireRemote(std::function<void(int)> cb)
 {
-    // Plain method call (NOT a Request) returning a unix fd — the PipeWire remote.
+    // Plain method call (NOT a Request) returning a unix fd — the PipeWire remote. Async
+    // for the same reason as portalRequest: this runs on the preflight path, and a portal
+    // that stops answering must not take the GUI thread down with it.
     QDBusMessage m = QDBusMessage::createMethodCall(
         QString::fromLatin1(kPortalService), QString::fromLatin1(kPortalPath),
         QStringLiteral("org.freedesktop.portal.ScreenCast"), QStringLiteral("OpenPipeWireRemote"));
     m.setArguments({QVariant::fromValue(QDBusObjectPath(m_rdSession)), QVariant::fromValue(QVariantMap())});
-    QDBusReply<QDBusUnixFileDescriptor> reply = QDBusConnection::sessionBus().call(m);
-    if (!reply.isValid() || !reply.value().isValid()) {
-        return -1;
-    }
-    // QDBusUnixFileDescriptor owns its fd and closes it when destroyed; dup so the fd
-    // outlives this reply.
-    return ::dup(reply.value().fileDescriptor());
+    auto *watcher =
+        new QDBusPendingCallWatcher(QDBusConnection::sessionBus().asyncCall(m), this);
+    connect(watcher, &QDBusPendingCallWatcher::finished, this, [cb](QDBusPendingCallWatcher *w) {
+        w->deleteLater();
+        QDBusPendingReply<QDBusUnixFileDescriptor> reply = *w;
+        if (reply.isError() || !reply.value().isValid()) {
+            cb(-1);
+            return;
+        }
+        // QDBusUnixFileDescriptor owns its fd and closes it when destroyed; dup so the fd
+        // outlives this reply.
+        cb(::dup(reply.value().fileDescriptor()));
+    });
 }
 
 #ifdef AK_HAVE_PIPEWIRE
@@ -1169,13 +1713,18 @@ void CoworkPortal::stopPwConsumer()
 }
 #endif // AK_HAVE_PIPEWIRE
 
-void CoworkPortal::runOneOp(const QJsonObject &op)
+bool CoworkPortal::runOneOp(const QJsonObject &op)
 {
     if (m_rdSession.isEmpty()) {
-        return;
+        ++m_batchDropped;
+        if (m_batchError.isEmpty()) {
+            m_batchError = i18n("the desktop control session is gone");
+        }
+        return false;
     }
     const QString t = op.value(QStringLiteral("t")).toString();
     const uint state = uint(op.value(QStringLiteral("state")).toInt());
+    bool applied = true;
     if (t == QLatin1String("key")) {
         notifyKeysym(op.value(QStringLiteral("keysym")).toInt(), state);
     } else if (t == QLatin1String("btn")) {
@@ -1190,13 +1739,29 @@ void CoworkPortal::runOneOp(const QJsonObject &op)
         if (globalToStream(gx, gy, node, lx, ly)) {
             notifyPointerMotionAbsolute(node, lx, ly);
             m_ptr = QPoint(gx, gy);
+            m_ptrKnown = true;
         } else {
             // No captured stream contains this point (or no screencast map at all): an
-            // absolute move is impossible without a node id, so skip it.
-            qWarning("cowork: move (%d,%d) has no containing screencast stream; skipped", gx, gy);
+            // absolute move is impossible without a node id, so it cannot be sent.
+            //
+            // SECURITY (audit F3): this is a DROP, not a skip. The cursor stays wherever it
+            // was — which is NOT where the core aimed it — so the core's mirror must not be
+            // allowed to record the requested point. m_ptrKnown goes false and the drop is
+            // counted; injectOutcome carries both back, and the core destroys the mirror.
+            qWarning("cowork: move (%d,%d) has no containing screencast stream; dropped", gx, gy);
+            m_ptrKnown = false;
+            applied = false;
+            if (m_batchError.isEmpty()) {
+                m_batchError = i18n("the desktop could not move the pointer to (%1,%2): that point "
+                                    "lies on no captured screen",
+                                    gx, gy);
+            }
         }
     } else if (t == QLatin1String("move_rel")) {
         // Raw relative delta — no stream map needed. Doubles so sub-pixel cadence survives.
+        // It does NOT touch m_ptr/m_ptrKnown: those answer "did the last ABSOLUTE move
+        // land where it was aimed", which is what the core cross-checks; the core does its
+        // own (bounds-checked) accounting for relative drift on top of that.
         notifyPointerMotionRelative(op.value(QStringLiteral("dx")).toDouble(),
                                     op.value(QStringLiteral("dy")).toDouble());
     } else if (t == QLatin1String("axis")) {
@@ -1205,7 +1770,49 @@ void CoworkPortal::runOneOp(const QJsonObject &op)
     } else if (t == QLatin1String("axis_discrete")) {
         notifyAxisDiscrete(uint(op.value(QStringLiteral("axis")).toInt()),
                            op.value(QStringLiteral("steps")).toInt());
+    } else {
+        // An op kind this build does not know how to play. Fail closed: report it dropped
+        // rather than let the core believe a batch ran in full.
+        qWarning("cowork: unknown inject op %s; dropped", qPrintable(t));
+        applied = false;
+        if (m_batchError.isEmpty()) {
+            m_batchError = i18n("the desktop could not play a \"%1\" action", t);
+        }
     }
+    if (applied) {
+        ++m_batchApplied;
+    } else {
+        ++m_batchDropped;
+    }
+    return applied;
+}
+
+void CoworkPortal::beginInjectBatch()
+{
+    m_batchApplied = 0;
+    m_batchDropped = 0;
+    m_batchError.clear();
+}
+
+void CoworkPortal::abandonBatch(int skipped)
+{
+    if (skipped > 0) {
+        m_batchDropped += skipped;
+    }
+    // A half-played batch must not leave a key or a mouse button logically down: the ops
+    // that would have released them are exactly the ones being abandoned.
+    releaseHeld();
+}
+
+QJsonObject CoworkPortal::injectOutcome() const
+{
+    return QJsonObject{
+        {QStringLiteral("opsApplied"), m_batchApplied},
+        {QStringLiteral("opsDropped"), m_batchDropped},
+        {QStringLiteral("ptrKnown"), m_ptrKnown},
+        {QStringLiteral("ptrX"), m_ptr.x()},
+        {QStringLiteral("ptrY"), m_ptr.y()},
+    };
 }
 
 void CoworkPortal::runInjectOps(const QString &corrId, const QJsonArray &ops)
@@ -1222,8 +1829,13 @@ void CoworkPortal::runInjectOps(const QString &corrId, const QJsonArray &ops)
         }
     }
     if (!anyDelay) {
-        for (const QJsonValue &ov : ops) {
-            runOneOp(ov.toObject());
+        beginInjectBatch();
+        for (int i = 0; i < ops.size(); ++i) {
+            if (!runOneOp(ops.at(i).toObject())) {
+                // Stop at the first op that could not be applied — see abandonBatch.
+                abandonBatch(ops.size() - i - 1);
+                break;
+            }
         }
         return; // caller replies (m_playCorrId stays != corrId)
     }
@@ -1231,6 +1843,7 @@ void CoworkPortal::runInjectOps(const QString &corrId, const QJsonArray &ops)
     // Timed playback: a profiled move is many move ops each carrying delayMs. Drive one
     // op per QTimer tick so the Qt event loop never blocks. The reply is sent on drain.
     stopPlayback(); // a prior playback (if any) is superseded
+    beginInjectBatch();
     m_playOps = ops;
     m_playIdx = 0;
     m_playCorrId = corrId;
@@ -1241,14 +1854,26 @@ void CoworkPortal::runInjectOps(const QString &corrId, const QJsonArray &ops)
 void CoworkPortal::playbackTick()
 {
     if (m_playIdx >= m_playOps.size() || m_rdSession.isEmpty()) {
-        // Drained (or session gone): reply success once and clear playback state.
+        // Drained (or session gone): reply once and clear playback state.
         const QString corrId = m_playCorrId;
         const bool sessionAlive = !m_rdSession.isEmpty();
+        // A session that vanished with ops still unplayed is a MID-PLAY failure, not a
+        // completed batch: the cursor is stranded somewhere along an interpolated path
+        // (which is allowed to cross Agent Kate's windows, since motion alone is harmless)
+        // and nobody can say where. Reporting success here would let the core commit its
+        // mirror to the target the batch never reached — say so instead, and the core
+        // destroys the mirror.
+        const bool completed =
+            sessionAlive && m_playIdx >= m_playOps.size() && m_batchError.isEmpty();
+        const QString err = m_batchError.isEmpty()
+            ? i18n("desktop control was stopped part-way through")
+            : m_batchError;
         m_playOps = QJsonArray();
         m_playIdx = 0;
         m_playCorrId.clear();
         if (!corrId.isEmpty()) {
-            replyResult(corrId, QStringLiteral("inject"), true, QString());
+            replyResult(corrId, QStringLiteral("inject"), completed,
+                        completed ? QString() : err, injectOutcome());
         }
         // Carry on with any batches that queued behind this timed one.
         if (sessionAlive && !m_injectQueue.isEmpty()) {
@@ -1257,8 +1882,16 @@ void CoworkPortal::playbackTick()
         return;
     }
     const QJsonObject op = m_playOps.at(m_playIdx).toObject();
-    runOneOp(op);
+    const bool applied = runOneOp(op);
     ++m_playIdx;
+    if (!applied) {
+        // The rest of the script is abandoned (see abandonBatch): jump to the drain branch,
+        // which now replies FAILURE because m_batchError is set.
+        abandonBatch(m_playOps.size() - m_playIdx);
+        m_playIdx = m_playOps.size();
+        m_playTimer.start(0);
+        return;
+    }
     // Schedule the next op after ITS delayMs (the pause applied BEFORE executing it).
     int nextDelay = 0;
     if (m_playIdx < m_playOps.size()) {
@@ -1267,7 +1900,7 @@ void CoworkPortal::playbackTick()
     m_playTimer.start(qMax(0, nextDelay));
 }
 
-void CoworkPortal::stopPlayback()
+void CoworkPortal::stopPlayback(const QString &reason)
 {
     m_playTimer.stop();
     // If a timed playback is still in flight, its corrId is the ONLY reference to that
@@ -1277,11 +1910,40 @@ void CoworkPortal::stopPlayback()
     // supersede caller (runInjectOps) only reaches here with no active playback, so this
     // never double-replies a live batch.
     if (!m_playCorrId.isEmpty()) {
-        replyResult(m_playCorrId, QStringLiteral("inject"), false, i18n("desktop control was stopped"));
+        // Outcome fields go out even on this failure path: the batch DID play in part, and
+        // the core needs "what actually landed" (not just "it failed") to reason about the
+        // stranded cursor.
+        replyResult(m_playCorrId, QStringLiteral("inject"), false,
+                    reason.isEmpty() ? i18n("desktop control was stopped") : reason,
+                    injectOutcome());
     }
     m_playOps = QJsonArray();
     m_playIdx = 0;
     m_playCorrId.clear();
+}
+
+void CoworkPortal::abortInjection(const QString &reason)
+{
+    const bool hadPlayback = !m_playCorrId.isEmpty();
+    const bool hadQueue = !m_injectQueue.isEmpty();
+    if (!hadPlayback && !hadQueue) {
+        return; // nothing in flight — a focus change is only interesting during playback
+    }
+    qWarning("cowork: aborting injection — %s", qPrintable(reason));
+    // stopPlayback answers the in-flight batch with THIS reason, so the agent (and the
+    // audit log) learn why its script stopped rather than "desktop control was stopped".
+    stopPlayback(reason);
+    // Anything the aborted script left pressed must not stay pressed: a stuck modifier is
+    // an implicit grab on the window that just took focus.
+    releaseHeld();
+    // Everything queued behind the aborted script was authorized under the same
+    // now-invalid focus assumption. Fail it too rather than replaying it into whatever
+    // took focus.
+    const auto queued = m_injectQueue;
+    m_injectQueue.clear();
+    for (const auto &pi : queued) {
+        replyResult(pi.corrId, QStringLiteral("inject"), false, reason);
+    }
 }
 
 // releaseHeld synthesises a key/button-up for every input still logically pressed.
@@ -1312,7 +1974,7 @@ void CoworkPortal::flushInjectQueue()
         for (const QString &corrId : waiting) {
             replyResult(corrId, QStringLiteral("preflight"), true, QString(),
                         {{QStringLiteral("remoteDesktop"), true},
-                         {QStringLiteral("accessibility"), true},
+                         {QStringLiteral("accessibility"), m_a11yEnabled},
                          {QStringLiteral("screencast"), m_scReady}});
         }
     }
@@ -1322,6 +1984,17 @@ void CoworkPortal::flushInjectQueue()
     // so the next flush (triggered after playback, see below) carries on. Since timed and
     // synchronous batches are processed in order, this preserves ordering.
     while (!m_injectQueue.isEmpty()) {
+        // A batch that queued behind a timed playback never went through handleInject's
+        // device check against the LIVE session, so re-check it here: running it on a
+        // session that lacks its devices would silently drop the ops. Only the device mask
+        // triggers a rebuild — a fresh session always comes up with keyboard|pointer, so
+        // this terminates; a missing screencast map would not be fixed by rebuilding, and
+        // an absolute move without one is skipped with a warning in runOneOp.
+        if ((deviceTypesFor(m_injectQueue.constFirst().ops) & ~m_rdTypes) != 0) {
+            closeSessionOnly(); // leaves the queue intact
+            startRemoteDesktop();
+            return;
+        }
         const PendingInject pi = m_injectQueue.takeFirst();
         runInjectOps(pi.corrId, pi.ops);
         if (m_playCorrId == pi.corrId) {
@@ -1329,7 +2002,8 @@ void CoworkPortal::flushInjectQueue()
             // still queued waits until playback finishes (re-flushed from playbackTick).
             return;
         }
-        replyResult(pi.corrId, QStringLiteral("inject"), true, QString());
+        replyResult(pi.corrId, QStringLiteral("inject"), m_batchError.isEmpty(), m_batchError,
+                    injectOutcome());
     }
 }
 
@@ -1359,23 +2033,70 @@ void CoworkPortal::failInjectQueue(const QString &err)
     m_preflightCorrIds.clear();
     for (const QString &corrId : waiting) {
         replyResult(corrId, QStringLiteral("preflight"), false, err,
-                    {{QStringLiteral("accessibility"), true}});
+                    {{QStringLiteral("accessibility"), m_a11yEnabled}});
     }
 }
 
 // closeSessionOnly drops the live portal session (releasing any held input first)
 // but leaves the inject queue untouched, so handleInject can rebuild a session with a
 // wider device set without failing the work that triggered the rebuild.
+void CoworkPortal::closePortalSessionPath(const QString &sessionPath)
+{
+    if (sessionPath.isEmpty()) {
+        return;
+    }
+    QDBusMessage msg = QDBusMessage::createMethodCall(
+        QString::fromLatin1(kPortalService), sessionPath,
+        QStringLiteral("org.freedesktop.portal.Session"), QStringLiteral("Close"));
+    QDBusConnection::sessionBus().asyncCall(msg);
+}
+
+void CoworkPortal::abandonPortalWaiters()
+{
+    // Layer 1 — the session the in-flight CreateSession was told to mint. We chose its
+    // token, so its object path is known WITHOUT waiting for the reply (portalHandlePath):
+    // if the portal has already created it, this closes it now; if it has not, the Close
+    // fails harmlessly on a path that does not exist yet, and layer 2 covers that case.
+    const QString predicted = m_rdPendingSessionPath;
+    m_rdPendingSessionPath.clear();
+    closePortalSessionPath(predicted);
+
+    // Layer 2 — the waiters. They are CANCELLED, not destroyed: a destroyed waiter can
+    // never run its continuation, and for CreateSession that continuation is what closes
+    // the session handle a late Response carries (the portal may mint the session after
+    // layer 1's Close). Cancelling keeps the subscription alive on a short leash instead,
+    // so the continuation still runs, still bails on the stale generation, and the waiter
+    // still self-destructs — bounded by kPortalCancelledGraceMs.
+    //
+    // Dropping them from m_rdWaiters is what makes this safe to call repeatedly: a
+    // cancelled waiter is nobody's to cancel again, and it frees itself.
+    const auto waiters = m_rdWaiters;
+    m_rdWaiters.clear();
+    for (const QPointer<PortalResponseWaiter> &w : waiters) {
+        if (w) {
+            // Never emits synchronously (it only re-arms a timer), so callers that bump
+            // m_rdGeneration immediately after this cannot be re-entered mid-bump.
+            w->cancel(kPortalCancelledGraceMs);
+        }
+    }
+}
+
 void CoworkPortal::closeSessionOnly()
 {
-    // Cancel any in-flight timed playback so it cannot drive ops into a torn-down session.
+    // Cancel any in-flight timed playback so it cannot drive ops into a torn-down session,
+    // and disarm the hand-shake watchdog: this attempt is over either way.
     stopPlayback();
+    m_rdWatchdog.stop();
+    // End of this attempt: every hand-shake continuation still in flight is now stale.
+    ++m_rdGeneration;
+    // ...and stale continuations are not just no-ops to be ignored, they are objects with a
+    // live D-Bus subscription, and one of them may still be handed a session handle nobody
+    // owns. Abandon them here — this is the single choke point every bail-out reaches
+    // (watchdog fire and kill-switch both come through failInjectQueue).
+    abandonPortalWaiters();
     if (!m_rdSession.isEmpty()) {
         releaseHeld();
-        QDBusMessage msg = QDBusMessage::createMethodCall(
-            QString::fromLatin1(kPortalService), m_rdSession,
-            QStringLiteral("org.freedesktop.portal.Session"), QStringLiteral("Close"));
-        QDBusConnection::sessionBus().asyncCall(msg);
+        closePortalSessionPath(m_rdSession);
     }
     // Tear down the screencast side: stop the PipeWire consumer, close the remote fd, and
     // drop the stream map. (No restore token to keep — remote-desktop sessions can't
@@ -1388,6 +2109,11 @@ void CoworkPortal::closeSessionOnly()
         m_pwFd = -1;
     }
     m_streams.clear();
+    // The stream map (and with it every coordinate this session could address) is gone, so
+    // the "last absolute move landed" evidence no longer describes anything we can vouch
+    // for. Drop it: the next batch re-establishes it, and until then the core is told the
+    // pointer position is unproven rather than being handed a stale one.
+    m_ptrKnown = false;
     m_scReady = false;
     m_rdSession.clear();
     m_rdReady = false;

@@ -112,7 +112,17 @@ func (r *reporter) Report(nonce string, payload string) *dbus.Error {
 }
 
 func (c *Client) registerNonce(nonce string) chan string {
-	ch := make(chan string, 1)
+	return c.registerNonceBuf(nonce, 1)
+}
+
+// registerNonceBuf is registerNonce with an explicit buffer. One-shot callers want 1;
+// a resident script that reports repeatedly (see WatchActiveWindow) wants headroom,
+// because Report DROPS a payload rather than block when the buffer is full.
+func (c *Client) registerNonceBuf(nonce string, n int) chan string {
+	if n < 1 {
+		n = 1
+	}
+	ch := make(chan string, n)
 	c.mu.Lock()
 	c.reports[nonce] = ch
 	c.mu.Unlock()

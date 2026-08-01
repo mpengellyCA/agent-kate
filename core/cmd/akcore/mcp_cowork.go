@@ -372,7 +372,10 @@ func coworkToolDefs() []map[string]any {
 			"name": "desktop_move_pointer",
 			"description": "Move the real cursor to a point without clicking — e.g. to reveal a " +
 				"hover menu or tooltip. x,y are GLOBAL desktop pixels by default; pass relativeTo " +
-				"to give them in a window's or element's frame instead. Capability 'pointer_control'.",
+				"to give them in a window's or element's frame instead. The point must be ON a " +
+				"screen: a move the desktop cannot apply (or one that stops part-way) fails and " +
+				"leaves the cursor position unverified, so the next bare click is refused until " +
+				"you move to an on-screen point again. Capability 'pointer_control'.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -394,8 +397,12 @@ func coworkToolDefs() []map[string]any {
 				"dy<0 up; the turn scales with magnitude × the game's sensitivity, so calibrate with a " +
 				"screenshot. steps>1 splits the delta into smooth, evenly-timed sub-nudges. For a " +
 				"precisely TIMED look+key+click sequence (strafe-and-turn, flick-shots) use " +
-				"desktop_play_input with 'move_rel' events instead. Does NOT change the tracked cursor " +
-				"position (a grab makes it unknowable). Capability 'pointer_control'.",
+				"desktop_play_input with 'move_rel' events instead. The tracked cursor position " +
+				"follows the delta, so a later bare click is still checked against where the pointer " +
+				"actually is; if the nudge would run past the edge of the desktop (the compositor " +
+				"clamps it there) the tracked position is dropped instead and bare clicks/scrolls are " +
+				"refused until you re-establish one with desktop_move_pointer or desktop_click(x,y). " +
+				"Capability 'pointer_control'.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -495,7 +502,10 @@ func playInputEventSchema() map[string]any {
 				},
 				"description": "Event kind. key/key_down/key_up press a key (whole tap or held " +
 					"half); button/button_down/button_up a mouse button; move moves to absolute x,y; " +
-					"move_rel nudges by a relative dx,dy delta (mouse-look for grab-mode games); " +
+					"move_rel nudges by a relative dx,dy delta (mouse-look for grab-mode games — it " +
+					"carries the tracked cursor position with it, and drops that position if the " +
+					"nudge would run off the desktop, which then refuses any later bare button/scroll " +
+					"in the same script); " +
 					"click clicks at x,y; scroll the wheel; wait pauses the clock.",
 			},
 			"key": map[string]any{

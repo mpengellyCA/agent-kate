@@ -50,10 +50,34 @@ void setPreferred(const QString &command);
 // name, so the custom-browser picker can pre-select the right one.
 QString guessFamily(const QString &commandOrPath);
 
-// launch starts b with accessibility forced on for its engine family. Returns false
-// and sets *error on failure. NOTE: the flag/env only takes effect on a FRESH browser
-// process — if the browser is already running, the new invocation just signals the
-// existing instance and accessibility is not enabled.
+// launch starts b with the PER-PROCESS accessibility switch for its engine family:
+// GNOME_ACCESSIBILITY=1 in the child's environment (firefox family) or
+// --force-renderer-accessibility=complete on its command line (chromium family).
+// Returns false and sets *error on failure. NOTE: these only take effect on a FRESH
+// browser process — if the browser is already running, the new invocation just
+// signals the existing instance and accessibility is not enabled.
+//
+// IT DOES NOT TOUCH org.a11y.Status. Chromium additionally needs that DESKTOP-WIDE
+// flag on at launch, but flipping it is a global permission change the whole session
+// sees, so it belongs to the caller who knows whether the human consented:
+//
+//   - Two audits landed on this function. F8: the flip was undisclosed, was left on
+//     after a decline or the kill-switch, and — because it happened HERE, inside the
+//     launch — it ran even when CoworkPortal had just decided not to flip, so an
+//     agent-triggered `desktop_launch_browser` still switched the desktop into
+//     accessibility mode out of a refused grant. Worse, this function never parked
+//     the pre-flip values, so nothing could put them back: the change outlived the
+//     app. F12: it flipped through a QDBusInterface, whose constructor performs a
+//     SYNCHRONOUS introspection call (~25 s default timeout) followed by two blocking
+//     Set calls — up to ~75 s of frozen GUI on a wedged org.a11y.Bus, on the very
+//     thread that paints the window.
+//   - CoworkPortal::enableAtspiStatusForLaunch is the one place that does it right:
+//     it parks the originals on disk BEFORE the flip (so a crash is recoverable),
+//     adopts another instance's parked values rather than capturing already-flipped
+//     ones, uses bounded 2 s raw D-Bus messages, and restores on teardown.
+//
+// So: call CoworkPortal::enableAtspiStatusForLaunch() (or the panel's portal-backed
+// path) first when the flip is warranted, then call this.
 bool launch(const Browser &b, QString *error);
 
 } // namespace BrowserLaunch
