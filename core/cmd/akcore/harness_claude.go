@@ -38,6 +38,10 @@ func (h *claudeHarness) Capabilities() harness.Capabilities {
 		Badge:       "", // the default engine stays unmarked in the roster
 		Fork:        true,
 		Compaction:  true,
+		// `claude --print --resume` runs a pass over a dormant session, and
+		// session.ReadTranscript reads its on-disk transcript for the local
+		// strategy — both produce summary text, so the cold path is real here.
+		ColdCompact: true,
 		// Verified present on claude 2.1.220: --fallback-model (one
 		// comma-separated value), --disallowedTools and --add-dir (both
 		// variadic).
@@ -52,9 +56,13 @@ func (h *claudeHarness) Capabilities() harness.Capabilities {
 		// called the new tool in the same session, so Cowork can be switched on
 		// without touching the running process.
 		LiveToolReveal: true,
-		// Verified against claude 2.1.220: set_model / set_permission_mode
-		// exist mid-session, set_effort does not — effort is start-time only.
-		EffortLive:        false,
+		// Verified against claude 2.1.220: there is no set_effort control
+		// request, but set_max_thinking_tokens IS accepted mid-session — and
+		// the effort tiers are thinking-token budgets underneath, so the lever
+		// exists under its real name. SetOption("effort") drives it; no
+		// relaunch. Keep in lockstep with ui/src/state/HarnessTraits.cpp
+		// claudeDefaults().
+		EffortLive:        true,
 		UsageReporting:    true,
 		SessionBrowse:     true,
 		TranscriptPreview: true, // claude keeps the on-disk session store
@@ -71,9 +79,32 @@ func (h *claudeHarness) Capabilities() harness.Capabilities {
 		// Models are discovered live (`claude -p /model` for direct, the
 		// provider's /v1/models for routed); the picker lists those plus free
 		// text. Permission modes and effort remain static vocabularies below.
-		ModelPicker: harness.ModelPickerDiscovered,
+		// --strict-mcp-config and --max-budget-usd, both verified in
+		// `claude -p --help` on 2.1.220.
+		StrictMCPConfig: true,
+		CostBudget:      true,
+		ModelPicker:     harness.ModelPickerDiscovered,
+		// The modes claude 2.1.220 accepts AND HONORS in print mode, in the
+		// order the UI's picker offers them — NOT in permissiveness order, and
+		// nothing reads it as one. How permissive each mode is lives in exactly
+		// one place, permissivenessRanks in authority.go, which both the launch
+		// authority gate and permissiveModes() consult; adding a mode here means
+		// ranking it there too, or it is treated as unknown (which fails closed:
+		// requesting it asks the human, and it is never named as a hint).
+		//
+		// `manual` is deliberately ABSENT even though `--permission-mode
+		// manual` is a valid choice. Probed against 2.1.220: a print-mode
+		// session launched with it reports `"permissionMode":"default"` in its
+		// init event — the flag is accepted and then silently downgraded, so
+		// offering it would promise a supervision level the session does not
+		// have. Every other entry here was probed the same way and reports
+		// itself back verbatim (`dontAsk` -> "dontAsk", `auto` -> "auto",
+		// `default` -> "default"). Re-probe before adding a mode:
+		//   claude -p --permission-mode <m> --output-format stream-json \
+		//     --verbose hi | head -1   # check .permissionMode
 		PermissionModes: []string{
-			"acceptEdits", "default", "plan", "auto", "bypassPermissions",
+			"acceptEdits", "default", "plan", "auto",
+			"dontAsk", "bypassPermissions",
 		},
 		Efforts: []string{"low", "medium", "high", "xhigh", "max"},
 	}
@@ -190,7 +221,8 @@ func (h *claudeHarness) Launch(spec harness.StartSpec) (harness.Launched, error)
 	// and the thread's opt-in (session.Record.CoworkEnabled, already persisted
 	// by the caller) is what the bridge reads to decide whether the desktop
 	// tools exist. That is what makes enabling it mid-session work.
-	mcpConfig, err := writeMCPConfig(h.exePath, h.socketPath, spec.ThreadID, spec.WorkDir)
+	mcpConfig, err := writeMCPConfig(h.exePath, h.socketPath, spec.ThreadID,
+		spec.WorkDir, spec.BridgeSecret, spec.CoworkBridgeSecret)
 	if err != nil {
 		return harness.Launched{}, fmt.Errorf("mcp config: %w", err)
 	}
@@ -218,6 +250,10 @@ func (h *claudeHarness) Launch(spec harness.StartSpec) (harness.Launched, error)
 		FallbackModels:  spec.FallbackModels,
 		DisallowedTools: spec.DisallowedTools,
 		AddDirs:         spec.AddDirs,
+		// The control-channel sweep.
+		StrictMCPConfig: spec.StrictMCPConfig,
+		MaxBudgetUSD:    spec.MaxBudgetUSD,
+		Title:           spec.Title,
 	}); err != nil {
 		os.Remove(mcpConfig)
 		return harness.Launched{}, err
@@ -247,6 +283,12 @@ func (h *claudeHarness) Launch(spec harness.StartSpec) (harness.Launched, error)
 
 func (h *claudeHarness) Send(threadID, text string, atts []agent.Attachment) error {
 	return h.sup.Send(threadID, text, atts)
+}
+
+// ReloadSkills makes a running thread re-read its skill directories, so a skill
+// installed from the catalogue mid-session becomes callable without a relaunch.
+func (h *claudeHarness) ReloadSkills(threadID string) error {
+	return h.sup.ReloadSkills(threadID)
 }
 
 func (h *claudeHarness) Interrupt(threadID string) error { return h.sup.Interrupt(threadID) }
@@ -298,7 +340,9 @@ func (h *claudeHarness) DiscoverModels(p *agent.Provider) ([]harness.DiscoveredO
 	}
 	out := make([]harness.DiscoveredOptionValue, 0, len(models))
 	for _, m := range models {
-		out = append(out, harness.DiscoveredOptionValue{Value: m.Value, Name: m.Name})
+		out = append(out, harness.DiscoveredOptionValue{
+			Value: m.Value, Name: m.Name, Efforts: m.Efforts,
+		})
 	}
 	return out, nil
 }
@@ -378,8 +422,10 @@ func (h *claudeHarness) SetOption(threadID, option, value string) (string, error
 	case "permissionMode":
 		return value, h.sup.SetPermissionMode(threadID, value)
 	case "effort":
-		return "", fmt.Errorf(
-			"Claude Code does not support changing the thinking effort mid-session")
+		// No set_effort control request exists, but the tiers ARE thinking-token
+		// budgets and set_max_thinking_tokens takes them mid-session, so the
+		// change lands from the next turn without a relaunch.
+		return value, h.sup.SetEffort(threadID, value)
 	default:
 		return "", fmt.Errorf("unknown option %q", option)
 	}

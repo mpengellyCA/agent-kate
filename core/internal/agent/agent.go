@@ -11,15 +11,18 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"agentkate/internal/safe"
 )
@@ -55,6 +58,13 @@ type Supervisor struct {
 	// that before SIGKILL. Overridable in tests; the defaults suit real claude.
 	interruptBackstopDelay time.Duration
 	interruptKillDelay     time.Duration
+
+	// One-shot cache of the CLI's long-option vocabulary (see cliflags.go), so
+	// the two version-sensitive launch flags can be omitted on a binary that
+	// does not know them instead of killing the spawn. Its own mutex: the probe
+	// runs a subprocess and must not be serialised behind thread bookkeeping.
+	flagMu    sync.Mutex
+	flagCache flagProbeResult
 
 	// reapWG tracks every in-flight reap() goroutine. StopAll waits on it so
 	// the caller can be sure every thread's "exited" lifecycle event has been
@@ -118,6 +128,12 @@ type StartOptions struct {
 	Provider       *Provider    // optional third-party API routing; nil/empty BaseURL = Claude direct
 	SystemPrompt   string       // claude --append-system-prompt; empty = none
 	AgentsJSON     string       // claude --agents payload, pre-rendered by the adapter; empty = none
+	// systemPromptFile is set by Start, never by a caller: the path of the
+	// 0600 temp file holding SystemPrompt. When it is set the persona travels
+	// as --append-system-prompt-file instead of as an argv element, keeping it
+	// out of /proc/<pid>/cmdline (audit F23). Unexported so the field cannot be
+	// used to make `claude` read an arbitrary file chosen elsewhere.
+	systemPromptFile string
 	// Env overlays the child's environment (applied AFTER provider routing, so
 	// a caller cannot silently redirect a routed thread's endpoint by ordering).
 	// See harness.StartSpec.Env for why this never comes from an agent.
@@ -126,12 +142,21 @@ type StartOptions struct {
 	FallbackModels  []string // claude --fallback-model (comma-joined)
 	DisallowedTools []string // claude --disallowedTools
 	AddDirs         []string // claude --add-dir
+	// The control-channel sweep. All three verified present in
+	// `claude -p --help` on 2.1.220.
+	StrictMCPConfig bool    // claude --strict-mcp-config: ignore the user's global MCP servers
+	MaxBudgetUSD    float64 // claude --max-budget-usd; 0 = uncapped
+	Title           string  // claude --name: the session label `claude agents` lists
 }
 
 // buildStartArgs assembles the `claude` argv for one thread. Split out of
 // Start so the flag plumbing is testable without spawning the CLI — the
 // process-shaping decisions (env, process group, pipes) stay in Start.
-func buildStartArgs(opts StartOptions) []string {
+//
+// flags is the installed CLI's probed long-option vocabulary (cliflags.go), and
+// comes first because it describes the binary rather than the thread; nil means
+// "unprobed", which treats every flag as supported.
+func buildStartArgs(flags cliFlags, opts StartOptions) []string {
 	mode := opts.PermissionMode
 	if mode == "" {
 		mode = "acceptEdits"
@@ -153,6 +178,29 @@ func buildStartArgs(opts StartOptions) []string {
 		"--permission-mode", mode,
 		"--allowedTools", allowedTools,
 	}
+	// Token-by-token output: the CLI adds `stream_event` lines carrying the
+	// raw Anthropic SSE shape (message_start / content_block_start /
+	// content_block_delta / …) alongside the authoritative `assistant`
+	// event, which still arrives afterwards. The UI paints the deltas into
+	// a provisional row and replaces it when the authoritative event lands,
+	// so nothing downstream — including replay of a stored transcript,
+	// which holds no stream_events — changes shape.
+	//
+	// GATED, unlike the rest of this fixed prefix: it is a recent flag, and an
+	// older claude aborts on an unknown option, so appending it unconditionally
+	// would make the newest CLI a hard requirement for every launch. Omitted,
+	// the stream simply degrades to whole-message rendering.
+	if flags.supports(flagIncludePartialMessages) {
+		args = append(args, flagIncludePartialMessages)
+	}
+	// Subagent output is forwarded onto this stream tagged with
+	// parent_tool_use_id instead of being visible only by tailing the
+	// subagent's transcript file after the fact. Gated for the same reason;
+	// omitted, subagent turns remain readable through the on-disk subagent
+	// transcripts.
+	if flags.supports(flagForwardSubagentText) {
+		args = append(args, flagForwardSubagentText)
+	}
 	// Reasoning effort is optional: an empty value leaves Claude Code on
 	// whatever default the user has configured.
 	if opts.Effort != "" {
@@ -166,9 +214,24 @@ func buildStartArgs(opts StartOptions) []string {
 	// Persona text rides ALONGSIDE Claude Code's own system prompt (verified
 	// in print mode against claude 2.1.220); --system-prompt would replace it,
 	// hiding the tool and skill injections, so it is deliberately not used.
+	//
+	// The file form is preferred when the CLI has it (Start writes a 0600 temp
+	// file): argv is world-readable through /proc/<pid>/cmdline for the life of
+	// the process, and a persona can carry instructions and context the human
+	// would not publish to every local user (audit F23). The inline form
+	// remains the fallback for a CLI that does not advertise the file flag —
+	// dropping the persona instead would silently change what the agent is.
 	if strings.TrimSpace(opts.SystemPrompt) != "" {
-		args = append(args, "--append-system-prompt", opts.SystemPrompt)
+		if opts.systemPromptFile != "" {
+			args = append(args, flagAppendSystemPromptFile, opts.systemPromptFile)
+		} else {
+			args = append(args, "--append-system-prompt", opts.SystemPrompt)
+		}
 	}
+	// NOT moved off argv: --agents has no file form on claude 2.1.220
+	// (`--agents-file` is rejected as an unknown option — probed live). Custom
+	// subagent definitions therefore remain visible in /proc/<pid>/cmdline;
+	// documented in docs/security-model.md.
 	// Custom subagent definitions for this session, already rendered into the
 	// CLI's JSON-object shape by the adapter (harness_claude.go owns that
 	// vocabulary, including which fields the binary honors).
@@ -195,6 +258,25 @@ func buildStartArgs(opts StartOptions) []string {
 			args = append(args, "--add-dir", dir)
 		}
 	}
+	// Isolate the thread from whatever MCP servers the human has configured
+	// globally: only the servers we pass with --mcp-config exist. Off by
+	// default, because the global set is usually the point.
+	if opts.StrictMCPConfig {
+		args = append(args, "--strict-mcp-config")
+	}
+	// A hard spend ceiling for this session. The CLI ends the turn with an
+	// error result once it trips, which the panel already surfaces.
+	if opts.MaxBudgetUSD > 0 {
+		args = append(args, "--max-budget-usd",
+			strconv.FormatFloat(opts.MaxBudgetUSD, 'f', -1, 64))
+	}
+	// The thread's own title, so a session started here is identifiable in
+	// `claude agents` rather than showing up as an anonymous print-mode run.
+	// truncateName trims for itself and comes back empty only for a title that
+	// was blank to begin with, which must not become `--name ""`.
+	if name := truncateName(opts.Title); name != "" {
+		args = append(args, "--name", name)
+	}
 	// A fresh thread is pinned to a session id we choose, so it can be resumed
 	// later; a resumed thread replays that same Claude Code session.
 	if opts.SessionID != "" {
@@ -218,6 +300,73 @@ func buildStartArgs(opts StartOptions) []string {
 			"--permission-prompt-tool", "mcp__cooperation__request_permission")
 	}
 	return args
+}
+
+// writePersonaFile stages a thread's persona text in an owner-only temp file
+// for --append-system-prompt-file, and returns its path.
+//
+// Why a file at all: argv is public. /proc/<pid>/cmdline is world-readable on
+// Linux, so `ps` shows every local user the whole persona for the life of the
+// process — and a persona is exactly where a human puts private standing
+// instructions and context (audit F23). The file is 0600 in the private temp
+// dir and is unlinked when the thread is reaped.
+//
+// FAIL CLOSED: any error is returned, and Start turns it into a failed launch.
+// The two silent alternatives are both worse — falling back to argv would make
+// the private path an illusion that disappears under load, and launching
+// without the persona would hand the human a different agent than the one they
+// configured, with nothing on screen to say so.
+//
+// os.CreateTemp is what creates the file, so the mode is 0600 from the first
+// byte (never 0644-then-chmod, which would be a window, however short). The
+// explicit Chmod is belt-and-braces for a future CreateTemp with a different
+// default; it costs one syscall per launch.
+func writePersonaFile(threadID, prompt string) (string, error) {
+	f, err := os.CreateTemp("", "agentkate-persona-"+threadID+"-*.txt")
+	if err != nil {
+		return "", fmt.Errorf("persona file: %w", err)
+	}
+	path := f.Name()
+	fail := func(err error) (string, error) {
+		f.Close()
+		os.Remove(path)
+		return "", fmt.Errorf("persona file: %w", err)
+	}
+	if err := f.Chmod(0o600); err != nil {
+		return fail(err)
+	}
+	if _, err := f.WriteString(prompt); err != nil {
+		return fail(err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(path)
+		return "", fmt.Errorf("persona file: %w", err)
+	}
+	return path, nil
+}
+
+// maxNameBytes bounds --name. Titles are summarised prompts, which can run
+// long; the CLI has no documented limit, so this keeps the label readable in
+// `claude agents` and the argv element small.
+const maxNameBytes = 120
+
+// truncateName trims a title and clips it to maxNameBytes on a rune boundary.
+//
+// The result is empty ONLY when the title was blank (empty or all whitespace),
+// which callers must treat as "no name" rather than a name of "". The clip
+// path cannot produce it: the leading TrimSpace guarantees a non-space first
+// rune, so neither the UTF-8 back-off (which never eats a valid leading rune)
+// nor the trailing trim can consume the whole clip.
+func truncateName(title string) string {
+	title = strings.TrimSpace(title)
+	if len(title) <= maxNameBytes {
+		return title
+	}
+	clipped := title[:maxNameBytes]
+	for len(clipped) > 0 && !utf8.ValidString(clipped) {
+		clipped = clipped[:len(clipped)-1]
+	}
+	return strings.TrimSpace(clipped)
 }
 
 // buildUserContent assembles a stream-json user message content array from the
@@ -260,6 +409,7 @@ type Thread struct {
 	cmd         *exec.Cmd
 	stdin       io.WriteCloser
 	mcpConfig   string      // temp --mcp-config file to clean up on exit
+	personaFile string      // temp 0600 --append-system-prompt-file to clean up on exit
 	meter       *toolMeter  // measures tool_result sizes for token-cost telemetry
 	usage       *usageMeter // measures per-turn LLM token usage and billed cost
 	alive       bool
@@ -267,6 +417,10 @@ type Thread struct {
 	interrupted bool // set by Interrupt so reap() reports a user-interrupt if the process dies
 	aborting    bool // set by Interrupt while an in-band abort is pending; cleared on the aborted turn's result
 	stopping    bool // a Stop is in flight; suppresses turn_aborted and rejects new Sends
+	// stdoutDrained / stderrDrained are closed when the respective output pump
+	// returns. reap() waits on them before cmd.Wait, which closes the pipes.
+	stdoutDrained chan struct{}
+	stderrDrained chan struct{}
 	// turnsInFlight counts user messages written whose `result` event has not
 	// arrived yet — the claude counterpart of the kimi supervisor's
 	// activePrompts. Every turn is initiated by our own Send (opening prompt,
@@ -280,10 +434,70 @@ type Thread struct {
 	// the CLI's actual verdict (e.g. "not a recognized model id") instead of
 	// fire-and-forgetting. Interrupt deliberately does not wait (its backstop
 	// covers the no-ack case).
-	controls   map[string]chan controlOutcome
-	hotCompact *hotCompact // when non-nil, the next assistant turn is captured for a summary
+	controls map[string]chan controlOutcome
+	// ctxProbePending guards the post-turn get_context_usage probe: one in
+	// flight at a time, so a burst of quick turns cannot stack up probes (each
+	// of which holds a controls entry and a goroutine for up to controlTimeout).
+	ctxProbePending bool
+	hotCompact      *hotCompact // when non-nil, the next assistant turn is captured for a summary
 
 	co *coalescer // batches this thread's events before they reach the emit callback
+
+	// wmu serializes writes to the child's stdin and is NEVER held together
+	// with mu. Writing under mu was the wedge in audit F9: a message larger
+	// than the 64 KiB pipe buffer (any base64 image attachment) blocks until
+	// the CLI drains it, and a `claude` that stops reading stdin therefore
+	// parked mu forever — Interrupt, Stop/closeStdin, abortPending and
+	// pumpStdout all serialize behind it, leaving the thread unkillable from
+	// the UI. State is decided under mu; the write happens after mu is
+	// released. This mirrors the kimi backend's dedicated write mutex.
+	wmu sync.Mutex
+	// writeBroken latches once a stdin write fails or times out. The frame that
+	// failed may have been written in part, so the stream's framing is no longer
+	// trustworthy: every later write fails fast instead of appending a fragment
+	// to a torn line. Guarded by wmu.
+	writeBroken bool
+}
+
+// stdinWriteTimeout bounds a single frame write to the child's stdin. The pipe
+// is pollable, so a deadline turns "wedged CLI" from an unbounded park into a
+// bounded, reportable failure. Generous enough that a large attachment on a
+// healthy-but-busy CLI never trips it.
+const stdinWriteTimeout = 30 * time.Second
+
+// deadlineWriter is the subset of *os.File a pipe from exec.Cmd.StdinPipe
+// satisfies. Type-asserted rather than required: if a future writer cannot take
+// a deadline we still write (correctness first), we just lose the bound.
+type deadlineWriter interface {
+	SetWriteDeadline(time.Time) error
+}
+
+// errStdinBroken is returned once the stdin stream's framing can no longer be
+// trusted (see Thread.writeBroken).
+var errStdinBroken = errors.New("agent stdin is no longer writable (a previous frame failed mid-write)")
+
+// writeFrame writes one newline-terminated frame to the child's stdin under
+// wmu, with mu NOT held. t.stdin is assigned once at construction and never
+// reassigned, so reading it here without mu is safe.
+func (t *Thread) writeFrame(frame []byte) error {
+	t.wmu.Lock()
+	defer t.wmu.Unlock()
+	if t.writeBroken {
+		return errStdinBroken
+	}
+	if dw, ok := t.stdin.(deadlineWriter); ok {
+		if err := dw.SetWriteDeadline(time.Now().Add(stdinWriteTimeout)); err == nil {
+			defer func() { _ = dw.SetWriteDeadline(time.Time{}) }()
+		}
+	}
+	if _, err := t.stdin.Write(frame); err != nil {
+		// Includes the deadline case (os.ErrDeadlineExceeded): a partial frame
+		// is on the wire, so refuse every later write rather than corrupt the
+		// CLI's parser with a fragment.
+		t.writeBroken = true
+		return err
+	}
+	return nil
 }
 
 // coalescer buffers a thread's events and flushes them to the supervisor's
@@ -375,9 +589,12 @@ func (c *coalescer) takeLocked() []json.RawMessage {
 }
 
 // controlOutcome is the CLI's answer to one control_request: an empty err
-// means the subtype succeeded.
+// means the subtype succeeded. payload carries the whole `response` object, so
+// the read-only subtypes (get_context_usage, list_models) can be answered with
+// data rather than only a verdict.
 type controlOutcome struct {
-	err string
+	err     string
+	payload json.RawMessage
 }
 
 // hotCompact tracks an in-flight Hot-Opus compaction: assistant text is
@@ -418,7 +635,35 @@ func NewThreadID() string {
 // tools stay gated. Every tool call is still surfaced to the UI. M2 will move
 // each thread into its own git worktree and add per-tool approval.
 func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
-	cmd := exec.Command(s.claudeBin, buildStartArgs(opts)...)
+	// Probe the binary's option vocabulary before shaping the argv: cached after
+	// the first launch, and the only thing it can change is whether the two
+	// optional streaming flags are appended.
+	flags := s.supportedFlags()
+	// Set once the Thread is registered and owns its temp files; until then the
+	// deferred cleanups below unlink them on every error return.
+	spawned := false
+	// Persona text goes to a private file rather than into argv when the CLI
+	// can read it from one (audit F23). writePersonaFile fails closed: if it
+	// cannot create an owner-only file it returns an error and the launch
+	// fails, rather than quietly falling back to the world-readable argv form
+	// or quietly dropping the persona. A CLI without the flag is a different
+	// case — nothing failed, the capability simply is not there — and keeps the
+	// inline form (see buildStartArgs).
+	if strings.TrimSpace(opts.SystemPrompt) != "" && flags.supports(flagAppendSystemPromptFile) {
+		path, err := writePersonaFile(opts.ID, opts.SystemPrompt)
+		if err != nil {
+			return nil, err
+		}
+		opts.systemPromptFile = path
+		// Every failure path below returns before the Thread exists to own the
+		// file; on success reap() unlinks it, like the --mcp-config file.
+		defer func() {
+			if !spawned {
+				_ = os.Remove(opts.systemPromptFile)
+			}
+		}()
+	}
+	cmd := exec.Command(s.claudeBin, buildStartArgs(flags, opts)...)
 	cmd.Dir = opts.WorkDir
 	// Route this child at a third-party Anthropic-compatible endpoint when a
 	// provider is selected; buildEnv scrubs any inherited Anthropic credentials
@@ -439,27 +684,52 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 	if err != nil {
 		return nil, fmt.Errorf("stdin pipe: %w", err)
 	}
-	stdout, err := cmd.StdoutPipe()
+	// Deliberately os.Pipe + cmd.Stdout, NOT cmd.StdoutPipe (audit F24):
+	// cmd.Wait closes the pipes it created as part of reaping, so a Wait that
+	// wins the race against the pump discards whatever is still in the pipe —
+	// and that tail is the turn's final `result` event. A pipe we own is closed
+	// by us, at real EOF. The child's copies of the write ends are closed right
+	// after Start, so EOF still arrives the moment the process (and anything it
+	// leaked the fds to) is gone.
+	stdout, stdoutW, err := os.Pipe()
 	if err != nil {
 		return nil, fmt.Errorf("stdout pipe: %w", err)
 	}
-	stderr, err := cmd.StderrPipe()
+	stderr, stderrW, err := os.Pipe()
 	if err != nil {
+		stdout.Close()
+		stdoutW.Close()
 		return nil, fmt.Errorf("stderr pipe: %w", err)
 	}
+	cmd.Stdout = stdoutW
+	cmd.Stderr = stderrW
+	// pumping is set once the reader goroutines own the read ends and will
+	// close them at EOF. Until then every failure exit must close them here, or
+	// each failed spawn leaks two descriptors.
+	pumping := false
+	defer func() {
+		// The parent has no use for the write ends once the child holds them.
+		stdoutW.Close()
+		stderrW.Close()
+		if !pumping {
+			stdout.Close()
+			stderr.Close()
+		}
+	}()
 
 	id := opts.ID
 	if id == "" {
 		id = NewThreadID()
 	}
 	t := &Thread{
-		ID:        id,
-		WorkDir:   opts.WorkDir,
-		cmd:       cmd,
-		stdin:     stdin,
-		mcpConfig: opts.MCPConfig,
-		meter:     newToolMeter(s.log, id),
-		usage:     newUsageMeter(s.log, id),
+		ID:          id,
+		WorkDir:     opts.WorkDir,
+		cmd:         cmd,
+		stdin:       stdin,
+		mcpConfig:   opts.MCPConfig,
+		personaFile: opts.systemPromptFile,
+		meter:       newToolMeter(s.log, id),
+		usage:       newUsageMeter(s.log, id),
 	}
 	t.co = newCoalescer(t.ID, s.emit)
 
@@ -484,6 +754,8 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 	}
 	s.threads[t.ID] = t
 	s.mu.Unlock()
+	// From here the Thread owns the persona file; reap() unlinks it.
+	spawned = true
 
 	// The "started" lifecycle event is emitted by the orchestration layer
 	// once the thread id is known to the UI; here we only log.
@@ -493,8 +765,22 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 	}
 	s.log.Info("agent process spawned", "thread", t.ID, "dir", opts.WorkDir, "pid", cmd.Process.Pid, "provider", provider)
 
-	safe.Go("agent.pumpStdout", func() { s.pumpStdout(t, stdout) })
-	safe.Go("agent.pumpStderr", func() { s.pumpStderr(t, stderr) })
+	// reap() waits on these before cmd.Wait(): os/exec closes the pipes as part
+	// of Wait, so calling it while a pump is still reading can discard the tail
+	// of the stream — and the tail is the turn's `result` event (audit F24).
+	t.stdoutDrained = make(chan struct{})
+	t.stderrDrained = make(chan struct{})
+	pumping = true
+	safe.Go("agent.pumpStdout", func() {
+		defer close(t.stdoutDrained)
+		defer stdout.Close()
+		s.pumpStdout(t, stdout)
+	})
+	safe.Go("agent.pumpStderr", func() {
+		defer close(t.stderrDrained)
+		defer stderr.Close()
+		s.pumpStderr(t, stderr)
+	})
 	s.reapWG.Add(1)
 	safe.Go("agent.reap", func() { s.reap(t) })
 
@@ -525,18 +811,31 @@ func (s *Supervisor) Send(threadID, text string, attachments []Attachment) error
 	if err != nil {
 		return err
 	}
+	// Decide under mu, write outside it (audit F9): buildUserContent routinely
+	// produces messages far larger than the pipe buffer, and blocking on that
+	// write while holding mu is what made a wedged CLI unkillable.
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	if !t.alive {
+		t.mu.Unlock()
 		return fmt.Errorf("thread %q is not running", threadID)
 	}
 	if t.stopping {
+		t.mu.Unlock()
 		return fmt.Errorf("thread %q is stopping", threadID)
 	}
-	if _, err := t.stdin.Write(append(msg, '\n')); err != nil {
+	// Count the turn BEFORE the write: the CLI can emit its result the instant
+	// the frame lands, and pumpStdout's decrement must never run first.
+	t.turnsInFlight++
+	t.mu.Unlock()
+
+	if err := t.writeFrame(append(msg, '\n')); err != nil {
+		t.mu.Lock()
+		if t.turnsInFlight > 0 {
+			t.turnsInFlight-- // the turn never started
+		}
+		t.mu.Unlock()
 		return fmt.Errorf("write to agent: %w", err)
 	}
-	t.turnsInFlight++
 	return nil
 }
 
@@ -672,14 +971,22 @@ func (s *Supervisor) Interrupt(threadID string) error {
 	t.aborting = true
 	pgid := t.pgid
 	proc := t.cmd.Process
+	t.mu.Unlock()
 	// In-band abort. stdin stays OPEN so the process stays resident for the next
 	// message.
-	_, werr := t.stdin.Write(append(frame, '\n'))
-	t.mu.Unlock()
-	if werr != nil {
-		s.log.Warn("interrupt frame write failed; relying on signal backstop",
-			"thread", threadID, "err", werr)
-	}
+	//
+	// The write is ASYNCHRONOUS and holds no thread lock (audit F9). Interrupt
+	// is the UI's escape hatch, so it must return promptly even when the child
+	// has stopped draining stdin: in that state the pipe is full and this write
+	// would block behind whatever large Send filled it. The signal backstop
+	// below is exactly the recovery for "the frame never landed", so an
+	// in-flight write is allowed to lose the race with it.
+	safe.Go("agent.interruptFrame", func() {
+		if werr := t.writeFrame(append(frame, '\n')); werr != nil {
+			s.log.Warn("interrupt frame write failed; relying on signal backstop",
+				"thread", threadID, "err", werr)
+		}
+	})
 
 	// Signal backstop: escalate only if the in-band abort never produced a
 	// result (a hung tool the CLI can't cancel). If the abort landed cleanly,
@@ -736,18 +1043,43 @@ func (s *Supervisor) SetPermissionMode(threadID, mode string) error {
 type ClaudeModel struct {
 	Value string
 	Name  string
+	// Efforts are the reasoning-effort tiers this model supports, as reported
+	// by the list_models control request. Empty means the CLI said nothing —
+	// which callers must read as "every tier", never as "none".
+	Efforts []string
 }
 
-// DiscoverModels runs `claude -p /model` — a local slash command that prints
-// the live model vocabulary without starting a turn (no tokens billed) and
-// works under OAuth (no API key needed). It returns the parsed alias list, or
-// an empty slice on any failure so callers leave a prior cache intact.
+// DiscoverModels enumerates the CLI's live model vocabulary, cheapest source
+// first:
+//
+//  1. the list_models control request on a thread the human already has open —
+//     free, and it carries per-model effort support;
+//  2. the same control request against a throwaway stream-json session (no turn
+//     is started, so nothing is billed);
+//  3. the legacy `claude -p /model` prose parse, for a CLI too old to know the
+//     subtype.
+//
+// Best-effort throughout: every failure falls through, and an exhausted chain
+// returns an empty slice rather than an error, so callers leave a prior cache
+// intact instead of blanking the picker.
 func (s *Supervisor) DiscoverModels(ctx context.Context) ([]ClaudeModel, error) {
+	if id := s.anyRunningThread(); id != "" {
+		if models, err := s.listModels(id); err == nil && len(models) > 0 {
+			return models, nil
+		} else if err != nil {
+			s.log.Debug("list_models on a live thread failed; probing", "thread", id, "err", err)
+		}
+	}
+	if models, err := s.listModelsProbe(ctx); err == nil && len(models) > 0 {
+		return models, nil
+	} else if err != nil {
+		s.log.Debug("list_models probe failed; falling back to /model prose", "err", err)
+	}
 	cmd := exec.CommandContext(ctx, s.claudeBin, "-p", "/model")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		// Best-effort: an unauthenticated or missing CLI yields nothing to
-		// cache, not a hard error that would blank the picker.
+		// An unauthenticated or missing CLI yields nothing to cache, not a hard
+		// error that would blank the picker.
 		return nil, nil
 	}
 	return parseClaudeModelList(string(out)), nil
@@ -831,13 +1163,36 @@ func prettyModelAlias(v string) string {
 // timeout means the process is wedged or dying.
 const controlTimeout = 10 * time.Second
 
+// reloadSkillsTimeout is deliberately shorter: reload_skills is broadcast to
+// every running thread at once when a skill is installed, so a wedged CLI's
+// share of the wait is paid by an interactive RPC rather than by a background
+// probe. Re-reading a skill directory is local work — a CLI that has not
+// answered in this long is not going to.
+const reloadSkillsTimeout = 3 * time.Second
+
+// controlTimeoutFor reports how long one control subtype may wait.
+func controlTimeoutFor(subtype string) time.Duration {
+	if subtype == "reload_skills" {
+		return reloadSkillsTimeout
+	}
+	return controlTimeout
+}
+
 // sendControl writes one control_request and waits (bounded) for its
 // control_response, returning the CLI's error verbatim if it rejected the
 // request.
 func (s *Supervisor) sendControl(threadID, subtype string, fields map[string]any) error {
+	_, err := s.sendControlResult(threadID, subtype, fields)
+	return err
+}
+
+// sendControlResult is sendControl with the answer kept: it returns the whole
+// `response` object of the matching control_response, which the read-only
+// subtypes (get_context_usage, list_models) carry their data in.
+func (s *Supervisor) sendControlResult(threadID, subtype string, fields map[string]any) (json.RawMessage, error) {
 	t := s.thread(threadID)
 	if t == nil {
-		return fmt.Errorf("unknown thread %q", threadID)
+		return nil, fmt.Errorf("unknown thread %q", threadID)
 	}
 	req := map[string]any{"subtype": subtype}
 	for k, v := range fields {
@@ -850,41 +1205,44 @@ func (s *Supervisor) sendControl(threadID, subtype string, fields map[string]any
 		"request":    req,
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	ch := make(chan controlOutcome, 1)
 	t.mu.Lock()
 	if !t.alive {
 		t.mu.Unlock()
-		return fmt.Errorf("thread %q is not running", threadID)
+		return nil, fmt.Errorf("thread %q is not running", threadID)
 	}
 	if t.stopping {
 		t.mu.Unlock()
-		return fmt.Errorf("thread %q is stopping", threadID)
+		return nil, fmt.Errorf("thread %q is stopping", threadID)
 	}
 	if t.controls == nil {
 		t.controls = make(map[string]chan controlOutcome)
 	}
 	t.controls[reqID] = ch
-	_, werr := t.stdin.Write(append(frame, '\n'))
-	if werr != nil {
+	t.mu.Unlock()
+	// Register first, write with mu released (audit F9). Registering before the
+	// write also removes the race where the response arrives before the waiter
+	// exists.
+	if werr := t.writeFrame(append(frame, '\n')); werr != nil {
+		t.mu.Lock()
 		delete(t.controls, reqID)
 		t.mu.Unlock()
-		return fmt.Errorf("write to agent: %w", werr)
+		return nil, fmt.Errorf("write to agent: %w", werr)
 	}
-	t.mu.Unlock()
 
 	select {
 	case out := <-ch:
 		if out.err != "" {
-			return fmt.Errorf("%s", out.err)
+			return nil, fmt.Errorf("%s", out.err)
 		}
-		return nil
-	case <-time.After(controlTimeout):
+		return out.payload, nil
+	case <-time.After(controlTimeoutFor(subtype)):
 		t.mu.Lock()
 		delete(t.controls, reqID)
 		t.mu.Unlock()
-		return fmt.Errorf("%s: no response from the agent", subtype)
+		return nil, fmt.Errorf("%s: no response from the agent", subtype)
 	}
 }
 
@@ -937,16 +1295,25 @@ func (s *Supervisor) pumpStdout(t *Thread, r io.Reader) {
 		// If a Hot-Opus compaction is in flight, accumulate the assistant
 		// text from this event and complete the channel on the next result.
 		observeHotCompact(t, raw)
+		boundary, dedup, subagent, typ := classifyEvent(raw)
 		// Telemetry: where context tokens go (tool outputs) and what we are
 		// billed for (per-turn usage). Both observe; neither alters the stream.
-		t.meter.Observe(raw)
-		t.usage.Observe(raw)
-		boundary, dedup, typ := classifyEvent(raw)
+		// Subagent-forwarded events (--forward-subagent-text, tagged with
+		// parent_tool_use_id) are excluded: their tokens are the subagent's own
+		// and are already billed inside the parent's Task tool_result, so
+		// metering them here double-counts, and their tool_use/tool_result ids
+		// belong to a stream this meter never sees both halves of. They still
+		// reach the UI, which renders them as the subagent's transcript.
+		if !subagent {
+			t.meter.Observe(raw)
+			t.usage.Observe(raw)
+		}
 		t.co.add(json.RawMessage(raw), boundary, dedup)
 		// A `result` ends a turn: decrement the in-flight count and complete a
 		// pending in-band interrupt. Done AFTER the result event itself is
-		// buffered so the turn_aborted lifecycle event orders behind it.
-		if typ == "result" {
+		// buffered so the turn_aborted lifecycle event orders behind it. A
+		// subagent's own result never ends the parent's turn.
+		if typ == "result" && !subagent {
 			s.observeTurnEnd(t)
 		}
 		// A control_response answers a SetModel / SetPermissionMode waiter.
@@ -960,10 +1327,15 @@ func (s *Supervisor) pumpStdout(t *Thread, r io.Reader) {
 }
 
 // classifyEvent inspects one stream-json event to decide whether it should
-// force an immediate coalescer flush (a semantic boundary) and whether it is
-// a candidate for byte-identical dedup within a batch, and reports the
-// event's type so the caller can track turn ends and control responses
-// without re-parsing.
+// force an immediate coalescer flush (a semantic boundary), whether it is a
+// candidate for byte-identical dedup within a batch, and whether it was
+// forwarded from a subagent, and reports the event's type so the caller can
+// track turn ends and control responses without re-parsing.
+//
+// subagent is true when the event carries a parent_tool_use_id — the tag
+// --forward-subagent-text puts on everything a child session emits. Such
+// events are display-only for us: they are not the parent thread's usage, not
+// its tool calls, and not its turn boundaries.
 //
 // Boundaries are kept conservative: a `result` (turn end) and any assistant
 // turn carrying a tool_use block (the UI renders a tool card and may gate on
@@ -971,30 +1343,38 @@ func (s *Supervisor) pumpStdout(t *Thread, r io.Reader) {
 // Plain assistant text events are dedup candidates because `claude --verbose`
 // can repeat an identical partial snapshot; only exact duplicates are dropped,
 // so no content is ever lost.
-func classifyEvent(raw json.RawMessage) (boundary, dedup bool, typ string) {
+func classifyEvent(raw json.RawMessage) (boundary, dedup, subagent bool, typ string) {
 	var head struct {
-		Type    string `json:"type"`
-		Message struct {
+		Type            string `json:"type"`
+		ParentToolUseID string `json:"parent_tool_use_id"`
+		Message         struct {
 			Content []struct {
 				Type string `json:"type"`
 			} `json:"content"`
 		} `json:"message"`
 	}
 	if json.Unmarshal(raw, &head) != nil {
-		return false, false, ""
+		return false, false, false, ""
 	}
+	subagent = head.ParentToolUseID != ""
 	switch head.Type {
 	case "result":
-		return true, false, head.Type
+		return true, false, subagent, head.Type
 	case "assistant":
 		for _, blk := range head.Message.Content {
 			if blk.Type == "tool_use" {
-				return true, false, head.Type
+				return true, false, subagent, head.Type
 			}
 		}
-		return false, true, head.Type
+		return false, true, subagent, head.Type
 	}
-	return false, false, head.Type
+	// Everything else — notably `stream_event`, the token-by-token deltas from
+	// --include-partial-messages — is neither a boundary nor a dedup
+	// candidate. Deltas in particular must never be deduped: two
+	// byte-identical " the" deltas in one batch are both real text, and they
+	// are exactly what the coalescer exists to batch, with the authoritative
+	// `assistant` event that follows carrying the semantics the UI gates on.
+	return false, false, subagent, head.Type
 }
 
 // observeControlResponse completes the waiter for one control_response. The
@@ -1002,25 +1382,29 @@ func classifyEvent(raw json.RawMessage) (boundary, dedup bool, typ string) {
 // for (e.g. an interrupt ack) are ignored.
 func observeControlResponse(t *Thread, raw json.RawMessage) {
 	var head struct {
-		Response struct {
-			RequestID string `json:"request_id"`
-			Subtype   string `json:"subtype"`
-			Error     string `json:"error"`
-		} `json:"response"`
+		Response json.RawMessage `json:"response"`
 	}
-	if json.Unmarshal(raw, &head) != nil || head.Response.RequestID == "" {
+	if json.Unmarshal(raw, &head) != nil || len(head.Response) == 0 {
+		return
+	}
+	var meta struct {
+		RequestID string `json:"request_id"`
+		Subtype   string `json:"subtype"`
+		Error     string `json:"error"`
+	}
+	if json.Unmarshal(head.Response, &meta) != nil || meta.RequestID == "" {
 		return
 	}
 	t.mu.Lock()
-	ch := t.controls[head.Response.RequestID]
-	delete(t.controls, head.Response.RequestID)
+	ch := t.controls[meta.RequestID]
+	delete(t.controls, meta.RequestID)
 	t.mu.Unlock()
 	if ch == nil {
 		return
 	}
-	out := controlOutcome{}
-	if head.Response.Subtype == "error" {
-		out.err = head.Response.Error
+	out := controlOutcome{payload: head.Response}
+	if meta.Subtype == "error" {
+		out.err = meta.Error
 		if out.err == "" {
 			out.err = "control request rejected"
 		}
@@ -1039,8 +1423,16 @@ func observeHotCompact(t *Thread, raw json.RawMessage) {
 		return
 	}
 	var head struct {
-		Type    string `json:"type"`
-		Message struct {
+		Type string `json:"type"`
+		// The --forward-subagent-text tag. A helper session's events are
+		// interleaved with the parent's on this one stdout, so without this
+		// filter a Task the compaction prompt happened to spawn would write
+		// ITS prose into the summary and, worse, END the capture on its own
+		// `result` — completing the compaction with a truncated, foreign
+		// summary. Same exclusion classifyEvent, the turn-end accounting and
+		// the meters apply, for the same reason.
+		ParentToolUseID string `json:"parent_tool_use_id"`
+		Message         struct {
 			Content []struct {
 				Type string `json:"type"`
 				Text string `json:"text"`
@@ -1048,6 +1440,9 @@ func observeHotCompact(t *Thread, raw json.RawMessage) {
 		} `json:"message"`
 	}
 	if json.Unmarshal(raw, &head) != nil {
+		return
+	}
+	if head.ParentToolUseID != "" {
 		return
 	}
 	switch head.Type {
@@ -1079,6 +1474,12 @@ func (s *Supervisor) observeTurnEnd(t *Thread) {
 	t.aborting = false
 	stopping := t.stopping
 	t.mu.Unlock()
+	// The turn is over and the CLI is idle: ask it what the context actually
+	// holds now, and ship the answer as a `_context` event. This is the only
+	// moment the figure is both stable and interesting.
+	if !stopping {
+		s.reportContextUsage(t)
+	}
 	if !aborted {
 		return
 	}
@@ -1152,9 +1553,34 @@ func (s *Supervisor) pumpStderr(t *Thread, r io.Reader) {
 	}
 }
 
+// drainGrace bounds how long reap waits for the output pumps once the process
+// is gone. EOF normally arrives immediately; a pump can only outlive the
+// process if a grandchild the CLI leaked still holds the pipe, and waiting on
+// that forever would leak the reaper — and with it the thread's "exited" event.
+const drainGrace = 5 * time.Second
+
 func (s *Supervisor) reap(t *Thread) {
 	defer s.reapWG.Done()
 	err := t.cmd.Wait()
+	// The pipes are ours (os.Pipe, not cmd.StdoutPipe), so Wait did NOT close
+	// them under the pumps — that close is what could discard the tail of the
+	// stream, i.e. the turn's final `result` event (audit F24). Give the pumps
+	// their moment to reach real EOF so their last events are emitted BEFORE
+	// the "exited" lifecycle event, not after it.
+	// One absolute deadline shared by both waits (a single Timer would be
+	// consumed by the first and could never fire for the second).
+	end := time.Now().Add(drainGrace)
+	for _, drained := range []chan struct{}{t.stdoutDrained, t.stderrDrained} {
+		if drained == nil {
+			continue
+		}
+		select {
+		case <-drained:
+		case <-time.After(time.Until(end)):
+			s.log.Warn("output pump still running at reap; proceeding without its tail",
+				"thread", t.ID)
+		}
+	}
 
 	t.mu.Lock()
 	t.alive = false
@@ -1170,6 +1596,9 @@ func (s *Supervisor) reap(t *Thread) {
 	}
 	if t.mcpConfig != "" {
 		_ = os.Remove(t.mcpConfig)
+	}
+	if t.personaFile != "" {
+		_ = os.Remove(t.personaFile)
 	}
 	t.mu.Unlock()
 

@@ -92,3 +92,50 @@ func TestHotCompactFinishIsIdempotent(t *testing.T) {
 type errSentinel struct{}
 
 func (errSentinel) Error() string { return "sentinel" }
+
+// TestObserveHotCompactIgnoresSubagentEvents: with --forward-subagent-text a
+// helper session's events are interleaved with the parent's on the same
+// stdout, tagged with parent_tool_use_id. If the compaction observer took
+// them, a Task spawned during the compaction turn would write its prose into
+// the summary AND end the capture on its own `result` — completing the
+// compaction with a truncated, foreign summary.
+func TestObserveHotCompactIgnoresSubagentEvents(t *testing.T) {
+	th, hc := newCompactTestThread()
+
+	observeHotCompact(th, mustMarshal(t, map[string]any{
+		"type": "assistant",
+		"message": map[string]any{
+			"content": []any{map[string]any{"type": "text", "text": "real summary"}},
+		},
+	}))
+	// A subagent's prose must not be appended...
+	observeHotCompact(th, mustMarshal(t, map[string]any{
+		"type":               "assistant",
+		"parent_tool_use_id": "toolu_child",
+		"message": map[string]any{
+			"content": []any{map[string]any{"type": "text", "text": " SUBAGENT NOISE"}},
+		},
+	}))
+	// ...and a subagent's result must not end the parent's capture.
+	observeHotCompact(th, mustMarshal(t, map[string]any{
+		"type":               "result",
+		"subtype":            "success",
+		"parent_tool_use_id": "toolu_child",
+	}))
+	select {
+	case <-hc.done:
+		t.Fatal("a subagent result must not complete the parent's compaction")
+	default:
+	}
+
+	// The parent's own result still does, with only the parent's text.
+	observeHotCompact(th, mustMarshal(t, json.RawMessage(`{"type":"result","subtype":"success"}`)))
+	select {
+	case <-hc.done:
+	default:
+		t.Fatal("the parent's result should complete the compaction")
+	}
+	if got := hc.text.String(); got != "real summary" {
+		t.Errorf("summary = %q, want %q", got, "real summary")
+	}
+}

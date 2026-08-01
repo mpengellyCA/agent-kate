@@ -79,6 +79,33 @@ for line in sys.stdin:
                 send({"type": "result", "subtype": "error_during_execution",
                       "is_error": True, "session_id": "sess-fake"})
                 held = False
+        elif sub == "get_context_usage":
+            # Nested envelope: the answer sits under response.response, with
+            # totalTokens/maxTokens/categories[{name,tokens}]. This is the
+            # shape claude 2.1.220 was captured sending (see control_test.go
+            # for the verbatim capture); the figures here are the double's.
+            send({"type": "control_response", "response": {
+                "request_id": rid, "subtype": "success",
+                "response": {"totalTokens": 41000, "maxTokens": 200000,
+                             "categories": [
+                                 {"name": "System prompt", "tokens": 3000},
+                                 {"name": "MCP tools", "tokens": 8000},
+                                 {"name": "Messages", "tokens": 30000}]}}})
+        elif sub == "list_models":
+            # Same nesting, with the captured entry vocabulary:
+            # value / displayName / supportsEffort / supportedEffortLevels.
+            send({"type": "control_response", "response": {
+                "request_id": rid, "subtype": "success",
+                "response": {"models": [
+                    {"value": "opus", "displayName": "Opus 5",
+                     "supportsEffort": True,
+                     "supportedEffortLevels": ["low", "medium", "high", "max"]},
+                    {"value": "haiku", "displayName": "Haiku 4.5",
+                     "supportsEffort": True,
+                     "supportedEffortLevels": ["low", "medium"]}]}}})
+        elif sub in ("set_max_thinking_tokens", "reload_skills"):
+            send({"type": "control_response", "response": {
+                "request_id": rid, "subtype": "success"}})
         elif sub in ("set_model", "set_permission_mode"):
             value = req.get("model") or req.get("mode") or ""
             if value == "bad":
