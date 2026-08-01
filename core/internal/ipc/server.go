@@ -336,6 +336,36 @@ func (s *Server) NotifyUI(method string, params any) {
 	}
 }
 
+// NotifyBridge sends a notification to the MCP bridge connections bound to one
+// agent thread — the reverse direction of the bridge's own Call, and the only
+// core→bridge push. It is how a live capability change (Cowork being switched
+// on mid-session) reaches the bridge so it can re-advertise its tool set; the
+// UI and other threads' bridges never see it.
+func (s *Server) NotifyBridge(threadID, method string, params any) {
+	if threadID == "" {
+		return
+	}
+	b, err := json.Marshal(params)
+	if err != nil {
+		s.log.Warn("notify-bridge marshal failed", "method", method, "err", err)
+		return
+	}
+	f := Frame{JSONRPC: "2.0", Method: method, Params: json.RawMessage(b)}
+
+	s.mu.RLock()
+	conns := make([]*conn, 0, 2)
+	for c := range s.conns {
+		if c.getRole() == "bridge" && c.getThreadID() == threadID {
+			conns = append(conns, c)
+		}
+	}
+	s.mu.RUnlock()
+
+	for _, c := range conns {
+		c.enqueue(&f)
+	}
+}
+
 // conn is one connected UI client. Frames are produced concurrently (per-agent
 // pumps, the fs-watcher loop, request handlers) but written by a single
 // dedicated goroutine draining out, so producers never block on socket I/O and

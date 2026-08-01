@@ -14,10 +14,10 @@ import (
 )
 
 // kimiHarness adapts the Kimi Code supervisor (`kimi acp` over ACP) to the
-// harness interface. Kimi has no session-fork, summary or promote primitive,
-// no provider routing and no Cowork — those stay honestly capability-gated
-// rather than emulated. Its effort analogue ("thinking") and approval modes
-// are discovered per session from the CLI's configOptions.
+// harness interface. Kimi has no session-fork, summary or promote primitive
+// and no provider routing — those stay honestly capability-gated rather than
+// emulated. Its effort analogue ("thinking") and approval modes are discovered
+// per session from the CLI's configOptions.
 type kimiHarness struct {
 	ksup       *kimi.Supervisor
 	exePath    string
@@ -42,7 +42,19 @@ func (h *kimiHarness) Capabilities() harness.Capabilities {
 		// One wire log per subagent under <session-dir>/agents/<id>/, probed
 		// on 0.30.0 — the viewer translates its event shapes.
 		SubagentTranscripts: true,
-		ModelPicker:         harness.ModelPickerDiscovered,
+		// Kimi forwards stdio MCP servers natively, so the Cowork desktop
+		// bridge works here exactly as it does for claude — every desktop
+		// action is still gated by the core's consent authority, which is
+		// backend-agnostic.
+		Cowork: true,
+		// ...but kimi 0.30 lists each server's tools once, at session/new, and
+		// ignores notifications/tools/list_changed (probed: the notification
+		// was sent, no re-list followed, and the revealed tool stayed invisible
+		// for the rest of the session). Switching Cowork on mid-session
+		// therefore re-attaches the thread — session/resume keeps the
+		// conversation and accepts a fresh mcpServers list (also probed).
+		LiveToolReveal: false,
+		ModelPicker:    harness.ModelPickerDiscovered,
 		// SystemPrompt / CustomSubagents stay false — see below for what was
 		// probed. PermissionModes/Efforts empty: the vocabularies come from
 		// the session handshake's configOptions ("mode", "thinking").
@@ -125,6 +137,7 @@ func (h *kimiHarness) Launch(spec harness.StartSpec) (harness.Launched, error) {
 		Env:         spec.Env,
 		MCPServers: []kimi.MCPServer{
 			coopMCPServer(h.exePath, h.socketPath, spec.ThreadID, spec.WorkDir),
+			coworkMCPServer(h.exePath, h.socketPath, spec.ThreadID, spec.WorkDir),
 		},
 	})
 	if err != nil {

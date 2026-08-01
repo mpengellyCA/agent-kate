@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"agentkate/internal/ipc"
 )
 
 // coworkMCPServerName is the opt-in desktop tool server (distinct from Cooperation).
@@ -19,6 +21,17 @@ func (b *mcpBridge) serverName() string {
 
 func (b *mcpBridge) advertisedTools() []map[string]any {
 	if b.cowork {
+		// The Cowork bridge is wired into EVERY thread, but its tools only
+		// exist for a thread that has opted in — so a disabled thread lists an
+		// empty catalogue and its agent sees no desktop tools at all. When the
+		// human (or an approved enable_cowork request) switches Cowork on, the
+		// core pushes cowork.enabledChanged and the bridge re-advertises via
+		// notifications/tools/list_changed — no relaunch. Refusing the CALL
+		// remains the real gate (requireCoworkBridge, core-side); this is what
+		// the model can see, not what it is allowed to do.
+		if !b.coworkEnabled() {
+			return []map[string]any{}
+		}
 		return coworkToolDefs()
 	}
 	defs := toolDefs()
@@ -36,6 +49,34 @@ func (b *mcpBridge) advertisedTools() []map[string]any {
 		return filtered
 	}
 	return defs
+}
+
+// coworkEnabled asks the core whether this bridge's thread has Cowork switched
+// on right now. Asked per tools/list rather than cached from launch: the answer
+// changes mid-session, and tools/list is rare (once per handshake, then once
+// per list_changed push).
+func (b *mcpBridge) coworkEnabled() bool {
+	var res struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := b.client.Call("cowork.threadState",
+		map[string]any{"threadId": b.thread}, &res); err != nil {
+		// Fail closed: an unreachable core means we cannot know, and listing
+		// desktop tools we would then refuse to run only misleads the model.
+		b.log.Warn("cowork bridge could not read its thread state", "err", err)
+		return false
+	}
+	return res.Enabled
+}
+
+// onCoreNotification handles the core's pushes to this bridge. The only one
+// today is cowork.enabledChanged, which the Cowork bridge turns into the MCP
+// tools/list_changed notification its client re-lists on.
+func (b *mcpBridge) onCoreNotification(method string, _ json.RawMessage) {
+	if method != "cowork.enabledChanged" || !b.cowork {
+		return
+	}
+	b.write(ipc.Frame{JSONRPC: "2.0", Method: "notifications/tools/list_changed"})
 }
 
 // coworkToolDefs is the Cowork tool catalogue (plan 07 §1.1): see (list windows,

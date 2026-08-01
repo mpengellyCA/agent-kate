@@ -699,17 +699,20 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     });
     rebuildModelCombo();
 
-    // Cowork desktop access. Wiring the agentkate-cowork MCP server into the agent is
-    // fixed at start (it is written into the MCP config when the claude process
-    // launches), so this is a start-time choice like the combos above. Deliberately
-    // NOT sticky: standing desktop access by default would be a footgun — the user
-    // opts in per agent. Making the tools available is harmless on its own; every
-    // action is still gated by the consent prompts and the Cowork panel toggles.
+    // Cowork desktop access. The agentkate-cowork MCP server is wired into every
+    // agent, but stays empty of tools until this is ticked — so unlike engine or
+    // isolation, it can be changed WHILE the agent runs, and the tools appear (or
+    // vanish) in place. Deliberately NOT sticky: standing desktop access by default
+    // would be a footgun — the user opts in per agent. Making the tools available is
+    // harmless on its own; every action is still gated by the consent prompts and the
+    // Cowork panel toggles.
     m_coworkCheck = new QCheckBox(QStringLiteral("See && control my desktop (Cowork)"), this);
     m_coworkCheck->setToolTip(QStringLiteral(
         "Give this agent the Cowork desktop tools (see windows, screenshot, read the\n"
-        "screen, click controls, type) from its very first message. Fixed once the\n"
-        "agent starts. Every action still needs your consent or a Cowork panel toggle."));
+        "screen, click controls, type). Can be turned on or off while the agent runs.\n"
+        "Turning it on also asks the desktop for screen and input permission right\n"
+        "away. Every action still needs your consent or a Cowork panel toggle."));
+    connect(m_coworkCheck, &QCheckBox::toggled, this, &AgentPanel::onCoworkToggled);
 
     // Compaction strategy. Keeping a thread resumable cheaply needs a
     // condensed summary on disk — otherwise the next resume re-caches the
@@ -1720,6 +1723,9 @@ void AgentPanel::setDormant(const QString &threadId, const QString &title, bool 
     m_isolated = isolated;
     m_backend = backend;
     loadTranscript();
+    // Desktop access is persisted per thread, so a restored agent must show its
+    // real state rather than the panel's blank default.
+    syncCoworkFromCore();
     // Pull the thread's persisted compaction strategy and reflect it in the
     // dropdown — overrides whatever sticky default the panel was showing.
     // Skipped for harnesses without compaction support: nothing to pull.
@@ -1796,6 +1802,10 @@ void AgentPanel::bindStartedThread(const QString &threadId, bool isolated,
     m_sessionCostUsd = 0.0;
     m_sessionInTokens = 0;
     m_sessionOutTokens = 0;
+    // A fork inherits its source's desktop access (the record is copied), and an
+    // ensemble worker may have been launched with it — read the truth rather than
+    // leaving the checkbox saying otherwise.
+    syncCoworkFromCore();
 }
 
 void AgentPanel::loadTranscript()
@@ -2121,8 +2131,10 @@ void AgentPanel::refresh()
             actions.first()->setEnabled(running); // "Hot Opus (live thread)"
         }
     }
-    // Engine, isolation and desktop access are baked into the agent's launch —
-    // frozen once a thread exists. Model and "when to ask" stay adjustable
+    // Engine and isolation are baked into the agent's launch — frozen once a
+    // thread exists. Desktop access is NOT: its MCP bridge is always wired in and
+    // simply reveals or hides its tools, so it is switchable mid-session on any
+    // harness that supports Cowork. Model and "when to ask" stay adjustable
     // WHILE THE AGENT RUNS (the core forwards mid-session changes through the
     // harness); thinking effort is live only where the harness says so.
     m_compactCombo->setEnabled(traits.compaction);
@@ -2133,7 +2145,7 @@ void AgentPanel::refresh()
     m_effortCombo->setEnabled(traits.effortLive ? (m_threadId.isEmpty() || running)
                                                 : m_threadId.isEmpty());
     m_modelCombo->setEnabled(m_threadId.isEmpty() || running);
-    m_coworkCheck->setEnabled(m_threadId.isEmpty() && traits.cowork);
+    m_coworkCheck->setEnabled(traits.cowork);
 
     // Offer promotion while a thread runs non-isolated in the workspace — but
     // only on a harness that supports it (the core rejects agent.promote
@@ -3548,6 +3560,13 @@ void AgentPanel::onNotification(const QString &method, const QJsonObject &params
         }
     } else if (method == QLatin1String("permission.requested")) {
         onPermissionRequested(params);
+    } else if (method == QLatin1String("cowork.enabledChanged")) {
+        // Switched somewhere else (the Cowork panel, or an agent's approved
+        // request) — keep this panel's checkbox honest.
+        if (!m_threadId.isEmpty()
+            && params.value(QStringLiteral("threadId")).toString() == m_threadId) {
+            setCoworkChecked(params.value(QStringLiteral("enabled")).toBool());
+        }
     } else if (method == QLatin1String("agent.reviewRequested")) {
         if (!m_threadId.isEmpty()
             && params.value(QStringLiteral("threadId")).toString() == m_threadId) {
@@ -3557,6 +3576,82 @@ void AgentPanel::onNotification(const QString &method, const QJsonObject &params
             emit statusMessage(QStringLiteral("Agent %1 requested a review").arg(m_threadId));
         }
     }
+}
+
+void AgentPanel::setCoworkChecked(bool on)
+{
+    if (m_coworkCheck->isChecked() == on) {
+        return;
+    }
+    // Mirroring core state must not look like the user flicking the switch.
+    m_syncingCowork = true;
+    m_coworkCheck->setChecked(on);
+    m_syncingCowork = false;
+}
+
+void AgentPanel::syncCoworkFromCore()
+{
+    if (m_threadId.isEmpty()) {
+        return;
+    }
+    QPointer<AgentPanel> self(this);
+    const QString tid = m_threadId;
+    m_core->call(QStringLiteral("cowork.threadState"), {{QStringLiteral("threadId"), tid}},
+                 [this, self, tid](const QJsonObject &res, const QJsonObject &err) {
+        // The panel may have been rebound to another thread while this was in flight.
+        if (!self || !err.isEmpty() || m_threadId != tid) {
+            return;
+        }
+        setCoworkChecked(res.value(QStringLiteral("enabled")).toBool());
+    }, this);
+}
+
+void AgentPanel::onCoworkToggled(bool on)
+{
+    if (m_syncingCowork || m_threadId.isEmpty()) {
+        return; // no thread yet: it is a start-time choice, read by agent.start
+    }
+    QPointer<AgentPanel> self(this);
+    const QString tid = m_threadId;
+    m_core->call(QStringLiteral("cowork.setEnabled"),
+                 {{QStringLiteral("threadId"), tid}, {QStringLiteral("enabled"), on}},
+                 [this, self, tid, on](const QJsonObject &res, const QJsonObject &err) {
+        if (!self || m_threadId != tid) {
+            return;
+        }
+        if (!err.isEmpty()) {
+            // Put the switch back where it was: the agent's access did not change.
+            setCoworkChecked(!on);
+            addNote(QStringLiteral("desktop access unchanged: %1")
+                        .arg(err.value(QStringLiteral("message")).toString().toHtmlEscaped()),
+                    QStringLiteral("err"));
+            return;
+        }
+        if (!on) {
+            addNote(QStringLiteral("desktop tools switched off for this agent."),
+                    QStringLiteral("sys"));
+            return;
+        }
+        // Say what actually reached the running agent — the three cases differ in
+        // whether it can act on this right now.
+        const QString applied = res.value(QStringLiteral("applied")).toString();
+        if (applied == QLatin1String("reattach")) {
+            addNote(QStringLiteral("desktop tools enabled — this engine cannot add them to a "
+                                   "live session, so the agent is re-attaching to its own "
+                                   "session (the conversation is kept)."),
+                    QStringLiteral("sys"));
+        } else if (applied == QLatin1String("nextStart")) {
+            addNote(QStringLiteral("desktop tools enabled — they will be available when this "
+                                   "agent next starts."),
+                    QStringLiteral("sys"));
+        } else {
+            addNote(QStringLiteral("desktop tools enabled — available from the next message, "
+                                   "no restart."),
+                    QStringLiteral("sys"));
+        }
+        emit statusMessage(QStringLiteral("Desktop access enabled — answer the system "
+                                          "permission dialog if it appears."));
+    }, this);
 }
 
 void AgentPanel::onPermissionRequested(const QJsonObject &params)

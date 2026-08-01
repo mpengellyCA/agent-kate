@@ -12,7 +12,6 @@ import (
 	"agentkate/internal/cowork"
 	"agentkate/internal/ipc"
 	"agentkate/internal/kde"
-	"agentkate/internal/session"
 )
 
 // codeCoworkDenied is returned when a Cowork action is refused (no consent, wrong
@@ -244,22 +243,9 @@ func registerCoworkHandlers(d handlerDeps) {
 		return map[string]any{"entries": entries, "nextSeq": next}, nil
 	})
 
-	d.srv.Handle("cowork.setEnabled", func(ctx context.Context, raw json.RawMessage) (any, error) {
-		if err := requireUI(d, ctx); err != nil {
-			return nil, err
-		}
-		var p struct {
-			ThreadID string `json:"threadId"`
-			Enabled  bool   `json:"enabled"`
-		}
-		if err := json.Unmarshal(raw, &p); err != nil {
-			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
-		}
-		if err := d.sessions.Update(p.ThreadID, func(r *session.Record) { r.CoworkEnabled = p.Enabled }); err != nil {
-			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
-		}
-		return map[string]any{"ok": true}, nil
-	})
+	// cowork.setEnabled / cowork.threadState / cowork.preflight live in
+	// cowork_enable.go and are registered unconditionally (a bridge must be able
+	// to ask for its state even when this service failed to start).
 
 	d.srv.Handle("cowork.portalResult", func(ctx context.Context, raw json.RawMessage) (any, error) {
 		if err := requireUI(d, ctx); err != nil {

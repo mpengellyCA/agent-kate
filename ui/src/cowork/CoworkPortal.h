@@ -84,6 +84,15 @@ private:
     // the run; the kill-switch tears it down.
     void handleInject(const QJsonObject &req);
     void handleKillInject(const QJsonObject &req);
+    // handlePreflight acquires the OS-level permissions UP FRONT, when the human
+    // switches Cowork on for an agent — instead of on the agent's first action, which
+    // is how a desktop-enabled agent used to sit there doing nothing while an
+    // unanswered (or never-raised) portal dialog blocked it. It turns the
+    // accessibility bus on and stands the RemoteDesktop + ScreenCast session up, so
+    // the human answers one dialog while they are already looking at the screen, and
+    // every later action reuses the approved session. It captures nothing: no
+    // screenshot is taken, only the permission is obtained.
+    void handlePreflight(const QJsonObject &req);
     void startRemoteDesktop();
     // Run a batch of ops for corrId. If no op carries delayMs>0, runs synchronously and
     // returns (the caller replies). If any op has delayMs>0, converts the batch into a
@@ -139,6 +148,11 @@ private:
         QString corrId;
         QJsonArray ops;
     };
+
+    // Preflight requests waiting on the same session hand-shake the inject queue waits
+    // on. Kept apart from m_injectQueue because they carry no ops: they are satisfied
+    // by the session coming up (or failed by it being declined), not by anything run.
+    QStringList m_preflightCorrIds;
 
     // One captured monitor stream: its PipeWire node id and its rect in global desktop
     // pixels. The vector is the coordinate map absolute motion resolves against.

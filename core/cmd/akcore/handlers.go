@@ -232,6 +232,11 @@ func registerHandlers(d handlerDeps) {
 	// Cowork (KDE desktop see/control) RPCs. No-op if the service is unavailable.
 	registerCoworkHandlers(d)
 
+	// The opt-in switch itself, plus the OS-permission preflight. Registered
+	// even when the Cowork service is unavailable: every thread's bridge asks
+	// for its state on each tools/list and needs a real "not enabled" answer.
+	registerCoworkEnableHandlers(d)
+
 	// Orchestration RPCs (agent.wait / agent.launchWorker) — the core side of
 	// the Cooperation bridge's launch/send/wait/close tools (plan 16 P1).
 	registerOrchestrationHandlers(d)

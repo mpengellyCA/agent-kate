@@ -78,6 +78,10 @@ func runMCPBridge(args []string) {
 		log:              log,
 		out:              bufio.NewWriter(os.Stdout),
 	}
+	// The core pushes capability changes (Cowork switched on mid-session) down
+	// this connection; the bridge relays them to its MCP client as a
+	// tools/list_changed notification.
+	client.OnNotify(b.onCoreNotification)
 	b.serve()
 }
 
@@ -114,8 +118,13 @@ func (b *mcpBridge) handle(f *ipc.Frame) {
 		}
 		b.reply(f, map[string]any{
 			"protocolVersion": protocol,
-			"capabilities":    map[string]any{"tools": map[string]any{}},
-			"serverInfo":      map[string]any{"name": b.serverName(), "version": version},
+			// listChanged: the Cowork catalogue appears and disappears with the
+			// thread's opt-in, mid-session. Claude Code 2.1.220 honours the
+			// notification (probed: the revealed tool became listable AND
+			// callable without a relaunch); kimi 0.30 ignores it, which is why
+			// its harness re-attaches instead (LiveToolReveal capability).
+			"capabilities": map[string]any{"tools": map[string]any{"listChanged": true}},
+			"serverInfo":   map[string]any{"name": b.serverName(), "version": version},
 		})
 	case "notifications/initialized":
 		// notification — no response
@@ -123,6 +132,12 @@ func (b *mcpBridge) handle(f *ipc.Frame) {
 		b.reply(f, map[string]any{})
 	case "tools/list":
 		b.reply(f, map[string]any{"tools": b.advertisedTools()})
+		// Tell the core the client now HAS this catalogue (the reply is already
+		// flushed). A live Cowork enable waits for exactly this, so "enabled"
+		// can mean "usable on the very next turn" instead of "eventually".
+		if b.cowork {
+			_ = b.client.Notify("cowork.toolsListed", map[string]any{"threadId": b.thread})
+		}
 	case "tools/call":
 		b.handleToolCall(f)
 	default:
@@ -441,6 +456,10 @@ func (b *mcpBridge) runTool(name string, args json.RawMessage) (string, error) {
 			PermissionMode string `json:"permission_mode"`
 			Effort         string `json:"effort"`
 			Wait           bool   `json:"wait"`
+			// Desktop access for the worker. Human-approved core-side, exactly
+			// like enable_cowork — otherwise spawning a worker would be a way
+			// around the prompt you cannot skip for yourself.
+			Cowork bool `json:"cowork"`
 			// The persona channels travel verbatim to the core, which owns
 			// the per-harness applied-truth (plan 16 P3).
 			SystemPrompt string                 `json:"system_prompt"`
@@ -486,7 +505,11 @@ func (b *mcpBridge) runTool(name string, args json.RawMessage) (string, error) {
 			"effort":         a.Effort,
 			"systemPrompt":   a.SystemPrompt,
 			"agents":         a.Agents,
-		}, &res, 3*time.Minute); err != nil {
+			"cowork":         a.Cowork,
+			// A cowork launch waits on a human decision, so it gets the same
+			// ceiling as the other human-gated verbs rather than the 3 minutes
+			// a plain launch needs.
+		}, &res, launchWorkerTimeout(a.Cowork)); err != nil {
 			return "", err
 		}
 		var sb strings.Builder
@@ -527,6 +550,63 @@ func (b *mcpBridge) runTool(name string, args json.RawMessage) (string, error) {
 			sb.WriteString("It is working now; collect its result with wait_agent.")
 		}
 		return strings.TrimRight(sb.String(), "\n"), nil
+
+	case "enable_cowork":
+		var a struct {
+			ThreadID string `json:"thread_id"`
+			Reason   string `json:"reason"`
+		}
+		if len(args) > 0 {
+			if err := json.Unmarshal(args, &a); err != nil {
+				return "", fmt.Errorf("enable_cowork: malformed arguments: %w", err)
+			}
+		}
+		if strings.TrimSpace(a.Reason) == "" {
+			return "", fmt.Errorf("enable_cowork requires a 'reason' — the human is " +
+				"deciding whether to hand over their desktop, and needs to know what for")
+		}
+		target := strings.TrimSpace(a.ThreadID)
+		if target == "" {
+			target = b.thread
+		}
+		var res struct {
+			Enabled        bool   `json:"enabled"`
+			Applied        string `json:"applied"`
+			AlreadyEnabled bool   `json:"alreadyEnabled"`
+			Harness        string `json:"harness"`
+		}
+		// Blocks on a human decision, so it gets the same long ceiling as the
+		// other human-gated verbs.
+		if err := b.client.CallTimeout("cowork.requestEnable", map[string]any{
+			"fromThreadId": b.thread,
+			"threadId":     target,
+			"reason":       a.Reason,
+		}, &res, 10*time.Minute); err != nil {
+			return "", err
+		}
+		who := "this thread"
+		if target != b.thread {
+			who = "thread " + target
+		}
+		if res.AlreadyEnabled {
+			return fmt.Sprintf("Desktop access was already enabled for %s.", who), nil
+		}
+		switch res.Applied {
+		case "reattach":
+			return fmt.Sprintf("The human approved desktop access for %s. Its session is "+
+				"being re-attached to pick up the desktop tools (this engine cannot add "+
+				"them to a live session) — the conversation is preserved. The desktop_* "+
+				"tools appear after that, and the human has been asked for the OS-level "+
+				"screen and input permission.", who), nil
+		case "nextStart":
+			return fmt.Sprintf("The human approved desktop access for %s, which is not "+
+				"running; the desktop tools will be there when it next starts.", who), nil
+		default:
+			return fmt.Sprintf("The human approved desktop access for %s. The desktop_* "+
+				"tools are live now — no restart. The OS-level screen and input permission "+
+				"has been requested too; if the human declines it, the tools that need it "+
+				"say so when you call them. Start with desktop_list_windows.", who), nil
+		}
 
 	case "send_agent":
 		var a struct {
@@ -850,6 +930,11 @@ func toolDefs() []map[string]any {
 						"description": "Reasoning effort / thinking level in the backend's vocabulary. Empty = default."},
 					"wait": map[string]any{"type": "boolean",
 						"description": "Block until the worker's first turn completes and include its reply."},
+					"cowork": map[string]any{"type": "boolean",
+						"description": "Give the worker desktop access (the desktop_* tools). The HUMAN is " +
+							"asked to approve before the worker starts, and can decline — the worker then " +
+							"launches without it, reported NOT APPLIED. Engines without desktop support " +
+							"report it NOT APPLIED too."},
 					"system_prompt": map[string]any{"type": "string",
 						"description": "Persona text to run the worker with, alongside its engine's own system prompt. Engines without the channel report it NOT APPLIED — put the persona in 'prompt' instead."},
 					"agents": map[string]any{
@@ -875,6 +960,31 @@ func toolDefs() []map[string]any {
 					},
 				},
 				"required": []string{"prompt"},
+			},
+		},
+		{
+			"name": "enable_cowork",
+			"description": "Ask the human to switch on DESKTOP ACCESS (Cowork) for an agent " +
+				"thread — yours by default, or a worker's via thread_id. The human sees your " +
+				"reason and decides; you cannot grant this yourself. On approval the desktop_* " +
+				"tools (see the screen, read windows via the accessibility tree, move the " +
+				"pointer, type, click, scroll, drag, open a browser) become available WITHOUT " +
+				"restarting — on an engine that cannot add tools to a live session, the thread " +
+				"is re-attached to its own session instead, keeping its conversation. Agent " +
+				"Kate also asks the desktop for the OS-level screen and input permission right " +
+				"away, so the first real action does not stall on a dialog. Every individual " +
+				"desktop action still asks for its own consent. Use this when a task needs the " +
+				"live desktop (drive a browser, read something only on screen, operate a GUI) " +
+				"and you have no desktop_* tools.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"reason": map[string]any{"type": "string",
+						"description": "What you need the desktop for, in one line. Shown to the human verbatim — be concrete."},
+					"thread_id": map[string]any{"type": "string",
+						"description": "Agent thread to enable. Omit for yourself. A thread outside your own worker subtree needs an extra approval."},
+				},
+				"required": []string{"reason"},
 			},
 		},
 		{
@@ -946,6 +1056,16 @@ func toolDefs() []map[string]any {
 			},
 		},
 	}
+}
+
+// launchWorkerTimeout bounds the synchronous launch. A plain launch is bounded
+// by worktree creation plus a CLI handshake; one that asks for desktop access
+// also waits on a human answering the approval prompt.
+func launchWorkerTimeout(cowork bool) time.Duration {
+	if cowork {
+		return 10 * time.Minute
+	}
+	return 3 * time.Minute
 }
 
 func toolResult(text string, isErr bool) map[string]any {

@@ -36,20 +36,21 @@ const mcpSummaryCap = 120
 // TestMCPToolMapCoversBridgeCallSites keeps it complete.
 var mcpToolNames = map[string]string{
 	// Cooperation
-	"coop.listOpenFiles": "list_open_files",
-	"coop.postNote":      "post_note",
-	"coop.readNotes":     "read_notes",
-	"coop.getPresence":   "get_presence",
-	"coop.claimFile":     "claim_file",
-	"coop.releaseFile":   "release_file",
-	"coop.requestReview": "request_review",
-	"agent.list":         "list_agents",
-	"agent.discard":      "discard_agent",
-	"agent.launchWorker": "launch_agent",
-	"agent.send":         "send_agent",
-	"agent.wait":         "wait_agent",
-	"agent.stopClose":    "close_agent",
-	"permission.request": "request_permission",
+	"coop.listOpenFiles":   "list_open_files",
+	"coop.postNote":        "post_note",
+	"coop.readNotes":       "read_notes",
+	"coop.getPresence":     "get_presence",
+	"coop.claimFile":       "claim_file",
+	"coop.releaseFile":     "release_file",
+	"coop.requestReview":   "request_review",
+	"agent.list":           "list_agents",
+	"agent.discard":        "discard_agent",
+	"agent.launchWorker":   "launch_agent",
+	"agent.send":           "send_agent",
+	"agent.wait":           "wait_agent",
+	"agent.stopClose":      "close_agent",
+	"permission.request":   "request_permission",
+	"cowork.requestEnable": "enable_cowork",
 	// Cowork desktop
 	"cowork.listWindows":         "desktop_list_windows",
 	"cowork.screenshot":          "desktop_screenshot",
@@ -69,13 +70,16 @@ var mcpToolNames = map[string]string{
 	"cowork.setPointerProfile":   "desktop_set_pointer_profile",
 }
 
-// mcpQuietMethods are the connection's own identity handshake — plumbing, not
-// tool use. bridge.identify binds the connection (so it is itself the first
-// request seen as a bridge); handshake can only reach here if a client
-// identified as both, which it never does.
+// mcpQuietMethods are the connection's own identity handshake and capability
+// reads — plumbing, not tool use. bridge.identify binds the connection (so it
+// is itself the first request seen as a bridge); handshake can only reach here
+// if a client identified as both, which it never does; cowork.threadState is
+// how the Cowork bridge decides whether it has any tools to advertise, asked
+// once per tools/list and never on the agent's behalf.
 var mcpQuietMethods = map[string]bool{
-	"bridge.identify": true,
-	"handshake":       true,
+	"bridge.identify":    true,
+	"handshake":          true,
+	"cowork.threadState": true,
 }
 
 // mcpToolFor names the tool behind an RPC method, falling back to the method.
@@ -127,6 +131,7 @@ func mcpArgsSummary(tool string, raw json.RawMessage) string {
 		Model          string            `json:"model"`
 		Title          string            `json:"title"`
 		ToolName       string            `json:"toolName"`
+		Reason         string            `json:"reason"`
 		ElementID      string            `json:"elementId"`
 		Action         string            `json:"action"`
 		Button         string            `json:"button"`
@@ -167,6 +172,10 @@ func mcpArgsSummary(tool string, raw json.RawMessage) string {
 		return capText(p.ThreadID + ": " + firstLine(p.Text))
 	case "wait_agent", "close_agent", "discard_agent":
 		return capText(p.ThreadID)
+	case "enable_cowork":
+		// The stated reason is the point of the entry — it is what the human
+		// was shown when they approved (or refused) desktop access.
+		return capText(firstLine(p.Reason))
 	case "request_permission":
 		// Name the tool being gated, never its input: a Bash command line or an
 		// API argument is exactly the kind of thing that carries secrets.

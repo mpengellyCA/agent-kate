@@ -191,8 +191,19 @@ CoworkPanel::CoworkPanel(CoreClient *core, QWidget *parent)
     m_enableBtn->setIcon(QIcon::fromTheme(QStringLiteral("dialog-ok-apply")));
     m_enableBtn->setEnabled(false);
     connect(m_enableBtn, &QPushButton::clicked, this, &CoworkPanel::enableForActiveThread);
+    // The OS-level grant (accessibility + the remote-control/screen-share portal) is
+    // taken at enable time, but KDE refuses to let a remote-desktop grant persist, so
+    // it lapses whenever Agent Kate restarts or the kill-switch fires. This button
+    // takes it back without waiting for an agent to trip over the missing permission.
+    m_preflightBtn = new QPushButton(i18n("Grant desktop access now"), this);
+    m_preflightBtn->setIcon(QIcon::fromTheme(QStringLiteral("preferences-desktop-accessibility")));
+    m_preflightBtn->setToolTip(i18n("Ask the desktop for screen and input permission now, so "
+                                    "agents never stall on the system dialog mid-task."));
+    m_preflightBtn->setEnabled(false);
+    connect(m_preflightBtn, &QPushButton::clicked, this, &CoworkPanel::requestPreflight);
     enableRow->addWidget(m_activeLabel);
     enableRow->addWidget(m_enableBtn);
+    enableRow->addWidget(m_preflightBtn);
     layout->addLayout(enableRow);
 
     // Capability tiles: flip a tile ON to pre-authorize it for any cowork-enabled
@@ -284,6 +295,39 @@ void CoworkPanel::onNotification(const QString &method, const QJsonObject &param
 {
     if (method == QLatin1String("cowork.grantRequested")) {
         handleGrantRequested(params);
+    } else if (method == QLatin1String("cowork.enableRequested")) {
+        handleEnableRequested(params);
+    } else if (method == QLatin1String("cowork.enabledChanged")) {
+        // Someone (this panel, the agent's settings, or an approved agent request)
+        // switched Cowork for a thread. Say what actually happened to the running
+        // agent — the old text always told the user to restart it, which is no
+        // longer true on an engine that can reveal tools live.
+        const bool on = params.value(QStringLiteral("enabled")).toBool();
+        const QString applied = params.value(QStringLiteral("applied")).toString();
+        m_status->setMessageType(KMessageWidget::Positive);
+        if (!on) {
+            m_status->setText(i18n("Desktop tools switched off for that agent."));
+        } else if (applied == QLatin1String("reattach")) {
+            m_status->setText(i18n("Desktop tools enabled. That agent's session is being "
+                                   "re-attached to load them — its conversation is kept."));
+        } else if (applied == QLatin1String("nextStart")) {
+            m_status->setText(i18n("Desktop tools enabled. They will be there when that "
+                                   "agent next starts."));
+        } else {
+            m_status->setText(i18n("Desktop tools enabled — the agent can use them right "
+                                   "away, no restart."));
+        }
+    } else if (method == QLatin1String("cowork.preflightResult")) {
+        if (params.value(QStringLiteral("ok")).toBool()) {
+            m_status->setMessageType(KMessageWidget::Positive);
+            m_status->setText(i18n("Desktop access granted. Agents can see and control the "
+                                   "screen without another system prompt this session."));
+        } else {
+            m_status->setMessageType(KMessageWidget::Warning);
+            m_status->setText(i18n("Desktop permission was not granted: %1. Agents can still "
+                                   "be asked to try — the system will prompt again.",
+                                   params.value(QStringLiteral("error")).toString()));
+        }
     } else if (method == QLatin1String("cowork.grantsChanged")) {
         refreshGrants();
         refreshAudit();
@@ -403,6 +447,9 @@ void CoworkPanel::refreshStatus()
         }
         m_killBtn->setText(m_killed ? i18n("Re-enable desktop access") : i18n("Stop ALL desktop access"));
         m_enableBtn->setEnabled(m_available && !m_activeThread.isEmpty());
+        // The OS grant is worth asking for whenever the desktop is reachable and not
+        // killed — it is not tied to any one agent.
+        m_preflightBtn->setEnabled(m_available && !m_killed && !tampered);
     }, this);
 }
 
@@ -585,13 +632,74 @@ void CoworkPanel::enableForActiveThread()
     }
     QPointer<CoworkPanel> self(this);
     QJsonObject p{{QStringLiteral("threadId"), m_activeThread}, {QStringLiteral("enabled"), true}};
-    m_core->call(QStringLiteral("cowork.setEnabled"), p, [this, self](const QJsonObject &, const QJsonObject &err) {
-        if (!self || !err.isEmpty()) {
+    // The reply says how it reached the running agent (live / re-attach / next start)
+    // and the core also broadcasts cowork.enabledChanged; both render the same text,
+    // so the panel reads correctly whether the switch came from here or elsewhere.
+    // The core raises the OS permission dialog straight after — no extra call here.
+    m_core->call(QStringLiteral("cowork.setEnabled"), p, [this, self](const QJsonObject &res, const QJsonObject &err) {
+        if (!self) {
             return;
         }
-        m_status->setMessageType(KMessageWidget::Positive);
-        m_status->setText(i18n("Cowork enabled for this agent. Restart or resume it to load the desktop tools."));
+        if (!err.isEmpty()) {
+            m_status->setMessageType(KMessageWidget::Error);
+            m_status->setText(i18n("Could not enable desktop tools: %1",
+                                   err.value(QStringLiteral("message")).toString()));
+            return;
+        }
+        QJsonObject changed = res;
+        changed.insert(QStringLiteral("enabled"), true);
+        onNotification(QStringLiteral("cowork.enabledChanged"), changed);
     }, this);
+}
+
+void CoworkPanel::requestPreflight()
+{
+    QPointer<CoworkPanel> self(this);
+    m_status->setMessageType(KMessageWidget::Information);
+    m_status->setText(i18n("Asking the desktop for screen and input permission — answer the "
+                           "system dialog."));
+    m_core->call(QStringLiteral("cowork.preflight"),
+                 {{QStringLiteral("threadId"), m_activeThread}},
+                 [this, self](const QJsonObject &res, const QJsonObject &err) {
+        if (!self) {
+            return;
+        }
+        QJsonObject out = res;
+        if (!err.isEmpty()) {
+            out.insert(QStringLiteral("ok"), false);
+            out.insert(QStringLiteral("error"), err.value(QStringLiteral("message")).toString());
+        }
+        onNotification(QStringLiteral("cowork.preflightResult"), out);
+    }, this);
+}
+
+void CoworkPanel::handleEnableRequested(const QJsonObject &params)
+{
+    const QString requestId = params.value(QStringLiteral("requestId")).toString();
+    const QString title = params.value(QStringLiteral("title")).toString();
+    const QString reason = params.value(QStringLiteral("reason")).toString();
+    const bool self = params.value(QStringLiteral("self")).toBool();
+
+    const QString who = title.isEmpty() ? i18n("An agent") : title;
+    const QString what = self
+        ? i18n("<b>%1</b> is asking for access to your desktop.", who.toHtmlEscaped())
+        : i18n("An agent is asking for desktop access on behalf of <b>%1</b>.", who.toHtmlEscaped());
+
+    const auto answer = KMessageBox::questionTwoActions(
+        this,
+        i18n("<p>%1</p><p>Its reason: <i>%2</i></p><p>If you allow this, that agent can see "
+             "your screen, read window contents, and move the pointer, type and click as you. "
+             "Every individual action still asks for its own permission, and the "
+             "kill-switch stops everything at once.</p>",
+             what, reason.toHtmlEscaped()),
+        i18n("Give an agent desktop access?"),
+        KGuiItem(i18n("Allow desktop access"), QStringLiteral("preferences-desktop-accessibility")),
+        KGuiItem(i18n("Keep it off"), QStringLiteral("process-stop")));
+
+    m_core->call(QStringLiteral("permission.respond"),
+                 {{QStringLiteral("requestId"), requestId},
+                  {QStringLiteral("allow"), answer == KMessageBox::PrimaryAction}},
+                 nullptr, this);
 }
 
 // ---------------------------------------------------------------------------

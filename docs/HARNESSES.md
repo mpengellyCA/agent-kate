@@ -96,6 +96,7 @@ Declare `Capabilities()` honestly — every flag gates real behavior:
 | `Compaction` | the whole summary family (setCompactStrategy, compactNow, summaryStatus, exit compaction, seeded resume) |
 | `ProviderRouting` | provider overlays in the Engine picker + agent.start validation |
 | `Cowork` | the desktop MCP server + the panel checkbox |
+| `LiveToolReveal` | whether the CLI honours MCP `notifications/tools/list_changed`. True = switching Cowork on reveals the desktop tools in the running session (the core waits for the CLI's re-list before reporting success). False = the core re-attaches the thread to its own session instead, which is the only way that CLI can learn about a server's new tools |
 | `EffortLive` | whether the effort picker stays live while running |
 | `TranscriptPreview` | whether the session browser can preview/forget an on-disk transcript store (false = the transcript lives only in the core's event log) |
 | `MintsSessionID` | whether the core pre-mints the session id (claude `--session-id`) or your CLI assigns one that `Launch` reports back |

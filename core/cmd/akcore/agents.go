@@ -777,23 +777,42 @@ func coopMCPServer(exePath, socketPath, threadID, workspace string) kimi.MCPServ
 	}
 }
 
+// coworkMCPServer is the Cowork desktop bridge as an ACP stdio server, wired
+// into every kimi session for the same reason the claude config always carries
+// it: the server list is fixed at session/new, so a bridge missing at handshake
+// time can never appear later. It lists no tools until the thread opts in.
+func coworkMCPServer(exePath, socketPath, threadID, workspace string) kimi.MCPServer {
+	return kimi.MCPServer{
+		Name:    "cowork",
+		Command: exePath,
+		Args:    mcpBridgeArgs(socketPath, threadID, workspace, true, true),
+		Env:     []kimi.MCPEnv{},
+	}
+}
+
 // writeMCPConfig writes a per-thread --mcp-config file that points `claude` at
-// this binary's Cooperation MCP bridge subcommand, plus the opt-in Cowork desktop
-// bridge when the thread enabled it (a second `akcore mcp ... --cowork` server).
-func writeMCPConfig(exePath, socketPath, threadID, workspace string, coworkEnabled bool) (string, error) {
+// this binary's Cooperation MCP bridge subcommand, plus the Cowork desktop
+// bridge (a second `akcore mcp ... --cowork` server).
+//
+// The Cowork bridge is wired in for EVERY thread, opted in or not: a CLI cannot
+// gain an MCP server mid-session, so a bridge that only exists at launch is a
+// bridge that can never be switched on later — the trap a forked, then-enabled
+// thread used to fall into. The bridge advertises an empty tool list until the
+// thread opts in (advertisedTools) and the core refuses every desktop call from
+// a thread that has not (requireCoworkBridge), so an always-present server
+// grants nothing on its own.
+func writeMCPConfig(exePath, socketPath, threadID, workspace string) (string, error) {
 	servers := map[string]any{
 		"cooperation": map[string]any{
 			"type":    "stdio",
 			"command": exePath,
 			"args":    mcpBridgeArgs(socketPath, threadID, workspace, false, false),
 		},
-	}
-	if coworkEnabled {
-		servers["cowork"] = map[string]any{
+		"cowork": map[string]any{
 			"type":    "stdio",
 			"command": exePath,
 			"args":    mcpBridgeArgs(socketPath, threadID, workspace, true, false),
-		}
+		},
 	}
 	cfg := map[string]any{"mcpServers": servers}
 	b, err := json.MarshalIndent(cfg, "", "  ")

@@ -47,6 +47,11 @@ func (h *claudeHarness) Capabilities() harness.Capabilities {
 		Promote:         true,
 		ProviderRouting: true,
 		Cowork:          true,
+		// Probed on 2.1.220 with a stdio server that revealed a second tool
+		// mid-session: claude re-listed on notifications/tools/list_changed and
+		// called the new tool in the same session, so Cowork can be switched on
+		// without touching the running process.
+		LiveToolReveal: true,
 		// Verified against claude 2.1.220: set_model / set_permission_mode
 		// exist mid-session, set_effort does not — effort is start-time only.
 		EffortLive:        false,
@@ -181,8 +186,11 @@ func buildAgentsJSON(profiles []harness.AgentProfile) (string, []harness.Applied
 }
 
 func (h *claudeHarness) Launch(spec harness.StartSpec) (harness.Launched, error) {
-	mcpConfig, err := writeMCPConfig(h.exePath, h.socketPath, spec.ThreadID,
-		spec.WorkDir, spec.Cowork)
+	// spec.Cowork is not a launch input here: both bridges are always wired in,
+	// and the thread's opt-in (session.Record.CoworkEnabled, already persisted
+	// by the caller) is what the bridge reads to decide whether the desktop
+	// tools exist. That is what makes enabling it mid-session work.
+	mcpConfig, err := writeMCPConfig(h.exePath, h.socketPath, spec.ThreadID, spec.WorkDir)
 	if err != nil {
 		return harness.Launched{}, fmt.Errorf("mcp config: %w", err)
 	}
@@ -201,7 +209,6 @@ func (h *claudeHarness) Launch(spec harness.StartSpec) (harness.Launched, error)
 		SessionID:      spec.SessionID,
 		Resume:         spec.Resume,
 		ForkSession:    spec.ForkSession,
-		CoworkEnabled:  spec.Cowork,
 		Provider:       spec.Provider,
 		SystemPrompt:   systemPrompt,
 		AgentsJSON:     agentsJSON,

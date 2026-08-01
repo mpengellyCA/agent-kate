@@ -222,6 +222,34 @@ rather than impossible (`core/internal/cowork/grants.go:1-12`).
   the agent moving the pointer onto AK's own Allow/kill-switch buttons and clicking
   (`core/internal/cowork/consent.go:459-482`).
 
+### The opt-in switch — an always-wired bridge that grants nothing
+
+The Cowork MCP bridge is spawned for **every** thread, not only opted-in ones
+(`core/cmd/akcore/agents.go` `writeMCPConfig` / `coworkMCPServer`), because
+neither CLI can be handed a new MCP server once it is running — a bridge that
+only exists at launch could never be switched on afterwards. Presence is not
+access:
+
+- A bridge whose thread has not opted in advertises an **empty** tool catalogue
+  (`core/cmd/akcore/mcp_cowork.go` `advertisedTools`), so the agent cannot see a
+  desktop tool, let alone call one.
+- That is cosmetic, not the gate. The real gate is unchanged and server-side:
+  every desktop RPC still runs `requireCoworkBridge`, which refuses a thread
+  whose record says Cowork is off (`core/cmd/akcore/cowork.go`). The
+  `--allowedTools mcp__cowork` entry now present on every claude thread grants
+  nothing for the same reason — the allow-list was never the authority.
+- Switching the opt-in on is **UI-only** (`cowork.setEnabled` behind
+  `requireUI`), with the same self-asserted-identity caveat as §2.
+- An agent may **ask** — the `enable_cowork` MCP tool, and `launch_agent`'s
+  `cowork` flag — but never grant. Both block on an explicit human prompt
+  carrying the agent's stated reason (`core/cmd/akcore/cowork_enable.go`
+  `askCoworkEnable`), and a target outside the caller's own worker subtree needs
+  the usual second orchestration approval on top.
+- Enabling raises the OS permission dialog immediately (the preflight), which is
+  a usability property, not a security one: the desktop's own portal grant is
+  still what authorises screen capture and input injection, and it is taken in
+  front of the human rather than mid-task.
+
 ### Audit hash chain — DETECTION, not prevention
 
 The audit log is an append-only JSONL file where each entry is hash-chained:

@@ -64,7 +64,6 @@ func TestHarnessCapabilities(t *testing.T) {
 		"Compaction":        kimi.Compaction,
 		"Promote":           kimi.Promote,
 		"ProviderRouting":   kimi.ProviderRouting,
-		"Cowork":            kimi.Cowork,
 		"UsageReporting":    kimi.UsageReporting,
 		"TranscriptPreview": kimi.TranscriptPreview,
 		"MintsSessionID":    kimi.MintsSessionID,
@@ -89,6 +88,20 @@ func TestHarnessCapabilities(t *testing.T) {
 	}
 	if !kimi.EffortLive {
 		t.Error("kimi EffortLive = false; session/set_config_option works mid-session")
+	}
+	// Cowork rides on a stdio MCP server, which kimi forwards natively — every
+	// desktop action is still gated by the backend-agnostic consent authority.
+	// What kimi cannot do is learn about a server's NEW tools mid-session: it
+	// ignores notifications/tools/list_changed (probed on 0.30.0), so enabling
+	// Cowork there re-attaches the session instead of revealing tools in place.
+	if !kimi.Cowork {
+		t.Error("kimi Cowork = false; kimi forwards the Cowork stdio MCP server natively")
+	}
+	if kimi.LiveToolReveal {
+		t.Error("kimi LiveToolReveal = true; kimi 0.30 ignores tools/list_changed")
+	}
+	if !claude.LiveToolReveal {
+		t.Error("claude LiveToolReveal = false; claude 2.1.220 honours tools/list_changed")
 	}
 	if !kimi.SessionBrowse {
 		t.Error("kimi SessionBrowse = false; session/list works via a one-shot probe")

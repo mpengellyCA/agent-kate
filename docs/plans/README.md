@@ -24,6 +24,7 @@ daily dogfooding. Each item has its own grounded plan file with the relevant
 | 15 | Kimi parity finish (option discovery, engine-aware new-agent quick menu, session browse) | Core (Go) + UI (C++) | [15-kimi-parity-finish.md](15-kimi-parity-finish.md) | M |
 | 16 | Multi-agent orchestration (cross-harness launch/send/wait MCP tools, user-defined controller/worker ensembles, live MCP traffic view, Kimi first-class parity, Claude flag sweep) | Core (Go) + UI (C++) | [16-multi-agent-orchestration.md](16-multi-agent-orchestration.md) | XL (6 phases) |
 | 17 | Editor session scoping (startup reopens files from unrelated projects) | UI (C++) | [17-editor-session-scoping.md](17-editor-session-scoping.md) | S–M |
+| 18 | Cowork mid-session (enable desktop access on a running agent, agent-requested via MCP, OS permission taken up front) | Core (Go) + UI (C++) | [18-cowork-mid-session.md](18-cowork-mid-session.md) | M |
 
 Size key: **S** ≈ <½ day, **M** ≈ 1–2 days, **L** ≈ 3–5 days.
 

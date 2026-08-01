@@ -143,6 +143,11 @@ public:
     // Re-read chat preferences (send key, tool-card visibility) from KConfig.
     void applyChatSettings();
 
+    // Show the thread's desktop-access state without acting on it — used when
+    // binding to an existing thread and when the core reports a change made
+    // somewhere else (the Cowork panel, or an agent's approved request).
+    void setCoworkChecked(bool on);
+
     // Re-read the configured API provider profiles (after the Providers settings
     // dialog closes) and rebuild the engine picker's provider entries. No-op once
     // a thread exists, since the picker is frozen then.
@@ -251,6 +256,14 @@ private:
     void onNotification(const QString &method, const QJsonObject &params);
     void renderEvent(const QJsonObject &event);
     void onPermissionRequested(const QJsonObject &params);
+    // Desktop access, toggled while the agent exists: the core switches the
+    // thread's Cowork tools on or off in place (or re-attaches the session on an
+    // engine that cannot reveal tools live) and raises the OS permission dialog.
+    // Before the thread exists this is just a start-time choice, read at launch.
+    void onCoworkToggled(bool on);
+    // Read the thread's current desktop-access state from the core into the
+    // checkbox. Cheap; called when a thread is bound.
+    void syncCoworkFromCore();
     // Pull the persisted Claude Code transcript and replay it into the feed so
     // a reopened dormant thread shows its prior conversation.
     void loadTranscript();
@@ -528,7 +541,8 @@ private:
     QStringList m_disallowedTools;
     QStringList m_addDirs;
     QToolButton *m_subagentsBtn = nullptr; // "Helpers ▾" — subagent transcripts
-    QCheckBox *m_coworkCheck = nullptr; // start this agent with the Cowork desktop tools wired in
+    QCheckBox *m_coworkCheck = nullptr; // this agent's Cowork desktop tools (switchable mid-session)
+    bool m_syncingCowork = false;       // guards the toggle handler while we mirror core state
     // Compaction strategy + strip flag — controls how the thread's transcript
     // is condensed to keep resume cost down. Both are sticky to last used.
     QComboBox *m_compactCombo = nullptr;

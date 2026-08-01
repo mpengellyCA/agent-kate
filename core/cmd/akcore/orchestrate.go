@@ -17,6 +17,7 @@ import (
 	"agentkate/internal/agent"
 	"agentkate/internal/harness"
 	"agentkate/internal/ipc"
+	"agentkate/internal/safe"
 	"agentkate/internal/session"
 	"agentkate/internal/worktree"
 )
@@ -272,6 +273,7 @@ func registerOrchestrationHandlers(d handlerDeps) {
 			Effort         string                 `json:"effort"`
 			SystemPrompt   string                 `json:"systemPrompt"`
 			Agents         []harness.AgentProfile `json:"agents"`
+			Cowork         bool                   `json:"cowork"`
 		}
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
@@ -303,6 +305,23 @@ func registerOrchestrationHandlers(d handlerDeps) {
 				"isolation must be auto, isolated or workspace")
 		}
 
+		// Desktop access for a worker follows the same rule as enable_cowork:
+		// an agent may ask, the human decides. Asked BEFORE the launch, so a
+		// refusal costs nothing and the worker simply comes up without it —
+		// reported NOT APPLIED rather than silently dropped.
+		cowork := false
+		coworkWhyNot := ""
+		switch {
+		case !p.Cowork:
+		case !caps.Cowork:
+			coworkWhyNot = unsupportedDetail("desktop cowork", caps)
+		case askCoworkEnable(d, p.ParentThreadID, "", orDefault(p.Title, "a new worker"),
+			capText(firstLine(p.Prompt))):
+			cowork = true
+		default:
+			coworkWhyNot = "the human did not approve desktop access for this worker"
+		}
+
 		threadID := agent.NewThreadID()
 		sessionID := ""
 		if caps.MintsSessionID {
@@ -324,9 +343,17 @@ func registerOrchestrationHandlers(d handlerDeps) {
 			Isolation:      p.Isolation,
 			SystemPrompt:   p.SystemPrompt,
 			Agents:         p.Agents,
+			CoworkEnabled:  cowork,
 		}, launchMeta{ParentThreadID: p.ParentThreadID, Title: p.Title})
 		if err != nil {
 			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		// An approved desktop worker asks for the OS-level permission right
+		// away, so its first desktop action does not stall on a dialog.
+		if cowork && d.cowork != nil && d.cowork.Available() {
+			safe.Go("cowork.preflight", func() {
+				_, _ = coworkPreflight(context.Background(), d, threadID, true)
+			})
 		}
 		// First worker promotes the launcher to controller; a worker that
 		// launches sub-workers keeps its own worker role (the parent chain
@@ -348,6 +375,11 @@ func registerOrchestrationHandlers(d handlerDeps) {
 		unapplied = append(unapplied,
 			unappliedPersona(p.SystemPrompt, p.Agents, launched, caps)...)
 		unapplied = append(unapplied, unappliedSweepReport(launched)...)
+		if coworkWhyNot != "" {
+			unapplied = append(unapplied, map[string]string{
+				"option": "cowork", "requested": "true", "reason": coworkWhyNot,
+			})
+		}
 		var appliedAgents []string
 		for _, a := range launched.Agents {
 			if a.Applied {

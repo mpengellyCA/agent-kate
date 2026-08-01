@@ -49,9 +49,18 @@ private:
     void refreshAudit();
     void refreshPolicy();
     void handleGrantRequested(const QJsonObject &params);
+    // An agent asked (via the enable_cowork MCP tool) for desktop access — for
+    // itself or for a worker it launched. The human decides here; nothing is
+    // switched on until they do.
+    void handleEnableRequested(const QJsonObject &params);
     void revokeGrant(const QString &id);
     void toggleKill();
     void enableForActiveThread();
+    // Acquire the OS-level permissions (accessibility bus + the remote-control /
+    // screen-share portal) on demand, so the dialog is answered now rather than
+    // in the middle of an agent's work. Fired automatically when Cowork is
+    // switched on; this is the manual re-run after a kill-switch or a decline.
+    void requestPreflight();
     void rebuildBrowserMenu();
     void pickCustomBrowser();
     void launchBrowserAndReport(const QString &name, const QString &command, const QString &family);
@@ -73,6 +82,7 @@ private:
     KMessageWidget *m_status = nullptr;
     QLabel *m_activeLabel = nullptr;
     QPushButton *m_enableBtn = nullptr;
+    QPushButton *m_preflightBtn = nullptr;
 
     // Capability tiles (control-centre grid). Keyed by capability key.
     QVBoxLayout *m_capsLayout = nullptr;         // the tile grid's FlowLayout lives inside

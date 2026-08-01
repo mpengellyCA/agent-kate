@@ -45,9 +45,18 @@ type Capabilities struct {
 	Promote         bool `json:"promote"`         // agent.promote (move session into an isolated worktree)
 	ProviderRouting bool `json:"providerRouting"` // third-party Anthropic-compatible endpoints
 	Cowork          bool `json:"cowork"`          // the KDE Cowork desktop MCP server
-	EffortLive      bool `json:"effortLive"`      // thinking effort adjustable mid-session
-	UsageReporting  bool `json:"usageReporting"`  // tokens/cost in result events
-	SessionBrowse   bool `json:"sessionBrowse"`   // on-disk session discovery (session.browse)
+	// LiveToolReveal: the CLI honours the MCP notifications/tools/list_changed
+	// notification, so a server that starts advertising new tools mid-session
+	// is picked up without a relaunch. True for claude 2.1.220 (probed: the
+	// revealed tool was listed AND callable in the next turn); false for kimi
+	// 0.30, which lists a server's tools once at session/new and never
+	// re-lists — switching Cowork on there re-attaches the session instead
+	// (session/resume keeps the conversation and takes a new mcpServers list,
+	// also probed).
+	LiveToolReveal bool `json:"liveToolReveal"`
+	EffortLive     bool `json:"effortLive"`     // thinking effort adjustable mid-session
+	UsageReporting bool `json:"usageReporting"` // tokens/cost in result events
+	SessionBrowse  bool `json:"sessionBrowse"`  // on-disk session discovery (session.browse)
 	// TranscriptPreview: the harness keeps a previewable, forgettable on-disk
 	// transcript store (session.preview / session.forget). False for harnesses
 	// whose transcript lives only in the core's translated-event log (kimi), so
@@ -132,7 +141,13 @@ type StartSpec struct {
 	Resume      bool   // re-attach SessionID instead of starting fresh
 	ForkSession bool   // with Resume: branch a NEW session off the resumed context
 
-	Cowork   bool            // opt into the Cowork desktop MCP server
+	// Cowork is the thread's desktop opt-in as it stands at launch. Both
+	// shipped adapters ignore it: they wire the Cowork bridge in
+	// unconditionally and it reads the session record live, which is what lets
+	// the opt-in change mid-session. It stays in the neutral spec for an
+	// adapter that must decide its tool wiring up front and has no equivalent
+	// of a bridge that can go quiet.
+	Cowork   bool
 	Provider *agent.Provider // third-party API routing; nil = direct
 
 	// Env overlays the agent process's environment, on top of the core's own

@@ -71,7 +71,10 @@ func TestBuildStartArgsPersonaOmitted(t *testing.T) {
 	if v, _ := flagValue(args, "--permission-mode"); v != "acceptEdits" {
 		t.Errorf("default --permission-mode = %q", v)
 	}
-	if v, _ := flagValue(args, "--allowedTools"); v != "mcp__cooperation" {
+	// Both bridges are allowed on every thread: the Cowork server is wired in
+	// unconditionally so it can be switched on mid-session, and advertises no
+	// tools until the thread opts in.
+	if v, _ := flagValue(args, "--allowedTools"); v != "mcp__cooperation,mcp__cowork" {
 		t.Errorf("--allowedTools = %q", v)
 	}
 }
@@ -81,7 +84,7 @@ func TestBuildStartArgsPersonaOmitted(t *testing.T) {
 // thread is spawned.
 func TestBuildStartArgsSessionAndCowork(t *testing.T) {
 	fork := buildStartArgs(StartOptions{
-		SessionID: "sess-1", Resume: true, ForkSession: true, CoworkEnabled: true,
+		SessionID: "sess-1", Resume: true, ForkSession: true,
 		MCPConfig: "/tmp/mcp.json",
 	})
 	if v, _ := flagValue(fork, "--resume"); v != "sess-1" {

@@ -25,6 +25,12 @@ type Client struct {
 
 	nextID  atomic.Int64
 	pending sync.Map // int64 id -> chan *Frame
+
+	// onNotify receives server-initiated notifications (no id). Nil by
+	// default: a client that never registers one simply drops them, which is
+	// what every caller did before core→bridge pushes existed.
+	notifyMu sync.RWMutex
+	onNotify func(method string, params json.RawMessage)
 }
 
 // Dial connects to a core listening on socketPath.
@@ -51,7 +57,16 @@ func (c *Client) readLoop() {
 			continue
 		}
 		if f.ID == nil {
-			continue // notifications are not consumed by the bridge
+			// Server-initiated notification. Delivered on this read loop, so a
+			// handler must not block: the bridge's only handler writes one MCP
+			// line to stdout.
+			c.notifyMu.RLock()
+			h := c.onNotify
+			c.notifyMu.RUnlock()
+			if h != nil {
+				h(f.Method, f.Params)
+			}
+			continue
 		}
 		var id int64
 		if json.Unmarshal(*f.ID, &id) != nil {
@@ -68,6 +83,14 @@ func (c *Client) readLoop() {
 		close(value.(chan *Frame))
 		return true
 	})
+}
+
+// OnNotify registers the handler for server-initiated notifications. Call it
+// before the first notification can arrive (i.e. right after Dial).
+func (c *Client) OnNotify(h func(method string, params json.RawMessage)) {
+	c.notifyMu.Lock()
+	c.onNotify = h
+	c.notifyMu.Unlock()
 }
 
 // Call issues a request and waits up to the default timeout for the response.

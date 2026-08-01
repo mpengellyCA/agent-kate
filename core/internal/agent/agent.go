@@ -110,7 +110,6 @@ type StartOptions struct {
 	SessionID      string       // Claude Code session id (a UUID)
 	Resume         bool         // true: --resume the session; false: --session-id a new one
 	ForkSession    bool         // with Resume: --fork-session — branch a NEW session off the resumed context
-	CoworkEnabled  bool         // opt this thread into the KDE Cowork desktop MCP server
 	Provider       *Provider    // optional third-party API routing; nil/empty BaseURL = Claude direct
 	SystemPrompt   string       // claude --append-system-prompt; empty = none
 	AgentsJSON     string       // claude --agents payload, pre-rendered by the adapter; empty = none
@@ -132,14 +131,15 @@ func buildStartArgs(opts StartOptions) []string {
 	if mode == "" {
 		mode = "acceptEdits"
 	}
-	// The Cooperation MCP is always allowed; the opt-in Cowork desktop server is
-	// added only when the thread enabled it. Consent for individual desktop
-	// actions is enforced server-side (the cowork consent authority), NOT by this
-	// allow-list — so --permission-mode cannot bypass it.
-	allowedTools := "mcp__cooperation"
-	if opts.CoworkEnabled {
-		allowedTools += ",mcp__cowork"
-	}
+	// Both MCP servers are always allowed. The Cowork server is wired in for
+	// every thread so it can be switched on mid-session (it advertises no tools
+	// until then), and a server-prefix allow-list covers tools that appear
+	// later — verified against claude 2.1.220, where a tool revealed by
+	// tools/list_changed was callable under this same allow entry. Consent for
+	// individual desktop actions is enforced server-side (the cowork consent
+	// authority), NOT by this allow-list — so --permission-mode cannot bypass
+	// it, and neither can an allow entry for a thread that never opted in.
+	allowedTools := "mcp__cooperation,mcp__cowork"
 	args := []string{
 		"--print",
 		"--output-format", "stream-json",

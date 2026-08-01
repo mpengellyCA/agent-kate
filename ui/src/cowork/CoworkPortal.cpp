@@ -353,6 +353,10 @@ void CoworkPortal::onNotification(const QString &method, const QJsonObject &para
         handleKillInject(params);
         return;
     }
+    if (kind == QLatin1String("preflight")) {
+        handlePreflight(params);
+        return;
+    }
     // Anything else is fail-closed so the core's staggered timeout resolves with a
     // clear error rather than hanging.
     replyResult(params.value(QStringLiteral("corrId")).toString(), kind, false,
@@ -783,6 +787,29 @@ void CoworkPortal::handleInject(const QJsonObject &req)
         closeSessionOnly();
     }
     m_injectQueue.append({corrId, ops});
+    if (!m_rdStarting) {
+        startRemoteDesktop();
+    }
+}
+
+void CoworkPortal::handlePreflight(const QJsonObject &req)
+{
+    const QString corrId = req.value(QStringLiteral("corrId")).toString();
+
+    // The accessibility bus first: it is what reading windows and clicking named
+    // elements ride on, it needs no dialog, and Chromium-family browsers only export
+    // their tree when it was already on AT THEIR LAUNCH — so switching it on at
+    // enable time (rather than at first use) is what makes a browser the agent opens
+    // afterwards readable at all.
+    enableAtspiStatusForLaunch();
+
+    if (m_rdReady && !m_rdSession.isEmpty()) {
+        // Already approved earlier in this run; the grant is reused as-is.
+        replyResult(corrId, QStringLiteral("preflight"), true, QString(),
+                    {{QStringLiteral("remoteDesktop"), true}, {QStringLiteral("accessibility"), true}});
+        return;
+    }
+    m_preflightCorrIds.append(corrId);
     if (!m_rdStarting) {
         startRemoteDesktop();
     }
@@ -1241,6 +1268,18 @@ void CoworkPortal::releaseHeld()
 
 void CoworkPortal::flushInjectQueue()
 {
+    // Preflights are satisfied the moment the session is up — they asked for the
+    // permission, not for any ops — so they are answered before the queue drains.
+    if (!m_preflightCorrIds.isEmpty()) {
+        const QStringList waiting = m_preflightCorrIds;
+        m_preflightCorrIds.clear();
+        for (const QString &corrId : waiting) {
+            replyResult(corrId, QStringLiteral("preflight"), true, QString(),
+                        {{QStringLiteral("remoteDesktop"), true},
+                         {QStringLiteral("accessibility"), true},
+                         {QStringLiteral("screencast"), m_scReady}});
+        }
+    }
     // Drain queued batches. A batch with no delayMs runs synchronously and is replied to
     // here. A timed (profiled-motion) batch is handed to runInjectOps, which drives it
     // off a QTimer and replies on drain — we then stop and re-queue any remaining batches
@@ -1268,6 +1307,15 @@ void CoworkPortal::failInjectQueue(const QString &err)
     m_injectQueue.clear();
     for (const auto &pi : queued) {
         replyResult(pi.corrId, QStringLiteral("inject"), false, err);
+    }
+    // A declined or failed portal is a failed preflight too — the human is told
+    // desktop control is not available, rather than finding out through an agent
+    // action that dies minutes later.
+    const QStringList waiting = m_preflightCorrIds;
+    m_preflightCorrIds.clear();
+    for (const QString &corrId : waiting) {
+        replyResult(corrId, QStringLiteral("preflight"), false, err,
+                    {{QStringLiteral("accessibility"), true}});
     }
 }
 
