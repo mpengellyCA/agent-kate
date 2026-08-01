@@ -25,7 +25,10 @@ type personaFake struct{ *fakeHarness }
 func (p personaFake) Capabilities() harness.Capabilities {
 	c := p.fakeHarness.Capabilities()
 	c.SystemPrompt = true
-	c.PermissionModes = []string{"default", "wideOpen"}
+	// A ranked vocabulary (authority.go's permissivenessRanks is the single
+	// source): the roster hint names the harness's own most permissive mode,
+	// and only when that mode really never asks.
+	c.PermissionModes = []string{"default", "bypassPermissions"}
 	return c
 }
 
@@ -57,6 +60,10 @@ func modeTestCore(t *testing.T, sessions *session.Store, h harness.Harness) (*ip
 		t.Fatalf("dial: %v", err)
 	}
 	t.Cleanup(func() { _ = client.Close() })
+	// mode.apply is UI-only (audit F5) — applying an ensemble starts a thread in
+	// an arbitrary directory, so it is the human's call. The test client stands
+	// in for the human and must hold their role.
+	markClientUI(t, srv, client)
 	return client, store
 }
 
@@ -207,9 +214,14 @@ func TestModeApplyBriefsTheController(t *testing.T) {
 		res.Unapplied[0]["requested"] != "fake-large" {
 		t.Errorf("unapplied = %v, want exactly the model downgrade", res.Unapplied)
 	}
-	// The unattended hint used this harness's own last permission mode.
-	if !strings.Contains(spec.Prompt, `permission_mode="wideOpen"`) {
+	// The never-ask hint uses this harness's own declared vocabulary, ranked by
+	// authority.go's table, and says what asking for it costs (audit F1) rather
+	// than selling it as the way to run unattended.
+	if !strings.Contains(spec.Prompt, `never-ask mode is "bypassPermissions"`) {
 		t.Error("roster hint did not use the harness's declared vocabulary")
+	}
+	if !strings.Contains(spec.Prompt, "needs the human's approval") {
+		t.Error("roster hint does not name the approval the never-ask mode costs")
 	}
 }
 

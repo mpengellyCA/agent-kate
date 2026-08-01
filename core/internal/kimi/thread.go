@@ -4,18 +4,23 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"agentkate/internal/agent"
+	"agentkate/internal/fsperm"
+	"agentkate/internal/harness"
 	"agentkate/internal/safe"
 )
 
@@ -27,7 +32,10 @@ type EventFunc func(threadID string, events []json.RawMessage)
 // PermissionFunc asks the human to approve a gated tool call and returns the
 // decision. The run loop wires it to the same broker + permission.requested
 // notification the Claude MCP bridge uses, so the UI flow is identical.
-type PermissionFunc func(threadID, toolName string, input json.RawMessage) (allow bool)
+// updatedInput carries whatever the human sent back with an allow — for a
+// bridged AskUserQuestion (see answerQuestion) that is the answered question,
+// which is the only way the CHOSEN answer reaches the CLI. Empty otherwise.
+type PermissionFunc func(threadID, toolName string, input json.RawMessage) (allow bool, updatedInput json.RawMessage)
 
 // MCPServer is one ACP stdio MCP server entry for session/new. Agent Kate
 // passes its Cooperation bridge (`akcore mcp ...`) this way — kimi forwards
@@ -107,7 +115,174 @@ type Thread struct {
 	// session setup, when the translator doesn't exist yet). Start replays it
 	// right after the init event so the UI's slash autocomplete is fed.
 	pendingCmds json.RawMessage
+	// commands is the CLI's current slash-command vocabulary, taken from the
+	// latest available_commands_update. nil means the CLI has not announced
+	// one yet, which is NOT the same as "no commands" — see hasCommand.
+	commands map[string]bool
+	// loading / pendingReplay buffer the history session/load streams as
+	// notifications DURING the load call. They are held back so the whole
+	// replayed conversation lands after the session's init event rather than
+	// before it.
+	loading       bool
+	pendingReplay []json.RawMessage
+	// internal is the Agent-Kate-issued turn in flight (`/compact`, `/usage`),
+	// if any. Its prompt response belongs to us, not to the human, so
+	// onPromptDone routes it here instead of ending the visible turn.
+	internal *internalTurn
+	// usageProbedAt is when the last `/usage` probe was STARTED, and throttles
+	// the next one — see refreshUsage.
+	usageProbedAt time.Time
+	// authMethods is what initialize advertised. Kept so a session/new failure
+	// on an unauthenticated CLI can say which sign-in to run instead of
+	// surfacing the raw RPC error.
+	authMethods []AuthMethod
 	logFile     *os.File
+	// stdoutDrained / stderrDrained are closed when the ACP reader and the
+	// stderr pump return. reap() waits on them before cmd.Wait, which closes
+	// the pipes.
+	stdoutDrained chan struct{}
+	stderrDrained chan struct{}
+	// logBytes is the event log's size as far as this thread knows (its size at
+	// open, plus everything written since). It drives the retention trim — see
+	// maxEventLogBytes.
+	logBytes int64
+}
+
+// Event-log retention (audit F10). The per-thread JSONL log is append-only and
+// a resumed thread appends to the SAME file, so a long-lived thread's log grows
+// without bound — nothing ever deleted it. Past this size the log is trimmed to
+// its most recent trimEventLogTo bytes on a line boundary: the replay only ever
+// serves the tail anyway (harness.MaxReplayBytes), so the discarded prefix was
+// already unreachable from the UI. The agent's own context is untouched by
+// this; the CLI keeps its own session store.
+const (
+	maxEventLogBytes  = 32 << 20
+	trimEventLogTo    = 8 << 20
+	trimLineScanLimit = 1 << 20 // give up looking for a line boundary past this
+)
+
+// trimEventLogLocked rewrites the thread's event log down to its last
+// trimEventLogTo bytes, starting at the first line boundary at or after the cut
+// so no partial event survives. Caller holds t.mu and t.logFile is open.
+//
+// Failure is never fatal: on any error the log is left exactly as it was (and
+// keeps growing) rather than risking a half-written transcript — losing the
+// conversation is far worse than a large file.
+func (s *Supervisor) trimEventLogLocked(t *Thread) {
+	path := s.eventLogPath(t.ID)
+	src, err := os.Open(path)
+	if err != nil {
+		s.log.Warn("kimi event log trim skipped", "thread", t.ID, "err", err)
+		return
+	}
+	defer src.Close()
+	st, err := src.Stat()
+	if err != nil || st.Size() <= trimEventLogTo {
+		return
+	}
+	if _, err := src.Seek(st.Size()-trimEventLogTo, io.SeekStart); err != nil {
+		return
+	}
+	// Advance to the next newline so the file starts on a whole event.
+	br := bufio.NewReaderSize(src, 64*1024)
+	if _, err := br.ReadBytes('\n'); err != nil {
+		return // no line boundary in the tail: leave the log alone
+	}
+
+	tmp := path + ".trim"
+	_ = os.Remove(tmp)
+	dst, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		s.log.Warn("kimi event log trim skipped", "thread", t.ID, "err", err)
+		return
+	}
+	n, cerr := io.Copy(dst, br)
+	closeErr := dst.Close()
+	if cerr != nil || closeErr != nil {
+		_ = os.Remove(tmp)
+		s.log.Warn("kimi event log trim failed", "thread", t.ID, "err", cerr)
+		return
+	}
+	// Swap only once the replacement is complete on disk.
+	_ = t.logFile.Close()
+	t.logFile = nil
+	if err := os.Rename(tmp, path); err != nil {
+		s.log.Warn("kimi event log trim failed", "thread", t.ID, "err", err)
+		_ = os.Remove(tmp)
+	}
+	lf, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		// The thread keeps running; it just stops recording. Loud, not fatal.
+		s.log.Warn("kimi event log unavailable after trim", "thread", t.ID, "err", err)
+		return
+	}
+	t.logFile = lf
+	t.logBytes = n
+	s.log.Info("kimi event log trimmed", "thread", t.ID, "bytes", n)
+}
+
+// AuthMethod is one sign-in method from the ACP initialize response.
+type AuthMethod struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
+// internalTurn is one prompt turn Agent Kate sends on its own behalf — the
+// slash commands the CLI answers locally. Silent turns leave no transcript
+// trace at all; the caller waits on done and reads the CLI's reply text.
+type internalTurn struct {
+	kind   string // "compact" | "usage" — for logging
+	silent bool
+
+	done chan struct{}
+	once sync.Once
+	mu   sync.Mutex
+	text string
+	err  error
+
+	// abandoned marks a turn whose bookkeeping was already unwound (it hung,
+	// or a user send pre-empted it). Guarded by the owning Thread's mu, not
+	// this one, because it is read and written alongside t.activePrompts.
+	// A late response for an abandoned turn is dropped: decrementing then
+	// would clear a LATER turn's in-flight state.
+	abandoned bool
+
+	// id is a process-unique, monotonic tag. It identifies which abandoned turn
+	// armed the translator's drop latch, so a straggling reply can only lift
+	// the latch it armed itself (see clearDropFor).
+	id uint64
+}
+
+// internalTurnSeq hands out internalTurn.id. Package-global and atomic: ids
+// only need to be unique, never ordered against anything but themselves, and
+// starting at 1 keeps 0 meaning "no owner".
+var internalTurnSeq atomic.Uint64
+
+func newInternalTurn(kind string, silent bool) *internalTurn {
+	return &internalTurn{
+		kind:   kind,
+		silent: silent,
+		done:   make(chan struct{}),
+		id:     internalTurnSeq.Add(1),
+	}
+}
+
+// finish completes the turn exactly once — a second call (say the reap racing
+// the prompt response) is a no-op.
+func (it *internalTurn) finish(text string, err error) {
+	it.once.Do(func() {
+		it.mu.Lock()
+		it.text, it.err = text, err
+		it.mu.Unlock()
+		close(it.done)
+	})
+}
+
+func (it *internalTurn) result() (string, error) {
+	it.mu.Lock()
+	defer it.mu.Unlock()
+	return it.text, it.err
 }
 
 // SessionID returns the kimi session id assigned by session/new (empty until
@@ -137,6 +312,49 @@ func (t *Thread) Mode() string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.appliedMode
+}
+
+// setCommandsLocked records the CLI's slash-command vocabulary. Names are
+// stored bare (kimi announces "compact", the composer shows "/compact"), so
+// membership tests read the same either way. Caller holds t.mu.
+func (t *Thread) setCommandsLocked(names []string) {
+	m := make(map[string]bool, len(names))
+	for _, n := range names {
+		m[strings.TrimPrefix(strings.TrimSpace(n), "/")] = true
+	}
+	t.commands = m
+}
+
+// releasePromptSlotLocked gives back one in-flight prompt slot and settles the
+// cancel flag with it. Every path that frees a slot must go through here:
+// t.cancelling is what cancelPending consults for the interrupt backstop, and
+// once nothing is in flight there is by definition no cancel left outstanding.
+// Releasing the slot WITHOUT clearing it (abandonInternal used to) left the
+// thread believing a cancel was pending forever — an Interrupt during an
+// in-flight `/usage` or `/compact` poisoned every later turn. Caller holds t.mu.
+func (t *Thread) releasePromptSlotLocked() {
+	if t.activePrompts > 0 {
+		t.activePrompts--
+	}
+	if t.activePrompts == 0 {
+		t.cancelling = false
+	}
+}
+
+// hasCommand reports whether the CLI offers a slash command. A thread that has
+// never received an available_commands_update answers true for everything:
+// silence does not prove absence, and gating on it would break a CLI that
+// simply never announces. Once a list HAS arrived it is authoritative — a
+// command missing from it would otherwise be delivered to the model as
+// literal prompt text, which for `/compact` means a wasted turn and a reply
+// the caller would mistake for a summary.
+func (t *Thread) hasCommand(name string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.commands == nil {
+		return true
+	}
+	return t.commands[strings.TrimPrefix(name, "/")]
 }
 
 // stderrTailString returns the buffered pre-handshake stderr as a single line,
@@ -177,6 +395,12 @@ type Supervisor struct {
 	discoverMu     sync.Mutex
 	discovered     bool
 	discoveredOpts []ConfigOption
+
+	// onPreempt, when set, runs inside Send's pre-empt/claim loop between
+	// preemptInternal returning and the lock being taken. That gap is exactly
+	// the race the loop exists to close, and it is otherwise unhittable from a
+	// test. Set only by tests; nil in every real supervisor.
+	onPreempt func(*Thread)
 }
 
 // NewSupervisor creates a kimi supervisor. An empty kimiBin defaults to "kimi"
@@ -188,6 +412,20 @@ func NewSupervisor(kimiBin string, log *slog.Logger, emit EventFunc, perm Permis
 	}
 	if eventDir == "" {
 		eventDir = DefaultEventDir()
+	}
+	// Migrate an event store an earlier build created world-readable. These
+	// logs are whole kimi transcripts — the most sensitive thing Agent Kate
+	// keeps — and the mode constants on the write path below only apply to
+	// files and directories they CREATE, so without this pass every log
+	// already on disk keeps its 0644 forever. Logged, never fatal: a store
+	// that cannot be tightened must still be usable, and the message is what
+	// makes the exposure visible.
+	if n, err := fsperm.HardenTree(eventDir); err != nil {
+		if log != nil {
+			log.Warn("could not tighten permissions on the kimi event store", "store", eventDir, "err", err)
+		}
+	} else if n > 0 {
+		fsperm.LogMigration(eventDir, n)
 	}
 	return &Supervisor{
 		kimiBin:             kimiBin,
@@ -228,10 +466,43 @@ func (s *Supervisor) ReadTranscript(threadID string) ([]json.RawMessage, error) 
 	return ReadTranscript(s.eventDir, threadID)
 }
 
+// DeleteTranscript removes a thread's event log (and any half-finished trim
+// beside it). Called when a thread is DESTROYED — discard, or cleanup's
+// archive-and-remove — because nothing else ever deleted these files: they are
+// full kimi transcripts, they were appended to on every resume, and they
+// outlived the threads they belonged to forever (audit F10).
+//
+// Unlike the claude transcript, which is the CLI's own file and is deliberately
+// left on disk so an archived thread stays recoverable, this log is ours and is
+// meaningless once the thread it replays is gone.
+//
+// A missing file is success: the caller is asking for the log to be gone.
+func (s *Supervisor) DeleteTranscript(threadID string) error {
+	if threadID == "" {
+		return nil
+	}
+	path := s.eventLogPath(threadID)
+	_ = os.Remove(path + ".trim")
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
 // ReadTranscript returns the translated events logged for a kimi thread, in
 // order, so the UI can replay the conversation when reopening a dormant
 // thread — the kimi counterpart of session.ReadTranscript. Returns nil with
 // no error if there is no log yet.
+//
+// The read is BOUNDED (audit F10): only the most recent events that fit the
+// replay caps are kept, and memory never exceeds them however long the log has
+// grown. When older events are dropped the returned slice opens with a
+// truncation notice, so a shortened history is visible rather than silent.
+//
+// A trailing line that is not valid JSON is skipped, not relayed: the log is
+// appended without fsync, so a crash can leave a torn last line, and shipping
+// that fragment to the UI as an event is a parse error in the panel for a
+// problem that belongs here.
 func ReadTranscript(eventDir, threadID string) ([]json.RawMessage, error) {
 	if eventDir == "" {
 		eventDir = DefaultEventDir()
@@ -246,18 +517,57 @@ func ReadTranscript(eventDir, threadID string) ([]json.RawMessage, error) {
 	defer f.Close()
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-	var out []json.RawMessage
+	// Budget leaves room for the notice event the handler-side cap would
+	// otherwise have to add on top (harness.CapTranscript is then a no-op).
+	maxEvents := harness.MaxReplayEvents - 1
+	maxBytes := harness.MaxReplayBytes - 4096
+
+	var (
+		ring    []json.RawMessage // most recent events, oldest first
+		bytesIn int
+		omitted int
+		torn    int
+	)
+	drop := func() {
+		bytesIn -= len(ring[0])
+		ring = ring[1:]
+		omitted++
+	}
 	for sc.Scan() {
 		line := sc.Bytes()
 		if len(line) == 0 {
 			continue
 		}
-		out = append(out, append(json.RawMessage(nil), line...))
+		if !json.Valid(line) {
+			torn++
+			continue
+		}
+		ring = append(ring, append(json.RawMessage(nil), line...))
+		bytesIn += len(line)
+		for len(ring) > maxEvents || (bytesIn > maxBytes && len(ring) > 1) {
+			drop()
+		}
 	}
 	if err := sc.Err(); err != nil {
-		return nil, err
+		// A line longer than the scanner cap ends the read. Everything up to it
+		// is still a usable history, so report what we have rather than nothing
+		// — but say so, because the tail is missing.
+		if !errors.Is(err, bufio.ErrTooLong) {
+			return nil, err
+		}
+		torn++
 	}
-	return out, nil
+	if torn > 0 {
+		slog.Warn("kimi transcript: skipped unreadable lines",
+			"thread", threadID, "lines", torn)
+	}
+	if omitted == 0 {
+		return ring, nil
+	}
+	if notice := harness.TruncationNotice(omitted); notice != nil {
+		return append([]json.RawMessage{notice}, ring...), nil
+	}
+	return ring, nil
 }
 
 // Start launches a new kimi thread: spawn `kimi acp`, run the ACP handshake
@@ -277,14 +587,36 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 	if err != nil {
 		return nil, fmt.Errorf("stdin pipe: %w", err)
 	}
-	stdout, err := cmd.StdoutPipe()
+	// Deliberately os.Pipe + cmd.Stdout, NOT cmd.StdoutPipe (audit F24):
+	// cmd.Wait closes the pipes it created, so a reap that wins the race
+	// against the ACP reader discards whatever is still in the pipe — the last
+	// frames of the final turn. A pipe we own is closed by us, at real EOF.
+	stdout, stdoutW, err := os.Pipe()
 	if err != nil {
 		return nil, fmt.Errorf("stdout pipe: %w", err)
 	}
-	stderr, err := cmd.StderrPipe()
+	stderr, stderrW, err := os.Pipe()
 	if err != nil {
+		stdout.Close()
+		stdoutW.Close()
 		return nil, fmt.Errorf("stderr pipe: %w", err)
 	}
+	cmd.Stdout = stdoutW
+	cmd.Stderr = stderrW
+	// readingOut/readingErr are set once the reader goroutines own the
+	// respective read end (each closes its own at EOF). Until then every
+	// failure exit must close it here, or a failed spawn leaks descriptors.
+	readingOut, readingErr := false, false
+	defer func() {
+		stdoutW.Close()
+		stderrW.Close()
+		if !readingOut {
+			stdout.Close()
+		}
+		if !readingErr {
+			stderr.Close()
+		}
+	}()
 
 	id := opts.ID
 	if id == "" {
@@ -308,7 +640,23 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 		s.onNotification(t, method, params)
 	}
 	t.client.onRequest = func(f acpFrame) { s.onAgentRequest(t, f) }
-	safe.Go("kimi.acpRead", func() { t.client.readLoop(stdout) })
+	// reap() waits on stdoutDrained before cmd.Wait(): os/exec closes the pipes
+	// as part of Wait, so reaping while the ACP reader is still draining can
+	// discard the tail of the stream — the last frames of the final turn
+	// (audit F24).
+	t.stdoutDrained = make(chan struct{})
+	readingOut = true
+	safe.Go("kimi.acpRead", func() {
+		defer close(t.stdoutDrained)
+		defer stdout.Close()
+		t.client.readLoop(stdout)
+	})
+
+	// A resume with no transcript of our own is a session Agent Kate never
+	// ran — browse-resumed from the CLI's own store. There is nothing to
+	// replay locally, so ask the CLI to replay it instead (session/load).
+	// Measured BEFORE the log is opened, since opening creates it.
+	loadHistory := opts.Resume && opts.SessionID != "" && !s.haveTranscript(id)
 
 	// The translated-event log is the thread's transcript; a start failure is
 	// logged, never fatal — replay simply degrades to empty. A resumed thread
@@ -318,9 +666,22 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 	if opts.Resume {
 		logFlags = os.O_CREATE | os.O_WRONLY | os.O_APPEND
 	}
-	if err := os.MkdirAll(s.eventDir, 0o755); err == nil {
-		if lf, err := os.OpenFile(s.eventLogPath(id), logFlags, 0o644); err == nil {
+	if err := fsperm.MkdirAll(s.eventDir); err == nil {
+		if lf, err := os.OpenFile(s.eventLogPath(id), logFlags, fsperm.FileMode); err == nil {
 			t.logFile = lf
+			// OpenFile applies its mode only when it CREATES the file, so a
+			// resumed thread appending to a log an earlier build left 0644
+			// would keep that mode for the life of the thread.
+			if _, herr := fsperm.HardenFile(s.eventLogPath(id)); herr != nil && s.log != nil {
+				s.log.Warn("could not tighten permissions on the kimi event log",
+					"path", s.eventLogPath(id), "err", herr)
+			}
+			// Seed the retention counter from what is already on disk: a resumed
+			// thread appends to an existing log, and the trim must account for
+			// every earlier session, not just this one.
+			if st, serr := lf.Stat(); serr == nil {
+				t.logBytes = st.Size()
+			}
 		} else {
 			s.log.Warn("kimi event log unavailable", "thread", id, "err", err)
 		}
@@ -332,7 +693,12 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 	// the session is live the pump buffers lines as a tail for a failure
 	// diagnostic; afterwards it emits them as _stderr cards.
 	stderrDone := make(chan struct{})
-	safe.Go("kimi.pumpStderr", func() { s.pumpStderr(t, stderr, stderrDone) })
+	t.stderrDrained = stderrDone
+	readingErr = true
+	safe.Go("kimi.pumpStderr", func() {
+		defer stderr.Close()
+		s.pumpStderr(t, stderr, stderrDone)
+	})
 
 	// teardown kills the process group (not just the leader — a handshake that
 	// failed after session/new may already have spawned children), lets the
@@ -363,7 +729,7 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 	// the caller turns it into an "error" lifecycle event, exactly like a
 	// failed Claude spawn. The drained stderr tail rides along so the user sees
 	// why (the RPC error alone rarely says).
-	if err := s.handshake(t, opts); err != nil {
+	if err := s.handshake(t, opts, loadHistory); err != nil {
 		teardown()
 		if tail := t.stderrTailString(); tail != "" {
 			err = fmt.Errorf("%w (kimi stderr: %s)", err, tail)
@@ -404,10 +770,19 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 	t.mu.Lock()
 	pendingCmds := t.pendingCmds
 	t.pendingCmds = nil
+	replay := t.pendingReplay
+	t.pendingReplay = nil
 	tr := t.tr
 	t.mu.Unlock()
 	if pendingCmds != nil {
 		s.emitEvents(t, tr.update(pendingCmds))
+	}
+	// A session/load handshake replayed the CLI's own history; ship it now, in
+	// order, after the init event (see Thread.loading).
+	if len(replay) > 0 {
+		s.log.Info("replayed kimi history from the CLI's store",
+			"thread", t.ID, "session", t.SessionID(), "events", len(replay))
+		s.emitEvents(t, replay)
 	}
 
 	// A fresh thread gets its opening turn now. A resumed thread has none —
@@ -420,17 +795,34 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 	return t, nil
 }
 
-// handshake performs initialize → session/new (or session/resume) and applies
-// the requested model.
-func (s *Supervisor) handshake(t *Thread, opts StartOptions) error {
+// haveTranscript reports whether this thread already has translated events of
+// its own on disk — the history the UI replays without any help from the CLI.
+func (s *Supervisor) haveTranscript(threadID string) bool {
+	st, err := os.Stat(s.eventLogPath(threadID))
+	return err == nil && st.Size() > 0
+}
+
+// handshake performs initialize → session/new (or session/resume, or
+// session/load when there is history only the CLI has) and applies the
+// requested model.
+func (s *Supervisor) handshake(t *Thread, opts StartOptions, loadHistory bool) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	// The request body is shared with the one-shot probes (discover.go) so the
 	// CLI always sees the same client capabilities.
-	if err := t.client.call(ctx, "initialize", initializeParams(), nil); err != nil {
+	var initRes struct {
+		AgentCapabilities struct {
+			LoadSession bool `json:"loadSession"`
+		} `json:"agentCapabilities"`
+		AuthMethods []AuthMethod `json:"authMethods"`
+	}
+	if err := t.client.call(ctx, "initialize", initializeParams(), &initRes); err != nil {
 		return fmt.Errorf("acp initialize: %w", err)
 	}
+	t.mu.Lock()
+	t.authMethods = initRes.AuthMethods
+	t.mu.Unlock()
 
 	mcpServers := opts.MCPServers
 	if mcpServers == nil {
@@ -442,10 +834,16 @@ func (s *Supervisor) handshake(t *Thread, opts StartOptions) error {
 	}
 	method := "session/new"
 	if opts.Resume {
-		// session/resume re-attaches WITHOUT replaying history (session/load
-		// would) — the UI already replays the transcript itself from the
-		// translated-event log, so an ACP-side replay would double every card.
+		// session/resume re-attaches WITHOUT replaying history — normally
+		// exactly right, since the UI replays the transcript itself from the
+		// translated-event log and an ACP-side replay would double every card.
+		// A session Agent Kate never ran (browse-resumed from the CLI's own
+		// store) has no such log, and that is the one case where the CLI's
+		// replay is the only history there is: session/load then.
 		method = "session/resume"
+		if loadHistory && initRes.AgentCapabilities.LoadSession {
+			method = "session/load"
+		}
 		sessionParams["sessionId"] = opts.SessionID
 	}
 	// The full config-option set (model / thinking / mode enumerations, each
@@ -455,8 +853,41 @@ func (s *Supervisor) handshake(t *Thread, opts StartOptions) error {
 		SessionID     string         `json:"sessionId"`
 		ConfigOptions []ConfigOption `json:"configOptions"`
 	}
-	if err := t.client.call(ctx, method, sessionParams, &sessionRes); err != nil {
-		return fmt.Errorf("acp %s: %w", method, err)
+	if method == "session/load" {
+		// The replay streams as session/update notifications DURING the call,
+		// so the translator has to exist before it is made. Its model and
+		// option set arrive with the response and are filled in below.
+		t.mu.Lock()
+		t.sessionID = opts.SessionID
+		t.tr = newTranslator(opts.SessionID, "", nil)
+		t.loading = true
+		t.mu.Unlock()
+	}
+	err := t.client.call(ctx, method, sessionParams, &sessionRes)
+	if err != nil && method == "session/load" {
+		// A CLI that advertises loadSession but refuses this session still has
+		// a working re-attach; take it and accept an empty transcript rather
+		// than failing the resume outright.
+		s.log.Warn("kimi session/load failed; falling back to session/resume",
+			"thread", t.ID, "session", opts.SessionID, "err", err)
+		t.mu.Lock()
+		t.loading = false
+		t.pendingReplay = nil
+		t.tr = nil
+		t.mu.Unlock()
+		method = "session/resume"
+		err = t.client.call(ctx, method, sessionParams, &sessionRes)
+	}
+	if err != nil {
+		return s.sessionError(t, method, err)
+	}
+	if t.loadingDone() {
+		// Everything the replay streamed is buffered; close the last message
+		// off, since a replay has no prompt response to end its final turn.
+		t.mu.Lock()
+		tr := t.tr
+		t.mu.Unlock()
+		t.appendReplay(tr.flush())
 	}
 	// session/new returns the fresh id; session/resume returns only
 	// configOptions, so the id we re-attached to is the one we passed.
@@ -494,14 +925,29 @@ func (s *Supervisor) handshake(t *Thread, opts StartOptions) error {
 	// current value.
 	setOption := func(id, value string) string {
 		if value != "" {
+			// The response is the authoritative post-change config; fold it in
+			// so an accepted-but-adjusted value is recorded as what it became.
+			var res json.RawMessage
 			if err := t.client.call(ctx, "session/set_config_option", map[string]any{
 				"sessionId": sessionID,
 				"configId":  id,
 				"value":     value,
-			}, nil); err != nil {
+			}, &res); err != nil {
 				s.log.Warn("could not set kimi config option; using the CLI default",
 					"thread", t.ID, "option", id, "value", value, "err", err)
 				value = ""
+			} else {
+				for _, up := range decodeConfigOptions(res) {
+					if up.ID != id || up.CurrentValue == "" {
+						continue
+					}
+					if up.CurrentValue != value {
+						s.log.Info("kimi adjusted a config option",
+							"thread", t.ID, "option", id,
+							"requested", value, "applied", up.CurrentValue)
+					}
+					value = up.CurrentValue
+				}
 			}
 		}
 		if value == "" {
@@ -522,9 +968,94 @@ func (s *Supervisor) handshake(t *Thread, opts StartOptions) error {
 	t.appliedModel = model
 	t.appliedThinking = thinking
 	t.appliedMode = mode
-	t.tr = newTranslator(sessionID, model, sessionRes.ConfigOptions)
+	if t.tr != nil {
+		// The session/load path built the translator early (see above); give
+		// it the model and option set the response finally supplied.
+		t.tr.setSession(model, sessionRes.ConfigOptions)
+	} else {
+		t.tr = newTranslator(sessionID, model, sessionRes.ConfigOptions)
+	}
 	t.mu.Unlock()
 	return nil
+}
+
+// loadingDone clears the replay-buffering flag and reports whether it was set.
+func (t *Thread) loadingDone() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	was := t.loading
+	t.loading = false
+	return was
+}
+
+// appendReplay buffers translated history for Start to emit after the init
+// event.
+func (t *Thread) appendReplay(events []json.RawMessage) {
+	if len(events) == 0 {
+		return
+	}
+	t.mu.Lock()
+	t.pendingReplay = append(t.pendingReplay, events...)
+	t.mu.Unlock()
+}
+
+// sessionError turns a failed session/new|resume|load into the clearest error
+// available. An unauthenticated CLI answers with an opaque RPC rejection, so
+// when initialize advertised sign-in methods and the failure looks like an auth
+// refusal, the message names them and says what to run — the difference
+// between "acp session/new: acp error -32000: authentication required" and an
+// instruction the user can act on.
+func (s *Supervisor) sessionError(t *Thread, method string, err error) error {
+	t.mu.Lock()
+	methods := t.authMethods
+	t.mu.Unlock()
+	if len(methods) == 0 || !looksLikeAuthFailure(err) {
+		return fmt.Errorf("acp %s: %w", method, err)
+	}
+	names := make([]string, 0, len(methods))
+	for _, m := range methods {
+		label := m.Name
+		if label == "" {
+			label = m.ID
+		}
+		if m.Description != "" {
+			label += " — " + m.Description
+		}
+		names = append(names, label)
+	}
+	return fmt.Errorf("%s is not signed in (%s %v). Sign in first: run `%s` in a "+
+		"terminal and complete one of: %s",
+		s.kimiBin, method, err, s.kimiBin, strings.Join(names, "; "))
+}
+
+// authRequiredCode is ACP's "the agent needs authentication" JSON-RPC code.
+const authRequiredCode = -32000
+
+// looksLikeAuthFailure reports whether an RPC rejection is about sign-in.
+// The code is the reliable signal; the wording is the backstop for a CLI that
+// reports it as a generic internal error.
+func looksLikeAuthFailure(err error) bool {
+	var ae *acpError
+	if errors.As(err, &ae) {
+		// -32000 doubles as our own stream-closed marker; a dead process is
+		// not an auth problem.
+		if ae.Message == errStreamClosed.Error() {
+			return false
+		}
+		if ae.Code == authRequiredCode {
+			return true
+		}
+	}
+	msg := strings.ToLower(err.Error())
+	for _, needle := range []string{
+		"auth", "not logged in", "log in", "login", "sign in", "signed in",
+		"unauthenticated", "unauthorized", "api key", "credential",
+	} {
+		if strings.Contains(msg, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 // buildPromptContent assembles ACP prompt content blocks from the message text
@@ -565,38 +1096,335 @@ func (s *Supervisor) Send(threadID, text string, attachments []agent.Attachment)
 	if t == nil {
 		return fmt.Errorf("unknown thread %q", threadID)
 	}
-	t.mu.Lock()
-	alive := t.alive
-	stopping := t.stopping
-	sid := t.sessionID
-	if alive && !stopping {
-		t.activePrompts++ // Interrupt has something to cancel from here on
+	// A `/usage` probe fired by the previous turn may still be in flight, and
+	// kimi rejects an overlapping prompt. It is discardable bookkeeping, so it
+	// is cancelled rather than waited out — the human's message must not queue
+	// behind it.
+	//
+	// preemptInternal necessarily runs WITHOUT the lock (it waits on the
+	// turn's unwind), which leaves a window between it returning and this
+	// goroutine claiming the turn slot. The post-turn `/usage` probe runs off
+	// its own goroutine and can start a fresh internal turn inside that
+	// window; both prompts would then be in flight and kimi would reject the
+	// human's. So the claim re-checks t.internal under the SAME lock hold that
+	// increments activePrompts, and pre-empts again if one appeared.
+	var (
+		alive, stopping bool
+		sid             string
+		tr              *translator
+		claimed         bool
+	)
+	for round := 0; round < preemptRounds && !claimed; round++ {
+		s.preemptInternal(t, preemptGrace)
+		if s.onPreempt != nil {
+			s.onPreempt(t)
+		}
+		t.mu.Lock()
+		alive, stopping, sid, tr = t.alive, t.stopping, t.sessionID, t.tr
+		switch {
+		case !alive || stopping:
+			claimed = true // nothing to claim; the error below is the answer
+		case t.internal != nil:
+			// Lost the race — go round and cancel the newcomer too.
+		default:
+			t.activePrompts++ // Interrupt has something to cancel from here on
+			claimed = true
+		}
+		t.mu.Unlock()
 	}
-	t.mu.Unlock()
 	if !alive {
 		return fmt.Errorf("thread %q is not running", threadID)
 	}
 	if stopping {
 		return fmt.Errorf("thread %q is stopping", threadID)
 	}
+	if !claimed {
+		// Only reachable if a new internal turn appeared on every round, which
+		// would mean something is spawning them in a loop. Refusing is far
+		// better than writing a prompt kimi is certain to reject.
+		return fmt.Errorf("thread %q is busy with its own bookkeeping turn", threadID)
+	}
+	// From here the feed belongs to the human's turn, so any drop latch a
+	// pre-empted probe left behind has to go — even if that probe never
+	// answered the cancel (see abandonCapture).
+	if tr != nil {
+		tr.clearDrop()
+	}
 	_, err := t.client.send("session/prompt", map[string]any{
 		"sessionId": sid,
 		"prompt":    buildPromptContent(text, attachments),
-	}, func(f acpFrame) { s.onPromptDone(t, f) })
+	}, func(f acpFrame) { s.onPromptDone(t, f, nil) })
 	if err != nil {
 		t.mu.Lock()
-		if t.activePrompts > 0 {
-			t.activePrompts--
-		}
+		t.releasePromptSlotLocked()
 		t.mu.Unlock()
 	}
 	return err
 }
 
+// The slash commands the CLI answers itself, sent as ordinary prompt text.
+// Both are local: `/compact` rewrites the session's own context and `/usage`
+// reports it back, neither spending a model call.
+const (
+	compactCommand = "/compact"
+	usageCommand   = "/usage"
+)
+
+// internalTurnTimeout bounds a locally-answered slash command. Both are
+// in-process work for the CLI, so anything approaching this is a hang.
+const internalTurnTimeout = 30 * time.Second
+
+// sendInternal issues one Agent-Kate-owned prompt turn and returns a handle to
+// wait on. ACP allows a single turn per session and kimi rejects an overlapping
+// prompt, so an internal turn is only ever started on an idle thread — the
+// caller's request is refused rather than queued, since these are all
+// best-effort bookkeeping.
+func (s *Supervisor) sendInternal(t *Thread, kind, prompt string, silent bool) (*internalTurn, error) {
+	t.mu.Lock()
+	switch {
+	case !t.alive:
+		t.mu.Unlock()
+		return nil, fmt.Errorf("thread %q is not running", t.ID)
+	case t.stopping:
+		t.mu.Unlock()
+		return nil, fmt.Errorf("thread %q is stopping", t.ID)
+	case t.internal != nil:
+		t.mu.Unlock()
+		return nil, fmt.Errorf("thread %q is already running a %s turn", t.ID, t.internal.kind)
+	case t.activePrompts > 0:
+		t.mu.Unlock()
+		return nil, fmt.Errorf("thread %q is busy; %s needs an idle turn", t.ID, kind)
+	case t.tr == nil:
+		t.mu.Unlock()
+		return nil, fmt.Errorf("thread %q has no session yet", t.ID)
+	}
+	it := newInternalTurn(kind, silent)
+	t.internal = it
+	t.activePrompts++
+	tr := t.tr
+	sid := t.sessionID
+	t.mu.Unlock()
+
+	tr.beginCapture(silent)
+	_, err := t.client.send("session/prompt", map[string]any{
+		"sessionId": sid,
+		"prompt":    []map[string]any{{"type": "text", "text": prompt}},
+	}, func(f acpFrame) { s.onPromptDone(t, f, it) })
+	if err != nil {
+		t.mu.Lock()
+		t.releasePromptSlotLocked()
+		if t.internal == it {
+			t.internal = nil
+		}
+		t.mu.Unlock()
+		tr.endCapture()
+		return nil, err
+	}
+	return it, nil
+}
+
+// runInternal sends an internal turn and waits for its reply text.
+func (s *Supervisor) runInternal(ctx context.Context, t *Thread, kind, prompt string, silent bool) (string, error) {
+	it, err := s.sendInternal(t, kind, prompt, silent)
+	if err != nil {
+		return "", err
+	}
+	select {
+	case <-it.done:
+		return it.result()
+	case <-ctx.Done():
+		// Giving up on the wait is not enough: the turn still holds
+		// t.internal and an activePrompts slot, and leaving them set would
+		// make every later Send pay the full timeout again — one hung
+		// bookkeeping turn would wedge the thread for good.
+		s.abandonInternal(t, it)
+		return "", ctx.Err()
+	}
+}
+
+// abandonInternal unwinds a stuck or pre-empted internal turn so the thread is
+// immediately usable again, exactly as sendInternal's error path does: the
+// in-flight counter is released, the capture closed, and the turn's waiter
+// released. The CLI is told to drop the turn too — it would otherwise keep
+// working on a prompt nobody awaits and reject the user's next one.
+func (s *Supervisor) abandonInternal(t *Thread, it *internalTurn) {
+	t.mu.Lock()
+	if it.abandoned || t.internal != it {
+		t.mu.Unlock()
+		return // already completed or already unwound
+	}
+	it.abandoned = true
+	t.internal = nil
+	t.releasePromptSlotLocked()
+	tr := t.tr
+	sid := t.sessionID
+	t.mu.Unlock()
+
+	if tr != nil {
+		// Closing the capture is not enough: the CLI has NOT stopped talking
+		// yet, and a silent probe's remaining chunks would land in the human's
+		// transcript as an assistant card. Latch them away until the abandoned
+		// prompt's own reply arrives (onPromptDone clears it) — and only that
+		// reply, hence the id: a second abandon may latch after this one.
+		tr.abandonCapture(it.id)
+	}
+	// A plain notify, not Interrupt: this must not arm the signal backstop,
+	// which would kill a healthy process over a bookkeeping turn.
+	_ = t.client.notify("session/cancel", map[string]any{"sessionId": sid})
+	s.log.Debug("abandoned kimi internal turn", "thread", t.ID, "kind", it.kind)
+	it.finish("", fmt.Errorf("the %s turn was abandoned before the CLI replied", it.kind))
+}
+
+// preemptInternal clears the way for a turn the HUMAN asked for (a send, or
+// "Summarize now"). An Agent-Kate-owned turn is always discardable bookkeeping
+// (`/usage`, or a `/compact` the user has now moved past), so it is cancelled
+// rather than waited out: the user's request must not sit behind a 30-second
+// timeout, nor be refused as busy. The cancel usually lands in
+// milliseconds; if the CLI does not ack within grace, the turn is abandoned
+// locally so the send proceeds regardless.
+func (s *Supervisor) preemptInternal(t *Thread, grace time.Duration) {
+	t.mu.Lock()
+	it := t.internal
+	sid := t.sessionID
+	t.mu.Unlock()
+	if it == nil {
+		return
+	}
+	_ = t.client.notify("session/cancel", map[string]any{"sessionId": sid})
+	select {
+	case <-it.done:
+	case <-time.After(grace):
+		s.abandonInternal(t, it)
+	}
+}
+
+// preemptGrace bounds how long a user's send waits for a cancelled internal
+// turn to unwind. Kept short: these turns are answered locally by the CLI, so
+// anything past this is a hang, and the human should never feel it.
+const preemptGrace = 2 * time.Second
+
+// preemptRounds bounds Send's pre-empt/claim retry loop. One retry covers the
+// real race (a probe that started while the previous pre-empt was unwinding);
+// the rest are slack, and the ceiling is what stops a pathological producer of
+// internal turns from spinning a user's send forever.
+const preemptRounds = 3
+
+// Compact runs kimi's own in-session compaction: `/compact` sent as an ordinary
+// prompt turn, which the CLI intercepts and answers by rewriting the session's
+// context in place. Verified against kimi 0.30 — there is no ACP compaction
+// method, but the slash command really does compact.
+//
+// The returned string is whatever the CLI wrote back. It is deliberately NOT a
+// summary in the Claude sense: claude's hot compaction asks the MODEL to write
+// a summary and the caller stores that text to seed a fresh session, whereas
+// kimi keeps the compacted context inside its own session and prints at most a
+// status line. See kimiHarness.Compact for what the adapter does with that
+// difference.
+func (s *Supervisor) Compact(ctx context.Context, threadID string) (string, error) {
+	t := s.thread(threadID)
+	if t == nil {
+		return "", fmt.Errorf("unknown thread %q", threadID)
+	}
+	// The command is only a command if the CLI says it is. Sent to a build
+	// that doesn't offer it, `/compact` is just prompt text: the model would
+	// spend a real turn on it and answer with prose the caller would store as
+	// a summary of a session that was never compacted.
+	if !t.hasCommand(compactCommand) {
+		return "", fmt.Errorf("this Kimi Code session offers no %s command", compactCommand)
+	}
+	// The `/usage` probe that follows EVERY turn may still be in flight, and an
+	// internal turn is only started on an idle thread — without this,
+	// "Summarize now" right after a turn is refused as busy.
+	s.preemptInternal(t, preemptGrace)
+	// Not silent: the human asked for this one, so the turn belongs in the
+	// transcript exactly as the claude backend's hot compaction is.
+	text, err := s.runInternal(ctx, t, "compact", compactCommand, false)
+	if err != nil {
+		return "", err
+	}
+	// The context just shrank — the one moment the figure moves the wrong way,
+	// and the readout on screen is now wrong. Never throttled.
+	s.refreshUsage(t, true)
+	return strings.TrimSpace(text), nil
+}
+
+// usageProbeInterval throttles the routine post-turn `/usage` probe.
+//
+// The probe is free of inference, but it is NOT free: it is a full extra ACP
+// round-trip per turn, and because it lands on an idle thread the human's next
+// send has to pre-empt it — up to preemptGrace (2s) of stall on a message they
+// have already hit send on. A rapid back-and-forth pays that on every turn
+// while the readout barely moves.
+//
+// Correctness is unaffected. The figure only ever grows within a session
+// (context accumulates), so a throttled readout under-reports slightly rather
+// than showing something false, and the one moment where it can move
+// DISCONTINUOUSLY — a compaction — passes force and is never throttled.
+// Compact is the only force:true caller; there is deliberately no "refresh the
+// meter" RPC, because the probe costs the turn slot the human's next send would
+// have to pre-empt, and the post-turn probe already keeps the meter honest.
+const usageProbeInterval = 30 * time.Second
+
+// refreshUsage asks the CLI for its context/token readout and publishes it.
+// Silent: it is Agent Kate's bookkeeping, not a turn the human took, and it
+// must leave no card behind. Best-effort throughout: a busy thread, an
+// unparseable answer or a CLI that has no `/usage` all end in nothing
+// published rather than an error anyone sees.
+//
+// force skips the throttle, for the callers whose whole point is that the
+// number just changed out from under the readout.
+func (s *Supervisor) refreshUsage(t *Thread, force bool) {
+	// Same reasoning as Compact: a CLI that doesn't offer `/usage` would treat
+	// it as a prompt and burn a real turn on it. Skipping silently is right —
+	// the readout is a nicety, and nobody asked for it.
+	if !t.hasCommand(usageCommand) {
+		return
+	}
+	now := time.Now()
+	t.mu.Lock()
+	if !force && !t.usageProbedAt.IsZero() && now.Sub(t.usageProbedAt) < usageProbeInterval {
+		t.mu.Unlock()
+		return
+	}
+	// Stamped on START, not completion: the cost this bounds is the probe
+	// occupying the turn slot, which begins now.
+	t.usageProbedAt = now
+	t.mu.Unlock()
+	safe.Go("kimi.refreshUsage", func() {
+		ctx, cancel := context.WithTimeout(context.Background(), internalTurnTimeout)
+		defer cancel()
+		text, err := s.runInternal(ctx, t, "usage", usageCommand, true)
+		if err != nil {
+			s.log.Debug("kimi usage probe skipped", "thread", t.ID, "err", err)
+			return
+		}
+		u, ok := parseUsage(text)
+		if !ok {
+			s.log.Debug("kimi usage output not recognised", "thread", t.ID, "text", text)
+			return
+		}
+		t.mu.Lock()
+		tr := t.tr
+		t.mu.Unlock()
+		if tr == nil {
+			return
+		}
+		if ev := tr.setUsage(u); ev != nil {
+			s.emitEvents(t, []json.RawMessage{ev})
+		}
+	})
+}
+
 // onPromptDone completes a turn: the prompt response's stopReason becomes the
 // result event. Runs on the ACP read-loop goroutine, after every session/update
 // for the turn has already been translated.
-func (s *Supervisor) onPromptDone(t *Thread, f acpFrame) {
+//
+// owner names the internal turn this reply belongs to (nil for a human turn).
+// It is checked against the thread's current one under the SAME lock hold that
+// releases the in-flight slot: an internal turn abandoned exactly as its reply
+// arrived has had its bookkeeping unwound already, and a human send may have
+// claimed the slot in between — decrementing again would end that turn.
+func (s *Supervisor) onPromptDone(t *Thread, f acpFrame, owner *internalTurn) {
 	// This prompt is over, however it ended — success, error or stream close.
 	// Clearing cancelling once no prompt remains in flight (not just on
 	// stopReason "cancelled") is what keeps the interrupt backstop from
@@ -604,15 +1432,50 @@ func (s *Supervisor) onPromptDone(t *Thread, f acpFrame) {
 	// completion: ACP treats a cancel of a finished turn as a no-op, so no
 	// "cancelled" stop reason ever arrives.
 	t.mu.Lock()
-	if t.activePrompts > 0 {
-		t.activePrompts--
+	if owner != nil && (owner.abandoned || t.internal != owner) {
+		// The slot was released by abandonInternal, but the cancel flag still
+		// has to settle against what is in flight NOW: a cancel that raced this
+		// abandoned turn has nothing left to acknowledge it, and leaving
+		// t.cancelling set would keep cancelPending true for good.
+		if t.activePrompts == 0 {
+			t.cancelling = false
+		}
+		tr := t.tr
+		t.mu.Unlock()
+		// The CLI has stopped streaming for the abandoned turn, so whatever it
+		// still had to say has now been said (and dropped). Lift only THIS
+		// turn's latch: a later abandoned turn may still be streaming behind it.
+		if tr != nil {
+			tr.clearDropFor(owner.id)
+		}
+		return
 	}
-	if t.activePrompts == 0 {
-		t.cancelling = false
-	}
+	t.releasePromptSlotLocked()
 	tr := t.tr
 	stopping := t.stopping
+	it := t.internal
+	t.internal = nil
 	t.mu.Unlock()
+
+	if it != nil {
+		// An Agent-Kate-owned turn (`/compact`, `/usage`): its reply goes to
+		// the caller that asked for it. A silent one's events were dropped as
+		// they streamed, so endTurn has nothing left to ship.
+		var events []json.RawMessage
+		if f.Error == nil {
+			events = tr.endTurn()
+		}
+		text := tr.endCapture()
+		s.emitEvents(t, events)
+		var err error
+		if f.Error != nil && !isStreamClosed(f.Error) {
+			err = fmt.Errorf("%s: %w", it.kind, f.Error)
+		} else if f.Error != nil {
+			err = f.Error
+		}
+		it.finish(text, err)
+		return
+	}
 
 	if f.Error != nil {
 		// A stream close means the process died — reap() reports the exit, so
@@ -643,6 +1506,13 @@ func (s *Supervisor) onPromptDone(t *Thread, f acpFrame) {
 	// shutting down would mislead.
 	if res.StopReason == "cancelled" && !stopping {
 		s.emitLifecycle(t, "turn_aborted", "interrupted — session kept, ready for your next message")
+	}
+	// The turn just changed how full the context is; read it back. This is the
+	// routine path, so it is throttled (usageProbeInterval) rather than run on
+	// every single turn — and not run at all while shutting down, where the
+	// only thing left to do is exit.
+	if !stopping {
+		s.refreshUsage(t, false)
 	}
 }
 
@@ -850,26 +1720,78 @@ func (s *Supervisor) onNotification(t *Thread, method string, params json.RawMes
 	if method != "session/update" {
 		return
 	}
+	kind := sessionUpdateKind(params)
 	t.mu.Lock()
+	// Retain the vocabulary whichever side of the handshake it arrives on:
+	// Compact and the usage probe check membership before sending a slash
+	// command the CLI might not answer.
+	if kind == "available_commands_update" {
+		if names := commandNames(params); names != nil {
+			t.setCommandsLocked(names)
+		}
+	}
 	tr := t.tr
 	if tr == nil {
 		// Pre-handshake chatter. The command list is worth keeping — kimi
 		// announces it during session setup, and the UI's slash autocomplete
 		// wants it — so stash the latest for Start to replay post-handshake.
-		var probe struct {
-			Update struct {
-				SessionUpdate string `json:"sessionUpdate"`
-			} `json:"update"`
-		}
-		if json.Unmarshal(params, &probe) == nil &&
-			probe.Update.SessionUpdate == "available_commands_update" {
+		if kind == "available_commands_update" {
 			t.pendingCmds = append(json.RawMessage(nil), params...)
 		}
 		t.mu.Unlock()
 		return
 	}
+	loading := t.loading
 	t.mu.Unlock()
-	s.emitEvents(t, tr.update(params))
+
+	events := tr.update(params)
+	if kind == "config_option_update" {
+		// The CLI just told us what it is really running (its own ExitPlanMode
+		// flip lands here too). Keep the thread's record in step, so a resume
+		// replays the mode the session ended on rather than the one it started
+		// with.
+		s.syncApplied(t, tr)
+	}
+	if loading {
+		// session/load replay: buffer until the init event has gone out.
+		t.appendReplay(events)
+		return
+	}
+	s.emitEvents(t, events)
+}
+
+// sessionUpdateKind peeks at a session/update notification's kind without
+// decoding the rest of it.
+func sessionUpdateKind(params json.RawMessage) string {
+	var probe struct {
+		Update struct {
+			SessionUpdate string `json:"sessionUpdate"`
+		} `json:"update"`
+	}
+	if json.Unmarshal(params, &probe) != nil {
+		return ""
+	}
+	return probe.Update.SessionUpdate
+}
+
+// syncApplied copies the translator's current config values onto the thread,
+// so Model/Thinking/Mode report what the CLI is running now rather than what
+// the handshake asked for.
+func (s *Supervisor) syncApplied(t *Thread, tr *translator) {
+	model := tr.configValue("model")
+	thinking := tr.configValue("thinking")
+	mode := tr.configValue("mode")
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if model != "" {
+		t.appliedModel = model
+	}
+	if thinking != "" {
+		t.appliedThinking = thinking
+	}
+	if mode != "" {
+		t.appliedMode = mode
+	}
 }
 
 // SetConfigOption applies one session config option (model / thinking / mode)
@@ -893,11 +1815,39 @@ func (s *Supervisor) SetConfigOption(threadID, configID, value string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	return t.client.call(ctx, "session/set_config_option", map[string]any{
+	// The response carries the authoritative post-change config — kimi may
+	// have applied something other than what was asked for. Take its word for
+	// it instead of assuming the request landed verbatim.
+	var res json.RawMessage
+	if err := t.client.call(ctx, "session/set_config_option", map[string]any{
 		"sessionId": sid,
 		"configId":  configID,
 		"value":     value,
-	}, nil)
+	}, &res); err != nil {
+		return err
+	}
+	s.applyConfigResponse(t, res)
+	return nil
+}
+
+// applyConfigResponse folds an authoritative config snapshot into the session
+// and announces it, so every consumer converges on what the CLI actually did.
+// Shared by the set_config_option response and anything else that returns one.
+func (s *Supervisor) applyConfigResponse(t *Thread, res json.RawMessage) {
+	opts := decodeConfigOptions(res)
+	if len(opts) == 0 {
+		return
+	}
+	t.mu.Lock()
+	tr := t.tr
+	t.mu.Unlock()
+	if tr == nil {
+		return
+	}
+	if ev := tr.applyConfigOptions(opts); ev != nil {
+		s.emitEvents(t, []json.RawMessage{ev})
+	}
+	s.syncApplied(t, tr)
 }
 
 // onAgentRequest answers an agent→client request. Only
@@ -914,10 +1864,7 @@ func (s *Supervisor) onAgentRequest(t *Thread, f acpFrame) {
 			Title      string `json:"title"`
 			Kind       string `json:"kind"`
 		} `json:"toolCall"`
-		Options []struct {
-			OptionID string `json:"optionId"`
-			Kind     string `json:"kind"`
-		} `json:"options"`
+		Options []permOption `json:"options"`
 	}
 	if err := json.Unmarshal(f.Params, &p); err != nil {
 		t.client.respondError(f.ID, codeInvalidParams, err.Error())
@@ -937,9 +1884,18 @@ func (s *Supervisor) onAgentRequest(t *Thread, f acpFrame) {
 		name = toolName(p.ToolCall.Title, p.ToolCall.Kind)
 	}
 
+	// Not every request on this channel is a permission: kimi has no
+	// session/request_question, so AskUserQuestion arrives here too, with the
+	// user's ANSWERS as the options. Answering that by kind would pick one at
+	// random — it needs the human's actual choice.
+	if isQuestionRequest(p.Options) {
+		s.answerQuestion(t, f, input, p.Options)
+		return
+	}
+
 	allow := false
 	if s.perm != nil {
-		allow = s.perm(t.ID, name, input)
+		allow, _ = s.perm(t.ID, name, input)
 	}
 
 	// Map the boolean decision onto kimi's option set by KIND — option ids are
@@ -967,6 +1923,169 @@ func (s *Supervisor) onAgentRequest(t *Thread, f acpFrame) {
 	t.client.respond(f.ID, map[string]any{
 		"outcome": map[string]any{"outcome": "selected", "optionId": optionID},
 	})
+}
+
+// permOption is one choice offered by session/request_permission. For a real
+// permission the ids are kimi-specific and the KINDS carry the meaning; for a
+// question (see answerQuestion) it is the other way round — every answer is
+// kind "allow_once" and only the id says which answer it is.
+type permOption struct {
+	OptionID string `json:"optionId"`
+	Name     string `json:"name"`
+	Kind     string `json:"kind"`
+}
+
+// askUserQuestionTool is the tool name a bridged question is presented under.
+// It is claude's, deliberately: the UI already renders a question form for it,
+// so the same card serves both engines.
+const askUserQuestionTool = "AskUserQuestion"
+
+// questionOptionID matches the option ids kimi mints when it bridges the
+// AskUserQuestion tool onto session/request_permission: one q<n>_opt_<i> per
+// answer, plus a q<n>_skip. Probed against kimi 0.30.0.
+var questionOptionID = regexp.MustCompile(`^q\d+_opt_\d+$`)
+
+// isQuestionRequest reports whether a permission request is really a question.
+// The option-id namespace is the tell — the title is not always present, and
+// the kinds are indistinguishable from an ordinary allow/reject pair.
+func isQuestionRequest(opts []permOption) bool {
+	for _, o := range opts {
+		if questionOptionID.MatchString(o.OptionID) {
+			return true
+		}
+	}
+	return false
+}
+
+// answerQuestion puts a bridged AskUserQuestion to the human with its REAL
+// answers and sends back the one they picked. The prompt travels down the
+// existing permission channel, shaped as claude's AskUserQuestion input
+// ({questions:[{question, options:[{label}]}]}) so the UI's question form
+// renders it unchanged; the answer comes back as updatedInput and is mapped to
+// an option id by label.
+//
+// Only labels cross the ACP bridge — kimi drops each option's description and
+// degrades multi-select before we see it — so nothing richer can be offered.
+// The CLI's own skip option is kept in the list: dismissing is a first-class
+// answer, and it is the only way to decline without inventing one.
+func (s *Supervisor) answerQuestion(t *Thread, f acpFrame, rawInput json.RawMessage, opts []permOption) {
+	labels := make([]any, 0, len(opts))
+	byLabel := make(map[string]string, len(opts))
+	for _, o := range opts {
+		label := o.Name
+		if label == "" {
+			label = o.OptionID
+		}
+		labels = append(labels, map[string]any{"label": label})
+		if _, dup := byLabel[label]; !dup {
+			byLabel[label] = o.OptionID
+		}
+	}
+	question := questionText(rawInput)
+	input, _ := json.Marshal(map[string]any{
+		"questions": []any{map[string]any{
+			"question":    question,
+			"multiSelect": false,
+			"options":     labels,
+		}},
+	})
+
+	allow, updated := false, json.RawMessage(nil)
+	if s.perm != nil {
+		allow, updated = s.perm(t.ID, askUserQuestionTool, input)
+	}
+	optionID := ""
+	if allow {
+		optionID = byLabel[answeredLabel(updated, question)]
+	}
+	if optionID == "" {
+		// Dismissed, or an answer that matches no option: say so with the
+		// CLI's own skip rather than guessing which answer was meant.
+		optionID = skipOptionID(opts)
+	}
+	if optionID == "" {
+		t.client.respond(f.ID, map[string]any{
+			"outcome": map[string]any{"outcome": "cancelled"},
+		})
+		return
+	}
+	t.client.respond(f.ID, map[string]any{
+		"outcome": map[string]any{"outcome": "selected", "optionId": optionID},
+	})
+}
+
+// questionText recovers what the agent actually asked from the AskUserQuestion
+// tool call's raw input. The permission request itself carries only the
+// answers, so a CLI that streamed no usable input leaves the generic prompt.
+func questionText(rawInput json.RawMessage) string {
+	var in struct {
+		Question  string `json:"question"`
+		Header    string `json:"header"`
+		Questions []struct {
+			Question string `json:"question"`
+			Header   string `json:"header"`
+		} `json:"questions"`
+	}
+	if json.Unmarshal(rawInput, &in) == nil {
+		for _, q := range []string{
+			in.Question, in.Header,
+		} {
+			if s := strings.TrimSpace(q); s != "" {
+				return s
+			}
+		}
+		if len(in.Questions) > 0 {
+			for _, q := range []string{in.Questions[0].Question, in.Questions[0].Header} {
+				if s := strings.TrimSpace(q); s != "" {
+					return s
+				}
+			}
+		}
+	}
+	return "The agent is asking a question — pick an answer."
+}
+
+// answeredLabel pulls the human's choice out of the answered input the UI
+// sends back: {"answers": {"<question>": "<label>"}} (a one-element array for
+// a multi-select UI). The question key is matched first; a single answer under
+// any other key is taken as that answer, since there is only ever one question
+// on this path.
+func answeredLabel(updated json.RawMessage, question string) string {
+	var in struct {
+		Answers map[string]json.RawMessage `json:"answers"`
+	}
+	if json.Unmarshal(updated, &in) != nil || len(in.Answers) == 0 {
+		return ""
+	}
+	raw, ok := in.Answers[question]
+	if !ok {
+		if len(in.Answers) != 1 {
+			return ""
+		}
+		for _, v := range in.Answers {
+			raw = v
+		}
+	}
+	var one string
+	if json.Unmarshal(raw, &one) == nil {
+		return one
+	}
+	var many []string
+	if json.Unmarshal(raw, &many) == nil && len(many) > 0 {
+		return many[0]
+	}
+	return ""
+}
+
+// skipOptionID returns the option that declines to answer — kimi's q<n>_skip,
+// identified by its reject kind so a renamed id still resolves.
+func skipOptionID(opts []permOption) string {
+	for _, o := range opts {
+		if strings.HasPrefix(o.Kind, "reject") {
+			return o.OptionID
+		}
+	}
+	return ""
 }
 
 // maxStderrTailLines bounds the pre-handshake stderr buffer kept for a failure
@@ -1000,13 +2119,38 @@ func (s *Supervisor) pumpStderr(t *Thread, r io.Reader, done chan<- struct{}) {
 	}
 }
 
+// drainGrace bounds how long reap waits for the output readers before calling
+// cmd.Wait anyway — a reader kept alive by a leaked grandchild must not leak
+// the reaper (and with it the thread's "exited" event) with it.
+const drainGrace = 5 * time.Second
+
 func (s *Supervisor) reap(t *Thread) {
 	defer s.reapWG.Done()
+	// Let the readers finish before Wait closes the pipes under them (audit
+	// F24). One absolute deadline shared by both waits.
+	end := time.Now().Add(drainGrace)
+	for _, drained := range []chan struct{}{t.stdoutDrained, t.stderrDrained} {
+		if drained == nil {
+			continue
+		}
+		select {
+		case <-drained:
+		case <-time.After(time.Until(end)):
+			s.log.Warn("output reader still running at reap; closing pipes anyway",
+				"thread", t.ID)
+		}
+	}
 	err := t.cmd.Wait()
 
 	t.mu.Lock()
 	t.alive = false
 	interrupted := t.interrupted
+	// Release any Agent-Kate-owned turn still waiting: its reply isn't coming.
+	if t.internal != nil {
+		t.internal.finish("", fmt.Errorf("agent exited before the %s turn completed",
+			t.internal.kind))
+		t.internal = nil
+	}
 	t.mu.Unlock()
 
 	s.mu.Lock()
@@ -1044,7 +2188,13 @@ func (s *Supervisor) emitEvents(t *Thread, events []json.RawMessage) {
 	t.mu.Lock()
 	if t.logFile != nil {
 		for _, ev := range events {
-			_, _ = t.logFile.Write(append(ev, '\n'))
+			n, _ := t.logFile.Write(append(ev, '\n'))
+			t.logBytes += int64(n)
+		}
+		// Retention: an append-only log that nothing ever deletes is a slow
+		// disk-fill on the user (audit F10).
+		if t.logBytes > maxEventLogBytes {
+			s.trimEventLogLocked(t)
 		}
 	}
 	t.mu.Unlock()

@@ -54,10 +54,12 @@ Use these tools (they are ordinary tools available to you right now):
 - claim_file before you edit a file, and release_file when you are done, so a worker does not overwrite you (and you do not overwrite it).
 - Prefer giving a worker a file to own over editing the same file from two agents.
 
-### Permissions
+### Permissions — you cannot give away authority you do not have
 
 - Workers run under the permission_mode you launch them with. A worker in the default mode stops and asks the HUMAN for permission on gated tools — good for anything destructive, but it stalls until the human answers.
-- If you want a worker to run unattended, launch it with the permissive mode its engine uses (the roster names it for each role) and give it a tightly scoped brief. That trades human review for autonomy; do not do it for work that touches anything outside this workspace.
+- Launching a worker MORE PERMISSIVE than your own mode, or with isolation="workspace" (the human's main checkout, not a throwaway worktree), stops the launch and asks the human first. Expect that pause, and only ask for it when the task genuinely needs it — say why in the worker's prompt, because the human sees its first line.
+- Leave permission_mode unset unless you have a reason. A worker that inherits the normal default launches immediately and still asks the human about anything destructive.
+- There is a cap on how many workers can run at once, per controller and per crew. Retire finished workers with close_agent rather than launching around the limit.
 
 ## Now
 
@@ -175,8 +177,14 @@ func WorkerRoster(m Mode, permissiveModes map[string]string) string {
 		if w.Notes != "" {
 			fmt.Fprintf(&b, "  %s\n", w.Notes)
 		}
+		// The engine's unattended mode is NAMED, never recommended: launching a
+		// worker above your own permission mode stops for the human's approval
+		// (core/cmd/akcore/authority.go), so a roster that sold it as the way to
+		// get autonomous work would be briefing controllers to trip a gate.
 		if pm := permissiveModes[backend]; w.PermissionMode == "" && pm != "" {
-			fmt.Fprintf(&b, "  Unattended: add permission_mode=%q (it stops asking the human).\n", pm)
+			fmt.Fprintf(&b, "  This engine's never-ask mode is %q; asking for it "+
+				"needs the human's approval, so only request it when the task "+
+				"truly cannot pause.\n", pm)
 		}
 	}
 	return strings.TrimRight(b.String(), "\n")

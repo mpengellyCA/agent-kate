@@ -248,13 +248,17 @@ func TestRenderFillsPlaceholders(t *testing.T) {
 			t.Errorf("rendered prompt is missing %q", want)
 		}
 	}
-	// The unattended hint uses the harness's OWN vocabulary, and only for roles
-	// that did not already pin a mode.
-	if !strings.Contains(out, `permission_mode="yolo"`) {
-		t.Error("no unattended hint for the kimi role")
+	// The never-ask hint uses the harness's OWN vocabulary, only for roles that
+	// did not already pin a mode — and NAMES the human approval it costs rather
+	// than selling it as the way to get autonomous work (audit F1).
+	if !strings.Contains(out, `never-ask mode is "yolo"`) {
+		t.Error("no never-ask hint for the kimi role")
 	}
-	if strings.Contains(out, `permission_mode="bypassPermissions"`) {
-		t.Error("gave an unattended hint to a role that already pins a mode")
+	if !strings.Contains(out, "needs the human's approval") {
+		t.Error("the never-ask hint does not name the human approval it costs")
+	}
+	if strings.Contains(out, `"bypassPermissions"`) {
+		t.Error("gave a never-ask hint to a role that already pins a mode")
 	}
 }
 
@@ -298,5 +302,173 @@ func TestWorkerRosterDefaultsBackendToController(t *testing.T) {
 	}
 	if out := WorkerRoster(m, nil); !strings.Contains(out, `backend="kimi"`) {
 		t.Errorf("roster did not inherit the controller's backend: %q", out)
+	}
+}
+
+// TestFlushRefusesSymlinkedTemp pins audit F20b: the store's staging file must
+// never be written *through* a pre-planted symlink. On the /tmp fallback path
+// another local user can create <path>.tmp pointing at a file of theirs (or of
+// ours) and os.WriteFile would follow it, redirecting the write. flush now
+// unlinks the name first (which removes the link, never its target) and creates
+// the staging file with O_EXCL|O_NOFOLLOW, so a link re-planted in the race
+// window fails the save instead of redirecting it.
+func TestFlushRefusesSymlinkedTemp(t *testing.T) {
+	dir := t.TempDir()
+	store := filepath.Join(dir, "modes.json")
+	victim := filepath.Join(dir, "victim.txt")
+	if err := os.WriteFile(victim, []byte("do not clobber"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, store+".tmp"); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := NewStore(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Save(Mode{Name: "attacked"}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	b, err := os.ReadFile(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "do not clobber" {
+		t.Fatalf("write followed the symlink: victim now %q", b)
+	}
+	fi, err := os.Lstat(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		t.Fatal("store path is a symlink")
+	}
+	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
+		t.Fatalf("store written group/world readable (mode %04o)", perm)
+	}
+	if _, err := os.Lstat(store + ".tmp"); !os.IsNotExist(err) {
+		t.Fatalf("staging file left behind: %v", err)
+	}
+}
+
+// TestFlushFailsOnRacedSymlink covers the other half: a symlink that appears
+// between the unlink and the create (an attacker spinning on the path) must
+// make the save fail, not silently write somewhere else.
+func TestFlushFailsOnRacedSymlink(t *testing.T) {
+	dir := t.TempDir()
+	store := filepath.Join(dir, "modes.json")
+	victim := filepath.Join(dir, "victim.txt")
+	if err := os.WriteFile(victim, []byte("intact"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Make the unlink impossible to win: a read-only parent directory would be
+	// the real-world equivalent; here we simply pre-create the staging path as a
+	// symlink AND make Remove fail by removing write permission after planting.
+	if err := os.Symlink(victim, store+".tmp"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	s := &Store{path: store, user: map[string]Mode{}, suppressed: map[string]bool{}}
+	if err := s.flush(); err == nil {
+		t.Fatal("flush succeeded with an unremovable symlinked staging path")
+	}
+	b, err := os.ReadFile(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "intact" {
+		t.Fatalf("write followed the symlink: victim now %q", b)
+	}
+}
+
+// TestStoreMigratesWorldReadableModes is the case every existing installation
+// is in (audit F2, migration gap): modes.json already exists, created 0644 in a
+// 0755 directory by an earlier build. flush's 0600 applies only to files it
+// CREATES, so without a migration pass at open the file a user already has
+// stays world-readable forever — and an ensemble carries the master prompt and
+// every role's system prompt.
+func TestStoreMigratesWorldReadableModes(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "agentkate")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "modes.json")
+	if err := os.WriteFile(path, []byte(`{"modes":[]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := NewStore(path); err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+
+	di, err := os.Lstat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := di.Mode().Perm(); got != 0o700 {
+		t.Errorf("data dir mode = %o after open, want 700", got)
+	}
+	fi, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != 0o600 {
+		t.Errorf("modes.json mode = %o after open, want 600", got)
+	}
+}
+
+// A planted staging symlink must not stop the daemon starting. harden
+// deliberately skips <path>.tmp: flush unlinks and re-creates it
+// O_EXCL|O_NOFOLLOW at 0600, so there is nothing to migrate, and failing the
+// OPEN on a name any local user can plant (on the /tmp fallback path) would
+// turn a handled condition into a denial of service.
+func TestStoreOpensDespiteSymlinkedStagingFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "modes.json")
+	victim := filepath.Join(dir, "victim.txt")
+	if err := os.WriteFile(victim, []byte("intact"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, path+".tmp"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewStore(path); err != nil {
+		t.Fatalf("NewStore refused to open over a planted staging symlink: %v", err)
+	}
+	b, err := os.ReadFile(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "intact" {
+		t.Fatalf("open touched the symlink's target: %q", b)
+	}
+}
+
+// A store FILE replaced by a symlink is the chmod-redirect primitive and must
+// fail the open loudly rather than tighten someone else's file.
+func TestStoreRefusesSymlinkedStoreFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "modes.json")
+	victim := filepath.Join(dir, "victim.txt")
+	if err := os.WriteFile(victim, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewStore(path); err == nil {
+		t.Fatal("NewStore opened a store whose file is a symlink")
+	}
+	fi, err := os.Lstat(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != 0o644 {
+		t.Errorf("chmod'd through the symlink: victim now %o", got)
 	}
 }

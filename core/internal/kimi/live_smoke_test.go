@@ -72,12 +72,12 @@ func TestLiveSmoke(t *testing.T) {
 	col := &eventCollector{}
 
 	permCalls := 0
-	perm := func(_, toolName string, _ json.RawMessage) bool {
+	perm := func(_, toolName string, _ json.RawMessage) (bool, json.RawMessage) {
 		permCalls++
 		if toolName != "Bash" {
 			t.Errorf("permission requested for %q, want Bash", toolName)
 		}
-		return true
+		return true, nil
 	}
 	sup := NewSupervisor(kimiBin, testLogger(), col.add, perm, t.TempDir())
 

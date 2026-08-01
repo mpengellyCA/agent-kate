@@ -15,21 +15,44 @@ import (
 
 // permissiveModes maps each registered backend to the permission mode that
 // runs a worker unattended, taken from that harness's own declared vocabulary
-// — never from a hardcoded table. It feeds the master prompt's roster hint, so
-// a controller can tell its crew to stop asking the human without the ensemble
-// author having to know each engine's spelling.
+// — never from a hardcoded table. It feeds the master prompt's roster hint,
+// which NAMES the mode without recommending it: since audit F1, launching a
+// worker more permissive than the controller's own mode stops for the human's
+// approval (authority.go), so the hint exists to spell the mode correctly when
+// a controller has a real reason to ask for it — not to brief crews to run
+// unattended by default.
 //
-// The rule is positional, not name-matched: a harness lists its modes from the
-// most supervised to the least (claude: acceptEdits → default → plan → auto →
-// bypassPermissions), so the last entry is the permissive end. A harness with a
-// discovered (empty) vocabulary contributes nothing, and its roles get no hint
-// rather than a guessed one.
+// The rule is RANKED, not positional: each declared mode is looked up in
+// permissivenessRanks (authority.go — the one table every authority decision is
+// made on) and the highest-ranked known mode wins. An earlier version took the
+// last entry of Capabilities().PermissionModes and documented that list as
+// running "most supervised to least", which it does not: claude declares it in
+// PICKER order (acceptEdits, default, plan, …) and only its tail happens to be
+// the permissive end. Two orderings meant two sources of truth for the same
+// question; there is now one, and it is authority.go's.
+//
+// A harness with a discovered (empty) vocabulary — or one whose modes are all
+// unranked — contributes nothing, and its roles get no hint rather than a
+// guessed one.
 func permissiveModes(reg *harness.Registry) map[string]string {
 	out := map[string]string{}
 	for _, h := range reg.All() {
 		caps := h.Capabilities()
-		if n := len(caps.PermissionModes); n > 0 {
-			out[caps.ID] = caps.PermissionModes[n-1]
+		best, bestRank := "", -1
+		for _, m := range caps.PermissionModes {
+			// Only modes the shared table ranks: naming one it has never heard
+			// of would tell a controller that a mode whose authority nobody has
+			// placed is the never-ask mode.
+			if r, ok := permissivenessRanks[m]; ok && r > bestRank {
+				best, bestRank = m, r
+			}
+		}
+		// ...and only if that mode really is one that never asks. An engine
+		// whose most permissive ranked mode still stops at the human's prompt
+		// has no never-ask mode to name, and inventing one would be a lie the
+		// controller then wastes an approval on.
+		if best != "" && bestRank >= permissivenessRanks["dontAsk"] {
+			out[caps.ID] = best
 		}
 	}
 	return out
@@ -98,7 +121,16 @@ func registerModeHandlers(d handlerDeps) {
 
 	// mode.save inserts or replaces one ensemble. Saving under a built-in's
 	// name shadows that built-in; the built-in itself is never edited.
-	d.srv.Handle("mode.save", func(_ context.Context, raw json.RawMessage) (any, error) {
+	//
+	// UI-only (audit F5), by the same reasoning as mode.apply: an ensemble is a
+	// stored recipe for creating threads, naming their permission modes and
+	// their isolation. A caller that could write one could plant a
+	// bypassPermissions/workspace crew for the human to launch later with one
+	// trusting click — creating a thread's authority a step ahead of time.
+	d.srv.Handle("mode.save", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUI(d, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			Mode modes.Mode `json:"mode"`
 		}
@@ -112,7 +144,13 @@ func registerModeHandlers(d handlerDeps) {
 		return map[string]any{"mode": modeToJSON(saved)}, nil
 	})
 
-	d.srv.Handle("mode.delete", func(_ context.Context, raw json.RawMessage) (any, error) {
+	// UI-only for the mirror-image reason: deleting the ensemble the human
+	// reaches for and letting a shadowed built-in (or nothing) take its place
+	// changes what their next click starts.
+	d.srv.Handle("mode.delete", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUI(d, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			Name string `json:"name"`
 		}
@@ -132,7 +170,15 @@ func registerModeHandlers(d handlerDeps) {
 	// the rendered master prompt. Workers are deliberately not pre-spawned —
 	// the controller launches the roles it actually needs via launch_agent, so
 	// applying an ensemble costs one agent, not five worktrees.
-	d.srv.Handle("mode.apply", func(_ context.Context, raw json.RawMessage) (any, error) {
+	//
+	// UI-only (audit F5): applying an ensemble starts a thread in an arbitrary
+	// workDir, optionally with desktop access, on whatever permission mode the
+	// stored ensemble names — the same authority agent.start carries, reached
+	// through a saved recipe instead of a form.
+	d.srv.Handle("mode.apply", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUI(d, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			Name          string `json:"name"`
 			WorkDir       string `json:"workDir"`
@@ -163,6 +209,10 @@ func registerModeHandlers(d handlerDeps) {
 		}
 		if p.CoworkEnabled && !caps.Cowork {
 			return nil, unsupported("Cowork", caps)
+		}
+		if err := authorizeCoworkAtStart(d, ctx, p.CoworkEnabled, m.Name,
+			"running the "+m.Name+" ensemble"); err != nil {
+			return nil, err
 		}
 
 		prompt := modes.Render(m, p.WorkDir, permissiveModes(d.harnesses))

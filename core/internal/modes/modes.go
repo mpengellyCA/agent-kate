@@ -18,10 +18,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+
+	"agentkate/internal/fsperm"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -97,16 +100,66 @@ func DefaultPath() string {
 }
 
 // NewStore opens (or starts) the store at path.
+//
+// Opening also MIGRATES permissions (see harden). flush already writes new
+// files 0600, but mode constants on new writes alone leave every EXISTING
+// installation's modes.json at the 0644 an earlier build gave it — and an
+// ensemble carries the master prompt and each role's system prompt, the same
+// data class as the thread store. The thread store got its migration pass
+// (session.Store.harden); this is the matching one (audit F2).
 func NewStore(path string) (*Store, error) {
 	s := &Store{
 		path:       path,
 		user:       make(map[string]Mode),
 		suppressed: make(map[string]bool),
 	}
+	if err := s.harden(); err != nil {
+		return nil, err
+	}
 	if err := s.load(); err != nil {
 		return nil, err
 	}
 	return s, nil
+}
+
+// harden tightens an already-existing modes.json to 0600 and the directory
+// holding it to 0700.
+//
+// The STAGING file (<path>.tmp) is deliberately NOT hardened, unlike the thread
+// store's. That store writes its staging file with os.WriteFile, whose mode
+// applies only on creation, so a leftover 0644 tmp from an older build's crash
+// would be renamed over the real store carrying its loose mode — hence the
+// migration there. flush here creates the staging file O_EXCL|O_NOFOLLOW at
+// 0600 after unlinking whatever name was there, so it is always freshly created
+// with the right mode and there is nothing to migrate. Touching it would also
+// be actively harmful: fsperm.HardenFile refuses symlinks (correctly), so a
+// planted <path>.tmp symlink would fail the store OPEN — turning a condition
+// flush already handles safely into a daemon that will not start.
+//
+// FAIL CLOSED on everything else: an error fails the store open rather than
+// proceeding with a store we could not confirm is private — same contract as
+// the thread store. HardenDir follows symlinks, because a relocated XDG data
+// directory is a legitimate layout; HardenFile does not, because a symlink
+// standing in for a store file is the classic chmod-redirect primitive.
+func (s *Store) harden() error {
+	dir := filepath.Dir(s.path)
+	tightened, err := fsperm.HardenDir(dir)
+	if err != nil {
+		return fmt.Errorf("ensemble store: %w", err)
+	}
+	n := 0
+	if tightened {
+		n++
+	}
+	t, err := fsperm.HardenFile(s.path)
+	if err != nil {
+		return fmt.Errorf("ensemble store: %w", err)
+	}
+	if t {
+		n++
+	}
+	fsperm.LogMigration(dir, n)
+	return nil
 }
 
 func (s *Store) load() error {
@@ -151,11 +204,31 @@ func (s *Store) flush() error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
 		return err
 	}
+	// The staging file is created O_EXCL|O_NOFOLLOW, not os.WriteFile: on the
+	// /tmp fallback path (audit F20b) os.WriteFile happily follows a symlink
+	// another local user planted at <path>.tmp, redirecting our write onto any
+	// file we can write. O_EXCL means an existing name — symlink or not — is a
+	// hard failure; a stale tmp from a crash is removed first, and that Remove
+	// unlinks the link itself, never its target.
 	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+	if err := os.Remove(tmp); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	fh, err := os.OpenFile(tmp,
+		os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := fh.Write(b); err != nil {
+		fh.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := fh.Close(); err != nil {
+		os.Remove(tmp)
 		return err
 	}
 	return os.Rename(tmp, s.path)

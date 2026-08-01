@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"agentkate/internal/agent"
@@ -42,6 +44,17 @@ func (h *kimiHarness) Capabilities() harness.Capabilities {
 		// One wire log per subagent under <session-dir>/agents/<id>/, probed
 		// on 0.30.0 — the viewer translates its event shapes.
 		SubagentTranscripts: true,
+		// `/compact` sent as ordinary prompt text performs a real in-session
+		// compaction (probed on 0.30.0). It is a live-thread mechanism that
+		// produces no summary text — see Compact for what that costs callers.
+		Compaction: true,
+		// ...but ONLY hot. ColdCompact stays false: there is no
+		// `kimi --resume --print` to run a pass with, and kimi's on-disk store
+		// is its own wire format, not the claude transcript session.ReadTranscript
+		// parses. Letting the cold path run here would read nothing, store a
+		// summary of nothing, and make the next resume seed a fresh session
+		// from it — silently discarding the thread's history.
+		ColdCompact: false,
 		// Kimi forwards stdio MCP servers natively, so the Cowork desktop
 		// bridge works here exactly as it does for claude — every desktop
 		// action is still gated by the core's consent authority, which is
@@ -54,6 +67,15 @@ func (h *kimiHarness) Capabilities() harness.Capabilities {
 		// therefore re-attaches the thread — session/resume keeps the
 		// conversation and accepts a fresh mcpServers list (also probed).
 		LiveToolReveal: false,
+		// UsageReporting stays false (the zero value, stated here because it is
+		// load-bearing): the ACP protocol reports no per-turn token accounting,
+		// and kimi's only token figure is `/usage`, a CUMULATIVE context
+		// snapshot. The translator therefore ships that as a `_context` event
+		// and puts no per-turn `usage` block on the result event (audit F19b) —
+		// so the UI must not accumulate a session total for kimi threads.
+		// LOCKSTEP with ui/src/state/HarnessTraits.cpp: `usageReporting` is set
+		// for claude only.
+		UsageReporting: false,
 		ModelPicker:    harness.ModelPickerDiscovered,
 		// SystemPrompt / CustomSubagents stay false — see below for what was
 		// probed. PermissionModes/Efforts empty: the vocabularies come from
@@ -100,6 +122,12 @@ const (
 		"(its agent-file frontmatter is read only by the v2 engine, which ACP never runs)"
 	kimiNoAddDirs = "Kimi Code sessions reach one working directory over ACP; " +
 		"extra roots are not expressible"
+	// The control-channel sweep. ACP's session/new takes the mcpServers list
+	// the core hands it and nothing else — there is no global-server set to
+	// isolate from — and the protocol carries no spend ceiling.
+	kimiNoStrictMCPConfig = "Kimi Code sessions already run with only the MCP " +
+		"servers Agent Kate passes over ACP; there is no global set to isolate from"
+	kimiNoCostBudget = "Kimi Code has no session spend ceiling over ACP"
 )
 
 // unappliedSweep reports every list-valued sweep option the caller asked for,
@@ -120,6 +148,16 @@ func unappliedSweep(spec harness.StartSpec) []harness.UnappliedOption {
 			out = append(out, harness.UnappliedOption{Option: o.name, Reason: o.reason})
 		}
 	}
+	// The scalar half of the control-channel sweep. Title is deliberately not
+	// reported: it is cosmetic, and ACP sessions carry no label to put it in.
+	if spec.StrictMCPConfig {
+		out = append(out, harness.UnappliedOption{
+			Option: "strictMcpConfig", Reason: kimiNoStrictMCPConfig})
+	}
+	if spec.MaxBudgetUSD > 0 {
+		out = append(out, harness.UnappliedOption{
+			Option: "maxBudgetUsd", Reason: kimiNoCostBudget})
+	}
 	return out
 }
 
@@ -136,8 +174,13 @@ func (h *kimiHarness) Launch(spec harness.StartSpec) (harness.Launched, error) {
 		Mode:        spec.PermissionMode,
 		Env:         spec.Env,
 		MCPServers: []kimi.MCPServer{
-			coopMCPServer(h.exePath, h.socketPath, spec.ThreadID, spec.WorkDir),
-			coworkMCPServer(h.exePath, h.socketPath, spec.ThreadID, spec.WorkDir),
+			// One secret per bridge process: a redeemed secret is spent while
+			// its holder is connected, so sharing one between these two would
+			// make whichever spawned second look like a replay (F13).
+			coopMCPServer(h.exePath, h.socketPath, spec.ThreadID, spec.WorkDir,
+				spec.BridgeSecret),
+			coworkMCPServer(h.exePath, h.socketPath, spec.ThreadID, spec.WorkDir,
+				spec.CoworkBridgeSecret),
 		},
 	})
 	if err != nil {
@@ -174,6 +217,14 @@ func (h *kimiHarness) ReadTranscript(threadID, _ string) ([]json.RawMessage, err
 	return h.ksup.ReadTranscript(threadID)
 }
 
+// DeleteTranscript implements transcriptDeleter: the kimi event log is Agent
+// Kate's OWN file, so a destroyed thread takes it with it. Claude deliberately
+// does not implement this — its transcript belongs to the CLI and is kept so an
+// archived thread stays recoverable.
+func (h *kimiHarness) DeleteTranscript(threadID string) error {
+	return h.ksup.DeleteTranscript(threadID)
+}
+
 // DiscoverOptions probes the CLI's live config-option vocabulary (model /
 // thinking / mode enumerations) via a one-shot `kimi acp` handshake, cached by
 // the supervisor for the process lifetime.
@@ -184,7 +235,10 @@ func (h *kimiHarness) DiscoverOptions() ([]harness.DiscoveredOption, error) {
 	}
 	out := make([]harness.DiscoveredOption, 0, len(opts))
 	for _, o := range opts {
-		d := harness.DiscoveredOption{ID: o.ID, Name: o.Name}
+		// CurrentValue travels with the enumeration: it is the value a fresh
+		// `kimi acp` session reports for the option, i.e. the CLI's own default.
+		// The launch authority gate reads the `mode` one (authority.go).
+		d := harness.DiscoveredOption{ID: o.ID, Name: o.Name, Current: o.CurrentValue}
 		for _, v := range o.Options {
 			d.Options = append(d.Options,
 				harness.DiscoveredOptionValue{Value: v.Value, Name: v.Name})
@@ -241,13 +295,59 @@ func (h *kimiHarness) SubagentTranscripts(_, sessionID string) ([]harness.Subage
 	return list, nil
 }
 
-// Compact is the honest gate: ACP has no in-session compaction turn we can
-// bracket, and there is no `kimi --resume --print` equivalent to run a cold
-// pass with. Capabilities().Compaction is false, so the RPC layer rejects the
-// request before it reaches here; this is the backstop for any caller that
-// forgets to check.
-func (h *kimiHarness) Compact(context.Context, harness.CompactSpec) (string, error) {
-	return "", harness.Unsupported("Compaction", h.Capabilities())
+// ErrCompactedInPlace reports the one outcome the Harness.Compact signature
+// cannot express: the compaction ran and succeeded, but produced no summary
+// text to store. Callers that only want the context smaller can treat it as
+// success; callers that need a body have nothing to write.
+var ErrCompactedInPlace = errors.New(
+	"Kimi Code compacted the session in place — its context is now smaller, but the " +
+		"CLI returns no summary text, so no summary was stored (none is needed: the " +
+		"compacted context lives in the kimi session and survives resume)")
+
+// minKimiSummaryBytes is the length below which a `/compact` reply is treated
+// as a status line ("Compacted 42 messages.") rather than a summary.
+//
+// This guard is load-bearing, not cosmetic. A stored summary makes resumeThread
+// seed a BRAND NEW session with the summary text in place of the conversation —
+// so storing a one-line status message would silently throw the whole thread's
+// context away on the next resume. When in doubt, store nothing: kimi's own
+// session already holds the compacted history.
+const minKimiSummaryBytes = 400
+
+// Compact runs kimi's in-session compaction. `/compact` sent as ordinary
+// prompt text is intercepted by the CLI and really does compact the session
+// (verified against kimi 0.30.0 by ACP probe) — there is no ACP method for it,
+// and no `kimi --resume --print` to run a cold pass with, so the hot form is
+// the only one and a cold request is refused.
+//
+// How this differs from claude, which the caller must tolerate: claude's hot
+// compaction asks the model to WRITE a summary and hands that text back to be
+// stored and replayed into a fresh session. Kimi rewrites its own context and
+// keeps it; the reply is a status line, if anything. So unless the CLI returns
+// something long enough to be a real summary, this reports ErrCompactedInPlace
+// and stores nothing — resume then re-attaches to the already-compacted
+// session, which is both cheaper and lossless.
+func (h *kimiHarness) Compact(ctx context.Context, spec harness.CompactSpec) (string, error) {
+	if !spec.Hot {
+		return "", fmt.Errorf("Kimi Code compacts only inside a live session; " +
+			"resume the thread and compact it hot (there is no cold pass to run)")
+	}
+	if !h.ksup.Running(spec.ThreadID) {
+		return "", fmt.Errorf("compaction requires a running Kimi Code thread; resume it first")
+	}
+	if spec.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, spec.Timeout)
+		defer cancel()
+	}
+	text, err := h.ksup.Compact(ctx, spec.ThreadID)
+	if err != nil {
+		return "", err
+	}
+	if len(strings.TrimSpace(text)) < minKimiSummaryBytes {
+		return "", ErrCompactedInPlace
+	}
+	return text, nil
 }
 
 func (h *kimiHarness) SetOption(threadID, option, value string) (string, error) {

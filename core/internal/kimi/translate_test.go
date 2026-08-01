@@ -326,3 +326,434 @@ func TestToolForPermission(t *testing.T) {
 		t.Errorf("unknown toolCallId gave name %q, want empty", name)
 	}
 }
+
+// --- config_option_update (the stale-mode bug) --------------------------
+
+// Kimi announces every mid-session option change — its own ExitPlanMode flip
+// included — and the translator turns that into an `_options` event carrying
+// the FULL set with the new current value, so a consumer reads one shape for
+// both the vocabulary and what is running now.
+func TestConfigOptionUpdateEmitsOptionsEvent(t *testing.T) {
+	tr := newTranslator("s1", "kimi-code/k3", []ConfigOption{{
+		ID: "mode", Name: "Mode", CurrentValue: "plan",
+		Options: []ConfigOptionValue{
+			{Value: "plan", Name: "Plan"},
+			{Value: "default", Name: "Default"},
+		},
+	}})
+	assertEvents(t, tr.update(upd("config_option_update", map[string]any{
+		"configId": "mode", "value": "default",
+	})),
+		`{"type":"_options","session_id":"s1","changed":["mode"],
+		  "configOptions":[{"id":"mode","name":"Mode","currentValue":"default",
+		   "options":[{"value":"plan","name":"Plan"},
+		              {"value":"default","name":"Default"}]}]}`)
+	if got := tr.configValue("mode"); got != "default" {
+		t.Errorf("configValue(mode) = %q, want default", got)
+	}
+}
+
+// The notification's other spellings — a single configOption object, or the
+// whole set — carry the same meaning and must translate identically.
+func TestConfigOptionUpdateShapes(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		extra map[string]any
+	}{
+		{"flat id/currentValue", map[string]any{"id": "mode", "currentValue": "yolo"}},
+		{"single object", map[string]any{
+			"configOption": map[string]any{"id": "mode", "currentValue": "yolo"}}},
+		{"full set", map[string]any{
+			"configOptions": []any{map[string]any{"id": "mode", "currentValue": "yolo"}}}},
+		{"nested config", map[string]any{
+			"config": []any{map[string]any{"id": "mode", "currentValue": "yolo"}}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := newTranslator("s1", "", []ConfigOption{{ID: "mode", CurrentValue: "plan"}})
+			events := tr.update(upd("config_option_update", tc.extra))
+			if len(events) != 1 {
+				t.Fatalf("event count = %d, want 1: %s", len(events), events)
+			}
+			if got := tr.configValue("mode"); got != "yolo" {
+				t.Errorf("configValue(mode) = %q, want yolo", got)
+			}
+		})
+	}
+}
+
+// An update the translator cannot make sense of must change nothing and emit
+// nothing — a wrong current value is worse than a stale one.
+func TestConfigOptionUpdateUnrecognisedIsDropped(t *testing.T) {
+	tr := newTranslator("s1", "", []ConfigOption{{ID: "mode", CurrentValue: "plan"}})
+	if events := tr.update(upd("config_option_update", map[string]any{
+		"somethingElse": true,
+	})); len(events) != 0 {
+		t.Fatalf("events = %s, want none", events)
+	}
+	if got := tr.configValue("mode"); got != "plan" {
+		t.Errorf("configValue(mode) = %q, want plan (unchanged)", got)
+	}
+}
+
+// An option the handshake never listed still arrives with its enumeration
+// intact, so a picker can offer it.
+func TestConfigOptionUpdateAddsUnknownOption(t *testing.T) {
+	tr := newTranslator("s1", "", nil)
+	assertEvents(t, tr.update(upd("config_option_update", map[string]any{
+		"configOption": map[string]any{
+			"id": "thinking", "name": "Thinking", "currentValue": "high",
+			"options": []any{map[string]any{"value": "high", "name": "High"}},
+		},
+	})),
+		`{"type":"_options","session_id":"s1","changed":["thinking"],
+		  "configOptions":[{"id":"thinking","name":"Thinking","currentValue":"high",
+		   "options":[{"value":"high","name":"High"}]}]}`)
+}
+
+// --- session/set_config_option's authoritative response ------------------
+
+// The response to a set_config_option is what the CLI actually applied, which
+// need not be what was asked for. Folding it in produces the same `_options`
+// event the notification does, so both routes converge on one shape.
+func TestSetConfigOptionResponseAppliesAuthoritativeValue(t *testing.T) {
+	tr := newTranslator("s1", "", []ConfigOption{{ID: "thinking", CurrentValue: "low"}})
+	// Asked for "max"; the CLI reports it settled on "high".
+	opts := decodeConfigOptions(json.RawMessage(
+		`{"configOptions":[{"id":"thinking","currentValue":"high"}]}`))
+	assertEvents(t, []json.RawMessage{tr.applyConfigOptions(opts)},
+		`{"type":"_options","session_id":"s1","changed":["thinking"],
+		  "configOptions":[{"id":"thinking","name":"","currentValue":"high"}]}`)
+	if got := tr.configValue("thinking"); got != "high" {
+		t.Errorf("configValue(thinking) = %q, want high", got)
+	}
+}
+
+// A response that says nothing (kimi answers some sets with an empty result)
+// leaves the recorded value alone and announces nothing.
+func TestSetConfigOptionEmptyResponseChangesNothing(t *testing.T) {
+	tr := newTranslator("s1", "", []ConfigOption{{ID: "mode", CurrentValue: "default"}})
+	for _, raw := range []string{`{}`, `{"configOptions":[]}`, `null`, ``} {
+		if opts := decodeConfigOptions(json.RawMessage(raw)); len(opts) != 0 {
+			t.Errorf("decodeConfigOptions(%q) = %+v, want none", raw, opts)
+		}
+	}
+	if ev := tr.applyConfigOptions(nil); ev != nil {
+		t.Errorf("event = %s, want none", ev)
+	}
+	if got := tr.configValue("mode"); got != "default" {
+		t.Errorf("configValue(mode) = %q, want default", got)
+	}
+}
+
+// --- slash-command argument hints ---------------------------------------
+
+// The ACP command list carries an argument hint per command; it rides into the
+// `_commands` payload as `hint` so the composer can show `/compact <what>`
+// instead of a bare name. Commands without one carry no field at all.
+func TestAvailableCommandsCarryArgumentHints(t *testing.T) {
+	tr := newTranslator("s1", "", nil)
+	assertEvents(t, tr.update(upd("available_commands_update", map[string]any{
+		"availableCommands": []any{
+			map[string]any{"name": "compact", "description": "Compact the context",
+				"input": map[string]any{"hint": "<instructions>"}},
+			map[string]any{"name": "usage", "description": "Show token usage",
+				"input": "<none>"},
+			map[string]any{"name": "clear", "description": "Clear the session"},
+		},
+	})),
+		`{"type":"_commands","commands":[
+		  {"name":"compact","description":"Compact the context","hint":"<instructions>"},
+		  {"name":"usage","description":"Show token usage","hint":"<none>"},
+		  {"name":"clear","description":"Clear the session"}]}`)
+}
+
+// --- context usage ------------------------------------------------------
+
+// The `/usage` readout reaches the UI as a `_context` event — the same event
+// shape claude's get_context_usage control request produces, which is the one
+// the UI's context meter consumes. The result event carries only the model's
+// context-window SIZE.
+//
+// It must never carry `usage.input_tokens` / `output_tokens` (audit F19b):
+// kimi's readout is a cumulative context snapshot, and the UI accumulates those
+// fields into the session total, so presenting the snapshot in per-turn field
+// names invents token spend that never happened. This test is the regression
+// gate on that — if the result event grows a `usage` block again, kimi threads
+// start reporting fictional billing.
+func TestResultEventCarriesNoPerTurnUsage(t *testing.T) {
+	tr := newTranslator("s1", "kimi-code/k3", nil)
+	assertEvents(t, []json.RawMessage{tr.setUsage(usageInfo{
+		PromptTokens: 12345, OutputTokens: 800, ContextWindow: 256000})},
+		`{"type":"_context","usedTokens":12345,"maxTokens":256000}`)
+	assertEvents(t, tr.endTurn(),
+		`{"type":"result","subtype":"success","is_error":false,"session_id":"s1",
+		  "modelUsage":{"kimi-code/k3":{"contextWindow":256000}}}`)
+
+	// Three turns at a growing context fill: the wire must show no per-turn
+	// token counts at all, so nothing can be summed into a session total.
+	for _, fill := range []int64{20000, 40000, 60000} {
+		tr.setUsage(usageInfo{PromptTokens: fill, ContextWindow: 256000})
+		for _, ev := range tr.endTurn() {
+			var m map[string]any
+			if err := json.Unmarshal(ev, &m); err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := m["usage"]; ok {
+				t.Fatalf("result event carries a per-turn usage block: %s", ev)
+			}
+			mu, _ := m["modelUsage"].(map[string]any)
+			for model, v := range mu {
+				per, _ := v.(map[string]any)
+				for _, k := range []string{"inputTokens", "outputTokens",
+					"cacheReadInputTokens", "cacheCreationInputTokens"} {
+					if _, ok := per[k]; ok {
+						t.Fatalf("modelUsage[%s] carries per-turn field %q: %s", model, k, ev)
+					}
+				}
+			}
+		}
+	}
+}
+
+// A readout with no window (a `/usage` layout we only half-recognised) puts
+// nothing on the result event: a context window is the one number there, and a
+// missing one is reported as missing rather than guessed.
+func TestResultEventWithoutContextWindow(t *testing.T) {
+	tr := newTranslator("s1", "kimi-code/k3", nil)
+	tr.setUsage(usageInfo{PromptTokens: 5000})
+	assertEvents(t, tr.endTurn(),
+		`{"type":"result","subtype":"success","is_error":false,"session_id":"s1"}`)
+}
+
+// Before any readout exists, the result event stays exactly as it was.
+func TestResultEventWithoutUsage(t *testing.T) {
+	tr := newTranslator("s1", "kimi-code/k3", nil)
+	if ev := tr.setUsage(usageInfo{}); ev != nil {
+		t.Errorf("event = %s, want none for an empty readout", ev)
+	}
+	assertEvents(t, tr.endTurn(),
+		`{"type":"result","subtype":"success","is_error":false,"session_id":"s1"}`)
+}
+
+func TestParseUsage(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		text string
+		want usageInfo
+	}{
+		{"fraction with commas", "Context: 12,345 / 256,000 tokens (5%)",
+			usageInfo{PromptTokens: 12345, ContextWindow: 256000}},
+		{"fraction with k suffix", "Tokens 12.5k/128k used",
+			usageInfo{PromptTokens: 12500, ContextWindow: 128000}},
+		{"labelled lines", "Context window: 200000\nTokens used: 41,000\nOutput: 812",
+			usageInfo{PromptTokens: 41000, OutputTokens: 812, ContextWindow: 200000}},
+		{"percentage only", "Context window: 128k — 25% full",
+			usageInfo{PromptTokens: 32000, ContextWindow: 128000}},
+		{"ansi coloured", "\x1b[32mContext: 100 / 1,000\x1b[0m",
+			usageInfo{PromptTokens: 100, ContextWindow: 1000}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := parseUsage(tc.text)
+			if !ok {
+				t.Fatalf("parseUsage(%q) reported nothing usable", tc.text)
+			}
+			if got != tc.want {
+				t.Errorf("parseUsage(%q) = %+v, want %+v", tc.text, got, tc.want)
+			}
+		})
+	}
+}
+
+// An unrecognised layout yields nothing at all — the meter stays empty rather
+// than showing a number invented from an unrelated figure.
+func TestParseUsageRejectsNonsense(t *testing.T) {
+	for _, text := range []string{
+		"", "   ", "Compacted 3/5 steps", "Session started 2026-07-31",
+		"Context: 900,000 / 128,000", // used > window: a misread
+	} {
+		if got, ok := parseUsage(text); ok {
+			t.Errorf("parseUsage(%q) = %+v, want nothing usable", text, got)
+		}
+	}
+}
+
+// --- session/load replay -------------------------------------------------
+
+// A session created outside Agent Kate replays through session/load, whose
+// user_message_chunk updates become the Claude-shaped user events the feed
+// already renders as "You" cards. Without this, half the conversation is lost.
+func TestUserMessageChunkReplaysAsUserEvent(t *testing.T) {
+	tr := newTranslator("s1", "", nil)
+	if events := tr.update(upd("user_message_chunk", map[string]any{
+		"content": map[string]any{"type": "text", "text": "fix the auth bug"},
+	})); len(events) != 1 {
+		t.Fatalf("event count = %d, want 1: %s", len(events), events)
+	} else {
+		assertEvents(t, events,
+			`{"type":"user","message":{"role":"user","content":[
+			  {"type":"text","text":"fix the auth bug"}]}}`)
+	}
+	// Assistant text buffered before a user message flushes ahead of it, so
+	// the replayed conversation reads in order.
+	tr.update(upd("agent_message_chunk", map[string]any{
+		"content": map[string]any{"type": "text", "text": "on it"}}))
+	assertEvents(t, tr.update(upd("user_message_chunk", map[string]any{
+		"content": map[string]any{"type": "text", "text": "thanks"}})),
+		`{"type":"assistant","message":{"role":"assistant","content":[
+		  {"type":"text","text":"on it"}]}}`,
+		`{"type":"user","message":{"role":"user","content":[
+		  {"type":"text","text":"thanks"}]}}`)
+}
+
+// A replay has no prompt response to close its last message; flush ships it.
+func TestFlushShipsBufferedTextWithoutEndingATurn(t *testing.T) {
+	tr := newTranslator("s1", "", nil)
+	tr.update(upd("agent_thought_chunk", map[string]any{
+		"content": map[string]any{"type": "text", "text": "hmm"}}))
+	assertEvents(t, tr.update(upd("agent_message_chunk", map[string]any{
+		"content": map[string]any{"type": "text", "text": "done"}})),
+		`{"type":"assistant","message":{"role":"assistant","content":[
+		  {"type":"thinking","thinking":"hmm"}]}}`)
+	assertEvents(t, tr.flush(),
+		`{"type":"assistant","message":{"role":"assistant","content":[
+		  {"type":"text","text":"done"}]}}`)
+	if events := tr.flush(); len(events) != 0 {
+		t.Errorf("second flush = %s, want none", events)
+	}
+}
+
+// --- internal turns ------------------------------------------------------
+
+// A silent internal turn (`/usage`) captures the CLI's reply and leaves no
+// trace in the transcript — no cards, no result event.
+func TestSilentInternalTurnEmitsNothing(t *testing.T) {
+	tr := newTranslator("s1", "", nil)
+	tr.beginCapture(true)
+	for _, ev := range [][]json.RawMessage{
+		tr.update(upd("agent_thought_chunk", map[string]any{
+			"content": map[string]any{"type": "text", "text": "counting"}})),
+		tr.update(upd("agent_message_chunk", map[string]any{
+			"content": map[string]any{"type": "text", "text": "Context: 10 / 1,000"}})),
+		tr.update(upd("plan", map[string]any{
+			"entries": []any{map[string]any{"content": "x", "status": "pending"}}})),
+		tr.endTurn(),
+	} {
+		if len(ev) != 0 {
+			t.Fatalf("silent turn emitted %s, want nothing", ev)
+		}
+	}
+	if got := tr.endCapture(); got != "Context: 10 / 1,000" {
+		t.Errorf("captured %q, want the reply text", got)
+	}
+	// The capture is closed: the next turn is the human's again.
+	assertEvents(t, tr.update(upd("agent_message_chunk", map[string]any{
+		"content": map[string]any{"type": "text", "text": "hello"}})))
+	assertEvents(t, tr.endTurn(),
+		`{"type":"assistant","message":{"role":"assistant","content":[
+		  {"type":"text","text":"hello"}]}}`,
+		`{"type":"result","subtype":"success","is_error":false,"session_id":"s1"}`)
+}
+
+// A visible internal turn (`/compact`) both captures the reply AND renders,
+// because the human asked for it.
+func TestVisibleInternalTurnStillRenders(t *testing.T) {
+	tr := newTranslator("s1", "", nil)
+	tr.beginCapture(false)
+	tr.update(upd("agent_message_chunk", map[string]any{
+		"content": map[string]any{"type": "text", "text": "Compacted."}}))
+	assertEvents(t, tr.endTurn(),
+		`{"type":"assistant","message":{"role":"assistant","content":[
+		  {"type":"text","text":"Compacted."}]}}`,
+		`{"type":"result","subtype":"success","is_error":false,"session_id":"s1"}`)
+	if got := tr.endCapture(); got != "Compacted." {
+		t.Errorf("captured %q, want the reply text", got)
+	}
+}
+
+// TestAbandonedSilentTurnKeepsItsTailOutOfTheFeed: `/usage` is Agent Kate's
+// own bookkeeping, and cancelling it does not stop the CLI mid-sentence. The
+// chunks that arrive after the turn was abandoned must not surface as an
+// assistant card in a transcript the human never asked a question in.
+func TestAbandonedSilentTurnKeepsItsTailOutOfTheFeed(t *testing.T) {
+	tr := newTranslator("s1", "kimi-code/k3", nil)
+	tr.beginCapture(true)
+	if got := tr.update(upd("agent_message_chunk", map[string]any{
+		"content": map[string]any{"type": "text", "text": "Context: 4,096"},
+	})); len(got) != 0 {
+		t.Fatalf("a silent turn emitted %s", got)
+	}
+	if text := tr.abandonCapture(1); text != "Context: 4,096" {
+		t.Errorf("captured text = %q, want what the CLI had said so far", text)
+	}
+	// The tail of the abandoned turn: still nothing, even though the capture
+	// is closed and `silent` with it.
+	if got := tr.update(upd("agent_message_chunk", map[string]any{
+		"content": map[string]any{"type": "text", "text": " / 128,000 tokens"},
+	})); len(got) != 0 {
+		t.Errorf("the abandoned turn's tail reached the transcript: %s", got)
+	}
+
+	// Once the latch is lifted the feed is the human's again.
+	tr.clearDrop()
+	tr.update(upd("agent_message_chunk", map[string]any{
+		"content": map[string]any{"type": "text", "text": "Hello"},
+	}))
+	assertEvents(t, tr.endTurn(),
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Hello"}]}}`,
+		`{"type":"result","subtype":"success","is_error":false,"session_id":"s1"}`)
+}
+
+// A NON-silent internal turn (Compact) that errors mid-reply must not leave
+// its partial text buffered: endTurn is skipped on the error path, so without
+// a drain in endCapture the fragment would flush into the NEXT turn's
+// transcript, attributed to a message the human just sent.
+func TestErroredInternalTurnDoesNotLeakIntoTheNextTurn(t *testing.T) {
+	tr := newTranslator("s1", "", nil)
+
+	tr.beginCapture(false) // Compact: the human asked, so it is visible
+	tr.update(upd("agent_thought_chunk", map[string]any{
+		"content": map[string]any{"type": "text", "text": "thinking about it"}}))
+	tr.update(upd("agent_message_chunk", map[string]any{
+		"content": map[string]any{"type": "text", "text": "half a compact rep"}}))
+	// onPromptDone's error path: no endTurn, straight to endCapture.
+	if got := tr.endCapture(); got != "half a compact rep" {
+		t.Errorf("captured text = %q, want the partial reply", got)
+	}
+
+	// The next human turn carries its own output and nothing else.
+	tr.update(upd("agent_message_chunk", map[string]any{
+		"content": map[string]any{"type": "text", "text": "the real answer"}}))
+	assertEvents(t, tr.endTurn(),
+		`{"type":"assistant","message":{"role":"assistant","content":[
+		  {"type":"text","text":"the real answer"}]}}`,
+		`{"type":"result","subtype":"success","is_error":false,"session_id":"s1"}`)
+}
+
+// Same leak, reached through the abandon path (a user send pre-empted the
+// turn, or it timed out). abandonCapture must drain too — and latch away the
+// late chunks the cancelled prompt is still streaming, which would otherwise
+// re-buffer into the next turn behind the drain.
+func TestAbandonedInternalTurnDoesNotLeakIntoTheNextTurn(t *testing.T) {
+	tr := newTranslator("s1", "", nil)
+
+	tr.beginCapture(false)
+	tr.update(upd("agent_message_chunk", map[string]any{
+		"content": map[string]any{"type": "text", "text": "compacting"}}))
+	if got := tr.abandonCapture(1); got != "compacting" {
+		t.Errorf("captured text = %q, want %q", got, "compacting")
+	}
+	// The CLI keeps streaming the cancelled prompt for a moment: latched away.
+	if ev := tr.update(upd("agent_message_chunk", map[string]any{
+		"content": map[string]any{"type": "text", "text": " ...late tail"}})); len(ev) != 0 {
+		t.Errorf("late chunk of an abandoned turn emitted %d events, want 0", len(ev))
+	}
+
+	// Send/onPromptDone hand the feed to the next turn.
+	tr.clearDrop()
+	tr.update(upd("agent_message_chunk", map[string]any{
+		"content": map[string]any{"type": "text", "text": "the real answer"}}))
+	assertEvents(t, tr.endTurn(),
+		`{"type":"assistant","message":{"role":"assistant","content":[
+		  {"type":"text","text":"the real answer"}]}}`,
+		`{"type":"result","subtype":"success","is_error":false,"session_id":"s1"}`)
+}

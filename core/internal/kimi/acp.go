@@ -82,6 +82,15 @@ func newACPClient(w io.Writer, log *slog.Logger) *acpClient {
 	}
 }
 
+// truncateForLog renders at most n bytes of a frame for a diagnostic, marking
+// what it left out. Never log a raw frame in full.
+func truncateForLog(b []byte, n int) string {
+	if len(b) <= n {
+		return string(b)
+	}
+	return string(b[:n]) + fmt.Sprintf("… (+%d bytes)", len(b)-n)
+}
+
 // readLoop dispatches frames from the child's stdout until the stream ends,
 // then fails every pending call so no caller blocks forever.
 func (c *acpClient) readLoop(r io.Reader) {
@@ -94,7 +103,12 @@ func (c *acpClient) readLoop(r io.Reader) {
 		}
 		var f acpFrame
 		if json.Unmarshal(line, &f) != nil {
-			c.log.Debug("kimi acp: undecodable frame", "line", string(line))
+			// Truncated, and only the head: an undecodable frame is still model
+			// or tool output, and logging it verbatim copies whatever it
+			// contains (file contents, tokens) into the journal (audit F24).
+			// The head is what identifies the shape; the body is the risk.
+			c.log.Debug("kimi acp: undecodable frame",
+				"bytes", len(line), "head", truncateForLog(line, 256))
 			continue
 		}
 		switch {

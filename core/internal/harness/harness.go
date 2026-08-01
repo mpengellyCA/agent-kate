@@ -40,8 +40,22 @@ type Capabilities struct {
 	// default engine so the common case stays unmarked.
 	Badge string `json:"badge"`
 
-	Fork            bool `json:"fork"`            // agent.fork (--fork-session semantics)
-	Compaction      bool `json:"compaction"`      // summaries: setCompactStrategy/compactNow/summaryStatus + exit compaction
+	Fork bool `json:"fork"` // agent.fork (--fork-session semantics)
+	// Compaction: the thread's context can be compacted at all — it gates the
+	// strategy/status RPCs and the HOT (in-session) mechanism, which every
+	// compacting harness has.
+	Compaction bool `json:"compaction"`
+	// ColdCompact: the harness can also compact a thread that is NOT running,
+	// by reading the session back from disk (session.ReadTranscript) or
+	// re-running the CLI over the stored session, and hand back summary TEXT
+	// the core stores and later replays into a fresh session.
+	//
+	// False for harnesses whose only mechanism rewrites the LIVE session's own
+	// context and keeps it (kimi's `/compact`): there is no local transcript in
+	// the claude format to read and no summary to store, so the cold path must
+	// be refused rather than fed an empty or foreign-shaped read — seeding a
+	// new session from that would discard the thread's whole history.
+	ColdCompact     bool `json:"coldCompact"`
 	Promote         bool `json:"promote"`         // agent.promote (move session into an isolated worktree)
 	ProviderRouting bool `json:"providerRouting"` // third-party Anthropic-compatible endpoints
 	Cowork          bool `json:"cowork"`          // the KDE Cowork desktop MCP server
@@ -85,6 +99,11 @@ type Capabilities struct {
 	FallbackModels  bool `json:"fallbackModels"`  // ordered model fallbacks
 	DisallowedTools bool `json:"disallowedTools"` // per-session tool deny-list
 	AddDirs         bool `json:"addDirs"`         // extra reachable directories
+	// The control-channel sweep. StrictMCPConfig: the thread can be isolated
+	// from the human's globally-configured MCP servers. CostBudget: the thread
+	// takes a hard spend ceiling the CLI enforces itself.
+	StrictMCPConfig bool `json:"strictMcpConfig"`
+	CostBudget      bool `json:"costBudget"`
 	// SubagentTranscripts: the CLI writes a per-subagent conversation file the
 	// UI can tail (agent.subagentTranscripts). False = a thread's delegations
 	// are only visible in its own transcript.
@@ -104,12 +123,26 @@ type DiscoveredOption struct {
 	ID      string                  `json:"id"`
 	Name    string                  `json:"name"`
 	Options []DiscoveredOptionValue `json:"options"`
+	// Current is the value a FRESH session of this harness comes up with — the
+	// CLI's own default for the option, not a guess. Empty when the harness
+	// does not report one.
+	//
+	// Load-bearing beyond the picker: the launch authority gate reads the
+	// `mode` option's Current to know what a worker launched with NO permission
+	// mode will actually run at, for engines whose vocabulary is discovered
+	// rather than declared (authority.go, launchBaselineRank). Dropping it here
+	// would make that gate fall back to a guess.
+	Current string `json:"current,omitempty"`
 }
 
 // DiscoveredOptionValue is one selectable value of a DiscoveredOption.
 type DiscoveredOptionValue struct {
 	Value string `json:"value"`
 	Name  string `json:"name"`
+	// Efforts, on a model value, are the reasoning-effort tiers that model
+	// supports (claude's list_models reports them). Empty means the harness
+	// said nothing, which the UI reads as "every tier" — never as "none".
+	Efforts []string `json:"efforts,omitempty"`
 }
 
 // BrowsableSession is one discoverable past session in the neutral browse
@@ -150,6 +183,23 @@ type StartSpec struct {
 	Cowork   bool
 	Provider *agent.Provider // third-party API routing; nil = direct
 
+	// BridgeSecret and CoworkBridgeSecret authenticate this launch's two MCP
+	// bridges back to the core (audit F13) — one secret each, because a
+	// redeemed secret is spent while its holder is connected, so two bridges
+	// sharing one would make the second look like a replay of the first.
+	//
+	// The adapter passes each to ITS OWN `akcore mcp` server, in the server's
+	// ENVIRONMENT — never in argv, which any local process can read — and never
+	// persists either: they are minted per launch and live only in the core's
+	// memory, the bridge process's environment, and (for claude) the 0600
+	// mcp-config file the supervisor deletes when the process exits.
+	//
+	// An adapter that spawns no akcore bridge ignores them. An empty value means
+	// none was minted; that bridge then fails its identify and exits, which is
+	// the fail-closed direction (no tools, rather than unauthenticated ones).
+	BridgeSecret       string
+	CoworkBridgeSecret string
+
 	// Env overlays the agent process's environment, on top of the core's own
 	// (and after any provider routing). Neutral by design — every adapter
 	// applies it the same way, because "run this thread's CLI with this
@@ -186,6 +236,22 @@ type StartSpec struct {
 	FallbackModels  []string
 	DisallowedTools []string
 	AddDirs         []string
+
+	// The control-channel sweep:
+	//
+	//   StrictMCPConfig  run with ONLY the MCP servers the core passes, ignoring
+	//                    the human's global configuration (claude
+	//                    --strict-mcp-config). Gated by Capabilities.StrictMCPConfig.
+	//   MaxBudgetUSD     a hard spend ceiling for the session, enforced by the
+	//                    CLI (claude --max-budget-usd). 0 = uncapped. Gated by
+	//                    Capabilities.CostBudget.
+	//   Title            the thread's human title, passed so the session is
+	//                    identifiable in the CLI's own session listings (claude
+	//                    --name). Cosmetic, so it is NOT capability-gated: an
+	//                    adapter with no equivalent simply ignores it.
+	StrictMCPConfig bool
+	MaxBudgetUSD    float64
+	Title           string
 }
 
 // AgentProfile is one custom subagent definition, harness-neutrally. Adapters
@@ -271,9 +337,11 @@ type UnappliedOption struct {
 //   - Cold: a fresh, separate pass over SessionID from WorkDir on Model. Works
 //     on a dormant thread and pays a full prefix re-cache.
 //
-// Only ever called on harnesses whose Capabilities().Compaction is true; the
-// rest return the shared not-supported error, so no caller needs to know which
-// CLI can do this.
+// Only ever called on harnesses whose Capabilities().Compaction is true, and
+// the cold shape additionally requires Capabilities().ColdCompact — a harness
+// whose compaction only rewrites the live session has no dormant pass to run.
+// The rest return the shared not-supported error, so no caller needs to know
+// which CLI can do this.
 type CompactSpec struct {
 	ThreadID  string
 	SessionID string // the session a cold pass resumes; empty for hot
@@ -321,9 +389,16 @@ type Harness interface {
 	BrowseSessions() ([]BrowsableSession, error)
 
 	// Compact runs one compaction pass and returns the summary body. Gated by
-	// Capabilities().Compaction: a harness without it returns
-	// Unsupported("Compaction", …) rather than emulating a summary, because a
-	// summary the model never wrote is worse than none.
+	// Capabilities().Compaction (and Capabilities().ColdCompact for a cold
+	// spec): a harness without it returns Unsupported("Compaction", …) rather
+	// than emulating a summary, because a summary the model never wrote is
+	// worse than none.
+	//
+	// A harness whose mechanism compacts the context in place and returns no
+	// text has no summary body to give. It reports that as its OWN sentinel
+	// error (see kimiHarness / ErrCompactedInPlace) — every caller must
+	// errors.Is it and treat it as success-without-summary: store nothing,
+	// reseed nothing, keep the same session.
 	Compact(ctx context.Context, spec CompactSpec) (string, error)
 }
 
