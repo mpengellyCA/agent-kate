@@ -2,6 +2,7 @@
 #include "AgentDock.h"
 #include "AgentPanel.h"
 #include "AppearanceDialog.h"
+#include "AttachmentBuilder.h"
 #include "CommandPalette.h"
 #include "EditorArea.h"
 #include "EditorSession.h"
@@ -51,10 +52,12 @@
 #include <KStandardAction>
 #include <KToggleAction>
 #include <KToolBar>
+#include <KWindowSystem>
 
 #include <QAction>
 #include <QActionGroup>
 #include <QApplication>
+#include <algorithm>
 #include <functional>
 #include <QCloseEvent>
 #include <QCoreApplication>
@@ -109,8 +112,43 @@ MainWindow::MainWindow(const QString &openPath, QWidget *parent)
     setupCore();
     setupExperience();
 
-    // Resolve the launch argument: a file opens its parent directory as the
-    // first project, then the file itself once that project is active.
+    openLaunchPath(openPath);
+
+    // Size/maximised state is persisted by KMainWindow's autosave into the
+    // "MainWindow" group of the STATE config (~/.local/state/agentkatestaterc) —
+    // NOT openConfig()'s agentkaterc. Reading the wrong file is what kept this
+    // guard permanently false and re-imposed the default size on every launch.
+    // KWindowConfig keys the size on the screen arrangement, and the count
+    // leads: KF6 writes "4 screens: Width=1440" / "4 screens: Height=1065"
+    // (older profiles carry the resolution-suffixed "Width 1920"), so matching on
+    // "contains" covers both. A window last closed maximised restores from
+    // Window-Maximized alone, which counts as restore data just as much.
+    // Position is deliberately not fought for: under Wayland the compositor
+    // places windows and there is no API to override it.
+    const QStringList savedWindowKeys =
+        KConfigGroup(KSharedConfig::openStateConfig(), QStringLiteral("MainWindow")).keyList();
+    const bool haveSavedGeometry =
+        std::any_of(savedWindowKeys.cbegin(), savedWindowKeys.cend(), [](const QString &k) {
+            return k.contains(QLatin1String("Width")) || k.contains(QLatin1String("Height"))
+                || k.contains(QLatin1String("Maximized"));
+        });
+    if (!haveSavedGeometry) {
+        resize(1500, 900);
+    }
+    setAutoSaveSettings();
+
+    // Both image cache dirs are append-only during a session; nothing ever
+    // removed from them. Sweep once, well after launch, so a long-lived profile
+    // does not accumulate gigabytes of dead screenshots.
+    agentkate::scheduleImageCachePrune();
+}
+
+// openLaunchPath resolves one command-line style argument: a directory becomes a
+// project, a file opens its parent directory as a project and then the file
+// itself, and an empty path falls back to the working directory. Called once at
+// construction and again for every path a second instance forwards to us.
+void MainWindow::openLaunchPath(const QString &openPath)
+{
     QString project = openPath;
     QString fileToOpen;
     if (!openPath.isEmpty()) {
@@ -129,9 +167,24 @@ MainWindow::MainWindow(const QString &openPath, QWidget *parent)
     if (!fileToOpen.isEmpty()) {
         m_editor->openFile(groupKey(), fileToOpen);
     }
+}
 
-    resize(1500, 900);
-    setAutoSaveSettings();
+// raiseAndActivate brings the window forward from wherever it is (minimised,
+// buried, on another activity). Under Wayland the compositor grants that only
+// against an XDG activation token proving a user action asked for it — the
+// caller passes the one it was handed (a clicked notification), or leaves it
+// empty when the current token has already been installed by someone else
+// (AgentNotifier does exactly that, and KWindowSystem::updateStartupId is how
+// the relaunch path installs the one KDBusService parks in the environment).
+void MainWindow::raiseAndActivate(const QString &xdgActivationToken)
+{
+    if (!xdgActivationToken.isEmpty()) {
+        KWindowSystem::setCurrentXdgActivationToken(xdgActivationToken);
+    }
+    setWindowState((windowState() & ~Qt::WindowMinimized) | Qt::WindowActive);
+    show();
+    raise();
+    KWindowSystem::activateWindow(windowHandle());
 }
 
 MainWindow::~MainWindow()
@@ -170,6 +223,10 @@ void MainWindow::setupUi()
     m_coworkPanel = new CoworkPanel(m_core, this);
     // CoworkPortal services the core's portal requests using this window's surface.
     m_coworkPortal = new CoworkPortal(m_core, this, this);
+    // The panel's browser-launch button needs the portal's park-then-flip of the
+    // desktop-wide org.a11y.Status; BrowserLaunch no longer does it itself, precisely
+    // so that an agent-triggered launch cannot (audit F8/F12).
+    m_coworkPanel->setPortal(m_coworkPortal);
 
     connect(problems, &ProblemsPanel::activated, this,
             [this](const QString &path, int line) {
@@ -494,6 +551,12 @@ void MainWindow::setupUi()
             &JobsPanel::setAgentTitles);
     connect(m_agent, &AgentDock::openJobsPanelRequested, this,
             [this] { raisePanelByKey(m_keyTasks); });
+    // A clicked desktop notification: the dock has already selected the agent,
+    // the window still has to come forward (it may be minimised or behind).
+    // The notifier has already installed the notification's activation token as
+    // the current one, so the empty argument here means "use it", not "none".
+    connect(m_agent, &AgentDock::raiseWindowRequested, this,
+            [this] { raiseAndActivate(); });
     connect(m_jobsPanel, &JobsPanel::clearFinishedRequested, m_agent,
             &AgentDock::forgetFinishedJobsEverywhere);
     connect(m_jobsPanel, &JobsPanel::openWorkflowRequested, m_agent,
@@ -1764,7 +1827,7 @@ void MainWindow::setupCore()
     // The status bar is the landing spot for transient agent feedback —
     // "Merged X into main", "Commit failed: …", etc. Without it those
     // messages are silently dropped (see AgentDock::statusMessage).
-    statusBar()->setSizeGripEnabled(false);
+    statusBar()->setSizeGripEnabled(true);
     connect(m_agent, &AgentDock::statusMessage, this, [this](const QString &text) {
         statusBar()->showMessage(text, 8000);
     });

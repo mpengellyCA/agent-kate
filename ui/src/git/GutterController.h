@@ -64,7 +64,15 @@ private:
     void watchView(KTextEditor::View *view);
 
     QPointer<KTextEditor::Document> m_doc;
-    CoreClient *m_core = nullptr;
+    // QPointer, not a raw pointer (audit F24): m_core is a SIBLING child of the
+    // same MainWindow, and this controller is created later — so on a
+    // parent-driven teardown m_core may already be gone by the time a pending
+    // timer tick or reply lands here. ~MainWindow re-tails m_core to make the
+    // ordering come out right, but "safe only because of destructor ordering"
+    // is exactly the arrangement that already crashed this app once
+    // (MainWindow.cpp, ~MainWindow). CoworkPortal holds the same relationship
+    // the same way.
+    QPointer<CoreClient> m_core;
     QString m_path;
     QTimer *m_pollTimer = nullptr;
     QTimer *m_debounceTimer = nullptr;

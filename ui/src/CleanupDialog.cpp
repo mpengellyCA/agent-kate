@@ -482,19 +482,45 @@ void CleanupDialog::showArchived()
         this); // lifetime guard on the cleanup.listArchived reply
 }
 
+// The busy cursor is application-wide, so ownership of it has to be explicit:
+// exactly one set, exactly one restore, whichever path ends the wait — the
+// reply, or the dialog being deleted out from under it.
+void CleanupDialog::holdBusyCursor()
+{
+    if (!m_cursorHeld) {
+        m_cursorHeld = true;
+        QApplication::setOverrideCursor(Qt::BusyCursor);
+    }
+}
+
+void CleanupDialog::releaseBusyCursor()
+{
+    if (m_cursorHeld) {
+        m_cursorHeld = false;
+        QApplication::restoreOverrideCursor();
+    }
+}
+
+CleanupDialog::~CleanupDialog()
+{
+    // Closed mid-analysis: the reply will be dropped by the lifetime guard, so
+    // this is the only remaining chance to give the cursor back (audit F22).
+    releaseBusyCursor();
+}
+
 void CleanupDialog::analyze(bool advise)
 {
     m_status->setText(i18n("Analyzing worktrees…"));
     m_removeBtn->setEnabled(false);
     if (advise) {
-        QApplication::setOverrideCursor(Qt::BusyCursor);
+        holdBusyCursor();
     }
     m_core->call(QStringLiteral("cleanup.analyze"),
                  QJsonObject{{QStringLiteral("project"), m_project},
                              {QStringLiteral("advise"), advise}},
                  [this, advise](const QJsonObject &result, const QJsonObject &error) {
                      if (advise) {
-                         QApplication::restoreOverrideCursor();
+                         releaseBusyCursor();
                      }
                      m_removeBtn->setEnabled(true);
                      if (!error.isEmpty()) {

@@ -16,6 +16,10 @@ class QStackedWidget;
 class QWidget;
 class QJsonArray;
 
+namespace agentkate {
+class AgentNotifier;
+}
+
 // AgentDock orchestrates the agent-centric workspace: a stack of agent
 // conversation panels plus the AgentRoster (project → agent tree). The shell
 // hosts these widgets in distinct layout slots — the roster on the left
@@ -138,6 +142,9 @@ Q_SIGNALS:
     void jobsChanged(const QString &threadId, const QVector<agentkate::AgentJob> &jobs);
     // The in-chat tray's "N finished" chip asks the window to raise the Jobs panel.
     void openJobsPanelRequested();
+    // A desktop notification was clicked: the window must un-minimise, raise and
+    // take focus. The dock has already selected the agent it was about.
+    void raiseWindowRequested();
 
 private:
     struct Entry {
@@ -162,6 +169,9 @@ private:
     void pushActiveWorktree(const QString &worktreePath);
 
     void ensureProject(const QString &path);
+    // Select an already-open project's most relevant agent. False when the
+    // project has no agents left to select.
+    bool focusExistingProject(const QString &path);
     // (Re)build the roster's "+ New Agent" quick menu from the harness
     // registry: an engine section per harness, its tier tokens or cached
     // discovered models beneath. Called at startup and on HarnessRegistry
@@ -228,6 +238,8 @@ private:
     QStackedWidget *m_stack = nullptr;
     AgentRoster *m_roster = nullptr;
     QWidget *m_dialogParent = nullptr; // window-scope parent for modal dialogs
+    // Desktop alerts for agents the user is not currently watching.
+    agentkate::AgentNotifier *m_notifier = nullptr;
     QList<Entry> m_agents;
     QStringList m_projects;
     // threadId → worktree path, refreshed from each git.snapshot. Lets the

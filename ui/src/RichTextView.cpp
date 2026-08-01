@@ -1,5 +1,7 @@
 #include "RichTextView.h"
 
+#include "SafeContent.h"
+
 #include "MarkdownUtil.h"
 
 #include <KConfigGroup>
@@ -12,7 +14,6 @@
 
 #include <QAction>
 #include <QActionGroup>
-#include <QDesktopServices>
 #include <QDir>
 #include <QEvent>
 #include <QFileInfo>
@@ -47,8 +48,8 @@ KConfigGroup modeConfig(RichTextView::Format format)
 QString markdownToHtml(const QString &md)
 {
     QTextDocument doc;
-    doc.setMarkdown(agentkate::neutralizeMarkdownRawHtml(md),
-                    QTextDocument::MarkdownDialectGitHub);
+    // Untrusted (a file in the workspace): raw HTML off at the parser.
+    agentkate::setMarkdownSafe(doc, md);
     return doc.toHtml();
 }
 
@@ -116,16 +117,21 @@ RichTextView::RichTextView(KTextEditor::Editor *editor, const QString &path, QWi
     m_view = m_doc->createView(m_splitter);
     m_splitter->addWidget(m_view);
 
-    m_preview = new QTextBrowser(m_splitter);
+    // Guarded: the previewed document can be a file an agent just wrote, and a
+    // bare QTextBrowser will read any local path an image name points at, with
+    // no size cap and no regular-file check (audit F15). The document's own
+    // directory is the extra root, which is what keeps relative image links
+    // working.
+    auto *preview = new agentkate::GuardedTextBrowser(m_splitter);
+    preview->addLocalRoot(QFileInfo(m_path).absolutePath());
+    m_preview = preview;
     m_preview->setOpenLinks(false); // route clicks ourselves (below)
     m_preview->setFrameStyle(QFrame::NoFrame);
     // Resolve relative image links against the file's directory.
     m_preview->setSearchPaths({QFileInfo(m_path).absolutePath()});
-    connect(m_preview, &QTextBrowser::anchorClicked, this, [](const QUrl &url) {
-        if (url.scheme() == QLatin1String("http") || url.scheme() == QLatin1String("https")
-            || url.scheme() == QLatin1String("mailto")) {
-            QDesktopServices::openUrl(url);
-        }
+    connect(m_preview, &QTextBrowser::anchorClicked, this, [this](const QUrl &url) {
+        // Same policy as the transcript's links, in one place now.
+        agentkate::openModelLink(this, url);
     });
     m_splitter->addWidget(m_preview);
     m_splitter->setStretchFactor(0, 1);

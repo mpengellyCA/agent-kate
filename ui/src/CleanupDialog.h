@@ -98,6 +98,7 @@ class CleanupDialog : public QDialog
     Q_OBJECT
 public:
     CleanupDialog(CoreClient *core, const QString &project, QWidget *parent = nullptr);
+    ~CleanupDialog() override;
 
 Q_SIGNALS:
     // Emitted after the run completes so the dashboard can refresh + toast.
@@ -127,4 +128,14 @@ private:
     QProgressDialog *m_progress = nullptr;
     QStringList m_removed;
     QStringList m_failures;
+
+    // True while this dialog holds an APPLICATION-WIDE override cursor for an
+    // in-flight "advise" analysis. The dialog is non-modal + WA_DeleteOnClose,
+    // so closing it mid-round-trip makes CoreClient's lifetime guard drop the
+    // reply — and with it the restoreOverrideCursor() that lived there. Every
+    // window then showed a busy cursor until restart (audit F22). The flag is
+    // what lets the destructor put the cursor back exactly once.
+    bool m_cursorHeld = false;
+    void holdBusyCursor();
+    void releaseBusyCursor();
 };

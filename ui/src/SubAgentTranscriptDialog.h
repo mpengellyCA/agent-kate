@@ -38,10 +38,19 @@ private:
     // chat blocks. Handles a truncated/rotated file by reloading from scratch.
     void pullNew();
 
+    // Drop blocks off the FRONT until the document is back inside both caps
+    // (block count and character count). Called after every append.
+    void trimDocument();
+
     QTextBrowser *m_browser = nullptr;
     QString m_path;
     qint64 m_offset = 0;      // bytes already consumed from the file
     QByteArray m_partial;     // trailing bytes past the last newline (incomplete line)
+    // The read is bounded (see the caps in the .cpp), so it can legitimately
+    // land mid-line: `m_resync` means "discard through the next newline before
+    // parsing anything", `m_skipped` means "tell the reader bytes were dropped".
+    bool m_resync = false;
+    bool m_skipped = false;
     QFileSystemWatcher *m_watcher = nullptr;
     QTimer *m_poll = nullptr;
 };

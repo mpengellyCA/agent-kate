@@ -14,7 +14,9 @@
     </p>
   </description>
   <url type="homepage">https://github.com/mpengelly/AgentKate</url>
-  <developer_name>Mike Pengelly</developer_name>
+  <developer id="io.leadrix">
+    <name>Mike Pengelly</name>
+  </developer>
   <categories>
     <category>Development</category>
     <category>IDE</category>

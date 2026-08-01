@@ -1,11 +1,14 @@
 #include "ipc/CoreClient.h"
 
+#include "ipc/SocketPath.h"
+
 #include <QCoreApplication>
 #include <QDir>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QLocalSocket>
 #include <QProcess>
+#include <QRegularExpression>
 #include <QTimer>
 
 namespace {
@@ -42,15 +45,21 @@ QJsonObject localError(const QString &message)
     };
 }
 
-// Mirrors akcore's default socket location, made unique per UI process.
-QString runtimeSocketPath()
+// Recovers the JSON-RPC id from the retained head of a frame that was too large
+// to keep. Deliberately a text probe and not a JSON parse: the head is a
+// truncated object, so it never parses — but the id is written near the front
+// of every reply the core sends, so this finds it in practice. No id found
+// means the pending call is simply left to the connection's own teardown.
+int probeFrameId(const QByteArray &head)
 {
-    QString dir = qEnvironmentVariable("XDG_RUNTIME_DIR");
-    if (dir.isEmpty()) {
-        dir = QDir::tempPath();
+    static const QRegularExpression re(QStringLiteral("\"id\"\\s*:\\s*(\\d+)"));
+    const auto m = re.match(QString::fromUtf8(head));
+    if (!m.hasMatch()) {
+        return -1;
     }
-    return QDir(dir).filePath(
-        QStringLiteral("agentkate-%1.sock").arg(QCoreApplication::applicationPid()));
+    bool ok = false;
+    const int id = m.captured(1).toInt(&ok);
+    return ok ? id : -1;
 }
 } // namespace
 
@@ -118,7 +127,16 @@ CoreClient::~CoreClient()
 
 void CoreClient::start(const QString &coreBinaryPath)
 {
-    m_socketPath = runtimeSocketPath();
+    // The core refuses to bind a socket in a directory it cannot vouch for
+    // (ipc.assertPrivateDir). Picking the path here with the SAME rules means a
+    // rejection surfaces as one clear message now, rather than as a core that
+    // exits on startup and a UI that spends six seconds connecting to nothing.
+    QString pathError;
+    m_socketPath = akipc::privateSocketPath(&pathError);
+    if (m_socketPath.isEmpty()) {
+        emit failed(QStringLiteral("cannot start the core: %1").arg(pathError));
+        return;
+    }
 
     m_proc = new QProcess(this);
     m_proc->setProgram(coreBinaryPath);
@@ -308,7 +326,7 @@ void CoreClient::onDisconnected()
     // half-frame left mid-stream cannot corrupt the first frame after a reconnect.
     const QHash<int, PendingReply> pending = m_pending;
     m_pending.clear();
-    m_buf.clear();
+    m_reader.clear();
     for (auto it = pending.constBegin(); it != pending.constEnd(); ++it) {
         const PendingReply &p = it.value();
         if (!p.cb || (p.guarded && p.context.isNull())) {
@@ -402,16 +420,30 @@ void CoreClient::attemptReconnect()
 
 void CoreClient::onReadyRead()
 {
-    m_buf.append(m_socket->readAll());
-    int nl;
-    while ((nl = m_buf.indexOf('\n')) >= 0) {
-        const QByteArray line = m_buf.left(nl);
-        m_buf.remove(0, nl + 1);
-        if (line.trimmed().isEmpty()) {
+    m_reader.append(m_socket->readAll());
+    akipc::FrameReader::Frame f;
+    while (m_reader.next(&f)) {
+        if (f.oversize > 0) {
+            // Over the inbound cap: the frame is gone, the connection is not.
+            // A caller waiting on it would otherwise hold its closure forever,
+            // so resolve it here when the retained head still names it.
+            const QString message =
+                QStringLiteral("the core sent a message too large to receive "
+                               "(%1 MB, cap %2 MB); it was discarded")
+                    .arg(f.oversize / (1024.0 * 1024.0), 0, 'f', 1)
+                    .arg(akipc::kMaxInboundFrameBytes / (1024 * 1024));
+            const int id = probeFrameId(f.probe);
+            if (id >= 0 && m_pending.contains(id)) {
+                const PendingReply pending = m_pending.take(id);
+                if (pending.cb && !(pending.guarded && pending.context.isNull())) {
+                    pending.cb({}, localError(message));
+                }
+            }
+            emit failed(message);
             continue;
         }
         QJsonParseError err{};
-        const QJsonDocument doc = QJsonDocument::fromJson(line, &err);
+        const QJsonDocument doc = QJsonDocument::fromJson(f.line, &err);
         if (err.error != QJsonParseError::NoError || !doc.isObject()) {
             emit failed(QStringLiteral("malformed frame from core: %1").arg(err.errorString()));
             continue;

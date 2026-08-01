@@ -114,12 +114,14 @@ BlameController::BlameController(KTextEditor::Document *doc, KTextEditor::View *
     // every unrelated working-tree change, so refetching on it re-shelled
     // `git blame` for nothing. Gate on git.log.invalidated, which the core
     // emits only when a thread's HEAD actually moves.
-    connect(m_core, &CoreClient::notification, this,
-            [this](const QString &m, const QJsonObject &) {
-                if (m_enabled && m == QLatin1String("git.log.invalidated")) {
-                    refresh();
-                }
-            });
+    if (m_core) {
+        connect(m_core, &CoreClient::notification, this,
+                [this](const QString &m, const QJsonObject &) {
+                    if (m_enabled && m == QLatin1String("git.log.invalidated")) {
+                        refresh();
+                    }
+                });
+    }
 }
 
 BlameController::~BlameController()
@@ -148,7 +150,9 @@ void BlameController::setEnabled(bool on)
 
 void BlameController::refresh()
 {
-    if (m_inFlight || m_path.isEmpty() || !m_core->isConnected()) {
+    // m_core is a QPointer: a torn-down sibling reads as null rather than as a
+    // dangling pointer, so this must test it before every dereference.
+    if (m_inFlight || m_path.isEmpty() || !m_core || !m_core->isConnected()) {
         return;
     }
     m_inFlight = true;

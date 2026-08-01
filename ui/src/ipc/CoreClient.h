@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ipc/FrameReader.h"
+
 #include <QByteArray>
 #include <QHash>
 #include <QJsonObject>
@@ -107,7 +109,9 @@ private:
     QProcess *m_proc = nullptr;
     QLocalSocket *m_socket = nullptr;
     QString m_socketPath;
-    QByteArray m_buf;
+    // Inbound framing, capped at the core's own inbound limit — an unbounded
+    // read buffer is an unbounded frame, and the GUI process pays for it.
+    akipc::FrameReader m_reader;
     int m_nextId = 1;
     int m_connectAttempts = 0;
 

@@ -84,7 +84,9 @@ QString LspHoverProvider::textHint(KTextEditor::View *view, const KTextEditor::C
             QString tip = trimmed;
             if (hover.markdown) {
                 QTextDocument md;
-                md.setMarkdown(agentkate::neutralizeMarkdownRawHtml(trimmed));
+                // Server-authored text about workspace code: raw HTML off at the
+                // parser, which is also what keeps "std::vector<int>" intact.
+                agentkate::setMarkdownSafe(md, trimmed);
                 tip = md.toHtml();
             }
             QToolTip::showText(QCursor::pos(), tip);

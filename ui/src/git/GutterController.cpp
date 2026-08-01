@@ -261,7 +261,9 @@ void GutterController::pollNow()
     if (!m_visible) {
         return;
     }
-    if (m_inFlight || m_path.isEmpty() || !m_doc || !m_core->isConnected()) {
+    // m_core is a QPointer: a torn-down sibling reads as null rather than as a
+    // dangling pointer, so this must test it before every dereference.
+    if (m_inFlight || m_path.isEmpty() || !m_doc || !m_core || !m_core->isConnected()) {
         // Restart the safety-net ticker so refreshes keep their cadence while
         // the file stays visible.
         if (!m_pollTimer->isActive()) {

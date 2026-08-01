@@ -11,6 +11,7 @@ Comment=Native KDE multi-agent coding arena built on the Kate editor engine
 Exec=@KDE_INSTALL_FULL_BINDIR@/agentkate %F
 Icon=agentkate
 Categories=Development;IDE;TextEditor;Qt;KDE;
+Keywords=ai;agent;agents;claude;kimi;llm;assistant;coding;arena;chat;editor;code;worktree;orchestration;
 Terminal=false
 MimeType=text/plain;inode/directory;
 StartupNotify=true

@@ -46,6 +46,14 @@ public:
     explicit MainWindow(const QString &openPath = QString(), QWidget *parent = nullptr);
     ~MainWindow() override;
 
+    // Open a launch-style path (project directory, or a file inside one). Used
+    // for the startup argument and for the arguments a second instance forwards.
+    void openLaunchPath(const QString &openPath);
+    // Bring the window forward. Pass the XDG activation token that justifies the
+    // focus change when the caller holds one; empty means "the current token is
+    // already set" (or that there is none).
+    void raiseAndActivate(const QString &xdgActivationToken = QString());
+
 protected:
     void closeEvent(QCloseEvent *event) override;
     bool eventFilter(QObject *watched, QEvent *event) override;

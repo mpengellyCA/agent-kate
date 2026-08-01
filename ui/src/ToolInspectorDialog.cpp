@@ -233,6 +233,9 @@ QWidget *ToolInspectorDialog::buildOverview(const QString &toolName,
         const QString desc = input.value(QStringLiteral("description")).toString();
         if (!desc.isEmpty()) {
             auto *d = new QLabel(desc, host);
+            // Model-authored: Qt::AutoText would sniff "<b>…" and render it as
+            // rich text inside the dialog the human reviews (audit F21).
+            d->setTextFormat(Qt::PlainText);
             d->setWordWrap(true);
             addSection(i18n("Description"), d);
         }
@@ -299,6 +302,7 @@ QWidget *ToolInspectorDialog::buildOverview(const QString &toolName,
         const QString digest = agentkate::permSummary(name, input);
         auto *call = new QLabel(
             digest.isEmpty() ? verb : verb + QStringLiteral(" — ") + digest, host);
+        call->setTextFormat(Qt::PlainText); // agent prose — never rich text (F21)
         call->setWordWrap(true);
         call->setTextInteractionFlags(Qt::TextSelectableByMouse);
         addSection(i18n("Call"), call);
@@ -321,12 +325,14 @@ QWidget *ToolInspectorDialog::buildOverview(const QString &toolName,
     } else if (name == QLatin1String("Grep") || name == QLatin1String("Glob")) {
         const QString pattern = input.value(QStringLiteral("pattern")).toString();
         auto *pat = new QLabel(pattern, host);
+        pat->setTextFormat(Qt::PlainText); // model-authored pattern (F21)
         pat->setTextInteractionFlags(Qt::TextSelectableByMouse);
         pat->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
         addSection(i18n("Pattern"), pat);
         const QString path = input.value(QStringLiteral("path")).toString();
         if (!path.isEmpty()) {
             auto *p = new QLabel(path, host);
+            p->setTextFormat(Qt::PlainText); // model-authored path (F21)
             p->setTextInteractionFlags(Qt::TextSelectableByMouse);
             addSection(i18n("In"), p);
         }
@@ -357,9 +363,14 @@ QWidget *ToolInspectorDialog::buildOverview(const QString &toolName,
                         .toJson(QJsonDocument::Compact));
             }
             auto *val = new QLabel(text, form);
+            val->setTextFormat(Qt::PlainText); // arbitrary tool input (F21)
             val->setWordWrap(true);
             val->setTextInteractionFlags(Qt::TextSelectableByMouse);
-            fl->addRow(k + QStringLiteral(":"), val);
+            // The KEY is model-authored too, and addRow(QString, …) would build
+            // an AutoText label for it. Build it here with the format pinned.
+            auto *keyLabel = new QLabel(k + QStringLiteral(":"), form);
+            keyLabel->setTextFormat(Qt::PlainText);
+            fl->addRow(keyLabel, val);
         }
         if (keys.isEmpty()) {
             fl->addRow(new QLabel(i18n("(no input fields)"), form));

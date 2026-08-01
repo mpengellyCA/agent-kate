@@ -12,6 +12,7 @@
 #include "ProviderConfig.h"
 #include "state/EnsembleCatalog.h"
 #include "state/HarnessTraits.h"
+#include "notify/AgentNotifier.h"
 
 #include <QDir>
 #include <QFileDialog>
@@ -38,7 +39,18 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
     , m_stack(new PanelStack(parent))
     , m_roster(new AgentRoster(parent))
     , m_dialogParent(parent)
+    , m_notifier(new agentkate::AgentNotifier(parent ? parent->window() : nullptr, this))
 {
+    // Clicking an alert lands the user in the agent it was about — select it
+    // here, and ask the window to come forward.
+    connect(m_notifier, &agentkate::AgentNotifier::agentActivationRequested, this,
+            [this](int agentId) {
+                if (entryById(agentId)) {
+                    m_roster->setCurrentAgent(agentId);
+                }
+                Q_EMIT raiseWindowRequested();
+            });
+
     connect(m_roster, &AgentRoster::openProjectRequested, this, &AgentDock::openProjectDialog);
     connect(m_roster, &AgentRoster::newAgentRequested, this, [this](const QString &project) {
         QString p = project;
@@ -93,6 +105,8 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
     connect(m_roster, &AgentRoster::agentActivated, this, [this](int id) {
         if (Entry *e = entryById(id)) {
             m_stack->setCurrentWidget(e->panel);
+            // The agent on screen needs no popup — its transitions are visible.
+            m_notifier->setVisibleAgent(e->id);
             // Remember where we are so the next launch lands here. No-op for a
             // blank starter agent (empty thread) — see setLastActiveThread.
             setLastActiveThread(e->project, e->panel->threadId());
@@ -454,7 +468,8 @@ void AgentDock::newAgentInActiveProjectGuided()
     panel->preselectEffort(c.effort);
     // The P6 sweep rides on the first start; the dialog only offered the
     // options this engine declares, so nothing here can be silently dropped.
-    panel->preselectLaunchOptions(c.fallbackModels, c.disallowedTools, c.addDirs);
+    panel->preselectLaunchOptions(c.fallbackModels, c.disallowedTools, c.addDirs,
+                                  c.strictMcpConfig, c.maxBudgetUsd);
     panel->setComposerText(c.task);
 }
 
@@ -665,8 +680,39 @@ void AgentDock::ensureProject(const QString &path)
     RecentProjects::remember(path); // welcome screen reads this on next launch
 }
 
+// focusExistingProject selects the agent that best stands for an already-open
+// project: the session the user last worked in when it is still on screen, else
+// that project's most recently added agent. Returns false only when the project
+// row has outlived all of its agents, which is the one case that still needs a
+// starter agent created for it.
+bool AgentDock::focusExistingProject(const QString &path)
+{
+    const QString last = lastActiveThread(path);
+    int target = -1;
+    for (const Entry &e : std::as_const(m_agents)) {
+        if (e.project != path) {
+            continue;
+        }
+        target = e.id;
+        if (!last.isEmpty() && e.panel->threadId() == last) {
+            break;
+        }
+    }
+    if (target < 0) {
+        return false;
+    }
+    m_roster->setCurrentAgent(target);
+    return true;
+}
+
 void AgentDock::addProject(const QString &path)
 {
+    // Re-launching `agentkate <path>` on a project that is already open is a
+    // request to LOOK at it, not to grow it: raise its agent and create nothing.
+    // Without this every forwarded relaunch left another blank starter behind.
+    if (m_projects.contains(path) && focusExistingProject(path)) {
+        return;
+    }
     const bool wasOpen = m_projects.contains(path);
     ensureProject(path);
     // Always create a starter agent so the UI is never empty (and as a fallback
@@ -963,9 +1009,14 @@ void AgentDock::wireAgentPanel(int agentId, AgentPanel *panel)
     connect(panel, &AgentPanel::openDiff, this, &AgentDock::openDiff);
     connect(panel, &AgentPanel::openFileRequested, this, &AgentDock::openFileRequested);
     connect(panel, &AgentPanel::titleChanged, this,
-            [this, agentId](const QString &title) { m_roster->setAgentTitle(agentId, title); });
-    connect(panel, &AgentPanel::statusChanged, this,
-            [this, agentId](int status) { m_roster->setAgentStatus(agentId, status); });
+            [this, agentId](const QString &title) {
+                m_roster->setAgentTitle(agentId, title);
+                m_notifier->setAgentTitle(agentId, title);
+            });
+    connect(panel, &AgentPanel::statusChanged, this, [this, agentId](int status) {
+        m_roster->setAgentStatus(agentId, status);
+        m_notifier->reportStatus(agentId, status);
+    });
     connect(panel, &AgentPanel::subtitleChanged, this,
             [this, agentId](const QString &text) { m_roster->setAgentSubtitle(agentId, text); });
     connect(panel, &AgentPanel::previewChanged, this,
@@ -974,8 +1025,10 @@ void AgentDock::wireAgentPanel(int agentId, AgentPanel *panel)
             });
     connect(panel, &AgentPanel::dormantChanged, this,
             [this, agentId](bool dormant) { m_roster->setAgentDormant(agentId, dormant); });
-    connect(panel, &AgentPanel::attentionChanged, this,
-            [this, agentId](bool on) { m_roster->setAgentAttention(agentId, on); });
+    connect(panel, &AgentPanel::attentionChanged, this, [this, agentId](bool on) {
+        m_roster->setAgentAttention(agentId, on);
+        m_notifier->reportAttention(agentId, on);
+    });
     connect(panel, &AgentPanel::threadIdChanged, this, [this, panel](const QString &threadId) {
         if (m_stack->currentWidget() == panel) {
             Q_EMIT activeThreadChanged(threadId);
@@ -1290,11 +1343,16 @@ void AgentDock::removeAgentEntry(int agentId)
             if (!goneThread.isEmpty()) {
                 Q_EMIT jobsChanged(goneThread, {});
             }
+            m_notifier->forgetAgent(agentId);
             m_agents.removeAt(i);
             m_stack->removeWidget(panel);
             // Sever any core->panel wiring before tearing it down so no further
             // core notifications or in-flight replies reach the doomed panel.
             QObject::disconnect(m_core, nullptr, panel, nullptr);
+            // And the panel->dock direction: deleteLater leaves the panel alive
+            // for another event loop turn, and a status/attention signal emitted
+            // in that window would re-create the state forgetAgent just dropped.
+            QObject::disconnect(panel, nullptr, this, nullptr);
             panel->deleteLater(); // ~AgentPanel stops its agent
             m_roster->removeAgent(agentId);
             return;

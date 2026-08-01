@@ -30,6 +30,9 @@ find_package(KF6 6.0 REQUIRED COMPONENTS
     Parts               # KParts — embedding the Konsole terminal
     WidgetsAddons       # KMultiTabBar — Kate-style collapsible side/bottom strip
     ColorScheme         # KColorScheme — native Breeze status-badge colours
+    Notifications       # KNotification — desktop alerts for background agents
+    DBusAddons          # KDBusService — single-instance, raise-on-relaunch
+    WindowSystem        # activation token handling when a relaunch raises us
     KIO                 # KIO::copy/move/trash, KPropertiesDialog, highlightInFileManager
     Archive             # KZip — native .xlsx (OOXML zip) reading in CsvView
 )
@@ -61,6 +64,7 @@ add_executable(agentkate
     src/XlsxReader.cpp
     src/RichTextView.cpp
     src/MarkdownUtil.cpp
+    src/SafeContent.cpp
     src/ExtensionsDialog.cpp
     src/ProviderConfig.cpp
     src/ProvidersDialog.cpp
@@ -84,6 +88,7 @@ add_executable(agentkate
     src/cowork/ConsentDialog.cpp
     src/cowork/ControlConsentDialog.cpp
     src/cowork/BrowserLaunch.cpp
+    src/notify/AgentNotifier.cpp
     src/CooperationPanel.cpp
     src/AiInspectorPanel.cpp
     src/JobsPanel.cpp
@@ -156,6 +161,9 @@ target_link_libraries(agentkate PRIVATE
     KF6::Parts
     KF6::WidgetsAddons
     KF6::ColorScheme
+    KF6::Notifications
+    KF6::DBusAddons
+    KF6::WindowSystem
     KF6::KIOCore
     KF6::KIOGui
     KF6::KIOWidgets
@@ -215,6 +223,12 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/org.kde.agentkate.desktop
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/org.kde.agentkate.metainfo.xml
         DESTINATION ${KDE_INSTALL_METAINFODIR})
 
+# The desktop notification catalogue. One [Event/…] per alert kind so each is
+# separately configurable — and silenceable — in System Settings ▸ Notifications.
+# KNotification finds it by component name, so the basename must stay "agentkate".
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/agentkate.notifyrc
+        DESTINATION ${KDE_INSTALL_KNOTIFYRCDIR})
+
 # Install the UI binary. akcore lives next to it (installed by the top-level
 # CMakeLists) so applicationDirPath() finds the core after `make install`.
 install(TARGETS agentkate RUNTIME DESTINATION ${KDE_INSTALL_BINDIR})
@@ -239,24 +253,60 @@ if(Qt6Test_FOUND)
     # for its model-availability helpers — hence the extra sources.
     add_executable(TranscriptModelTest tests/TranscriptModelTest.cpp
         src/TranscriptModel.cpp src/TranscriptDelegate.cpp
-        src/AgentChatHelpers.cpp src/MarkdownUtil.cpp
+        src/AgentChatHelpers.cpp src/MarkdownUtil.cpp src/AttachmentBuilder.cpp
+        src/SafeContent.cpp
         src/state/HarnessTraits.cpp src/ProviderConfig.cpp src/ipc/CoreClient.cpp
         src/theme/ThemeManager.cpp)
     target_include_directories(TranscriptModelTest PRIVATE src)
     target_link_libraries(TranscriptModelTest PRIVATE Qt6::Widgets Qt6::Test
         Qt6::Network KF6::ColorScheme KF6::ConfigCore KF6::I18n
-        KF6::SyntaxHighlighting)
+        KF6::SyntaxHighlighting KF6::WidgetsAddons)
     add_test(NAME TranscriptModelTest COMMAND TranscriptModelTest)
     set_tests_properties(TranscriptModelTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
-    # Regression guard: QTextDocument::setMarkdown swallows text around raw-HTML
-    # angle brackets (e.g. "Reactive<T>"); the neutralizer escapes them first.
+    # Audit F16. QTextDocument::setMarkdown runs md4c with raw HTML ON: it
+    # swallows text around angle brackets (e.g. "Reactive<T>") and turns
+    # model-authored HTML into live rich text. setMarkdownSafe passes md4c's own
+    # MarkdownNoHTML flag, so the property holds by construction; this test pins
+    # it, including a scan proving no call site opts out.
     add_executable(MarkdownUtilTest tests/MarkdownUtilTest.cpp src/MarkdownUtil.cpp)
     target_include_directories(MarkdownUtilTest PRIVATE src)
     target_link_libraries(MarkdownUtilTest PRIVATE Qt6::Gui Qt6::Test)
     add_test(NAME MarkdownUtilTest COMMAND MarkdownUtilTest)
     set_tests_properties(MarkdownUtilTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    # Audit F14/F15: what model-authored content may reach the OS. The link
+    # scheme policy and the image-resource allowlist are security gates, so they
+    # get a regression test of their own — including the /dev/... special-file
+    # case that hung the GUI thread, and the end-to-end render tests proving a
+    # markdown image outside every root is never read (MarkdownUtil is linked in
+    # so those go through the app's real markdown path).
+    add_executable(SafeContentTest tests/SafeContentTest.cpp src/SafeContent.cpp
+        src/MarkdownUtil.cpp)
+    target_include_directories(SafeContentTest PRIVATE src)
+    target_link_libraries(SafeContentTest PRIVATE Qt6::Widgets Qt6::Test
+        KF6::I18n KF6::WidgetsAddons)
+    add_test(NAME SafeContentTest COMMAND SafeContentTest)
+    set_tests_properties(SafeContentTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    # The sub-agent transcript view's document bounds. A block COUNT does not
+    # bound block SIZE, so the dialog's cap needs both — this pins the
+    # few-but-huge shape the block cap sails past.
+    add_executable(SubAgentTranscriptDialogTest
+        tests/SubAgentTranscriptDialogTest.cpp src/SubAgentTranscriptDialog.cpp
+        src/AgentChatHelpers.cpp src/MarkdownUtil.cpp src/SafeContent.cpp
+        src/theme/ThemeManager.cpp src/state/HarnessTraits.cpp
+        src/ProviderConfig.cpp src/ipc/CoreClient.cpp)
+    target_include_directories(SubAgentTranscriptDialogTest PRIVATE src)
+    target_link_libraries(SubAgentTranscriptDialogTest PRIVATE Qt6::Widgets
+        Qt6::Test Qt6::Network KF6::I18n KF6::WidgetsAddons KF6::ConfigCore
+        KF6::ConfigGui KF6::ColorScheme KF6::CoreAddons
+        KF6::SyntaxHighlighting)
+    add_test(NAME SubAgentTranscriptDialogTest COMMAND SubAgentTranscriptDialogTest)
+    set_tests_properties(SubAgentTranscriptDialogTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
     # Plan 16 P5: the roster is no longer a two-level tree — workers nest under
@@ -279,8 +329,12 @@ if(Qt6Test_FOUND)
     add_executable(AttachmentBuilderTest tests/AttachmentBuilderTest.cpp
         src/AttachmentBuilder.cpp)
     target_include_directories(AttachmentBuilderTest PRIVATE src)
-    target_link_libraries(AttachmentBuilderTest PRIVATE Qt6::Core Qt6::Test KF6::I18n)
+    # Qt6::Gui for QImage: raw clipboard/drag images are ingested as pixels.
+    target_link_libraries(AttachmentBuilderTest PRIVATE Qt6::Core Qt6::Gui Qt6::Test
+        KF6::I18n)
     add_test(NAME AttachmentBuilderTest COMMAND AttachmentBuilderTest)
+    set_tests_properties(AttachmentBuilderTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
     # Plan 19: the Jobs panel aggregates work it does not own — agents publish
     # snapshots and it replaces their rows wholesale. Guards the three ways that
@@ -289,13 +343,26 @@ if(Qt6Test_FOUND)
     add_executable(JobsPanelTest tests/JobsPanelTest.cpp
         src/JobsPanel.cpp src/SubAgentTranscriptDialog.cpp src/AgentChatHelpers.cpp
         src/MarkdownUtil.cpp src/theme/ThemeManager.cpp src/state/HarnessTraits.cpp
-        src/ipc/CoreClient.cpp src/ProviderConfig.cpp)
+        src/ipc/CoreClient.cpp src/ProviderConfig.cpp src/SafeContent.cpp)
     target_include_directories(JobsPanelTest PRIVATE src)
     target_link_libraries(JobsPanelTest PRIVATE Qt6::Widgets Qt6::Test Qt6::Network
         KF6::I18n KF6::ConfigCore KF6::CoreAddons KF6::SyntaxHighlighting
         KF6::ColorScheme KF6::WidgetsAddons)
     add_test(NAME JobsPanelTest COMMAND JobsPanelTest)
     set_tests_properties(JobsPanelTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    # Desktop alerts: which agent transitions are worth interrupting the user
+    # for. Covers the finish/fail rules, the status+attention dedup (one popup
+    # per prompt, arriving in either order), the on-screen suppression rule and
+    # a closed agent's late signals.
+    add_executable(AgentNotifierTest tests/AgentNotifierTest.cpp
+        src/notify/AgentNotifier.cpp)
+    target_include_directories(AgentNotifierTest PRIVATE src)
+    target_link_libraries(AgentNotifierTest PRIVATE Qt6::Widgets Qt6::Test
+        KF6::I18n KF6::Notifications KF6::WindowSystem)
+    add_test(NAME AgentNotifierTest COMMAND AgentNotifierTest)
+    set_tests_properties(AgentNotifierTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
     # Plan 16 P4: the ensemble round-trip and the editable model combo, the two
@@ -326,6 +393,17 @@ if(Qt6Test_FOUND)
     target_link_libraries(FlowLayoutTest PRIVATE Qt6::Widgets Qt6::Test)
     add_test(NAME FlowLayoutTest COMMAND FlowLayoutTest)
     set_tests_properties(FlowLayoutTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    # The two transport bounds the core also enforces: the socket path handed to
+    # akcore must satisfy ipc.assertPrivateDir (or the core refuses to bind and
+    # the app never starts), and the inbound frame buffer must be capped (audit
+    # F10). Header-only units, so no extra sources.
+    add_executable(IpcTransportTest tests/IpcTransportTest.cpp)
+    target_include_directories(IpcTransportTest PRIVATE src)
+    target_link_libraries(IpcTransportTest PRIVATE Qt6::Core Qt6::Test)
+    add_test(NAME IpcTransportTest COMMAND IpcTransportTest)
+    set_tests_properties(IpcTransportTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 endif()
 

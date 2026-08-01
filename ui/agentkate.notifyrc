@@ -1,0 +1,38 @@
+# Agent Kate's desktop notification catalogue.
+#
+# One [Event/…] section per kind of alert, so each can be silenced, sounded or
+# switched off independently in System Settings ▸ Notifications. That is the
+# KDE-native answer to "don't spam me", and it is why AgentNotifier never
+# invents its own enable/disable setting.
+#
+# The section names are the eventId strings AgentNotifier passes to
+# KNotification; the file is found by COMPONENT NAME, which is this file's
+# basename ("agentkate") — not the application's display name.
+#
+# Persistence is not expressed here: it is a KNotification::Persistent flag on
+# the alert itself, so a needs-attention popup stays on screen until answered
+# even though the user can still downgrade it to silence from System Settings.
+
+[Global]
+IconName=agentkate
+DesktopEntry=org.kde.agentkate
+Name=Agent Kate
+Comment=Alerts from the agents running in your arena
+
+[Event/agentNeedsAttention]
+Name=Agent needs attention
+Comment=An agent has stopped and is waiting for you before it can continue
+Action=Popup
+Urgency=High
+
+[Event/agentFinished]
+Name=Agent finished its turn
+Comment=An agent stopped working and is waiting for your next instruction
+Action=Popup
+Urgency=Low
+
+[Event/agentFailed]
+Name=Agent failed
+Comment=An agent's start or turn ended with an error
+Action=Popup
+Urgency=Normal

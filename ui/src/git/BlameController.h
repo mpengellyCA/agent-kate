@@ -61,7 +61,10 @@ private:
 
     QPointer<KTextEditor::Document> m_doc;
     QPointer<KTextEditor::View> m_view;
-    CoreClient *m_core = nullptr;
+    // QPointer, not a raw pointer (audit F24) — same reason as
+    // GutterController: m_core is a sibling child of MainWindow destroyed on an
+    // ordering this class must not depend on. See the note there.
+    QPointer<CoreClient> m_core;
     QString m_path;
     BlameAnnotationModel *m_model = nullptr;
     bool m_enabled = false;
