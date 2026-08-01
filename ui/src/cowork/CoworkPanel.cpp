@@ -323,9 +323,12 @@ void CoworkPanel::onNotification(const QString &method, const QJsonObject &param
             m_status->setText(i18n("Desktop access granted. Agents can see and control the "
                                    "screen without another system prompt this session."));
         } else {
+            // No "it will prompt again" reassurance: the common failure here is not a
+            // decline but the portal missing its remote-control backend, which will
+            // fail identically until it is fixed. The detail carries the fix when
+            // there is one (CoworkPortal::portalFailureDetail).
             m_status->setMessageType(KMessageWidget::Warning);
-            m_status->setText(i18n("Desktop permission was not granted: %1. Agents can still "
-                                   "be asked to try — the system will prompt again.",
+            m_status->setText(i18n("Desktop permission is not available: %1",
                                    params.value(QStringLiteral("error")).toString()));
         }
     } else if (method == QLatin1String("cowork.grantsChanged")) {

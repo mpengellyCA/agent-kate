@@ -1,5 +1,7 @@
 #pragma once
 
+#include "state/AgentJob.h"
+
 #include <QHash>
 #include <QList>
 #include <QObject>
@@ -91,6 +93,11 @@ public:
     void openActiveAgentTerminal();
     void closeActiveAgent();
 
+    // Jobs-panel actions, routed to the agents that own the work.
+    void forgetFinishedJobsEverywhere();
+    void showWorkflowMonitorFor(const QString &threadId);
+    void selectAgentByThread(const QString &threadId);
+
 Q_SIGNALS:
     void statusMessage(const QString &text);
     void openDiff(const QString &title, const QString &diffText);
@@ -120,9 +127,17 @@ Q_SIGNALS:
     // Carries an agent's WORKTREE path (distinct from a project path) so the
     // shell can open a terminal rooted there.
     void openWorktreeTerminalRequested(const QString &worktreePath);
-    // Human agent titles keyed by thread id, refreshed alongside the #N badges
-    // (refreshAgentNumbers). The WorktreeDashboard uses these to name each card.
+    // Human agent titles keyed by thread id, re-pushed on every event that can
+    // change the mapping (a rename, a thread being bound, a git.snapshot). The
+    // WorktreeDashboard names each card from these; the Jobs panel names each
+    // agent group, which would otherwise read as a raw uuid.
     void agentTitlesChanged(const QHash<QString, QString> &titlesByThread);
+    // One agent's full background-job set, forwarded from its panel to the Jobs
+    // panel. An empty vector means "this agent has none" — which is also how a
+    // closing agent's rows are reaped.
+    void jobsChanged(const QString &threadId, const QVector<agentkate::AgentJob> &jobs);
+    // The in-chat tray's "N finished" chip asks the window to raise the Jobs panel.
+    void openJobsPanelRequested();
 
 private:
     struct Entry {
@@ -164,6 +179,9 @@ private:
     void closeOtherProjects(const QString &keepPath);
     void wireAgentPanel(int agentId, AgentPanel *panel);
     void restoreThreads(const QString &project);
+    // Settle every on-screen agent after the core was replaced by a fresh
+    // process: their threads died with the old one, and only the UI knows it.
+    void handleCoreRespawn();
     // Reconcile the roster with the core's orchestration linkage (plan 16 P5):
     // adopt agent-launched workers, nest them under their controller, and push
     // roles for the ⇄ badges.
@@ -179,6 +197,12 @@ private:
     // Pull git.snapshot and push each thread's worktree Number into the
     // roster, so the #N badge stays in sync with WorktreeDashboard.
     void refreshAgentNumbers();
+    // Emit agentTitlesChanged from the roster's current titles. Split out of
+    // refreshAgentNumbers because that one only ever fires from a git.snapshot
+    // reply: a rename, a freshly-bound thread or a newly-wired panel would
+    // otherwise not reach the title consumers until git next moved, leaving the
+    // Jobs panel naming agents by raw thread uuid.
+    void pushAgentTitles();
     bool hasThread(const QString &threadId) const;
     // Add or remove one tag on an agent, optimistic with rollback on error.
     void mutateTag(int agentId, const QString &tag, bool add);

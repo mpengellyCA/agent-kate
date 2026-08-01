@@ -1,5 +1,6 @@
 #pragma once
 
+#include "state/AgentJob.h"
 #include "state/HarnessTraits.h"
 
 #include <QHash>
@@ -59,6 +60,11 @@ public:
 
     void setWorkspace(const QString &path);
     QString threadId() const { return m_threadId; }
+    // The thread id this panel's last non-empty job publish was keyed on. A
+    // panel can lose or change its thread id (a "Stop & close" reply clears it
+    // before the close; a failed start falls back to a blank panel), so reaping
+    // its job rows has to target the id they were published under.
+    QString publishedThreadId() const { return m_publishedThreadId; }
     bool isIsolated() const { return m_isolated; }
     // The agent's isolated worktree directory (the working dir a lifecycle
     // event / dormant record reports). Empty when the agent runs directly in
@@ -171,6 +177,16 @@ public:
     void promptAttach() { onAttachClicked(); }
     void showChanges() { onChangesClicked(); }
 
+    // Jobs-panel entry points. That panel mirrors what this one publishes, so
+    // acting on a job routes back here, where the state actually lives.
+    void forgetFinishedJobs();
+    void showWorkflowMonitor() { openWorkflowMonitor(); }
+    // Re-publish this agent's jobs — used when a consumer attaches after the
+    // work started, so it doesn't sit empty until the next task event. Forces
+    // the emit: the publish path is otherwise change-gated, and a fresh
+    // consumer has seen nothing at all.
+    void republishJobs();
+
 Q_SIGNALS:
     void statusMessage(const QString &text);
     void titleChanged(const QString &title);
@@ -200,6 +216,14 @@ Q_SIGNALS:
     // Roster card affordance: attention = a turn is waiting on the user's input
     // (a permission prompt). The roster paints this as a card marker.
     void attentionChanged(bool attention);
+    // This agent's complete background-work set, re-published as a snapshot on
+    // every change (a job starting, finishing, or gaining an output path). The
+    // Jobs panel keys on threadId and replaces that agent's rows wholesale, so
+    // it never has to reason about deltas — or hold a pointer into this panel.
+    void jobsChanged(const QString &threadId, const QVector<agentkate::AgentJob> &jobs);
+    // The tray's "N finished" chip: raise the Jobs panel, which is where
+    // finished work (and every other agent's) now lives.
+    void openJobsPanelRequested();
     void openDiff(const QString &title, const QString &diffText);
     // A text/file attachment chip was clicked — ask the window to open the file
     // in the editor (and make the editor visible if it was chat-only).
@@ -235,7 +259,15 @@ private:
     void addYouCard(const QString &text, const QJsonArray &attachments);
     // Send a message to the live thread now: adds the You card, marks the turn
     // busy, and calls agent.send. Assumes a running (non-dormant) thread.
-    void deliverMessage(const QString &text, const QJsonArray &attachments);
+    // False = refused before any side effect (the frame guard); the caller still
+    // owns the text and must not discard it.
+    bool deliverMessage(const QString &text, const QJsonArray &attachments);
+    // Refuse a request whose finalized params would overflow the core's
+    // JSON-RPC frame cap (16 MB, core/internal/ipc/server.go). An oversize
+    // frame never reaches a handler, so the message would just vanish; refusing
+    // here keeps it in the composer where it can still be edited. Reports it in
+    // the attach banner and returns true.
+    bool wouldOverflowFrame(const QJsonObject &params);
     // Fire the next queued follow-up, if any, once the thread is idle. Called
     // on every `result` event; sends one message per turn boundary.
     void drainSendQueue();
@@ -325,6 +357,15 @@ private:
     void handleTaskEvent(const QString &subtype, const QJsonObject &ev);
     void openBackgroundJob(const QString &taskId);
     void updateJobsBar();
+    // Emit jobsChanged when the snapshot — or the thread it belongs to —
+    // actually changed. A panel whose thread id moved first reaps the rows it
+    // published under the old one, or the Jobs panel keeps a duplicate group
+    // for a thread that no longer exists, permanently.
+    void publishJobs(QVector<agentkate::AgentJob> jobs);
+    // Drop tool_use → task_id entries whose task record is gone. The map is
+    // only consulted while that task's launch result is still arriving, so an
+    // entry outliving its job is pure growth.
+    void dropTaskMappings(const QSet<QString> &taskIds);
     // Remember the most recent `Workflow` tool launch on this thread (its input +
     // launch result), spin up a WorkflowMonitor for the chip's live label, and
     // reveal the "Workflow" chip. Called when a Workflow tool_result lands.
@@ -459,7 +500,10 @@ private:
     // names only).
     QList<QPair<QString, QString>> m_slashCommands;
     QListWidget *m_slashPopup = nullptr;
-    // One background task (shell or async subagent) reported by the CLI.
+    // One background task (shell or async subagent) reported by the CLI. The
+    // tray's chips are rebuilt from this map rather than stored on it: chips now
+    // come and go as jobs finish, and a retained pointer to a deleted one is a
+    // crash waiting to happen.
     struct BgJob {
         QString id;          // CLI task_id
         QString description;
@@ -467,13 +511,35 @@ private:
         QString outputFile;  // parsed from the tool result / task_notification
         qint64 startedMs = 0;
         bool done = false;
-        QPushButton *chip = nullptr;
+        bool failed = false; // done with a non-"completed" status, or killed with the agent
+        bool noted = false;  // terminal summary already added to the feed (emit once)
+        quint64 order = 0;   // insertion sequence — QHash iteration is unordered
     };
     QHash<QString, BgJob> m_bgJobs;         // by task_id
+    quint64 m_bgJobSeq = 0;
+    // Retention for finished job records. They are no longer drawn in the tray,
+    // but the Jobs panel lists them, so they outlive their chips — bounded here
+    // so a marathon session doesn't accumulate them forever.
+    static constexpr int kMaxRetainedJobs = 500;
     QHash<QString, QString> m_taskByToolUse; // tool_use_id -> task_id
     QFrame *m_jobsBar = nullptr;
     FlowLayout *m_jobsFlow = nullptr;
+    // Live chips by task id, and a fingerprint of what the tray currently shows
+    // (running ids + their output paths, the finished count). The 15 s tick only
+    // moves a minute-granular elapsed suffix, so rebuilding the widgets each
+    // time would flicker the row under the composer for nothing: an unchanged
+    // fingerprint relabels in place instead. It covers the CHIPS and nothing
+    // else — publishing compares m_lastPublishedJobs.
+    QHash<QString, QPushButton *> m_jobChips;
+    QString m_jobsFingerprint;
     QTimer *m_jobsTimer = nullptr; // refreshes running chips' elapsed suffix
+    // What the last jobsChanged carried, and the thread id it was keyed on.
+    // Publishing is compared against these rather than against the tray's
+    // fingerprint: the fingerprint answers "do the CHIPS need rebuilding", and
+    // deliberately ignores everything no chip draws (a finished job's late
+    // output path, a failure, a record dropped by "Clear finished").
+    QVector<agentkate::AgentJob> m_lastPublishedJobs;
+    QString m_publishedThreadId;
     // Observability (plan 14 P5). Context fill: the latest turn's prompt-side
     // tokens vs the model's context window (from modelUsage) — the number
     // that predicts auto-compaction. Turn timing: running average of the
@@ -497,6 +563,15 @@ private:
     QString m_workflowInput;
     QString m_workflowResult;
     WorkflowMonitor *m_workflowMonitor = nullptr; // drives the chip label (running/done)
+    // When the workflow run was launched — the monitor reads the run's on-disk
+    // artifacts, which carry no start time, so the job row's Elapsed would
+    // otherwise be blank for the longest-running job on the panel.
+    qint64 m_workflowStartedMs = 0;
+    // "Clear finished" suppressing a terminal workflow row. The row is
+    // synthesized from the monitor on every publish rather than stored in
+    // m_bgJobs, so there is no record to erase — only a flag, cleared by the
+    // next launch.
+    bool m_workflowForgotten = false;
     QFrame *m_workflowBar = nullptr;
     QPushButton *m_workflowChip = nullptr;
     // The Message row whose selection overlay is currently open (invalid = none).

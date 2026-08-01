@@ -28,6 +28,8 @@ QStringList buildPathAttachments(const QStringList &paths, const QString &worksp
 // `items` that carries a "line" key (widening by a few lines of context each
 // side); items without a line range are collected into `wholeFile` for the
 // caller to route through buildPathAttachments. De-duplicates by display name.
+// Excerpts are truncated and budgeted exactly as whole files are — a line range
+// bounds nothing in a minified file, whose single line is the entire file.
 // Returns the human-readable reasons any items were skipped, for the caller's
 // banner.
 QStringList buildItemAttachments(const QJsonArray &items, QJsonArray &attachments,

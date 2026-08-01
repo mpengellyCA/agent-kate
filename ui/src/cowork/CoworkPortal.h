@@ -103,6 +103,12 @@ private:
     void runOneOp(const QJsonObject &op);
     void flushInjectQueue();
     void failInjectQueue(const QString &err);
+    // failPortalStep is the ONLY way a portalRequest failure branch should fail the
+    // queue: it picks the wording from what actually happened and appends
+    // portalFailureDetail(), so no branch can assert "you declined" when the real
+    // fault was a missing portal backend. `declined` is the wording for a genuine
+    // refusal, `faulted` for a portal/environment failure (empty = reuse `declined`).
+    void failPortalStep(const QString &declined, const QString &faulted = QString());
     void teardownRemoteDesktop();
     // closeSessionOnly drops the live portal session (after force-releasing held
     // input) WITHOUT failing the queue — used to rebuild a session that lacks a
@@ -143,6 +149,11 @@ private:
     // Response to cb. options gains a fresh handle_token; args precede options.
     void portalRequest(const QString &iface, const QString &method, const QVariantList &args,
                        QVariantMap options, std::function<void(uint, const QVariantMap &)> cb);
+    // A trailing clause naming WHY the last portal call failed, appended to the
+    // user-facing failure. Empty when the portal answered normally (a plain decline
+    // needs no explanation); actionable when the failure is a fixable environment
+    // fault rather than the user saying no.
+    QString portalFailureDetail() const;
 
     struct PendingInject {
         QString corrId;
@@ -153,6 +164,13 @@ private:
     // on. Kept apart from m_injectQueue because they carry no ops: they are satisfied
     // by the session coming up (or failed by it being declined), not by anything run.
     QStringList m_preflightCorrIds;
+
+    // The last D-Bus error a portal call returned, so a failure can say what went
+    // wrong instead of implying the user declined something. The name is kept
+    // separately because it, not the (localisable, sometimes empty) message, is what
+    // identifies a missing portal backend.
+    QString m_lastPortalError;     // human-readable text (falls back to the error name)
+    QString m_lastPortalErrorName; // D-Bus error name, e.g. org.freedesktop.DBus.Error.UnknownMethod
 
     // One captured monitor stream: its PipeWire node id and its rect in global desktop
     // pixels. The vector is the coordinate map absolute motion resolves against.

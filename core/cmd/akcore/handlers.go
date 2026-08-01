@@ -208,6 +208,7 @@ func recordAttachments(d handlerDeps, threadID, text string, atts []agent.Attach
 			Path:      a.Path,
 			MediaType: a.MediaType,
 			Outside:   a.Outside,
+			CachePath: a.CachePath,
 		})
 	}
 	if err := d.attachSide.Append(threadID, session.AttachmentTurn{Text: text, Attachments: metas}); err != nil {

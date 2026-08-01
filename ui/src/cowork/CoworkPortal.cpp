@@ -720,9 +720,42 @@ void CoworkPortal::portalRequest(const QString &iface, const QString &method,
         // "declined" with no clue why.
         qWarning("cowork: portal %s.%s failed: %s", qUtf8Printable(iface), qUtf8Printable(method),
                  qUtf8Printable(reply.errorMessage()));
+        // Keep the reason for the failure path to quote. A generic "the session could
+        // not be created" sends the user looking for a permission they never denied.
+        // The message can be empty (some errors carry only a name), which would leave
+        // the failure unexplained — fall back to the name.
+        m_lastPortalErrorName = reply.errorName();
+        m_lastPortalError = reply.errorMessage().isEmpty() ? m_lastPortalErrorName : reply.errorMessage();
         waiter->deleteLater();
         cb(2, QVariantMap()); // no Response will arrive; surface the failure now
+    } else {
+        m_lastPortalError.clear();
+        m_lastPortalErrorName.clear();
     }
+}
+
+QString CoworkPortal::portalFailureDetail() const
+{
+    if (m_lastPortalError.isEmpty()) {
+        return QString();
+    }
+    // The one failure that is NOT a decline and IS fixable: xdg-desktop-portal running
+    // without the backend that owns RemoteDesktop/ScreenCast. It comes up this way often
+    // enough (a startup race at login) that the message should carry the fix rather than
+    // read like a refused permission the user has to hunt for. Matched on the error NAME:
+    // the message is free-form and localisable, while these four names are exactly how the
+    // bus reports "that interface/method/object/service is not there".
+    static const QStringList missingBackend{
+        QStringLiteral("org.freedesktop.DBus.Error.UnknownMethod"),
+        QStringLiteral("org.freedesktop.DBus.Error.UnknownInterface"),
+        QStringLiteral("org.freedesktop.DBus.Error.UnknownObject"),
+        QStringLiteral("org.freedesktop.DBus.Error.ServiceUnknown"),
+    };
+    if (missingBackend.contains(m_lastPortalErrorName)) {
+        return i18n(" — the desktop portal is running without its remote-control backend. "
+                    "Restart it with:  systemctl --user restart xdg-desktop-portal.service");
+    }
+    return QStringLiteral(" — %1").arg(m_lastPortalError);
 }
 
 uint CoworkPortal::deviceTypesFor(const QJsonArray &ops)
@@ -838,7 +871,7 @@ void CoworkPortal::startRemoteDesktop()
     portalRequest(QStringLiteral("org.freedesktop.portal.RemoteDesktop"), QStringLiteral("CreateSession"),
                   {}, createOpts, [this, startTypes, wantScreencast](uint code, const QVariantMap &results) {
         if (code != 0) {
-            failInjectQueue(i18n("the remote-control session could not be created"));
+            failPortalStep(i18n("the remote-control session could not be created"));
             return;
         }
         m_rdSession = results.value(QStringLiteral("session_handle")).toString();
@@ -853,7 +886,8 @@ void CoworkPortal::startRemoteDesktop()
                       {QVariant::fromValue(QDBusObjectPath(m_rdSession))}, selOpts,
                       [this, startTypes, wantScreencast](uint code2, const QVariantMap &) {
             if (code2 != 0) {
-                failInjectQueue(i18n("input devices were not granted"));
+                failPortalStep(i18n("input devices were not granted"),
+                               i18n("input devices could not be requested"));
                 return;
             }
             // The Start step is shared by both paths; capture it so SelectSources can
@@ -873,7 +907,8 @@ void CoworkPortal::startRemoteDesktop()
                         return;
                     }
                     if (code3 != 0) {
-                        failInjectQueue(i18n("remote control was declined"));
+                        failPortalStep(i18n("remote control was declined"),
+                                       i18n("remote control could not be started"));
                         return;
                     }
                     m_rdReady = true;
@@ -925,7 +960,8 @@ void CoworkPortal::startRemoteDesktop()
                           {QVariant::fromValue(QDBusObjectPath(m_rdSession))}, scOpts,
                           [this, doStart](uint codeSc, const QVariantMap &) {
                 if (codeSc != 0) {
-                    failInjectQueue(i18n("screen capture for cursor control was declined"));
+                    failPortalStep(i18n("screen capture for cursor control was declined"),
+                                   i18n("screen capture for cursor control could not be started"));
                     return;
                 }
                 doStart();
@@ -1297,12 +1333,20 @@ void CoworkPortal::flushInjectQueue()
     }
 }
 
+void CoworkPortal::failPortalStep(const QString &declined, const QString &faulted)
+{
+    // An empty detail means the portal answered normally, i.e. the user really did decline.
+    const QString detail = portalFailureDetail();
+    const QString base = (detail.isEmpty() || faulted.isEmpty()) ? declined : faulted;
+    failInjectQueue(base + detail);
+}
+
 void CoworkPortal::failInjectQueue(const QString &err)
 {
-    m_rdStarting = false;
-    m_rdReady = false;
-    m_rdSession.clear();
-    m_rdTypes = 0;
+    // A half-built session (CreateSession returned a handle, a later step failed) is
+    // still a live portal session; drop it properly instead of just forgetting the
+    // path, or every failed attempt — and preflight makes those routine — leaks one.
+    closeSessionOnly();
     const auto queued = m_injectQueue;
     m_injectQueue.clear();
     for (const auto &pi : queued) {
@@ -1353,8 +1397,7 @@ void CoworkPortal::closeSessionOnly()
 
 void CoworkPortal::teardownRemoteDesktop()
 {
-    closeSessionOnly();
-    failInjectQueue(i18n("desktop control was stopped"));
+    failInjectQueue(i18n("desktop control was stopped")); // closes the session first
 }
 
 void CoworkPortal::handleKillInject(const QJsonObject &req)

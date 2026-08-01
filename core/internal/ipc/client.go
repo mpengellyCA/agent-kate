@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -44,14 +46,32 @@ func Dial(socketPath string) (*Client, error) {
 	return c, nil
 }
 
+// readLoop drains inbound frames until the connection fails. It uses the shared
+// resilient frameReader rather than a bufio.Scanner: a Scanner treats an
+// over-long frame as terminal, so one huge core→bridge result (a
+// cowork.screenshot, say) silently ended this loop while the Client stayed
+// alive — every later Call then blocked for its full timeout. An oversize frame
+// is logged and skipped instead; only a real read error ends the loop, and it
+// fails the pending calls fast.
 func (c *Client) readLoop() {
-	sc := bufio.NewScanner(c.conn)
-	sc.Buffer(make([]byte, 0, 64*1024), maxFrameBytes)
-	for sc.Scan() {
-		line := sc.Bytes()
-		if len(line) == 0 {
+	fr := newFrameReader(c.conn)
+	for {
+		line, oversize, err := fr.readFrame()
+		if oversize > 0 {
+			slog.Warn("oversize frame from core discarded",
+				"bytes", oversize, "cap", maxFrameBytes)
+		}
+		if err != nil {
+			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+				slog.Warn("core connection read error", "err", err)
+			}
+			break
+		}
+		if oversize > 0 || len(line) == 0 {
 			continue
 		}
+		// Frame's json.RawMessage fields copy on unmarshal, so the decoded frame
+		// does not alias the reader's reusable buffer.
 		var f Frame
 		if json.Unmarshal(line, &f) != nil {
 			continue

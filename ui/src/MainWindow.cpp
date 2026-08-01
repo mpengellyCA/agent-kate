@@ -19,12 +19,12 @@
 #include "WelcomeDialog.h"
 #include "WorktreeDashboard.h"
 #include "AiInspectorPanel.h"
+#include "JobsPanel.h"
 #include "CooperationPanel.h"
 #include "cowork/CoworkPanel.h"
 #include "cowork/CoworkPortal.h"
 #include "shell/ShellLayout.h"
 #include "shell/SideBar.h"
-#include "shell/StubPanel.h"
 #include "git/BlameController.h"
 #include "git/GutterController.h"
 #include "git/LogViewer.h"
@@ -46,6 +46,7 @@
 #include <KHamburgerMenu>
 #include <KHelpMenu>
 #include <KLocalizedString>
+#include <KMessageWidget>
 #include <KSharedConfig>
 #include <KStandardAction>
 #include <KToggleAction>
@@ -83,6 +84,7 @@
 #include <QTimer>
 #include <QToolBar>
 #include <QToolButton>
+#include <QVBoxLayout>
 
 MainWindow::MainWindow(const QString &openPath, QWidget *parent)
     : KMainWindow(parent)
@@ -256,12 +258,9 @@ void MainWindow::setupUi()
     coreLogView->setFrameShape(QFrame::NoFrame);
     registerPanel(m_keyOutput, QIcon::fromTheme(QStringLiteral("utilities-log-viewer")),
                   i18n("Output"), coreLogView, QStringLiteral("bottom"));
+    m_jobsPanel = new JobsPanel(this);
     registerPanel(m_keyTasks, QIcon::fromTheme(QStringLiteral("view-task")),
-                  i18n("Tasks"),
-                  new StubPanel(i18n("Tasks / Hooks"),
-                                i18n("Background tasks, hook runs, and queued work appear here."),
-                                this),
-                  QStringLiteral("bottom"));
+                  i18n("Jobs"), m_jobsPanel, QStringLiteral("bottom"));
 
     // Plain-language descriptions for every activity-rail tab. The rail is
     // icon-only by default, which reads as cryptic to anyone who isn't a
@@ -283,7 +282,8 @@ void MainWindow::setupUi()
         {m_keyReferences, i18n("Everywhere the selected symbol is used.")},
         {m_keyProblems, i18n("Errors and warnings from the language tools.")},
         {m_keyOutput, i18n("Background log output from Agent Kate's core.")},
-        {m_keyTasks, i18n("Background tasks, hook runs and queued work.")},
+        {m_keyTasks, i18n("Everything running in the background — detached shells, "
+                          "sub-agents and Workflow runs — across every agent.")},
     };
     for (auto it = panelHelp.constBegin(); it != panelHelp.constEnd(); ++it) {
         SideBar *bar = panelBar(it.key());
@@ -320,7 +320,23 @@ void MainWindow::setupUi()
     shellSlots.editor = m_editor;
     shellSlots.agentPanel = m_agent->panelStack();
     m_shell = new ShellLayout(shellSlots, this);
-    setCentralWidget(m_shell);
+
+    // Shell-wide banner, above everything. The status bar's transient notices
+    // cannot carry a condition that persists and disables the whole window —
+    // losing the core does exactly that, so it gets a strip that stays put until
+    // the connection is back.
+    m_coreBanner = new KMessageWidget(this);
+    m_coreBanner->setWordWrap(true);
+    m_coreBanner->setCloseButtonVisible(false);
+    m_coreBanner->setVisible(false);
+
+    auto *centre = new QWidget(this);
+    auto *centreLayout = new QVBoxLayout(centre);
+    centreLayout->setContentsMargins(0, 0, 0, 0);
+    centreLayout->setSpacing(0);
+    centreLayout->addWidget(m_coreBanner);
+    centreLayout->addWidget(m_shell, 1);
+    setCentralWidget(centre);
 
     // KMainWindow's autoSaveSettings() blob persists dock geometry. The new
     // shell stops using addDockWidget for tool panels, so that blob is dead.
@@ -428,6 +444,7 @@ void MainWindow::setupUi()
     // re-point the thread-keyed panels when it lands — otherwise "Enable Cowork for
     // this agent" stays greyed out and Git Log keeps the stale thread.
     connect(m_agent, &AgentDock::activeThreadChanged, this, [this](const QString &threadId) {
+        rememberThreadProject(threadId);
         // The shown agent's tab group was keyed on a pending (per-run) id while
         // it had no thread; re-key it and follow it, so tabs opened during the
         // session start stay with the agent instead of being stranded.
@@ -470,6 +487,26 @@ void MainWindow::setupUi()
             });
     connect(m_agent, &AgentDock::agentTitlesChanged, m_worktreeDashboard,
             &WorktreeDashboard::setAgentTitles);
+    // Jobs panel: agents publish their background work, and acting on a row
+    // routes back to the agent that owns it.
+    connect(m_agent, &AgentDock::jobsChanged, m_jobsPanel, &JobsPanel::setAgentJobs);
+    connect(m_agent, &AgentDock::agentTitlesChanged, m_jobsPanel,
+            &JobsPanel::setAgentTitles);
+    connect(m_agent, &AgentDock::openJobsPanelRequested, this,
+            [this] { raisePanelByKey(m_keyTasks); });
+    connect(m_jobsPanel, &JobsPanel::clearFinishedRequested, m_agent,
+            &AgentDock::forgetFinishedJobsEverywhere);
+    connect(m_jobsPanel, &JobsPanel::openWorkflowRequested, m_agent,
+            &AgentDock::showWorkflowMonitorFor);
+    connect(m_jobsPanel, &JobsPanel::goToAgentRequested, m_agent,
+            &AgentDock::selectAgentByThread);
+    connect(m_jobsPanel, &JobsPanel::statusMessage, this,
+            [this](const QString &text) { statusBar()->showMessage(text, 4000); });
+    connect(m_jobsPanel, &JobsPanel::openFileRequested, this,
+            [this](const QString &threadId, const QString &path) {
+                ensureEditorVisible();
+                m_editor->openFile(editorGroupForThread(threadId), path);
+            });
     // The same titles name the agents in the inspector's all-threads timeline,
     // so a cross-agent call reads as "Reviewer" rather than a bare thread id.
     connect(m_agent, &AgentDock::agentTitlesChanged, this,
@@ -1810,6 +1847,67 @@ void MainWindow::setupCore()
     connect(m_core, &CoreClient::failed, this, [](const QString &msg) {
         qWarning().noquote() << "[core]" << msg;
     });
+    // A refused send drops something the human composed, so it is said out loud
+    // through the same banner the connection uses — the log line is for us, not
+    // for them. Transient by nature: the connection is fine, so it fades on its
+    // own unless a real core loss has taken the banner over in the meantime.
+    connect(m_core, &CoreClient::sendRefused, this,
+            [this](const QString &method, const QString &reason) {
+                qWarning().noquote() << "[core] refused" << method << ":" << reason;
+                const QString text =
+                    i18n("A message was too large to send to the core and was "
+                         "dropped — try again with fewer or smaller attachments.");
+                m_coreBanner->setMessageType(KMessageWidget::Warning);
+                m_coreBanner->setIcon(QIcon::fromTheme(QStringLiteral("dialog-warning")));
+                m_coreBanner->setCloseButtonVisible(true);
+                m_coreBanner->setText(text);
+                m_coreBanner->animatedShow();
+                statusBar()->showMessage(text, 8000);
+                QTimer::singleShot(15000, this, [this, text] {
+                    if (m_coreBanner->text() == text) {
+                        m_coreBanner->animatedHide();
+                    }
+                });
+            });
+    // Losing the core disables every action in the window, so its recovery is
+    // the one condition that gets the persistent banner rather than a toast.
+    connect(m_core, &CoreClient::reconnecting, this, [this] {
+        m_coreBanner->setMessageType(KMessageWidget::Warning);
+        m_coreBanner->setIcon(QIcon::fromTheme(QStringLiteral("dialog-warning")));
+        m_coreBanner->setCloseButtonVisible(false);
+        m_coreBanner->setText(
+            i18n("Lost the connection to Agent Kate's core — reconnecting…"));
+        m_coreBanner->animatedShow();
+    });
+    connect(m_core, &CoreClient::reconnected, this, [this](bool coreRespawned) {
+        if (!coreRespawned) {
+            m_coreBanner->animatedHide();
+            statusBar()->showMessage(i18n("Reconnected to the core"), 6000);
+            return;
+        }
+        // The core came back as a NEW process, so every agent that was running
+        // died with the old one — AgentDock settles them as resumable off this
+        // same signal. Keep the banner up saying so rather than flash
+        // "reconnected" over a roster the user last saw working.
+        m_coreBanner->setMessageType(KMessageWidget::Warning);
+        m_coreBanner->setIcon(QIcon::fromTheme(QStringLiteral("dialog-warning")));
+        m_coreBanner->setCloseButtonVisible(true);
+        m_coreBanner->setText(i18n("The core was restarted, so your agents were "
+                                   "interrupted. Their sessions were kept — "
+                                   "Resume an agent to carry on."));
+        m_coreBanner->animatedShow();
+        statusBar()->showMessage(
+            i18n("Reconnected to a restarted core — agents were interrupted"), 8000);
+    });
+    connect(m_core, &CoreClient::reconnectFailed, this, [this] {
+        m_coreBanner->setMessageType(KMessageWidget::Error);
+        m_coreBanner->setIcon(QIcon::fromTheme(QStringLiteral("dialog-error")));
+        m_coreBanner->setCloseButtonVisible(true);
+        m_coreBanner->setText(i18n("The core stopped and could not be restarted; "
+                                   "running agents were lost. Restart Agent Kate "
+                                   "to carry on."));
+        m_coreBanner->animatedShow();
+    });
     // The UI handshake (claiming the "ui" role) is now sent by CoreClient as the first
     // frame on connect, so by the time connected() fires the role is already being
     // established ahead of any UI-only query. Just do the post-connect work here.
@@ -1848,6 +1946,7 @@ void MainWindow::onAgentActivated(int agentId, const QString &projectPath,
 {
     m_activeAgentId = agentId;
     m_activeProject = projectPath;
+    rememberThreadProject(m_agent ? m_agent->currentThreadId() : QString());
     // The file browser scopes to the project root or the agent's worktree via
     // its own tab; Terminal/Search/Git Log stay project-scoped by design.
     m_tree->setRoots(projectPath, worktreePath);
@@ -1908,6 +2007,32 @@ QString MainWindow::groupKey() const
         return EditorSession::pendingKey(m_activeProject, m_activeAgentId);
     }
     return EditorSession::agentKey(m_activeProject, threadId);
+}
+
+void MainWindow::rememberThreadProject(const QString &threadId)
+{
+    if (threadId.isEmpty() || m_activeProject.isEmpty()) {
+        return;
+    }
+    m_projectByThread.insert(threadId, m_activeProject);
+}
+
+// editorGroupForThread names the tab group belonging to a GIVEN agent rather
+// than the one on screen. The Jobs panel shows every agent's background work, so
+// opening a shell log from there must land in the owning agent's group — putting
+// it in the active one would break the per-agent scoping of plan 17 and hand a
+// foreign path to that group's session persistence. A thread this window has
+// never had activated has no known project, so it falls back to the active
+// group: the file still opens, just where the user is looking.
+QString MainWindow::editorGroupForThread(const QString &threadId) const
+{
+    const QString project = m_projectByThread.value(threadId);
+    if (threadId.isEmpty() || project.isEmpty()) {
+        return groupKey();
+    }
+    const QString key = m_tabsByAgent ? EditorSession::agentKey(project, threadId)
+                                      : EditorSession::projectKey(project);
+    return key.isEmpty() ? groupKey() : key;
 }
 
 void MainWindow::setTabsByAgent(bool byAgent)

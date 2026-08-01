@@ -2,13 +2,16 @@ package ipc
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
+	"regexp"
 	"runtime/debug"
 	"sync"
 	"time"
@@ -19,6 +22,21 @@ import (
 // maxFrameBytes caps a single inbound JSON-RPC line. Agent stream-json events
 // can be sizable; 16 MiB is generous headroom.
 const maxFrameBytes = 16 * 1024 * 1024
+
+// readBufferBytes is the per-connection read buffer. Lines longer than it are
+// still read whole (readFrame accumulates across ErrBufferFull); it only sets
+// how many syscalls a large frame costs.
+const readBufferBytes = 64 * 1024
+
+// idProbeBytes is how much of an oversize frame's head is retained to recover
+// the request id for the error reply. The id sits in the frame's first object
+// keys; keeping more would defeat the point of discarding the frame.
+const idProbeBytes = 4096
+
+// retainedBufferBytes caps the accumulation buffer a frameReader keeps between
+// frames. Reuse exists to spare the steady state its allocations; a one-off
+// giant frame must not pin its whole array on an otherwise idle connection.
+const retainedBufferBytes = 1 << 20
 
 // outboundBuffer is the depth of each connection's outbound frame queue. A slow
 // UI client may fall this far behind before backpressure kicks in.
@@ -173,15 +191,31 @@ func (s *Server) serveConn(ctx context.Context, netConn net.Conn) {
 			}
 		}()
 
-		sc := bufio.NewScanner(netConn)
-		sc.Buffer(make([]byte, 0, 64*1024), maxFrameBytes)
-		for sc.Scan() {
-			line := sc.Bytes()
-			if len(line) == 0 {
+		fr := newFrameReader(netConn)
+		for {
+			frame, oversize, err := fr.readFrame()
+			if oversize > 0 {
+				s.log.Warn("oversize inbound frame discarded",
+					"bytes", oversize, "cap", maxFrameBytes)
+				// A caller blocked in Client.Call would otherwise wait out its
+				// whole timeout, so answer it when the retained prefix still
+				// carries a usable id.
+				if id := frameID(frame); id != nil {
+					c.enqueue(&Frame{JSONRPC: "2.0", ID: id,
+						Error: Errorf(CodeInvalidRequest, fmt.Sprintf(
+							"frame too large (%d bytes, cap %d MiB)",
+							oversize, maxFrameBytes/(1024*1024)))})
+				}
+			}
+			if err != nil {
+				if !errors.Is(err, io.EOF) {
+					s.log.Warn("connection read error", "err", err)
+				}
+				return
+			}
+			if oversize > 0 || len(frame) == 0 {
 				continue
 			}
-			// Scanner reuses its buffer; copy before handing to a goroutine.
-			frame := append([]byte(nil), line...)
 			// Bound in-flight dispatch goroutines for this connection: a client
 			// that stalls draining responses makes each handler block in enqueue,
 			// so without this the reader would spawn them without bound. Acquiring
@@ -193,15 +227,133 @@ func (s *Server) serveConn(ctx context.Context, netConn net.Conn) {
 				return
 			case c.sem <- struct{}{}:
 			}
+			// frame aliases the reader's reusable buffer, which the next
+			// readFrame overwrites while this dispatch is still running.
+			msg := append([]byte(nil), frame...)
 			safe.Go("ipc.dispatch", func() {
 				defer func() { <-c.sem }()
-				s.dispatch(ctx, c, frame)
+				s.dispatch(ctx, c, msg)
 			})
 		}
-		if err := sc.Err(); err != nil {
-			s.log.Warn("connection read error", "err", err)
-		}
 	})
+}
+
+// idPattern finds the request id in a truncated frame prefix. It is deliberately
+// lexical, not a JSON parse: the prefix of an oversize frame is not valid JSON.
+// Matching the first `"id": <number|string>` is right for frames the client
+// emits (id precedes params), and a miss simply means no error reply.
+var idPattern = regexp.MustCompile(`"id"\s*:\s*(\d+|"[^"]*")`)
+
+// paramsKey bounds the id search: an "id" inside params belongs to the payload,
+// not to JSON-RPC, and answering with it would resolve an unrelated in-flight
+// request.
+var paramsKey = []byte(`"params"`)
+
+// frameID extracts the JSON-RPC id from raw frame bytes, or nil if absent.
+//
+// raw may be a probe-truncated prefix, so the recovery is deliberately
+// conservative in two ways — a wrong id resolves someone else's call, which is
+// worse than no reply at all:
+//   - only the bytes before the first "params" key are searched, so a nested id
+//     inside the payload can never be mistaken for the request id;
+//   - a match that ends exactly at the end of raw is refused, because the probe
+//     cut may have severed a number mid-digits or a string mid-value.
+func frameID(raw []byte) *json.RawMessage {
+	head := raw
+	if i := bytes.Index(head, paramsKey); i >= 0 {
+		head = head[:i]
+	}
+	m := idPattern.FindSubmatchIndex(head)
+	if m == nil {
+		return nil
+	}
+	if m[3] == len(raw) {
+		return nil // possibly truncated mid-token
+	}
+	id := json.RawMessage(append([]byte(nil), head[m[2]:m[3]]...))
+	return &id
+}
+
+// frameReader reads newline-delimited frames from one connection. The
+// accumulation buffer is reused across frames: a fresh append-doubling buffer
+// per frame is pure garbage on a stream of large agent events.
+type frameReader struct {
+	r     *bufio.Reader
+	buf   []byte // reused accumulator; reset to [:0] per frame
+	probe []byte // small, separate head buffer for oversize frames
+}
+
+func newFrameReader(rd io.Reader) *frameReader {
+	return &frameReader{r: bufio.NewReaderSize(rd, readBufferBytes)}
+}
+
+// readFrame reads one newline-delimited frame, enforcing maxFrameBytes without
+// killing the connection — the reason this is not a bufio.Scanner. A Scanner
+// treats an over-long token as terminal (ErrTooLong ends the loop), so a single
+// bad frame would drop the UI connection and, it being the last client, stop the
+// whole core.
+//
+// On an oversize line the rest of the line is drained up to the next '\n' and
+// oversize is the discarded line's length in bytes; the returned bytes are only
+// the leading idProbeBytes, retained so the caller can answer the sender.
+// Otherwise oversize is 0 and the returned bytes are the line, EOL stripped.
+//
+// The returned slice aliases the reader's own buffer and is invalidated by the
+// next readFrame call: a caller that hands it to another goroutine must copy it.
+func (fr *frameReader) readFrame() (line []byte, oversize int, err error) {
+	fr.buf = fr.buf[:0]
+	if cap(fr.buf) > retainedBufferBytes {
+		fr.buf = nil // release a one-off giant frame's array
+	}
+	total := 0
+	over := false
+	eol := false
+	for {
+		chunk, rerr := fr.r.ReadSlice('\n')
+		total += len(chunk)
+		switch {
+		case over:
+			// Draining the remainder of the line: the head is already capped at
+			// idProbeBytes and nothing past it is retained, only counted.
+		case total > maxFrameBytes:
+			over = true
+			if len(fr.buf) > idProbeBytes {
+				fr.buf = fr.buf[:idProbeBytes]
+			} else if room := idProbeBytes - len(fr.buf); room > 0 {
+				fr.buf = append(fr.buf, chunk[:min(room, len(chunk))]...)
+			}
+		default:
+			fr.buf = append(fr.buf, chunk...)
+		}
+		if errors.Is(rerr, bufio.ErrBufferFull) {
+			continue // line longer than the read buffer; keep going
+		}
+		if rerr != nil {
+			if errors.Is(rerr, io.EOF) && total > 0 {
+				break // unterminated trailing line; EOF is reported on the next call
+			}
+			return nil, 0, rerr
+		}
+		eol = true
+		break
+	}
+	if over {
+		if eol {
+			total--
+		}
+		// Hand back a small copy and drop the accumulator, so the up-to-16-MiB
+		// array a rejected frame grew is not pinned by a 4 KiB reslice.
+		fr.probe = append(fr.probe[:0], fr.buf...)
+		fr.buf = nil
+		return fr.probe, total, nil
+	}
+	if eol {
+		fr.buf = fr.buf[:len(fr.buf)-1]
+		if n := len(fr.buf); n > 0 && fr.buf[n-1] == '\r' {
+			fr.buf = fr.buf[:n-1]
+		}
+	}
+	return fr.buf, 0, nil
 }
 
 // callHandler runs one handler with its own recover, so a panicking handler

@@ -92,6 +92,33 @@ constexpr char kAttachMime[] = "application/x-agentkate-attachment+json";
 constexpr int kToolResultDisplayClip = 4000;
 constexpr int kToolResultStoreCap = 128 * 1024;
 
+// Attachment / frame budgets, both anchored on the core's 16 MB JSON-RPC frame
+// cap (core/internal/ipc/server.go maxFrameBytes). An oversize frame never
+// reaches a handler, so the message is simply lost — the human's text and files
+// have to be refused HERE, where they can still be edited.
+//
+// kMaxTotalAttachBytes mirrors AttachmentBuilder's budget for the paths where
+// attachments are MERGED rather than built — two queued messages that were each
+// within budget union past it. kMaxSendFrameBytes is the last line: the whole
+// request, message text included, measured as it will actually be serialized.
+//
+// Ordering invariant: kMaxSendFrameBytes < CoreClient::kMaxFrameBytes (15 MiB)
+// < the core's maxFrameBytes (16 MiB). These guards must nest strictly, and this
+// one measures only `params` while CoreClient measures the whole JSON-RPC frame
+// (jsonrpc/id/method wrapper plus the newline, ~64 bytes more) — at an equal
+// limit a request accepted here would be refused by the transport, which is the
+// failure mode this guard exists to prevent.
+constexpr qsizetype kMaxTotalAttachBytes = 12 * 1024 * 1024;
+constexpr qsizetype kMaxSendFrameBytes = 14 * 1024 * 1024;
+
+// The wire cost of one already-built attachment object. Deliberately measures
+// the serialized object rather than just its body, so the metadata (name, path,
+// cachePath) is counted too.
+qsizetype attachmentWireCost(const QJsonObject &att)
+{
+    return QJsonDocument(att).toJson(QJsonDocument::Compact).size();
+}
+
 bool isDark(const QWidget *w)
 {
     return w->palette().color(QPalette::Base).lightness() < 128;
@@ -836,6 +863,11 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     m_jobsBar = new QFrame(this);
     m_jobsFlow = new FlowLayout(m_jobsBar, 0, 6, 6);
     m_jobsBar->setVisible(false);
+    // Job rows are keyed on the thread, so a panel that gains or changes one has
+    // to re-publish immediately — otherwise the retained records would surface
+    // under the new id only at the next task event, while the old id's rows sat
+    // in the Jobs panel forever.
+    connect(this, &AgentPanel::threadIdChanged, this, &AgentPanel::updateJobsBar);
 
     m_attachBtn = new QPushButton(
         QIcon::fromTheme(QStringLiteral("mail-attachment")), QStringLiteral("Attach…"), this);
@@ -2676,6 +2708,16 @@ void AgentPanel::onSendClicked()
     // Holding it here keeps the queue visible and editable. We drain one per
     // `result`. Mirrors the m_permQueue defer pattern.
     if (!m_threadId.isEmpty() && !m_idle) {
+        // Measured against the params the drain will actually build. Queuing an
+        // oversize message unchecked would refuse it only at the turn boundary,
+        // by which point the composer is empty and the message sits at the head
+        // of the queue blocking every follow-up behind it.
+        const QJsonObject queuedParams{{QStringLiteral("threadId"), m_threadId},
+                                       {QStringLiteral("text"), text},
+                                       {QStringLiteral("attachments"), m_attachments}};
+        if (wouldOverflowFrame(queuedParams)) {
+            return; // composer untouched — the human can drop an attachment and retry
+        }
         m_input->clear();
         clearDraft();
         m_sendQueue.append(QueuedMsg{text, m_attachments});
@@ -2688,38 +2730,19 @@ void AgentPanel::onSendClicked()
         return;
     }
 
-    m_input->clear();
-    clearDraft();
-
-    // Detach the pending attachments for this message, then clear the bar.
+    // The composer is not cleared until the message is actually committed to a
+    // request: everything below can still refuse it (an unavailable model, an
+    // oversized frame), and a refused send must leave the human's text and
+    // attachment chips exactly where they were.
     const QJsonArray attachments = m_attachments;
-    m_attachments = QJsonArray();
-    rebuildAttachChips();
+    const auto commitComposer = [this] {
+        m_input->clear();
+        clearDraft();
+        m_attachments = QJsonArray();
+        rebuildAttachChips();
+    };
 
     if (m_threadId.isEmpty()) {
-        // A fresh session — start the meters from zero.
-        m_sessionCostUsd = 0.0;
-        m_sessionInTokens = 0;
-        m_sessionOutTokens = 0;
-        m_ctxPromptTokens = 0;
-        m_ctxWindow = 0;
-        m_turnDurTotalMs = 0;
-        m_turnDurCount = 0;
-        m_working->setAverageTurnMs(0);
-        addYouCard(text, attachments);
-        m_idle = false;
-        m_working->setActivity(QString()); // a new turn starts in generic mode
-        m_working->setTurnStart(QDateTime::currentMSecsSinceEpoch());
-
-        QString title = text.simplified();
-        if (title.isEmpty()) {
-            title = QStringLiteral("(attachments)");
-        }
-        if (title.length() > 26) {
-            title = title.left(25) + QChar(0x2026);
-        }
-        emit titleChanged(title);
-
         // If a stale model id is selected (e.g. a resumed pick, or a hand-typed
         // id no longer offered), ask for a live replacement before starting
         // rather than failing on the CLI.
@@ -2771,6 +2794,34 @@ void AgentPanel::onSendClicked()
         insertList("fallbackModels", m_fallbackModels);
         insertList("disallowedTools", m_disallowedTools);
         insertList("addDirs", m_addDirs);
+        if (wouldOverflowFrame(startParams)) {
+            return; // composer untouched — the human can drop an attachment and retry
+        }
+
+        commitComposer();
+        // A fresh session — start the meters from zero.
+        m_sessionCostUsd = 0.0;
+        m_sessionInTokens = 0;
+        m_sessionOutTokens = 0;
+        m_ctxPromptTokens = 0;
+        m_ctxWindow = 0;
+        m_turnDurTotalMs = 0;
+        m_turnDurCount = 0;
+        m_working->setAverageTurnMs(0);
+        addYouCard(text, attachments);
+        m_idle = false;
+        m_working->setActivity(QString()); // a new turn starts in generic mode
+        m_working->setTurnStart(QDateTime::currentMSecsSinceEpoch());
+
+        QString title = text.simplified();
+        if (title.isEmpty()) {
+            title = QStringLiteral("(attachments)");
+        }
+        if (title.length() > 26) {
+            title = title.left(25) + QChar(0x2026);
+        }
+        emit titleChanged(title);
+
         m_startedProviderId = startedProviderId;
         m_core->call(QStringLiteral("agent.start"), startParams,
                      [this](const QJsonObject &result, const QJsonObject &error) {
@@ -2794,8 +2845,26 @@ void AgentPanel::onSendClicked()
                      this);
         refresh();
     } else {
-        deliverMessage(text, attachments);
+        if (!deliverMessage(text, attachments)) {
+            return; // refused — the composer keeps the message
+        }
+        commitComposer();
     }
+}
+
+// wouldOverflowFrame refuses a request whose serialized params would not fit
+// the core's JSON-RPC frame. The per-attachment and total-attachment budgets
+// upstream bound the files; this bounds the WHOLE request, because the message
+// text rides in the same frame — 12 MB of images plus a pasted log is over the
+// cliff with every individual budget respected.
+bool AgentPanel::wouldOverflowFrame(const QJsonObject &params)
+{
+    if (QJsonDocument(params).toJson(QJsonDocument::Compact).size() <= kMaxSendFrameBytes) {
+        return false;
+    }
+    showAttachNotice(i18n("This message is too large to send — remove an attachment or "
+                          "shorten the text."));
+    return true;
 }
 
 // compactAttachments strips the heavy body (dataB64 / text) from a live
@@ -2814,6 +2883,12 @@ QJsonArray AgentPanel::compactAttachments(const QJsonArray &attachments)
         }
         if (a.contains(QStringLiteral("mediaType"))) {
             c[QStringLiteral("mediaType")] = a.value(QStringLiteral("mediaType"));
+        }
+        // Our durable copy of an image's bytes. Carried on the card precisely
+        // BECAUSE the body is stripped here: the chip thumbnail is redrawn from
+        // a path, and the origin path may be a temp file that is already gone.
+        if (a.contains(QStringLiteral("cachePath"))) {
+            c[QStringLiteral("cachePath")] = a.value(QStringLiteral("cachePath"));
         }
         if (a.value(QStringLiteral("outside")).toBool()) {
             c[QStringLiteral("outside")] = true;
@@ -2841,17 +2916,25 @@ void AgentPanel::addYouCard(const QString &text, const QJsonArray &attachments)
 // deleted since it was attached) degrades to a friendly status note.
 void AgentPanel::openAttachment(const QJsonObject &att)
 {
-    const QString path = att.value(QStringLiteral("path")).toString();
+    QString path = att.value(QStringLiteral("path")).toString();
     const QString name = att.value(QStringLiteral("name")).toString();
     const bool image =
         att.value(QStringLiteral("kind")).toString() == QLatin1String("image");
 
+    // Prefer the origin: for a workspace file that is the copy worth opening,
+    // since edits there count. Fall back to our cached copy of an image's bytes
+    // so a reaped temp screenshot still previews instead of erroring.
     if (path.isEmpty() || !QFileInfo::exists(path)) {
-        emit statusMessage(
-            i18n("Can't open “%1” — the file has moved or been deleted since it was "
-                 "attached.",
-                 name.isEmpty() ? path : name));
-        return;
+        const QString cached = att.value(QStringLiteral("cachePath")).toString();
+        if (!cached.isEmpty() && QFileInfo::exists(cached)) {
+            path = cached;
+        } else {
+            emit statusMessage(
+                i18n("Can't open “%1” — the file has moved or been deleted since it was "
+                     "attached.",
+                     name.isEmpty() ? path : name));
+            return;
+        }
     }
 
     if (image) {
@@ -2918,11 +3001,7 @@ void AgentPanel::handleTaskEvent(const QString &subtype, const QJsonObject &ev)
         if (!toolUseId.isEmpty()) {
             m_taskByToolUse.insert(toolUseId, id);
         }
-        job.chip = new QPushButton(m_jobsBar);
-        job.chip->setCursor(Qt::PointingHandCursor);
-        connect(job.chip, &QPushButton::clicked, this,
-                [this, id] { openBackgroundJob(id); });
-        m_jobsFlow->addWidget(job.chip);
+        job.order = ++m_bgJobSeq; // insertion order; QHash iteration is unordered
         m_bgJobs.insert(id, job);
         updateJobsBar();
         return;
@@ -2945,12 +3024,22 @@ void AgentPanel::handleTaskEvent(const QString &subtype, const QJsonObject &ev)
                       .toObject()
                       .value(QStringLiteral("status"))
                       .toString();
-        if (!status.isEmpty() && status != QLatin1String("running") && !it->done) {
+        if (!status.isEmpty() && status != QLatin1String("running")) {
+            // Applied whatever `done` already says: background_tasks_changed
+            // flips done on any task that left the running set, and it cannot
+            // know WHY it left. Gating this on !done let that event win the race
+            // and render a failed job as a tick, permanently. Only the addNote
+            // below is one-shot.
             it->done = true;
+            // "completed" is the only success terminal state the CLI reports;
+            // anything else (failed, cancelled) is a failure the Jobs panel has
+            // to show as such rather than as a tick.
+            it->failed = status != QLatin1String("completed");
             // The CLI's human-readable completion line, e.g. «Background
             // command "…" completed (exit code 0)».
             const QString summary = ev.value(QStringLiteral("summary")).toString();
-            if (!summary.isEmpty()) {
+            if (!summary.isEmpty() && !it->noted) {
+                it->noted = true; // exactly one summary per job, however many arrive
                 addNote(summary.toHtmlEscaped(),
                         status == QLatin1String("completed") ? QStringLiteral("ok")
                                                              : QStringLiteral("err"));
@@ -2976,6 +3065,57 @@ void AgentPanel::handleTaskEvent(const QString &subtype, const QJsonObject &ev)
     }
 }
 
+// forgetFinishedJobs drops this agent's completed job records and republishes.
+// The Jobs panel mirrors these snapshots rather than owning them, so its "Clear
+// finished" has to act here — clearing the view alone would be undone by the
+// next snapshot. Running work is deliberately untouched.
+void AgentPanel::forgetFinishedJobs()
+{
+    bool removed = false;
+    QSet<QString> gone;
+    for (auto it = m_bgJobs.begin(); it != m_bgJobs.end();) {
+        if (it->done) {
+            gone.insert(it.key());
+            it = m_bgJobs.erase(it);
+            removed = true;
+        } else {
+            ++it;
+        }
+    }
+    dropTaskMappings(gone);
+    // The workflow row has no record in m_bgJobs — it is synthesized from the
+    // monitor on every publish — so there is nothing to erase and a flag is the
+    // only way "Clear finished" can reach it. Cleared by the next launch.
+    if (!m_workflowForgotten && m_workflowMonitor && m_workflowMonitor->isValid()) {
+        const WorkflowMonitor::State state = m_workflowMonitor->snapshot().state;
+        if (state == WorkflowMonitor::State::Completed
+            || state == WorkflowMonitor::State::Failed) {
+            m_workflowForgotten = true;
+            removed = true;
+        }
+    }
+    if (removed) {
+        updateJobsBar();
+    }
+}
+
+// dropTaskMappings forgets tool_use → task_id entries for tasks that no longer
+// exist. Only the arriving launch result ever reads one, so an entry that
+// outlives its job is dead weight the map would otherwise carry for the session.
+void AgentPanel::dropTaskMappings(const QSet<QString> &taskIds)
+{
+    if (taskIds.isEmpty()) {
+        return;
+    }
+    for (auto it = m_taskByToolUse.begin(); it != m_taskByToolUse.end();) {
+        if (taskIds.contains(it.value())) {
+            it = m_taskByToolUse.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 void AgentPanel::openBackgroundJob(const QString &taskId)
 {
     const auto it = m_bgJobs.constFind(taskId);
@@ -2998,45 +3138,178 @@ void AgentPanel::openBackgroundJob(const QString &taskId)
     dlg->show();
 }
 
+// updateJobsBar rebuilds the in-chat tray and publishes this agent's jobs.
+//
+// The tray shows RUNNING jobs only, plus one trailing "N finished" chip that
+// opens the Jobs panel. It used to keep every chip it had ever made — nothing
+// removed them — so a long session buried the composer under dozens of dead ✓
+// chips and leaked a QPushButton per task. Finished work still exists, it just
+// lives in the panel that can hold it, which is also the only place that can
+// show jobs from OTHER agents.
 void AgentPanel::updateJobsBar()
 {
     if (!m_jobsBar) {
         return;
     }
-    int visible = 0;
+    // Drop the oldest finished records once retention is exceeded, so a very
+    // long session can't grow this map without bound either.
+    if (m_bgJobs.size() > kMaxRetainedJobs) {
+        QList<QString> finished;
+        for (auto it = m_bgJobs.cbegin(); it != m_bgJobs.cend(); ++it) {
+            if (it->done) {
+                finished.append(it.key());
+            }
+        }
+        std::sort(finished.begin(), finished.end(),
+                  [this](const QString &a, const QString &b) {
+                      return m_bgJobs.value(a).order < m_bgJobs.value(b).order;
+                  });
+        QSet<QString> evicted;
+        for (int i = 0; i < finished.size() && m_bgJobs.size() > kMaxRetainedJobs; ++i) {
+            m_bgJobs.remove(finished.at(i));
+            evicted.insert(finished.at(i));
+        }
+        dropTaskMappings(evicted);
+    }
+
+    QVector<agentkate::AgentJob> jobs;
+    jobs.reserve(m_bgJobs.size());
+    QList<const BgJob *> running;
+    int finishedCount = 0;
     bool anyRunning = false;
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
-    for (auto it = m_bgJobs.begin(); it != m_bgJobs.end(); ++it) {
-        if (!it->chip) {
-            continue;
+
+    for (auto it = m_bgJobs.cbegin(); it != m_bgJobs.cend(); ++it) {
+        agentkate::AgentJob j;
+        j.id = it->id;
+        j.kind = it->taskType == QLatin1String("local_bash")
+            ? agentkate::AgentJob::Kind::Shell
+            : agentkate::AgentJob::Kind::Subagent;
+        j.description = it->description;
+        j.outputFile = it->outputFile;
+        j.startedMs = it->startedMs;
+        j.done = it->done;
+        j.failed = it->failed;
+        jobs.append(j);
+
+        if (it->done) {
+            ++finishedCount;
+        } else {
+            running.append(&it.value());
+            anyRunning = true;
         }
-        const bool agent = it->taskType != QLatin1String("local_bash");
-        QString label = it->description.simplified();
+    }
+    // The workflow run is a job too — it just has its own chip already, so it
+    // is published to the panel without being duplicated into the tray.
+    if (m_workflowMonitor && m_workflowMonitor->isValid() && !m_workflowForgotten) {
+        const WorkflowMonitor::Snapshot snap = m_workflowMonitor->snapshot();
+        agentkate::AgentJob j;
+        // The run id is parsed out of the launch result and can be missing when
+        // that blob is shaped unexpectedly; without SOME id the row is inert
+        // (nothing to key an action on), so fall back through the other anchors.
+        j.id = !snap.runId.isEmpty()
+            ? snap.runId
+            : (!snap.taskId.isEmpty() ? snap.taskId : snap.transcriptDir);
+        j.kind = agentkate::AgentJob::Kind::Workflow;
+        j.description = snap.summary.isEmpty()
+            ? i18n("Workflow (%1 sub-agents)", snap.agentCount)
+            : snap.summary;
+        j.outputFile = snap.transcriptDir;
+        // The run's artifacts carry no start time — the launch we watched is
+        // the only place it exists.
+        j.startedMs = m_workflowStartedMs;
+        j.done = snap.state == WorkflowMonitor::State::Completed
+            || snap.state == WorkflowMonitor::State::Failed;
+        j.failed = snap.state == WorkflowMonitor::State::Failed;
+        jobs.append(j);
+    }
+
+    std::sort(running.begin(), running.end(),
+              [](const BgJob *a, const BgJob *b) { return a->order < b->order; });
+
+    // chipLabel is shared by the build and the in-place refresh so the two can
+    // never disagree about what a chip says.
+    const auto chipLabel = [&now](const BgJob *job) {
+        const bool agent = job->taskType != QLatin1String("local_bash");
+        QString label = job->description.simplified();
         if (label.length() > 40) {
             label = label.left(39) + QChar(0x2026);
         }
-        const QString icon = it->done
-            ? QStringLiteral("✓")
-            : (agent ? QStringLiteral("\U0001f916") : QStringLiteral("⚙"));
-        QString text = icon + QStringLiteral(" ") + label;
+        QString text = (agent ? QStringLiteral("\U0001f916 ") : QStringLiteral("⚙ ")) + label;
         // Elapsed suffix for long-running jobs — honest "still going" signal.
-        if (!it->done && it->startedMs > 0) {
-            anyRunning = true;
-            const qint64 mins = (now - it->startedMs) / 60000;
+        if (job->startedMs > 0) {
+            const qint64 mins = (now - job->startedMs) / 60000;
             if (mins >= 1) {
                 text += i18nc("background job elapsed minutes", " · %1m", mins);
             }
         }
-        it->chip->setText(text);
-        it->chip->setToolTip(
-            (it->done ? i18n("Finished background task — click to open its output")
-                      : i18n("Running in the background — click to watch its output"))
-            + (it->outputFile.isEmpty()
-                   ? QString()
-                   : QStringLiteral("\n") + it->outputFile));
-        ++visible;
+        return text;
+    };
+
+    // Publishing first, and on its own terms. It used to hang off the tray's
+    // fingerprint, which answers a narrower question — "do the CHIPS need
+    // rebuilding" — and so swallowed every change no chip draws: a finished
+    // job's late output path, a failure, a forced republish for a consumer that
+    // has seen nothing. The snapshot compares itself instead.
+    publishJobs(jobs);
+
+    // Which chips the tray should hold. Recreating widgets on the 15 s tick
+    // would flicker the row under the composer for no reason — the elapsed
+    // suffix is the only thing that moves between real changes, and it is
+    // minute-granular. So rebuild only when the SET changes, and otherwise
+    // relabel in place. The workflow is absent by design: it has no chip here
+    // (it draws its own bar) and its progress no longer needs to force a
+    // rebuild just to reach the Jobs panel.
+    QString fingerprint;
+    for (const BgJob *job : std::as_const(running)) {
+        fingerprint += job->id + QLatin1Char('|') + job->outputFile + QLatin1Char(';');
     }
-    m_jobsBar->setVisible(visible > 0);
+    fingerprint += QLatin1Char('#') + QString::number(finishedCount);
+
+    if (fingerprint == m_jobsFingerprint) {
+        for (const BgJob *job : std::as_const(running)) {
+            if (QPushButton *chip = m_jobChips.value(job->id)) {
+                chip->setText(chipLabel(job));
+            }
+        }
+    } else {
+        m_jobsFingerprint = fingerprint;
+
+        while (QLayoutItem *item = m_jobsFlow->takeAt(0)) {
+            if (QWidget *w = item->widget()) {
+                w->deleteLater();
+            }
+            delete item;
+        }
+        m_jobChips.clear();
+
+        for (const BgJob *job : std::as_const(running)) {
+            auto *chip = new QPushButton(chipLabel(job), m_jobsBar);
+            chip->setCursor(Qt::PointingHandCursor);
+            chip->setToolTip(i18n("Running in the background — click to watch its output")
+                             + (job->outputFile.isEmpty()
+                                    ? QString()
+                                    : QStringLiteral("\n") + job->outputFile));
+            const QString id = job->id;
+            connect(chip, &QPushButton::clicked, this, [this, id] { openBackgroundJob(id); });
+            m_jobsFlow->addWidget(chip);
+            m_jobChips.insert(id, chip);
+        }
+        if (finishedCount > 0) {
+            auto *chip = new QPushButton(
+                i18ncp("finished background jobs", "✓ %1 finished", "✓ %1 finished",
+                       finishedCount),
+                m_jobsBar);
+            chip->setCursor(Qt::PointingHandCursor);
+            chip->setToolTip(
+                i18n("Open the Jobs panel to see finished work from every agent"));
+            connect(chip, &QPushButton::clicked, this, &AgentPanel::openJobsPanelRequested);
+            m_jobsFlow->addWidget(chip);
+        }
+
+        m_jobsBar->setVisible(!running.isEmpty() || finishedCount > 0);
+    }
+
     // Tick the elapsed suffixes while anything runs; quiesce when nothing does.
     if (anyRunning) {
         if (!m_jobsTimer) {
@@ -3052,10 +3325,60 @@ void AgentPanel::updateJobsBar()
     }
 }
 
+void AgentPanel::publishJobs(QVector<agentkate::AgentJob> jobs)
+{
+    // Deterministic order first. The records come out of a QHash, so a rehash
+    // can reshuffle them and an element-wise compare would then call an
+    // unchanged set changed. Nothing downstream depends on this order — the
+    // Jobs panel sorts its own rows — but the comparison below does.
+    std::sort(jobs.begin(), jobs.end(),
+              [](const agentkate::AgentJob &a, const agentkate::AgentJob &b) {
+                  return a.startedMs != b.startedMs ? a.startedMs < b.startedMs
+                                                    : a.id < b.id;
+              });
+    // Job rows are addressed by thread. An id-less panel gives the Jobs panel
+    // nothing to key on, so it publishes nothing; whatever it is holding is
+    // published once a thread is bound and the next task event lands.
+    if (m_threadId.isEmpty()) {
+        jobs.clear();
+    }
+    // The id moved under us — a failed start dropped it, "Stop & close" cleared
+    // it, a dormant panel rebound. Reap the old id's rows before claiming the
+    // new one, or the same work shows twice and the old group never leaves.
+    if (!m_publishedThreadId.isEmpty() && m_publishedThreadId != m_threadId) {
+        Q_EMIT jobsChanged(m_publishedThreadId, {});
+        m_publishedThreadId.clear();
+        m_lastPublishedJobs.clear();
+    }
+    if (jobs == m_lastPublishedJobs) {
+        return;
+    }
+    m_lastPublishedJobs = jobs;
+    // Only a non-empty publish leaves rows behind to reap.
+    m_publishedThreadId = jobs.isEmpty() ? QString() : m_threadId;
+    Q_EMIT jobsChanged(m_threadId, jobs);
+}
+
+// republishJobs forces the next publish through. Publishing is change-gated,
+// and a consumer that attaches after the work started has nothing to compare
+// against — it would sit empty until the next task event, which for a
+// long-running job may be never.
+void AgentPanel::republishJobs()
+{
+    m_lastPublishedJobs.clear();
+    updateJobsBar();
+}
+
 void AgentPanel::noteWorkflowLaunch(const QString &inputJson, const QString &resultText)
 {
     m_workflowInput = inputJson;
     m_workflowResult = resultText;
+    // "Now" is only the launch time for a live tool_result. During replay the
+    // run may be days old, and stamping now would show a finished workflow as
+    // having just started; 0 renders as no Elapsed at all.
+    m_workflowStartedMs = m_replaying ? 0 : QDateTime::currentMSecsSinceEpoch();
+    // A new run outranks any "Clear finished" the human applied to the old one.
+    m_workflowForgotten = false;
 
     // A fresh monitor drives the chip's live label (running → done) and stops
     // polling once the run reaches a terminal state. Replaces any prior one so
@@ -3067,7 +3390,12 @@ void AgentPanel::noteWorkflowLaunch(const QString &inputJson, const QString &res
     m_workflowMonitor = new WorkflowMonitor(m_workflowInput, m_workflowResult, this);
     connect(m_workflowMonitor, &WorkflowMonitor::changed, this,
             &AgentPanel::updateWorkflowChip);
+    // The workflow is published to the Jobs panel as a job row too, so its
+    // state changes have to re-publish the set, not just relabel the chip.
+    connect(m_workflowMonitor, &WorkflowMonitor::changed, this,
+            &AgentPanel::updateJobsBar);
     updateWorkflowChip();
+    updateJobsBar();
 }
 
 void AgentPanel::updateWorkflowChip()
@@ -3110,19 +3438,24 @@ void AgentPanel::openWorkflowMonitor()
 // deliverMessage sends a message to the live thread right now: it shows the
 // You card, marks the turn busy, and issues agent.send. Used both for an
 // immediate send and to drain one queued follow-up per turn boundary.
-void AgentPanel::deliverMessage(const QString &text, const QJsonArray &attachments)
+bool AgentPanel::deliverMessage(const QString &text, const QJsonArray &attachments)
 {
+    const QJsonObject params{{QStringLiteral("threadId"), m_threadId},
+                             {QStringLiteral("text"), text},
+                             {QStringLiteral("attachments"), attachments}};
+    // Checked before any side effect: a refusal must leave no You card, no busy
+    // turn and no consumed message behind.
+    if (wouldOverflowFrame(params)) {
+        return false;
+    }
     addYouCard(text, attachments);
     m_idle = false;
     m_errored = false; // a fresh turn clears any prior failure state
     m_working->setActivity(QString()); // a new turn starts in generic mode
     m_working->setTurnStart(QDateTime::currentMSecsSinceEpoch());
-    m_core->call(QStringLiteral("agent.send"),
-                 QJsonObject{{QStringLiteral("threadId"), m_threadId},
-                             {QStringLiteral("text"), text},
-                             {QStringLiteral("attachments"), attachments}},
-                 nullptr, this);
+    m_core->call(QStringLiteral("agent.send"), params, nullptr, this);
     refresh();
+    return true;
 }
 
 // drainSendQueue fires the next queued follow-up once the thread is idle. It
@@ -3133,9 +3466,35 @@ void AgentPanel::drainSendQueue()
     if (m_sendQueue.isEmpty() || m_threadId.isEmpty() || m_dormant || !m_idle) {
         return;
     }
-    const QueuedMsg q = m_sendQueue.takeFirst();
+    const QueuedMsg q = m_sendQueue.constFirst();
+    if (!deliverMessage(q.text, q.attachments)) {
+        // The queue branch of onSendClicked already refuses an oversize message
+        // at queue time, so reaching here means it became unsendable afterwards.
+        // Either way the head must be REMOVED: left in place it can never send
+        // and nothing behind it ever drains again. The text is handed back to
+        // the composer when that is empty, so it is refused, not eaten.
+        m_sendQueue.removeFirst();
+        rebuildQueueChips();
+        // Only into an empty composer: overwriting a draft the human is typing
+        // would trade one lost message for another.
+        const bool returned =
+            m_input->toPlainText().trimmed().isEmpty() && m_attachments.isEmpty();
+        if (returned) {
+            m_input->setPlainText(q.text);
+            m_attachments = q.attachments;
+            rebuildAttachChips();
+        }
+        addNote(returned
+                    ? QStringLiteral("A queued message was too large to send — it is back "
+                                     "in the composer, where it can be shortened.")
+                    : QStringLiteral("A queued message was too large to send and was "
+                                     "dropped so the rest of the queue could drain."),
+                QStringLiteral("err"));
+        refresh();
+        return;
+    }
+    m_sendQueue.removeFirst();
     rebuildQueueChips();
-    deliverMessage(q.text, q.attachments);
 }
 
 // restoreQueuedToComposer moves any still-queued follow-ups back into the
@@ -3143,6 +3502,14 @@ void AgentPanel::drainSendQueue()
 // messages join with blank lines; if the composer already holds a draft the
 // queued text is prepended so nothing typed is clobbered. Attachments from the
 // queued messages are restored to the pending bar (deduped by path).
+//
+// The merge is budgeted, and the composer's own pending attachments claim the
+// budget first — they are the live selection the human can see. Each queued
+// message was within the total-attachment limit on its own, but their union
+// need not be: two 8 MB sets restored into one composer sail past the core's
+// frame cap, and the next send is then unsendable. Over-budget files are dropped
+// BY NAME in the banner — the message text, which is what the human actually
+// typed, never is.
 void AgentPanel::restoreQueuedToComposer()
 {
     if (m_sendQueue.isEmpty()) {
@@ -3151,16 +3518,47 @@ void AgentPanel::restoreQueuedToComposer()
     QStringList parts;
     QJsonArray restoredAttachments;
     QSet<QString> seenPaths;
+    qsizetype total = 0;
+    QStringList droppedNames;
+    // Keeps one attachment if it fits the running budget; names it as dropped
+    // otherwise. Dedup runs BEFORE the budget and marks the path seen either
+    // way: a duplicate of a dropped file must not be weighed — or reported — a
+    // second time. Only a non-empty path can collide.
+    const auto keep = [&](const QJsonValue &a) {
+        const QJsonObject obj = a.toObject();
+        const QString path = obj.value(QStringLiteral("path")).toString();
+        if (!path.isEmpty()) {
+            if (seenPaths.contains(path)) {
+                return;
+            }
+            seenPaths.insert(path);
+        }
+        const qsizetype cost = attachmentWireCost(obj);
+        if (total + cost > kMaxTotalAttachBytes) {
+            QString name = obj.value(QStringLiteral("name")).toString();
+            if (name.isEmpty()) {
+                name = path.isEmpty() ? i18n("(unnamed attachment)")
+                                      : QFileInfo(path).fileName();
+            }
+            droppedNames << name;
+            return;
+        }
+        total += cost;
+        restoredAttachments.append(a);
+    };
+
+    // The composer's own pending attachments are folded in FIRST: they are the
+    // human's live selection, visible in the chip bar right now, and a restored
+    // message must never be able to evict one of them.
+    for (const QJsonValue &a : std::as_const(m_attachments)) {
+        keep(a);
+    }
     for (const QueuedMsg &q : m_sendQueue) {
         if (!q.text.isEmpty()) {
             parts << q.text;
         }
         for (const QJsonValue &a : q.attachments) {
-            const QString path = a.toObject().value(QStringLiteral("path")).toString();
-            if (path.isEmpty() || !seenPaths.contains(path)) {
-                seenPaths.insert(path);
-                restoredAttachments.append(a);
-            }
+            keep(a);
         }
     }
     m_sendQueue.clear();
@@ -3173,15 +3571,17 @@ void AgentPanel::restoreQueuedToComposer()
                                   ? queued
                                   : queued + QStringLiteral("\n\n") + existing);
     }
-    // Fold the queued attachments back in front of any already-pending ones.
-    for (const QJsonValue &a : m_attachments) {
-        const QString path = a.toObject().value(QStringLiteral("path")).toString();
-        if (path.isEmpty() || !seenPaths.contains(path)) {
-            restoredAttachments.append(a);
-        }
-    }
     m_attachments = restoredAttachments;
     rebuildAttachChips();
+    if (!droppedNames.isEmpty()) {
+        showAttachNotice(
+            i18np("%1 attachment was dropped (%2) — the restored messages together "
+                  "exceed the %3 MB attachment limit.",
+                  "%1 attachments were dropped (%2) — the restored messages together "
+                  "exceed the %3 MB attachment limit.",
+                  droppedNames.size(), droppedNames.join(QStringLiteral(", ")),
+                  kMaxTotalAttachBytes / (1024 * 1024)));
+    }
 }
 
 // rebuildQueueChips redraws the queued-message chip bar from m_sendQueue.
@@ -4217,9 +4617,11 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
                     // ("Output is being written to: …" for shells,
                     // "output_file: …" for async subagents) — capture it so
                     // the tray chip can open the output before completion.
-                    const auto taskIt = m_taskByToolUse.constFind(id);
-                    if (taskIt != m_taskByToolUse.constEnd()) {
-                        auto jobIt = m_bgJobs.find(taskIt.value());
+                    // Taken, not read: this is the one result that consults the
+                    // mapping, so leaving the entry behind is pure growth.
+                    const QString taskId = m_taskByToolUse.take(id);
+                    if (!taskId.isEmpty()) {
+                        auto jobIt = m_bgJobs.find(taskId);
                         if (jobIt != m_bgJobs.end() && jobIt->outputFile.isEmpty()) {
                             static const QRegularExpression pathRe(QStringLiteral(
                                 "(?:Output is being written to:|output_file:)\\s*(\\S+?\\.output)"));
@@ -4426,6 +4828,10 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             m_errored = true; // roster card shows Error until the next send/resume
             if (!m_dormant) {
                 m_threadId.clear(); // a fresh start failed — back to a blank panel
+                // Silent clear (no threadIdChanged — nothing bound to the dead
+                // id should act as if a new one arrived), so reap the job rows
+                // published under it here.
+                updateJobsBar();
             }
             // A follow-up queued during the failed turn can never drain now —
             // hand the text back to the composer instead of stranding it.
@@ -4438,8 +4844,13 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             const bool wasInterrupt = phase == QLatin1String("interrupted");
             // Background tasks are children of the agent process — they ended
             // with it. Their output files persist, so chips stay clickable.
+            // Still-running ones died with the process: that is a failure, not
+            // a completion, and the Jobs panel must not tick them.
             for (auto it = m_bgJobs.begin(); it != m_bgJobs.end(); ++it) {
-                it->done = true;
+                if (!it->done) {
+                    it->done = true;
+                    it->failed = true;
+                }
             }
             updateJobsBar();
             addNote(wasInterrupt

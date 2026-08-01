@@ -3,10 +3,12 @@ package ipc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -95,5 +97,367 @@ func TestDispatchBoundIsPerConn(t *testing.T) {
 		return entered.Load() == int32(total)
 	}) {
 		t.Fatalf("after release in-flight = %d, want %d", entered.Load(), total)
+	}
+}
+
+// startServer runs srv until the test ends and waits for its socket to accept.
+func startServer(t *testing.T, srv *Server, sock string) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = srv.Serve(ctx) }()
+	if !waitFor(t, 2*time.Second, func() bool {
+		conn, err := net.Dial("unix", sock)
+		if err != nil {
+			return false
+		}
+		conn.Close()
+		return true
+	}) {
+		t.Fatal("server never accepted a connection")
+	}
+}
+
+// dialServer starts srv on a temp socket and returns a connected client.
+func dialServer(t *testing.T, srv *Server, sock string) net.Conn {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = srv.Serve(ctx) }()
+
+	var c net.Conn
+	if !waitFor(t, 2*time.Second, func() bool {
+		conn, err := net.Dial("unix", sock)
+		if err != nil {
+			return false
+		}
+		c = conn
+		return true
+	}) {
+		t.Fatal("server never accepted a connection")
+	}
+	t.Cleanup(func() { c.Close() })
+	return c
+}
+
+// writeOversizeFrame writes a single line longer than maxFrameBytes, starting
+// with the given prefix (so a test can control whether an id is recoverable).
+func writeOversizeFrame(t *testing.T, c net.Conn, prefix string) {
+	t.Helper()
+	// Bound every write: a regression that stops draining the oversize line must
+	// fail the test, not hang it until the package timeout.
+	if err := c.SetWriteDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.SetWriteDeadline(time.Time{}) }()
+	if _, err := c.Write([]byte(prefix)); err != nil {
+		t.Fatalf("write oversize prefix: %v", err)
+	}
+	pad := make([]byte, 1<<20)
+	for i := range pad {
+		pad[i] = 'x'
+	}
+	for written := 0; written <= maxFrameBytes; written += len(pad) {
+		if _, err := c.Write(pad); err != nil {
+			t.Fatalf("write oversize padding: %v", err)
+		}
+	}
+	if _, err := c.Write([]byte("\"}\n")); err != nil {
+		t.Fatalf("terminate oversize frame: %v", err)
+	}
+}
+
+// TestOversizeFrameIsSurvivable is the regression test for the failure mode in
+// which one over-long line ended the read loop, dropped the only client, and so
+// stopped the entire core: the connection must stay usable and the sender must
+// get an error reply naming the cap.
+func TestOversizeFrameIsSurvivable(t *testing.T) {
+	sock := t.TempDir() + "/ipc.sock"
+	srv := NewServer(sock, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv.Handle("echo", func(_ context.Context, p json.RawMessage) (any, error) {
+		return map[string]any{"got": string(p)}, nil
+	})
+	var gone atomic.Bool
+	srv.OnAllClientsGone(func() { gone.Store(true) })
+
+	c := dialServer(t, srv, sock)
+	writeOversizeFrame(t, c, `{"jsonrpc":"2.0","id":7,"method":"echo","params":"`)
+
+	dec := json.NewDecoder(c)
+	if err := c.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	var errResp Frame
+	if err := dec.Decode(&errResp); err != nil {
+		t.Fatalf("no reply to the oversize frame: %v", err)
+	}
+	if errResp.ID == nil || string(*errResp.ID) != "7" {
+		t.Fatalf("error reply id = %v, want 7", errResp.ID)
+	}
+	if errResp.Error == nil || !strings.Contains(errResp.Error.Message, "frame too large") {
+		t.Fatalf("error reply = %+v, want a frame-too-large error", errResp.Error)
+	}
+	if !strings.Contains(errResp.Error.Message, "cap 16 MiB") {
+		t.Fatalf("error message %q does not name the cap", errResp.Error.Message)
+	}
+
+	// The connection must still serve ordinary traffic.
+	id := json.RawMessage("8")
+	b, err := json.Marshal(Frame{JSONRPC: "2.0", ID: &id, Method: "echo", Params: json.RawMessage(`"hi"`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Write(append(b, '\n')); err != nil {
+		t.Fatalf("write follow-up request: %v", err)
+	}
+	var ok Frame
+	if err := dec.Decode(&ok); err != nil {
+		t.Fatalf("no reply to the follow-up request: %v", err)
+	}
+	if ok.ID == nil || string(*ok.ID) != "8" {
+		t.Fatalf("follow-up reply id = %v, want 8", ok.ID)
+	}
+	if ok.Error != nil {
+		t.Fatalf("follow-up failed: %+v", ok.Error)
+	}
+	if !strings.Contains(string(ok.Result), `\"hi\"`) {
+		t.Fatalf("follow-up result = %s", ok.Result)
+	}
+	if gone.Load() {
+		t.Fatal("the client was disconnected by the oversize frame")
+	}
+}
+
+// TestOversizeFrameWithoutRecoverableID covers the case where the discarded
+// prefix carries no id: nothing is sent back, but the connection survives.
+func TestOversizeFrameWithoutRecoverableID(t *testing.T) {
+	sock := t.TempDir() + "/ipc.sock"
+	srv := NewServer(sock, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv.Handle("echo", func(_ context.Context, p json.RawMessage) (any, error) {
+		return map[string]any{"got": string(p)}, nil
+	})
+
+	c := dialServer(t, srv, sock)
+	writeOversizeFrame(t, c, `{"jsonrpc":"2.0","method":"echo","params":"`)
+
+	id := json.RawMessage("1")
+	b, err := json.Marshal(Frame{JSONRPC: "2.0", ID: &id, Method: "echo", Params: json.RawMessage(`"after"`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Write(append(b, '\n')); err != nil {
+		t.Fatalf("write follow-up request: %v", err)
+	}
+	if err := c.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	// The next frame on the wire must be the follow-up's reply — proof that no
+	// error frame was invented for the id-less oversize line.
+	var resp Frame
+	if err := json.NewDecoder(c).Decode(&resp); err != nil {
+		t.Fatalf("no reply after the id-less oversize frame: %v", err)
+	}
+	if resp.ID == nil || string(*resp.ID) != "1" || resp.Error != nil {
+		t.Fatalf("unexpected reply: id=%v err=%+v", resp.ID, resp.Error)
+	}
+}
+
+// TestFrameIDExtraction pins the lexical id recovery used on truncated prefixes.
+func TestFrameIDExtraction(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want string // "" means no id
+	}{
+		{`{"jsonrpc":"2.0","id":42,"method":"x","params":{"blob":"aaa`, "42"},
+		{`{"jsonrpc":"2.0","id": "abc-1" ,"method":"x"`, `"abc-1"`},
+		{`{"jsonrpc":"2.0","method":"x","params":{"blob":"aaa`, ""},
+		{`{"jsonrpc":"2.0","id":`, ""},
+		// A probe cut can sever the id mid-token; replying with the fragment
+		// would resolve an unrelated in-flight request.
+		{`{"jsonrpc":"2.0","id":123456`, ""},
+		{`{"jsonrpc":"2.0","id":"abc`, ""},
+		// An id inside params is the payload's, not the request's.
+		{`{"jsonrpc":"2.0","method":"x","params":{"id":99,"blob":"aaa`, ""},
+		{`{"jsonrpc":"2.0","id":5,"method":"x","params":{"id":99,"blob":"aaa`, "5"},
+	}
+	for _, tc := range cases {
+		got := frameID([]byte(tc.raw))
+		switch {
+		case tc.want == "" && got != nil:
+			t.Errorf("frameID(%q) = %s, want none", tc.raw, *got)
+		case tc.want != "" && got == nil:
+			t.Errorf("frameID(%q) = none, want %s", tc.raw, tc.want)
+		case tc.want != "" && string(*got) != tc.want:
+			t.Errorf("frameID(%q) = %s, want %s", tc.raw, *got, tc.want)
+		}
+	}
+}
+
+// nonRepeatingPayload builds n JSON-safe bytes with no repeating block, so a
+// byte-for-byte comparison catches a mis-stitched chunk boundary that a run of
+// identical padding would hide.
+func nonRepeatingPayload(n int) string {
+	const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+	b := make([]byte, n)
+	x := uint64(0x2545F4914F6CDD1D)
+	for i := range b {
+		x ^= x << 13
+		x ^= x >> 7
+		x ^= x << 17
+		b[i] = alphabet[x&63]
+	}
+	return string(b)
+}
+
+// TestLargeValidFrameRoundTrip covers the accumulation path: a frame far larger
+// than readBufferBytes but under the cap is stitched across many ErrBufferFull
+// reads and must arrive intact, byte for byte, in both directions.
+func TestLargeValidFrameRoundTrip(t *testing.T) {
+	sock := t.TempDir() + "/ipc.sock"
+	srv := NewServer(sock, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv.Handle("echo", func(_ context.Context, p json.RawMessage) (any, error) {
+		var s string
+		if err := json.Unmarshal(p, &s); err != nil {
+			return nil, err
+		}
+		return s, nil
+	})
+
+	c := dialServer(t, srv, sock)
+	payload := nonRepeatingPayload(5 << 20)
+
+	id := json.RawMessage("11")
+	pb, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal(Frame{JSONRPC: "2.0", ID: &id, Method: "echo", Params: pb})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetWriteDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Write(append(b, '\n')); err != nil {
+		t.Fatalf("write large frame: %v", err)
+	}
+	if err := c.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	var resp Frame
+	if err := json.NewDecoder(c).Decode(&resp); err != nil {
+		t.Fatalf("no reply to the large frame: %v", err)
+	}
+	if resp.Error != nil {
+		t.Fatalf("large frame rejected: %+v", resp.Error)
+	}
+	if resp.ID == nil || string(*resp.ID) != "11" {
+		t.Fatalf("reply id = %v, want 11", resp.ID)
+	}
+	var got string
+	if err := json.Unmarshal(resp.Result, &got); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	if len(got) != len(payload) {
+		t.Fatalf("echoed length = %d, want %d", len(got), len(payload))
+	}
+	if got != payload {
+		for i := range got {
+			if got[i] != payload[i] {
+				t.Fatalf("payload differs at byte %d: got %q want %q", i, got[i], payload[i])
+			}
+		}
+	}
+}
+
+// TestReadFrameBoundaries drives readFrame directly over the edges the socket
+// tests cannot reach cheaply: the exact cap, CRLF, and an unterminated line.
+func TestReadFrameBoundaries(t *testing.T) {
+	// The newline counts toward the cap, so the largest accepted payload is
+	// maxFrameBytes-1 and one byte more is rejected.
+	t.Run("at cap", func(t *testing.T) {
+		body := strings.Repeat("a", maxFrameBytes-1)
+		fr := newFrameReader(strings.NewReader(body + "\n"))
+		line, over, err := fr.readFrame()
+		if err != nil || over != 0 {
+			t.Fatalf("readFrame = (%d bytes, over %d, err %v), want accepted", len(line), over, err)
+		}
+		if len(line) != maxFrameBytes-1 {
+			t.Fatalf("line length = %d, want %d", len(line), maxFrameBytes-1)
+		}
+	})
+	t.Run("one past cap", func(t *testing.T) {
+		body := strings.Repeat("a", maxFrameBytes)
+		fr := newFrameReader(strings.NewReader(body + "\n"))
+		line, over, err := fr.readFrame()
+		if err != nil {
+			t.Fatalf("readFrame err = %v", err)
+		}
+		if over != maxFrameBytes {
+			t.Fatalf("oversize = %d, want %d", over, maxFrameBytes)
+		}
+		if len(line) != idProbeBytes {
+			t.Fatalf("retained head = %d bytes, want %d", len(line), idProbeBytes)
+		}
+	})
+	t.Run("crlf and reuse", func(t *testing.T) {
+		fr := newFrameReader(strings.NewReader("one\r\ntwo\n\nthree"))
+		for _, want := range []string{"one", "two", ""} {
+			line, over, err := fr.readFrame()
+			if err != nil || over != 0 {
+				t.Fatalf("readFrame = (%q, %d, %v)", line, over, err)
+			}
+			if string(line) != want {
+				t.Fatalf("line = %q, want %q", line, want)
+			}
+		}
+		// Unterminated trailing line: returned whole, EOF only on the next call.
+		line, over, err := fr.readFrame()
+		if err != nil || over != 0 || string(line) != "three" {
+			t.Fatalf("trailing line = (%q, %d, %v), want (\"three\", 0, nil)", line, over, err)
+		}
+		if _, _, err := fr.readFrame(); !errors.Is(err, io.EOF) {
+			t.Fatalf("after trailing line err = %v, want EOF", err)
+		}
+	})
+}
+
+// TestClientSurvivesOversizeFrame is the client-side mirror of the server test:
+// an over-cap core→bridge response (a huge cowork.screenshot result) must not
+// end the read loop, or every later Call would block for its full timeout.
+func TestClientSurvivesOversizeFrame(t *testing.T) {
+	sock := t.TempDir() + "/ipc.sock"
+	srv := NewServer(sock, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv.Handle("big", func(_ context.Context, _ json.RawMessage) (any, error) {
+		return strings.Repeat("y", maxFrameBytes+4096), nil
+	})
+	srv.Handle("small", func(_ context.Context, _ json.RawMessage) (any, error) {
+		return "pong", nil
+	})
+	startServer(t, srv, sock)
+
+	cl, err := Dial(sock)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { cl.Close() })
+
+	// The oversize reply is discarded, so this call can only end in its timeout.
+	var sink string
+	if err := cl.CallTimeout("big", nil, &sink, 2*time.Second); err == nil {
+		t.Fatal("oversize reply was accepted, want a timeout")
+	} else if !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("big call err = %v, want a timeout", err)
+	}
+
+	// The client must still be usable: proof the read loop survived.
+	var out string
+	if err := cl.CallTimeout("small", nil, &out, 5*time.Second); err != nil {
+		t.Fatalf("follow-up call after oversize frame: %v", err)
+	}
+	if out != "pong" {
+		t.Fatalf("follow-up result = %q, want pong", out)
 	}
 }

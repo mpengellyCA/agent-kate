@@ -86,6 +86,7 @@ add_executable(agentkate
     src/cowork/BrowserLaunch.cpp
     src/CooperationPanel.cpp
     src/AiInspectorPanel.cpp
+    src/JobsPanel.cpp
     src/TerminalPanel.cpp
     src/SearchPanel.cpp
     src/SessionBrowserDialog.cpp
@@ -270,6 +271,31 @@ if(Qt6Test_FOUND)
         KF6::SyntaxHighlighting)
     add_test(NAME AgentRosterTest COMMAND AgentRosterTest)
     set_tests_properties(AgentRosterTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    # Plan 19: attaching a screenshot is attaching a temp file that gets reaped.
+    # Guards the durable copy (survives the origin, never displaces it) and the
+    # total attachment budget, whose absence let a send kill the IPC connection.
+    add_executable(AttachmentBuilderTest tests/AttachmentBuilderTest.cpp
+        src/AttachmentBuilder.cpp)
+    target_include_directories(AttachmentBuilderTest PRIVATE src)
+    target_link_libraries(AttachmentBuilderTest PRIVATE Qt6::Core Qt6::Test KF6::I18n)
+    add_test(NAME AttachmentBuilderTest COMMAND AttachmentBuilderTest)
+
+    # Plan 19: the Jobs panel aggregates work it does not own — agents publish
+    # snapshots and it replaces their rows wholesale. Guards the three ways that
+    # loses or invents work: one agent's snapshot clobbering another's, rows
+    # outliving a closed agent, and a filter hiding a job under its group.
+    add_executable(JobsPanelTest tests/JobsPanelTest.cpp
+        src/JobsPanel.cpp src/SubAgentTranscriptDialog.cpp src/AgentChatHelpers.cpp
+        src/MarkdownUtil.cpp src/theme/ThemeManager.cpp src/state/HarnessTraits.cpp
+        src/ipc/CoreClient.cpp src/ProviderConfig.cpp)
+    target_include_directories(JobsPanelTest PRIVATE src)
+    target_link_libraries(JobsPanelTest PRIVATE Qt6::Widgets Qt6::Test Qt6::Network
+        KF6::I18n KF6::ConfigCore KF6::CoreAddons KF6::SyntaxHighlighting
+        KF6::ColorScheme KF6::WidgetsAddons)
+    add_test(NAME JobsPanelTest COMMAND JobsPanelTest)
+    set_tests_properties(JobsPanelTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
     # Plan 16 P4: the ensemble round-trip and the editable model combo, the two

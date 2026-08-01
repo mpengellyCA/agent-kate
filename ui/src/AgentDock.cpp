@@ -126,6 +126,14 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
         }
         refreshAgentNumbers();
     });
+    // A recovery that had to launch a NEW core comes back to a core that has
+    // never heard of the agents on screen; reconcile them before anything else
+    // acts on the fresh connection.
+    connect(m_core, &CoreClient::reconnected, this, [this](bool coreRespawned) {
+        if (coreRespawned) {
+            handleCoreRespawn();
+        }
+    });
     // git.invalidated fires whenever a worktree appears / mutates, which is
     // exactly when an agent's #N may have just been assigned (fresh start)
     // or changed. Keep the roster badges in sync with the dashboard.
@@ -972,6 +980,9 @@ void AgentDock::wireAgentPanel(int agentId, AgentPanel *panel)
         if (m_stack->currentWidget() == panel) {
             Q_EMIT activeThreadChanged(threadId);
         }
+        // The agent only becomes nameable to thread-keyed consumers here — its
+        // title existed all along, but there was no id to hang it on.
+        pushAgentTitles();
     });
     // A live start/resume/promote reveals (or moves) this agent's worktree — if
     // it is the shown agent, re-root the file browser's Worktree tab.
@@ -989,6 +1000,51 @@ void AgentDock::wireAgentPanel(int agentId, AgentPanel *panel)
     });
     connect(panel, &AgentPanel::forkRequested, this,
             [this, agentId] { forkAgent(agentId); });
+    connect(panel, &AgentPanel::jobsChanged, this, &AgentDock::jobsChanged);
+    connect(panel, &AgentPanel::openJobsPanelRequested, this,
+            &AgentDock::openJobsPanelRequested);
+    // A panel that already has jobs when it is wired (an adopted worker, a
+    // re-wire) would otherwise stay invisible to the Jobs panel until its next
+    // task event — which for a long-running job may be never.
+    panel->republishJobs();
+    // Same reason for the names: a dormant/adopted panel arrives with both a
+    // thread and a title, and the rows it just published would read as raw
+    // uuids until git next moved.
+    pushAgentTitles();
+}
+
+// forgetFinishedJobsEverywhere backs the Jobs panel's "Clear finished": each
+// agent drops its own completed records and republishes, so the panel's view
+// and the agents' state cannot drift apart.
+void AgentDock::forgetFinishedJobsEverywhere()
+{
+    for (const Entry &e : std::as_const(m_agents)) {
+        e.panel->forgetFinishedJobs();
+    }
+}
+
+// showWorkflowMonitorFor opens the workflow monitor belonging to one thread —
+// the launch blob lives on that agent's panel and nowhere else.
+void AgentDock::showWorkflowMonitorFor(const QString &threadId)
+{
+    for (const Entry &e : std::as_const(m_agents)) {
+        if (e.panel->threadId() == threadId) {
+            e.panel->showWorkflowMonitor();
+            return;
+        }
+    }
+}
+
+// selectAgentByThread focuses an agent in the roster from its thread id, so a
+// job row can take the user to the agent that owns it.
+void AgentDock::selectAgentByThread(const QString &threadId)
+{
+    for (const Entry &e : std::as_const(m_agents)) {
+        if (e.panel->threadId() == threadId) {
+            m_roster->setCurrentAgent(e.id);
+            return;
+        }
+    }
 }
 
 bool AgentDock::hasThread(const QString &threadId) const
@@ -1059,6 +1115,38 @@ void AgentDock::restoreThreads(const QString &project)
                      }
                  },
                  this);
+}
+
+// handleCoreRespawn reconciles the roster with a core that has never heard of
+// it. The old core's death took every agent process with it, and the fresh one
+// will never report an exit for a thread it did not start — so without this
+// nothing ever stops drawing them as running, and restoreThreads skips them
+// (hasThread) because they are already on screen. The panels already know how
+// to present a dead-but-resumable thread; stating the fact they are waiting for
+// gets the note, the frozen composer, the failed background jobs, the roster
+// badge and the Resume button out of the paths that already exist. The sessions
+// are on disk, so Resume against the fresh core genuinely continues them.
+void AgentDock::handleCoreRespawn()
+{
+    // Snapshot the threads first: delivering the event re-enters the panels,
+    // and a panel that reacts by asking to close would mutate m_agents mid-walk.
+    QStringList live;
+    for (const Entry &e : std::as_const(m_agents)) {
+        if (e.panel->isRunning()) {
+            live.append(e.panel->threadId());
+        }
+    }
+    for (const QString &threadId : std::as_const(live)) {
+        m_core->deliverLocalEvent(
+            threadId,
+            QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("_lifecycle")},
+                {QStringLiteral("phase"), QStringLiteral("exited")},
+                {QStringLiteral("detail"),
+                 i18n("the core was restarted, so this agent's process ended — "
+                      "Resume to carry on from the saved session")},
+            });
+    }
 }
 
 void AgentDock::restoreInitialFocus(const QString &project)
@@ -1145,21 +1233,16 @@ void AgentDock::refreshAgentNumbers()
                              m_worktreePathByThread.insert(id, p);
                          }
                      }
-                     QHash<QString, QString> titlesByThread;
                      for (const Entry &e : m_agents) {
                          const QString tid = e.panel->threadId();
                          if (tid.isEmpty()) {
                              continue;
                          }
                          m_roster->setAgentNumber(e.id, byThread.value(tid, 0));
-                         const QString title = m_roster->agentTitle(e.id);
-                         if (!title.isEmpty()) {
-                             titlesByThread.insert(tid, title);
-                         }
                      }
-                     // Feed the WorktreeDashboard so its cards can name the
-                     // agent, not just its branch.
-                     emit agentTitlesChanged(titlesByThread);
+                     // Feed the WorktreeDashboard and the Jobs panel so their
+                     // rows name the agent, not just its branch / thread id.
+                     pushAgentTitles();
                      // A dormant agent's worktree path may only have become known
                      // in this snapshot — refresh the shown agent's file-browser
                      // scope so its Worktree tab enables without re-selecting it.
@@ -1168,11 +1251,45 @@ void AgentDock::refreshAgentNumbers()
                  this);
 }
 
+// pushAgentTitles publishes thread id → human title for every bound agent.
+// Cheap and synchronous — deliberately no RPC, so the callers that need a title
+// to land NOW (a rename, a thread id arriving, a panel being wired) don't have
+// to wait on a git.snapshot round-trip that may not be due for minutes.
+void AgentDock::pushAgentTitles()
+{
+    QHash<QString, QString> titlesByThread;
+    for (const Entry &e : std::as_const(m_agents)) {
+        const QString tid = e.panel->threadId();
+        if (tid.isEmpty()) {
+            continue;
+        }
+        const QString title = m_roster->agentTitle(e.id);
+        if (!title.isEmpty()) {
+            titlesByThread.insert(tid, title);
+        }
+    }
+    Q_EMIT agentTitlesChanged(titlesByThread);
+}
+
 void AgentDock::removeAgentEntry(int agentId)
 {
     for (int i = 0; i < m_agents.size(); ++i) {
         if (m_agents.at(i).id == agentId) {
             AgentPanel *panel = m_agents.at(i).panel;
+            // Reap this agent's job rows before the panel goes: an empty set is
+            // how the Jobs panel is told an agent is gone, and the panel is
+            // about to stop being able to say anything at all.
+            //
+            // Keyed on the id the rows were PUBLISHED under, not the current
+            // one: the primary close path is "Stop & close", whose reply clears
+            // the panel's thread id before it asks to be closed, so keying on
+            // threadId() reaped nothing and stranded the rows forever.
+            const QString goneThread = panel->publishedThreadId().isEmpty()
+                ? panel->threadId()
+                : panel->publishedThreadId();
+            if (!goneThread.isEmpty()) {
+                Q_EMIT jobsChanged(goneThread, {});
+            }
             m_agents.removeAt(i);
             m_stack->removeWidget(panel);
             // Sever any core->panel wiring before tearing it down so no further
@@ -1262,6 +1379,7 @@ void AgentDock::renameAgent(int agentId)
     // rejects it. With no backend thread yet the rename is local-only (still
     // pinned so the first derived title can't clobber it).
     m_roster->setAgentTitlePinned(agentId, title);
+    pushAgentTitles(); // thread-keyed consumers (Jobs, worktree cards) rename too
     if (threadId.isEmpty()) {
         return;
     }
@@ -1279,6 +1397,7 @@ void AgentDock::renameAgent(int agentId)
                          } else {
                              m_roster->restoreAgentTitleUnpinned(agentId, current);
                          }
+                         pushAgentTitles(); // the optimistic name is gone again
                          emit statusMessage(i18n("Rename failed: %1",
                              error.value(QStringLiteral("message")).toString()));
                      } else {

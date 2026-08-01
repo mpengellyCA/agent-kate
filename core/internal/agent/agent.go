@@ -95,6 +95,11 @@ type Attachment struct {
 	// the on-disk transcript keeps only the inlined content, not the origin.
 	Path    string `json:"path,omitempty"`
 	Outside bool   `json:"outside,omitempty"`
+	// CachePath is the UI's own durable copy of an image attachment's bytes.
+	// Also never sent to the model. Path may point at a temp file the capture
+	// tool has already reaped, in which case the replayed chip has nothing to
+	// draw its thumbnail from; this survives that.
+	CachePath string `json:"cachePath,omitempty"`
 }
 
 // StartOptions configures a new agent thread.

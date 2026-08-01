@@ -322,9 +322,19 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
                         // Decode the stored path into a small thumbnail. Chips on
                         // replayed cards have only a path (no dataB64), so load
                         // from the file; a moved file just falls back to no icon.
+                        // cachePath is our own durable copy, tried when the
+                        // origin is gone — a temp screenshot is usually reaped
+                        // long before the card stops being drawn.
                         const QString path =
                             att.value(QStringLiteral("path")).toString();
                         QPixmap pm(path);
+                        if (pm.isNull()) {
+                            const QString cached =
+                                att.value(QStringLiteral("cachePath")).toString();
+                            if (!cached.isEmpty()) {
+                                pm.load(cached);
+                            }
+                        }
                         const QRect iconR(textLeft, c.rect.top() + (kChipH - kChipIcon) / 2,
                                           kChipIcon, kChipIcon);
                         if (!pm.isNull()) {

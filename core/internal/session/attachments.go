@@ -26,6 +26,11 @@ type AttachmentMeta struct {
 	Path      string `json:"path,omitempty"`
 	MediaType string `json:"mediaType,omitempty"`
 	Outside   bool   `json:"outside,omitempty"`
+	// CachePath is the UI's durable copy of an image's bytes, recorded so a
+	// replayed chip can still draw its thumbnail when the origin path was a
+	// temp file that has since been deleted. Still a path, not bytes — this
+	// sidecar stays body-free.
+	CachePath string `json:"cachePath,omitempty"`
 }
 
 // AttachmentTurn is the attachment metadata for one outgoing user message. Text

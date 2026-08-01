@@ -24,10 +24,12 @@ class LogViewer;
 class CoworkPanel;
 class CooperationPanel;
 class AiInspectorPanel;
+class JobsPanel;
 class CoworkPortal;
 class SideBar;
 class ShellLayout;
 class CommandPalette;
+class KMessageWidget;
 class QAction;
 class QLabel;
 class QLineEdit;
@@ -116,6 +118,11 @@ private:
                           const QString &worktreePath);
     void setTabsByAgent(bool byAgent);
     QString groupKey() const;
+    // Record the project an agent thread belongs to, so a cross-agent action
+    // (the Jobs panel opening another agent's shell log) can resolve that
+    // agent's editor group instead of the active one.
+    void rememberThreadProject(const QString &threadId);
+    QString editorGroupForThread(const QString &threadId) const;
     void pushOpenFilesToCore();
 
     void persistShellState();
@@ -149,8 +156,12 @@ private:
     CoworkPanel *m_coworkPanel = nullptr;
     CooperationPanel *m_coopPanel = nullptr;
     AiInspectorPanel *m_inspectorPanel = nullptr;
+    JobsPanel *m_jobsPanel = nullptr;
     CoworkPortal *m_coworkPortal = nullptr;
     QLabel *m_gitStatusLabel = nullptr; // status-bar git widget for the active editor
+    // Window-wide banner above the shell, used for states that outlast a
+    // status-bar message — today, the core connection being lost and recovered.
+    KMessageWidget *m_coreBanner = nullptr;
 
     ShellLayout *m_shell = nullptr;
     CommandPalette *m_commandPalette = nullptr; // lazily created on first use
@@ -246,6 +257,10 @@ private:
     QString m_activeFilePath;
 
     QString m_activeProject;
+    // Thread id → owning project path, filled as agents are activated / bound.
+    // Only ever grows within a run; a stale entry costs one wrong-group open at
+    // worst, whereas dropping entries would silently defeat editorGroupForThread.
+    QHash<QString, QString> m_projectByThread;
     int m_activeAgentId = -1;
     bool m_tabsByAgent = false; // editor tab grouping: false = project, true = agent
 
