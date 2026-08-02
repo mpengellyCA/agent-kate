@@ -67,6 +67,11 @@ QVariant WorktreeModel::data(const QModelIndex &index, int role) const
             return r.error;
         }
         QString tip = i18n("thread %1\n%2", r.threadId, r.path);
+        // Audit F50: a workspace row is indistinguishable from an isolated one
+        // on the card, and the difference is what Discard destroys — say it.
+        if (!r.isolated) {
+            tip += QLatin1Char('\n') + WorktreeCopy::notIsolatedTooltip();
+        }
         if (r.hasUpstream) {
             tip += QLatin1Char('\n')
                    + i18nc("remote tracking tooltip: ahead/behind counts vs origin",
@@ -179,7 +184,10 @@ WorktreeDashboard::WorktreeDashboard(CoreClient *core, QWidget *parent)
     m_discardBtn->setEnabled(false);
     m_commitBtn = new QPushButton(i18nc("@action:button", "Commit selected…"), this);
     m_commitBtn->setEnabled(false);
-    m_landBtn = new QPushButton(i18nc("@action:button", "Land into main…"), this);
+    // "Land into workspace…", not "into main": git.land merges into whatever
+    // branch the workspace is currently on (worktree.LandWithOptions reads
+    // `git branch --show-current`), which is very often not main (audit F50).
+    m_landBtn = new QPushButton(i18nc("@action:button", "Land into workspace…"), this);
     m_landBtn->setEnabled(false);
     m_prBtn = new QPushButton(i18nc("@action:button", "Open PR…"), this);
     m_prBtn->setEnabled(false);
@@ -421,19 +429,26 @@ void WorktreeDashboard::discardSelected()
         return;
     }
     const QString threadId = r->threadId;
-    const QString label = r->number > 0 ? QStringLiteral("#%1").arg(r->number)
-                                        : r->branch;
-    if (QMessageBox::question(
-            this, i18nc("@title:window", "Discard all changes?"),
-            i18np("Permanently discard the 1 uncommitted change in worktree "
-                  "<b>%2</b>?<br><br>This runs <tt>git reset --hard</tt> and "
-                  "<tt>git clean</tt> — it cannot be undone.",
-                  "Permanently discard all %1 uncommitted changes in worktree "
-                  "<b>%2</b>?<br><br>This runs <tt>git reset --hard</tt> and "
-                  "<tt>git clean</tt> — it cannot be undone.",
-                  r->dirty, label.toHtmlEscaped()),
-            QMessageBox::Yes | QMessageBox::No, QMessageBox::No)
-        != QMessageBox::Yes) {
+    // SAFETY (audit F29): a non-isolated row's dirty count is the porcelain
+    // status of the user's REAL checkout — their own uncommitted work included —
+    // and the core will happily `git reset --hard` it. The prompt therefore
+    // branches: see WorktreeCopy::discardPrompt for what each branch must say.
+    const WorktreeCopy::DiscardPrompt prompt =
+        WorktreeCopy::discardPrompt(r->isolated, r->number, r->branch, r->path,
+                                    r->dirty);
+    QMessageBox box(this);
+    box.setIcon(QMessageBox::Warning);
+    box.setWindowTitle(prompt.title);
+    box.setTextFormat(Qt::RichText);
+    box.setText(prompt.body);
+    // A named destructive button rather than "Yes": the label is the last thing
+    // read before the work is gone. Cancel stays the default and the Esc action.
+    QPushButton *go = box.addButton(prompt.confirmLabel, QMessageBox::DestructiveRole);
+    QPushButton *cancel = box.addButton(QMessageBox::Cancel);
+    box.setDefaultButton(cancel);
+    box.setEscapeButton(cancel);
+    box.exec();
+    if (box.clickedButton() != go) {
         return;
     }
     m_discardBtn->setEnabled(false);

@@ -223,9 +223,25 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, CoreClient *core,
     m_sandbox = new QCheckBox(
         i18n("Work in a private copy, so changes don't touch my files until I approve"), this);
     m_sandbox->setChecked(true);
+    // HONEST LABELLING (audit F30): this is not a sandbox and must not be called
+    // one — docs/security-model.md says so in bold. A git worktree isolates
+    // CHECKOUT STATE, not the process: the agent still runs as you, with your
+    // network and your credentials, and a tool writing an absolute path outside
+    // the copy is invisible to every diff and dirty count we show. The checkbox
+    // label above is the canonical wording ("private copy"); the tooltip says
+    // what the mechanism is and, in the same breath, what it is not.
+    //
+    // The last sentence is the honest half of audit F49: the isolation request
+    // is "auto" (see choices()), so a project with no commits yet — nothing for
+    // git to branch from — starts the agent in the workspace instead of failing.
     m_sandbox->setToolTip(
-        i18n("Recommended. The agent works in its own sandbox (a git worktree); "
-             "you merge its changes back when you're happy with them."));
+        i18n("Recommended. The agent works in its own private copy of the "
+             "project (a git worktree); you merge its changes back when you're "
+             "happy with them. It keeps your working files untouched — it is "
+             "not a security sandbox, and the agent still runs with your own "
+             "permissions. A project with no commits yet has nothing to copy, "
+             "so the agent works directly in your files and says so when it "
+             "starts."));
     root->addWidget(m_sandbox);
 
     // Power options, hidden until asked for.
@@ -345,7 +361,14 @@ NewAgentChoices NewAgentDialog::choices() const
     c.backend = engine.section(QLatin1Char('|'), 0, 0);
     c.providerId = engine.section(QLatin1Char('|'), 1);
     c.modelId = m_model->currentData().toString();
-    c.isolation = m_sandbox->isChecked() ? QStringLiteral("isolated")
+    // UX (audit F49): "auto", never "isolated". worktree.Create refuses
+    // ModeIsolated on a repo with no commit to branch from ("isolation needs at
+    // least one commit"), so the RECOMMENDED default used to fail a brand-new
+    // project with raw git-speak in the conversation. ModeAuto isolates wherever
+    // isolation is possible and falls back to the workspace where it is not —
+    // and the fallback is not silent: the core reports the effective isolation
+    // and the panel says "Working directly in your files" once the agent starts.
+    c.isolation = m_sandbox->isChecked() ? QStringLiteral("auto")
                                          : QStringLiteral("workspace");
     c.permissionMode = m_permission->currentData().toString();
     c.effort = m_effort->currentData().toString();

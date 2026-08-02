@@ -95,8 +95,18 @@ func registerSubagentHandlers(d handlerDeps) {
 	// subagents a thread delegated to, so the UI can tail one. Gated on the
 	// harness capability, and served by the adapter that knows its CLI's
 	// layout — the UI never computes a CLI's private paths.
+	//
+	// SECURITY (audit F34 pass 4): UI-only, the same data class as
+	// agent.transcript, which F34 gated. It answers for ANY thread named on the
+	// wire, and what it hands back is the on-disk PATH of each subagent
+	// conversation — a caller that has those paths and can read files has the
+	// transcripts themselves, gate or no gate on agent.transcript. Its only
+	// caller is ui/src/AgentPanel.cpp.
 	d.srv.Handle("agent.subagentTranscripts",
-		func(_ context.Context, raw json.RawMessage) (any, error) {
+		func(ctx context.Context, raw json.RawMessage) (any, error) {
+			if err := requireUIWindow(d.srv, ctx); err != nil {
+				return nil, err
+			}
 			var p struct {
 				ThreadID string `json:"threadId"`
 			}

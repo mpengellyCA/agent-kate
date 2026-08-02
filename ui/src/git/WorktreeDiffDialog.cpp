@@ -100,7 +100,11 @@ WorktreeDiffDialog::WorktreeDiffDialog(CoreClient *core, const QString &threadId
     auto *commitBtn =
         buttons->addButton(i18nc("@action:button", "Commit…"),
                            QDialogButtonBox::ActionRole);
-    auto *landBtn = buttons->addButton(i18nc("@action:button", "Land into main…"),
+    // "Land into workspace…", not "into main" (audit F50): this button emits
+    // landRequested, the dashboard answers it with git.land, and git.land merges
+    // into the workspace's CURRENT branch — whatever it happens to be. Matches
+    // WorktreeDashboard's own button, which raises the same operation.
+    auto *landBtn = buttons->addButton(i18nc("@action:button", "Land into workspace…"),
                                        QDialogButtonBox::ActionRole);
     auto *prBtn =
         buttons->addButton(i18nc("@action:button", "Open PR…"),

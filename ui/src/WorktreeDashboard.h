@@ -5,6 +5,8 @@
 
 #include "state/Reactive.h"
 
+#include <KLocalizedString>
+
 #include <QAbstractListModel>
 #include <QHash>
 #include <QJsonObject>
@@ -59,6 +61,98 @@ struct WorktreeRow {
     }
     bool operator!=(const WorktreeRow &o) const { return !(*this == o); }
 };
+
+// WorktreeCopy holds the dashboard's load-bearing user-facing sentences, apart
+// from the widgets that show them, so they can be asserted on directly. The
+// discard prompt is here because it is the one place in the app where a wrong
+// sentence costs the user their work (audit F29), and a sentence that is only
+// reachable through QMessageBox::exec() cannot be tested at all.
+namespace WorktreeCopy {
+
+// The three strings a discard confirmation needs. confirmLabel is deliberately
+// not "Yes": the destructive button spells out what it does.
+struct DiscardPrompt {
+    QString title;
+    QString body;         // rich text
+    QString confirmLabel; // destructive button
+};
+
+// discardPrompt builds the confirmation for `git reset --hard` + `git clean`
+// in this row's working directory.
+//
+// SAFETY (audit F29): the two rows are NOT the same action wearing one label.
+//
+//   isolated   — the blast radius is the agent's own worktree. "#N" names it and
+//                nothing of the user's is at stake.
+//   workspace  — the agent runs directly in the user's real checkout, so
+//                `dirty` is the porcelain status of that checkout: the user's
+//                own uncommitted work is counted in it and destroyed with it.
+//                The prompt must therefore never say "worktree #N" (which
+//                frames the blast radius as agent-scoped), must name the real
+//                path, and must say in plain words that the user's own changes
+//                go too. The dashboard already refuses to REMOVE a workspace
+//                row ("never the shared workspace"); this is the same
+//                distinction, said rather than enforced, because discarding
+//                everything uncommitted in your checkout is a thing a user may
+//                legitimately want — being surprised by it is not.
+inline DiscardPrompt discardPrompt(bool isolated, int number, const QString &branch,
+                                   const QString &path, int dirty)
+{
+    DiscardPrompt p;
+    if (!isolated) {
+        p.title = i18nc("@title:window", "Discard everything uncommitted here?");
+        p.body = i18np(
+            "This agent has no private copy — it works <b>directly in your own "
+            "files</b> at <tt>%2</tt>.<br><br>"
+            "That folder has 1 uncommitted change, and discarding throws away "
+            "<b>all of it, including anything you changed yourself</b>. Agent "
+            "Kate cannot tell your edits from the agent's here.<br><br>"
+            "This runs <tt>git reset --hard</tt> and <tt>git clean</tt> in that "
+            "folder — it cannot be undone.",
+            "This agent has no private copy — it works <b>directly in your own "
+            "files</b> at <tt>%2</tt>.<br><br>"
+            "That folder has %1 uncommitted changes, and discarding throws away "
+            "<b>all of them, including anything you changed yourself</b>. Agent "
+            "Kate cannot tell your edits from the agent's here.<br><br>"
+            "This runs <tt>git reset --hard</tt> and <tt>git clean</tt> in that "
+            "folder — it cannot be undone.",
+            dirty, path.toHtmlEscaped());
+        p.confirmLabel =
+            i18nc("@action:button destructive", "Discard my changes too");
+        return p;
+    }
+    const QString label = number > 0 ? QStringLiteral("#%1").arg(number) : branch;
+    p.title = i18nc("@title:window", "Discard all changes?");
+    p.body = i18np(
+        "Permanently discard the 1 uncommitted change in worktree <b>%2</b>?"
+        "<br><br>This runs <tt>git reset --hard</tt> and <tt>git clean</tt> — "
+        "it cannot be undone.",
+        "Permanently discard all %1 uncommitted changes in worktree <b>%2</b>?"
+        "<br><br>This runs <tt>git reset --hard</tt> and <tt>git clean</tt> — "
+        "it cannot be undone.",
+        dirty, label.toHtmlEscaped());
+    p.confirmLabel = i18nc("@action:button destructive", "Discard changes");
+    return p;
+}
+
+// The card pill marking a row that is NOT isolated (audit F50): a workspace row
+// otherwise paints "#3 main" exactly like an isolated one, hiding the very
+// property that decides what Discard destroys.
+inline QString notIsolatedPill()
+{
+    return i18nc("worktree pill: the agent runs in the user's own checkout",
+                 "not isolated");
+}
+
+// The tooltip line that says the same thing in a sentence, for the row whose
+// pills are elided or whose user is hovering to find out.
+inline QString notIsolatedTooltip()
+{
+    return i18n("Not isolated — this agent works directly in your own files, so "
+                "uncommitted changes here include yours.");
+}
+
+} // namespace WorktreeCopy
 
 // Item-data roles the WorktreeCardDelegate reads. The whole WorktreeRow is
 // exposed via RowRole so the delegate can paint every pill in one pass without

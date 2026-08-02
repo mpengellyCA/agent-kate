@@ -102,6 +102,16 @@ QList<Pill> pillsFor(const WorktreeRow &r, const QPalette &pal, bool selected)
     const QColor neutralText = selected ? pal.color(QPalette::Highlight)
                                         : pal.color(QPalette::PlaceholderText);
 
+    // "not isolated" first, so it reads furthest from the counts: this row is
+    // the user's own checkout, not a private copy (audit F50). It is a fact
+    // about the row rather than an alarm, so it takes the informational hue —
+    // but it must be legible, because it is the property that decides what
+    // "Discard changes…" destroys (audit F29).
+    if (!r.isolated) {
+        const QColor info = selected ? pal.color(QPalette::HighlightedText) : ak.info;
+        const QColor infoText = selected ? ak.info : readableOn(info);
+        pills << Pill{WorktreeCopy::notIsolatedPill(), info, infoText};
+    }
     // Ahead / behind vs the fork base — only when non-zero, so a clean, fully
     // merged worktree carries no clutter.
     if (r.ahead > 0 || r.behindBase > 0) {

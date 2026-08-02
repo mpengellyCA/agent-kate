@@ -5,6 +5,7 @@
 package worktree
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -249,7 +250,23 @@ func Promote(wt Worktree) (Worktree, error) {
 // For an isolated worktree it stages all changes (harmless — the worktree is
 // the agent's own) so that newly created files appear, then diffs against the
 // base commit. For the non-isolated fallback it diffs tracked changes against
-// HEAD without touching the user's index.
+// HEAD — without touching the user's index — and appends a synthesized
+// new-file diff for every untracked path.
+//
+// UX (audit F41): `git diff HEAD` covers TRACKED files only, so a
+// workspace-mode agent that had only CREATED files produced an empty diff and
+// the UI told the user, falsely, that the agent "has not changed anything
+// yet" — the "where did my code go" report. The workspace index belongs to the
+// human, so the isolated path's `git add -A` is not available here; diffing the
+// untracked paths against /dev/null yields exactly the patch git itself would
+// have shown had they been staged, and concatenates cleanly after the tracked
+// hunks. Same reason the empty-repo case no longer short-circuits to "": with
+// no commit at all, every file the agent wrote is untracked.
+//
+// The honest limit that remains: in workspace mode the agent and the human
+// share one checkout, so a change cannot be attributed to either of them. This
+// is "everything uncommitted in the agent's working directory", not "everything
+// the agent did" — the UI is responsible for saying so.
 func Diff(wt Worktree) (string, error) {
 	if wt.Isolated {
 		if _, err := git(wt.Path, "add", "-A"); err != nil {
@@ -257,10 +274,62 @@ func Diff(wt Worktree) (string, error) {
 		}
 		return git(wt.Path, "diff", "--cached", wt.Base)
 	}
-	if _, ok := headCommit(wt.Path); !ok {
-		return "", nil
+	var tracked string
+	if _, ok := headCommit(wt.Path); ok {
+		out, err := git(wt.Path, "diff", "HEAD")
+		if err != nil {
+			return "", err
+		}
+		tracked = out
 	}
-	return git(wt.Path, "diff", "HEAD")
+	return tracked + untrackedDiff(wt.Path), nil
+}
+
+// untrackedDiff synthesizes a new-file patch for every untracked, non-ignored
+// path in dir. Best-effort by design: this feeds a review view, so a path git
+// cannot diff is skipped rather than failing the whole diff.
+//
+// Ignored files stay out (--exclude-standard), matching DiscardChanges' `clean
+// -fd` without -x: build artefacts and .env are neither shown nor destroyed.
+// Agent Kate's own worktree directory is skipped explicitly — those are other
+// threads' isolated checkouts, not this thread's work.
+func untrackedDiff(dir string) string {
+	raw, err := git(dir, "ls-files", "--others", "--exclude-standard", "-z")
+	if err != nil {
+		return ""
+	}
+	managed := filepath.Join(managedDir...) + string(filepath.Separator)
+	var sb strings.Builder
+	for _, name := range strings.Split(raw, "\x00") {
+		if name == "" || strings.HasPrefix(filepath.Clean(name), managed) {
+			continue
+		}
+		// `git diff --no-index` exits 1 whenever it finds a difference, which a
+		// new-file diff always is — that exit code is the success case here.
+		out, err := gitAllowExit1(dir, "diff", "--no-color", "--no-index", "--",
+			os.DevNull, name)
+		if err != nil {
+			continue
+		}
+		sb.WriteString(out)
+	}
+	return sb.String()
+}
+
+// gitAllowExit1 runs git in dir and treats exit status 1 as success, for the
+// `git diff` family where 1 means "differences found" rather than failure.
+func gitAllowExit1(dir string, args ...string) (string, error) {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		var exit *exec.ExitError
+		if errors.As(err, &exit) && exit.ExitCode() == 1 {
+			return string(out), nil
+		}
+		return "", err
+	}
+	return string(out), nil
 }
 
 // Commit stages every change in the worktree and commits it to the thread's

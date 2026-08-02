@@ -70,6 +70,125 @@ func TestCreateDiffRemove(t *testing.T) {
 	}
 }
 
+// TestDiffWorkspaceIncludesNewFiles is audit F41: a workspace-mode agent that
+// only CREATES files used to produce an empty diff (`git diff HEAD` is
+// tracked-only), and the UI then told the user the agent "has not changed
+// anything yet". The diff must show the new file, must not have staged it into
+// the human's index, and must leave ignored files alone.
+func TestDiffWorkspaceIncludesNewFiles(t *testing.T) {
+	repo := initRepo(t)
+	wt, err := Create(repo, "t-ws-diff", ModeWorkspace)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(repo, ".gitignore"),
+		[]byte("ignored.txt\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, repo, "git", "add", ".gitignore")
+	run(t, repo, "git", "commit", "-q", "-m", "ignore")
+
+	// The agent creates a brand-new file and touches nothing tracked.
+	if err := os.WriteFile(filepath.Join(repo, "brand-new.txt"),
+		[]byte("the work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "ignored.txt"),
+		[]byte("build artefact\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	diff, err := Diff(wt)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+	if !strings.Contains(diff, "brand-new.txt") || !strings.Contains(diff, "the work") {
+		t.Fatalf("workspace diff omitted the new file:\n%s", diff)
+	}
+	if strings.Contains(diff, "ignored.txt") {
+		t.Fatalf("workspace diff included an ignored file:\n%s", diff)
+	}
+
+	// The human's index must be untouched — nothing staged behind their back.
+	staged, err := exec.Command("git", "-C", repo, "diff", "--cached", "--name-only").Output()
+	if err != nil {
+		t.Fatalf("git diff --cached: %v", err)
+	}
+	if strings.TrimSpace(string(staged)) != "" {
+		t.Fatalf("Diff staged files in the user's index: %q", staged)
+	}
+}
+
+// TestDiffWorkspaceTrackedAndUntracked pins that the tracked hunks are still
+// there once untracked files are appended — the fix must add, never replace.
+func TestDiffWorkspaceTrackedAndUntracked(t *testing.T) {
+	repo := initRepo(t)
+	wt, _ := Create(repo, "t-ws-both", ModeWorkspace)
+	if err := os.WriteFile(filepath.Join(repo, "a.txt"), []byte("edited\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "b.txt"), []byte("added\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	diff, err := Diff(wt)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+	if !strings.Contains(diff, "a.txt") || !strings.Contains(diff, "b.txt") {
+		t.Fatalf("diff missing tracked or untracked change:\n%s", diff)
+	}
+}
+
+// TestDiffWorkspaceNoCommits covers the fresh project (audit F49's repo shape):
+// with no HEAD to diff against, every file the agent wrote is untracked, and
+// returning "" there is the same false "nothing changed" F41 is about.
+func TestDiffWorkspaceNoCommits(t *testing.T) {
+	repo := t.TempDir()
+	run(t, repo, "git", "init", "-q")
+	wt, err := Create(repo, "t-fresh", ModeAuto)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if wt.Isolated {
+		t.Fatal("setup: auto on a commitless repo should fall back to the workspace")
+	}
+	if err := os.WriteFile(filepath.Join(repo, "first.txt"),
+		[]byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	diff, err := Diff(wt)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+	if !strings.Contains(diff, "first.txt") {
+		t.Fatalf("commitless-repo diff omitted the agent's only file:\n%s", diff)
+	}
+}
+
+// TestDiffWorkspaceSkipsManagedWorktrees: another thread's isolated worktree
+// lives under .agentkate/worktrees inside this repo. Its files are not this
+// thread's work and must never appear in the workspace agent's diff.
+func TestDiffWorkspaceSkipsManagedWorktrees(t *testing.T) {
+	repo := initRepo(t)
+	ws, _ := Create(repo, "t-ws-mixed", ModeWorkspace)
+	iso, err := Create(repo, "t-other", ModeIsolated)
+	if err != nil {
+		t.Fatalf("Create isolated: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(iso.Path, "other-agent.txt"),
+		[]byte("someone else's work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	diff, err := Diff(ws)
+	if err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+	if strings.Contains(diff, "other-agent.txt") {
+		t.Fatalf("workspace diff leaked another thread's worktree:\n%s", diff)
+	}
+}
+
 func TestCommit(t *testing.T) {
 	repo := initRepo(t)
 	wt, err := Create(repo, "t-commit", ModeAuto)
