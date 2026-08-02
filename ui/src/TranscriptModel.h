@@ -58,6 +58,7 @@ public:
         ToolFullResultRole,
         ToolTruncatedRole, // bool — result was clipped
         ToolDoneRole,      // bool — result has arrived (✓ vs ⋯)
+        ToolErrorRole,     // bool — the result was a FAILURE (✗ vs ✓)
         ToolExpandedRole,  // bool — detail revealed
         ToolVisibleRole,   // bool — honours the showTools setting
         ChecklistRole,     // QJsonArray of {content, status} items
@@ -87,6 +88,10 @@ public:
         QString toolFullResult;
         bool toolTruncated = false;
         bool toolDone = false;
+        // The tool_result carried is_error (audit F40). A failure used to paint
+        // exactly like a success, so finding the one tool that failed in a long
+        // turn meant expanding every row.
+        bool toolError = false;
         bool toolExpanded = false;
         bool toolVisible = true;
         // Checklist items ({content, status} objects, status one of
@@ -111,7 +116,13 @@ public:
                       const QString &bodyHtml, const QString &plain, bool replayed,
                       const QString &timestamp,
                       const QJsonArray &attachments = {});
-    int appendNote(const QString &html, const QString &noteKind);
+    // A status note. `html` is the rendered line; a plain-text form is derived
+    // from it once, here, so find and "Copy text" can reach a note's words —
+    // every error, compaction and rate-limit line lives in one (audit F48).
+    // `timestamp` is the short local time shown at the row's right edge; empty
+    // for a replayed note, which has no honest live time to show.
+    int appendNote(const QString &html, const QString &noteKind,
+                   const QString &timestamp = QString());
     int appendTool(const QString &toolName, const QString &summary,
                    const QString &detail, bool visible);
     // A thinking card: collapsed to `preview` until expanded to the rendered
@@ -141,8 +152,10 @@ public:
     // the stable key from appendTool (a tool_result arrives after a round-trip,
     // by which time eviction may have shifted positions); a no-op if that row
     // has already been evicted.
+    // `isError` is the tool_result's own is_error flag (both engines set it —
+    // claude natively, kimi's translator on a failed tool call).
     void setToolResult(int key, const QString &shown, const QString &fullResult,
-                       bool truncated);
+                       bool truncated, bool isError = false);
     // Attach image chips to a tool row (a tool_result carrying image blocks —
     // e.g. a screenshot). Chips are {name, kind, path} like a message's; the
     // delegate paints them under the tool header.
@@ -163,6 +176,13 @@ public:
 
     const Item &itemAt(int row) const { return m_items.at(row); }
     int count() const { return m_items.size(); }
+
+    // Everything this row shows the user, as one searchable string. Find used
+    // to scan Message prose only (audit F48), so tool names, paths, commands,
+    // results, reasoning and — worst — NOTES were invisible to it: every error,
+    // compaction, rate-limit and API-failure line lives in a note, and
+    // searching for the error text on screen answered "No matches".
+    QString searchText(int row) const;
 
 Q_SIGNALS:
     // A row's content changed in a way that can change its measured height or

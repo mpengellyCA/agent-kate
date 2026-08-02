@@ -219,7 +219,10 @@ QString resolveBodyHtml(const QModelIndex &idx)
 {
     const auto kind = TranscriptModel::Kind(idx.data(TranscriptModel::KindRole).toInt());
     QString html = idx.data(TranscriptModel::HtmlRole).toString();
-    if (kind == TranscriptModel::Message) {
+    // Notes highlight like messages (audit F48): a note is where every error,
+    // rate-limit and compaction line lives, so a find that reaches them but
+    // cannot show WHERE the hit is only half-works.
+    if (kind == TranscriptModel::Message || kind == TranscriptModel::Note) {
         const auto *m = qobject_cast<const TranscriptModel *>(idx.model());
         if (m && !m->findNeedle().isEmpty()) {
             const QString plain = idx.data(TranscriptModel::PlainRole).toString();
@@ -582,7 +585,17 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
     }
 
     if (kind == TranscriptModel::Note) {
-        const int textW = contentWidth - 2 * kNotePadX;
+        // Notes carry a live timestamp like message cards do: an error or a
+        // rate-limit line the user reads ten minutes later says nothing about
+        // WHEN it happened otherwise (audit F50). Its column is reserved out of
+        // the note's own wrap width so the two never overlap. Replayed notes
+        // have no timestamp — and get no reserved column.
+        const QString ts = idx.data(TranscriptModel::TimestampRole).toString();
+        QFont small = opt.font;
+        small.setPointSizeF(opt.font.pointSizeF() * 0.85);
+        const int tsW =
+            ts.isEmpty() ? 0 : QFontMetrics(small).horizontalAdvance(ts) + kNotePadX;
+        const int textW = contentWidth - 2 * kNotePadX - tsW;
         QTextDocument *doc = self->bodyDoc(idx, qMax(1, textW), opt);
         const int h = int(doc->size().height()) + 2 * kNotePadY;
         if (painter) {
@@ -596,6 +609,15 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
                                            dark));
             doc->documentLayout()->draw(painter, ctx);
             painter->restore();
+            if (tsW > 0) {
+                painter->save();
+                painter->setFont(small);
+                painter->setPen(opt.palette.color(QPalette::Mid));
+                painter->drawText(QRect(rowRect.left() + contentLeft + kNotePadX + textW,
+                                        rowRect.top() + kNotePadY, tsW, lineH),
+                                  Qt::AlignRight | Qt::AlignVCenter, ts);
+                painter->restore();
+            }
         }
         return h;
     }
@@ -865,10 +887,20 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
             detailH = int(detailDoc->size().height());
         }
         QString result = idx.data(TranscriptModel::ToolResultRole).toString();
-        if (done) {
-            if (result.isEmpty()) {
-                result = QStringLiteral("(no output)");
-            }
+        // A RUNNING row shows whatever partial text it has — a helper's
+        // forwarded output under a Task row, live command output. Measuring
+        // and painting this only `if (done)` meant the whole live-subagent
+        // pipeline (buffered, bounded, coalesced, repainted) was never visible
+        // and the row sat at "⋯" for the entire run (audit F39). Only the
+        // "(no output)" placeholder is done-only: a running tool with nothing
+        // yet has produced no output, it has not produced none.
+        if (done && result.isEmpty()) {
+            result = QStringLiteral("(no output)");
+        }
+        if (!result.isEmpty()) {
+            // The cache key carries the text, so streaming partial output
+            // re-lays this row's own document rather than defeating the cache
+            // or serving a stale height (audit F18).
             resultDoc = self->toolDoc(idx, TranscriptDelegate::ToolSlot::Result, result,
                                       mono, detailW);
             resultH = int(resultDoc->size().height());
@@ -881,11 +913,17 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
     }
 
     if (painter) {
+        // A failed tool used to render exactly like a successful one — same ✓,
+        // same frame — so the only way to find the failure in a long turn was
+        // to expand every row (audit F40). It now carries a ✗ in the theme's
+        // negative colour and a negative card border.
+        const bool failed = idx.data(TranscriptModel::ToolErrorRole).toBool();
+        const QColor errColor = ThemeManager::palette().negative;
         const QRect card(rowRect.left() + contentLeft, rowRect.top(),
                          contentWidth, total);
         painter->save();
         painter->setRenderHint(QPainter::Antialiasing, true);
-        painter->setPen(opt.palette.color(QPalette::Mid));
+        painter->setPen(failed ? errColor : opt.palette.color(QPalette::Mid));
         painter->setBrush(Qt::NoBrush);
         painter->drawRoundedRect(card.adjusted(0, 0, -1, -1), 7, 7);
         painter->restore();
@@ -894,19 +932,39 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
         // glyph right. Cooperation calls (agent-to-agent coordination and
         // orchestration) carry ⇄ instead of the 🔧 file/shell wrench, so a
         // controller's traffic stands out from its own tool use at a glance.
+        // The arrow+mark prefix is drawn separately so the failure mark can
+        // take the negative colour while the rest of the line stays readable.
         const QString arrow = expanded ? QStringLiteral("▾") : QStringLiteral("▸");
-        const QString mark = done ? QStringLiteral("✓") : QStringLiteral("⋯");
+        const QString mark = !done ? QStringLiteral("⋯")
+                                   : (failed ? QStringLiteral("✗") : QStringLiteral("✓"));
         const QString kind = name.startsWith(QLatin1String("mcp__cooperation__"))
                                  ? QStringLiteral("⇄")
                                  : QStringLiteral("\U0001f527");
-        const QString header = QStringLiteral("%1  %2  %3 %4   %5")
-                                   .arg(arrow, mark, kind, name, summary);
+        const QString prefix = QStringLiteral("%1  %2  ").arg(arrow, mark);
+        QString header = QStringLiteral("%1 %2   %3").arg(kind, name, summary);
+        // A RUNNING row carrying partial output shows its latest line right in
+        // the header. Tool rows are collapsed by default, so painting live text
+        // only inside the expanded body would still leave a subagent's whole
+        // run reading "⋯" for anyone who did not open the row (audit F39).
+        if (!done) {
+            const QString partial = idx.data(TranscriptModel::ToolResultRole).toString();
+            const QString tail =
+                partial.section(QLatin1Char('\n'), -1, -1).simplified();
+            if (!tail.isEmpty()) {
+                header += QStringLiteral("   · ") + tail;
+            }
+        }
         const QRect hdr(card.left() + 8, card.top(),
                         card.width() - 8 - kToolCopyW - kToolInspectW, kToolHeaderH);
         painter->save();
+        const int prefixW = fm.horizontalAdvance(prefix);
+        painter->setPen(failed ? errColor : opt.palette.color(QPalette::WindowText));
+        painter->drawText(hdr, Qt::AlignLeft | Qt::AlignVCenter, prefix);
+        const QRect restR(hdr.left() + prefixW, hdr.top(),
+                          qMax(0, hdr.width() - prefixW), hdr.height());
         painter->setPen(opt.palette.color(QPalette::WindowText));
-        painter->drawText(hdr, Qt::AlignLeft | Qt::AlignVCenter,
-                          fm.elidedText(header, Qt::ElideRight, hdr.width()));
+        painter->drawText(restR, Qt::AlignLeft | Qt::AlignVCenter,
+                          fm.elidedText(header, Qt::ElideRight, restR.width()));
         painter->setPen(opt.palette.color(QPalette::Mid));
         // "Open in inspector" glyph, then the copy glyph on the far right.
         const QRect inspectR(card.right() - kToolCopyW - kToolInspectW, card.top(),
@@ -974,6 +1032,12 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
                 painter->translate(card.left() + kDetailPadX, y);
                 QAbstractTextDocumentLayout::PaintContext ctx;
                 ctx.palette = opt.palette;
+                if (!done) {
+                    // Provisional output of a still-running tool: dimmed so it
+                    // is legible as "so far", not as the result (audit F39).
+                    ctx.palette.setColor(QPalette::Text,
+                                         opt.palette.color(QPalette::Mid));
+                }
                 resultDoc->documentLayout()->draw(painter, ctx);
                 painter->restore();
                 y += resultH;

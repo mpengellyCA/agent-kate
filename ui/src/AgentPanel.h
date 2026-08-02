@@ -286,6 +286,11 @@ private:
     // Move still-queued follow-ups back into the composer when a turn stops or
     // fails, so the human's text is never silently discarded.
     void restoreQueuedToComposer();
+    // restoreQueuedToComposer plus the opening prompt of a fresh start that
+    // never reached an agent (audit F37). Use this at every failure site: the
+    // opening prompt is committed to the feed before the start RPC, so without
+    // it the human has to copy their own first message out of the transcript.
+    void restoreUnsentToComposer();
     // Rebuild the "queued messages" chip bar from m_sendQueue.
     void rebuildQueueChips();
     void onStopClicked();
@@ -383,6 +388,11 @@ private:
     void rebuildModelCombo();
     void showNextPermission();
     void answerPermission(bool allow);
+    // Open the pending request's complete, unabridged input in a read-only
+    // scrollable view. The bar's one-line summary is clipped (and, for Bash,
+    // clipped in the middle) — this is the only way to read the rest before
+    // deciding (audit F28).
+    void showPermissionDetails();
     void buildQuestionForm(const QJsonObject &req);
     void onQuestionSubmit();
     // Count the visible permission prompt down to the core broker's deadline
@@ -506,6 +516,12 @@ private:
     void saveDraft();
     void restoreDraft();
     void clearDraft();
+
+    // Composer history (audit F50): Up on the first line walks back through the
+    // messages sent this session, Down walks forward and hands back the draft
+    // the walk interrupted. Session-only, never persisted.
+    void rememberSent(const QString &text);
+    void setComposerFromHistory(const QString &text);
 
     // In-conversation find bar.
     void toggleFindBar();
@@ -719,6 +735,15 @@ private:
     // Debounced draft autosave for the composer.
     QTimer *m_draftTimer = nullptr;
 
+    // Composer history ring: messages sent this session, oldest first. -1 means
+    // "not walking"; while walking, m_historyDraft holds the text the walk
+    // interrupted so Down can put it back. m_historyNavigating tells the
+    // textChanged handler that a write is ours, not the human's.
+    QStringList m_composerHistory;
+    int m_historyIndex = -1;
+    QString m_historyDraft;
+    bool m_historyNavigating = false;
+
     // In-conversation find bar (hidden by default; toggled with Ctrl+F).
     QFrame *m_findBar = nullptr;
     QLineEdit *m_findEdit = nullptr;
@@ -781,6 +806,7 @@ private:
     QLabel *m_permLabel = nullptr;
     QPushButton *m_permAllow = nullptr;
     QPushButton *m_permDeny = nullptr;
+    QPushButton *m_permDetails = nullptr; // full raw input (audit F28)
     QList<QJsonObject> m_permQueue;
 
     // FIFO of follow-up messages typed while a turn was in progress. The
@@ -795,6 +821,10 @@ private:
     QList<QueuedMsg> m_sendQueue;
     QFrame *m_queueBar = nullptr;
     FlowLayout *m_queueLayout = nullptr;
+    // The opening prompt of a fresh start, held from the moment the composer is
+    // cleared until `_lifecycle/started` proves the agent got it. A start that
+    // fails hands it back instead of stranding it in the feed (audit F37).
+    QueuedMsg m_pendingOpening;
 
     // Promote-to-worktree bar, shown while a thread runs non-isolated.
     QFrame *m_promoteBar = nullptr;

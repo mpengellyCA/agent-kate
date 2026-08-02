@@ -99,6 +99,16 @@ constexpr char kAttachMime[] = "application/x-agentkate-attachment+json";
 constexpr int kToolResultDisplayClip = 4000;
 constexpr int kToolResultStoreCap = 128 * 1024;
 
+// Characters of tool summary the permission bar shows before it elides. The
+// core builds its worker-launch prompt to exactly this budget (audit F1), so
+// the two must stay in step. Whatever the clip drops is reachable in full via
+// the bar's Details… view (audit F28).
+constexpr int kPermSummaryBudget = 240;
+
+// How many sent messages the composer's Up-arrow history keeps. Session-only
+// (never written to disk — a prompt can hold anything the human typed).
+constexpr int kComposerHistoryMax = 50;
+
 // Attachment / frame budgets, both anchored on the core's 16 MB JSON-RPC frame
 // cap (core/internal/ipc/server.go maxFrameBytes). An oversize frame never
 // reaches a handler, so the message is simply lost — the human's text and files
@@ -645,6 +655,12 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     m_permLabel = new QLabel(m_permBar);
     m_permLabel->setTextFormat(Qt::RichText);
     m_permLabel->setWordWrap(true);
+    // SECURITY (audit F28): the label is a clipped one-liner, so the bar must
+    // also offer the FULL request. Without it the only answer to "what is the
+    // rest of that command?" was Deny.
+    m_permDetails = new QPushButton(i18n("Details…"), m_permBar);
+    m_permDetails->setCursor(Qt::PointingHandCursor);
+    m_permDetails->setToolTip(i18n("Show the complete, unabridged tool input"));
     m_permDeny = new QPushButton(QStringLiteral("Deny"), m_permBar);
     m_permDeny->setCursor(Qt::PointingHandCursor);
     m_permAllow = new QPushButton(QStringLiteral("Approve"), m_permBar);
@@ -652,6 +668,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     auto *permLayout = new QHBoxLayout(m_permBar);
     permLayout->setContentsMargins(10, 8, 10, 8);
     permLayout->addWidget(m_permLabel, 1);
+    permLayout->addWidget(m_permDetails);
     permLayout->addWidget(m_permDeny);
     permLayout->addWidget(m_permAllow);
 
@@ -716,6 +733,13 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     connect(m_input, &QPlainTextEdit::textChanged, this, [this] {
         m_draftTimer->start();
         updateSlashPopup();
+        // Typing leaves the history walk (audit F50) — the edited text is the
+        // human's again, not an entry to keep stepping through. The guard keeps
+        // OUR own programmatic setPlainText from cancelling the walk it makes.
+        if (!m_historyNavigating) {
+            m_historyIndex = -1;
+            m_historyDraft.clear();
+        }
     });
 
     // Slash-command autocomplete popup: an overlay list above the composer,
@@ -800,7 +824,12 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
 
     m_isolationCombo = new QComboBox(this);
     m_isolationCombo->addItem(QStringLiteral("Automatic"), QStringLiteral("auto"));
-    m_isolationCombo->addItem(QStringLiteral("In a private copy (sandbox)"),
+    // "sandbox" is the word this control must never use (audit F30):
+    // docs/security-model.md says in bold that a worktree is NOT a sandbox and
+    // does not pretend to be one — it isolates checkout state, not the process
+    // (no filesystem, network or credential containment). NewAgentDialog's
+    // "(git worktree)" is the honest form; this reuses it verbatim.
+    m_isolationCombo->addItem(QStringLiteral("In a private copy (git worktree)"),
                               QStringLiteral("isolated"));
     m_isolationCombo->addItem(QStringLiteral("Directly in my files"),
                               QStringLiteral("workspace"));
@@ -808,8 +837,10 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
         "Whether the agent works on a private copy of your project or directly\n"
         "in your files. Fixed once it starts:\n"
         "• Automatic — a private copy when the project is a git repo, else your files\n"
-        "• In a private copy — always its own sandbox; merge it back when you're happy\n"
-        "• Directly in my files — no sandbox; changes land in your project immediately"));
+        "• In a private copy — always its own git worktree; merge it back when you're happy\n"
+        "• Directly in my files — changes land in your project immediately\n"
+        "A private copy separates the agent's CHANGES from yours. It does not\n"
+        "confine the program: it runs as you, with your files and network."));
     // Sticky: the last choice becomes the default for the next agent.
     {
         const QString saved = KSharedConfig::openConfig()
@@ -1236,6 +1267,8 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     connect(m_attachBtn, &QPushButton::clicked, this, &AgentPanel::onAttachClicked);
     connect(m_permAllow, &QPushButton::clicked, this, [this] { answerPermission(true); });
     connect(m_permDeny, &QPushButton::clicked, this, [this] { answerPermission(false); });
+    connect(m_permDetails, &QPushButton::clicked, this,
+            &AgentPanel::showPermissionDetails);
     // Queued so a notification can never be delivered re-entrantly while this
     // panel is being torn down (deleteLater'd on agent/project removal). Qt
     // drops any still-queued events after the receiver is destroyed.
@@ -1961,6 +1994,42 @@ bool AgentPanel::eventFilter(QObject *obj, QEvent *event)
                 break;
             }
         }
+        // Composer history (audit F50): Up on the FIRST line walks back through
+        // the messages sent this session, Down walks forward and returns the
+        // draft that was there. Anywhere else Up/Down are ordinary cursor keys,
+        // so a multi-line message is still editable. Session-only and never
+        // persisted — a prompt can hold anything the human typed.
+        if ((key->key() == Qt::Key_Up || key->key() == Qt::Key_Down)
+            && !key->modifiers().testFlag(Qt::ControlModifier)
+            && !key->modifiers().testFlag(Qt::ShiftModifier)) {
+            const QTextCursor cur = m_input->textCursor();
+            const bool onFirstLine = cur.blockNumber() == 0;
+            const bool onLastLine = cur.blockNumber() == m_input->blockCount() - 1;
+            if (key->key() == Qt::Key_Up && onFirstLine && !m_composerHistory.isEmpty()
+                && m_historyIndex != 0) {
+                if (m_historyIndex < 0) {
+                    m_historyDraft = m_input->toPlainText();
+                    m_historyIndex = m_composerHistory.size();
+                }
+                --m_historyIndex;
+                setComposerFromHistory(m_composerHistory.at(m_historyIndex));
+                return true;
+            }
+            if (key->key() == Qt::Key_Down && onLastLine && m_historyIndex >= 0) {
+                if (m_historyIndex + 1 < m_composerHistory.size()) {
+                    ++m_historyIndex;
+                    setComposerFromHistory(m_composerHistory.at(m_historyIndex));
+                } else {
+                    // Past the newest entry: hand back the draft the walk
+                    // interrupted rather than leaving the last message in place.
+                    const QString draft = m_historyDraft;
+                    m_historyIndex = -1;
+                    m_historyDraft.clear();
+                    setComposerFromHistory(draft);
+                }
+                return true;
+            }
+        }
         // Esc while a turn is in flight interrupts it (keeps the session hot) so
         // you can redirect the agent without reaching for the toolbar button.
         if (key->key() == Qt::Key_Escape && !m_threadId.isEmpty() && !m_dormant
@@ -2656,7 +2725,14 @@ void AgentPanel::addMessageCard(const QString &role, const QString &accentHex,
 
 void AgentPanel::addNote(const QString &html, const QString &kind)
 {
-    m_model->appendNote(html, kind);
+    // Notes carry the same live timestamp message cards do (audit F50): "rate
+    // limit resets at 15:04" or "agent failed: …" is far less useful when the
+    // feed cannot say when it happened. A replayed note gets none — the same
+    // rule as addMessageCard, so the feed never stamps history as "now".
+    const QString ts = m_replaying
+        ? QString()
+        : QLocale().toString(QTime::currentTime(), QLocale::ShortFormat);
+    m_model->appendNote(html, kind, ts);
     if (!m_stickBottom) {
         m_jumpUnread = true;
         updateJumpButton();
@@ -2711,6 +2787,23 @@ void AgentPanel::showFeedContextMenu(const QModelIndex &idx, const QPoint &globa
             }
         });
         toolMenu.exec(globalPos);
+        return;
+    }
+    // Notes and reasoning are paint-only: no selection overlay reaches them, so
+    // without this the CLI error text and rate-limit reset time a user wants to
+    // paste into a bug report can only be retyped (audit F48).
+    if (kind == TranscriptModel::Note || kind == TranscriptModel::Thinking) {
+        const QString text = idx.data(TranscriptModel::PlainRole).toString();
+        if (text.isEmpty()) {
+            return;
+        }
+        QMenu noteMenu(this);
+        QAction *copy = noteMenu.addAction(
+            QIcon::fromTheme(QStringLiteral("edit-copy")), i18n("Copy text"));
+        connect(copy, &QAction::triggered, this, [text] {
+            QGuiApplication::clipboard()->setText(text);
+        });
+        noteMenu.exec(globalPos);
         return;
     }
     if (kind != TranscriptModel::Message) {
@@ -2900,6 +2993,37 @@ void AgentPanel::restoreDraft()
     }
 }
 
+// setComposerFromHistory replaces the composer with a history entry (or the
+// interrupted draft) and parks the cursor at the end, without the textChanged
+// handler mistaking our own write for the human editing and cancelling the walk.
+void AgentPanel::setComposerFromHistory(const QString &text)
+{
+    m_historyNavigating = true;
+    m_input->setPlainText(text);
+    m_input->moveCursor(QTextCursor::End);
+    m_historyNavigating = false;
+}
+
+// rememberSent pushes a message the human actually sent onto the session-only
+// history ring the composer's Up arrow walks. Consecutive duplicates collapse
+// (re-sending the same prompt twice should not need two Ups) and the ring is
+// bounded.
+void AgentPanel::rememberSent(const QString &text)
+{
+    if (text.isEmpty()) {
+        return;
+    }
+    if (!m_composerHistory.isEmpty() && m_composerHistory.last() == text) {
+        return;
+    }
+    m_composerHistory.append(text);
+    if (m_composerHistory.size() > kComposerHistoryMax) {
+        m_composerHistory.removeFirst();
+    }
+    m_historyIndex = -1;
+    m_historyDraft.clear();
+}
+
 void AgentPanel::clearDraft()
 {
     const QString key = draftKey();
@@ -2955,14 +3079,17 @@ void AgentPanel::runFind(int direction)
         }
         return;
     }
-    // Recompute the matching rows: a message row matches if its plain source
-    // contains the needle. The delegate paints the per-row highlight from the
-    // model's find state, so no HTML rewriting happens here.
+    // Recompute the matching rows. Every row kind is scanned through the model's
+    // own searchText — notes, tool names/commands/results and reasoning included
+    // (audit F48): the error text the user is staring at lives in a note, and
+    // scanning message prose alone answered "No matches" for it. The delegate
+    // paints the per-row highlight from the model's find state (messages and
+    // notes; a matched tool/thinking row is scrolled to and counted but not
+    // highlighted — its body is behind a collapsed header), so no HTML
+    // rewriting happens here.
     m_findHits.clear();
     for (int row = 0; row < m_model->count(); ++row) {
-        const TranscriptModel::Item &it = m_model->itemAt(row);
-        if (it.kind == TranscriptModel::Message
-            && it.plain.contains(needle, Qt::CaseInsensitive)) {
+        if (m_model->searchText(row).contains(needle, Qt::CaseInsensitive)) {
             m_findHits.append(row);
         }
     }
@@ -3009,9 +3136,15 @@ void AgentPanel::onSendClicked()
     if (!m_core->isConnected()) {
         // Without this guard, the message lands in the feed but the RPC is
         // dropped silently by CoreClient — the user just sees a dead chat.
-        emit statusMessage(QStringLiteral("Core is not connected — restart Agent Kate"));
-        addNote(QStringLiteral("Core process is not connected — the message was not sent. "
-                               "Restart Agent Kate to recover."),
+        // The advice used to say "Restart Agent Kate to recover" WHILE the
+        // reconnect ladder that usually succeeds seconds later was still
+        // running — telling the user to throw away a session that was about to
+        // come back (audit F50). Say what is actually happening; the ladder's
+        // own terminal state is what earns a restart.
+        emit statusMessage(QStringLiteral("Core is not connected — reconnecting"));
+        addNote(QStringLiteral("Core process is not connected — the message was not "
+                               "sent. Agent Kate is reconnecting; your text is still "
+                               "in the composer, so send it again in a moment."),
                 QStringLiteral("err"));
         return;
     }
@@ -3061,6 +3194,7 @@ void AgentPanel::onSendClicked()
         }
         m_input->clear();
         clearDraft();
+        rememberSent(text);
         m_sendQueue.append(QueuedMsg{text, m_attachments});
         m_attachments = QJsonArray();
         rebuildAttachChips();
@@ -3076,9 +3210,10 @@ void AgentPanel::onSendClicked()
     // oversized frame), and a refused send must leave the human's text and
     // attachment chips exactly where they were.
     const QJsonArray attachments = m_attachments;
-    const auto commitComposer = [this] {
+    const auto commitComposer = [this, text] {
         m_input->clear();
         clearDraft();
+        rememberSent(text);
         m_attachments = QJsonArray();
         rebuildAttachChips();
     };
@@ -3174,6 +3309,10 @@ void AgentPanel::onSendClicked()
         emit titleChanged(title);
 
         m_startedProviderId = startedProviderId;
+        // Held until the agent process actually starts. If the start fails
+        // instead, this is what goes back to the composer rather than leaving
+        // the human to copy their own first message out of the feed (audit F37).
+        m_pendingOpening = QueuedMsg{text, attachments};
         m_core->call(QStringLiteral("agent.start"), startParams,
                      [this](const QJsonObject &result, const QJsonObject &error) {
                          if (!error.isEmpty()) {
@@ -3182,6 +3321,7 @@ void AgentPanel::onSendClicked()
                                                   .toString()
                                                   .toHtmlEscaped()),
                                      QStringLiteral("err"));
+                             restoreUnsentToComposer();
                              return;
                          }
                          m_threadId = result.value(QStringLiteral("threadId")).toString();
@@ -4000,6 +4140,27 @@ void AgentPanel::restoreQueuedToComposer()
     }
 }
 
+// restoreUnsentToComposer hands back EVERY message the human typed that never
+// reached an agent: the opening prompt of a fresh start that failed (audit F37
+// — it was committed to the feed and then stranded there, so the only way to
+// retry was to copy it out of the transcript) plus any queued follow-ups. The
+// opening prompt goes to the FRONT so the composer reads in the order it was
+// typed. Restoring is a no-op once the agent has started: `_lifecycle/started`
+// clears the pending opening, because from then on the message did arrive.
+void AgentPanel::restoreUnsentToComposer()
+{
+    if (!m_pendingOpening.text.isEmpty() || !m_pendingOpening.attachments.isEmpty()) {
+        m_sendQueue.prepend(m_pendingOpening);
+        m_pendingOpening = QueuedMsg{};
+    }
+    if (m_sendQueue.isEmpty()) {
+        return;
+    }
+    restoreQueuedToComposer();
+    addNote(i18n("your message is back in the composer — nothing was sent"),
+            QStringLiteral("dim"));
+}
+
 // rebuildQueueChips redraws the queued-message chip bar from m_sendQueue.
 // Each chip shows the message (truncated) and removes it on click.
 void AgentPanel::rebuildQueueChips()
@@ -4083,8 +4244,14 @@ void AgentPanel::attachItems(const QJsonArray &items)
     const QStringList skipped =
         agentkate::buildItemAttachments(items, m_attachments, wholeFile);
     m_attachSkipped += int(skipped.size());
-    for (const QString &reason : skipped) {
-        showAttachNotice(i18n("Couldn't attach %1", reason));
+    // One banner listing every rejection, the way attachPaths does it. The
+    // per-reason loop this replaces overwrote itself, so dropping five files
+    // reported only the last one (audit F50).
+    if (!skipped.isEmpty()) {
+        showAttachNotice(skipped.size() == 1
+                             ? i18n("Couldn't attach %1", skipped.first())
+                             : i18n("Couldn't attach some files:\n• %1",
+                                    skipped.join(QStringLiteral("\n• "))));
     }
     rebuildAttachChips();
     if (!wholeFile.isEmpty()) {
@@ -4389,9 +4556,24 @@ void AgentPanel::onInterruptClicked()
         return;
     }
     addNote(QStringLiteral("&#9209; interrupting…"), QStringLiteral("sys"));
+    // An error-reporting reply callback, not nullptr (audit F50): a failed
+    // interrupt used to leave the feed reading "interrupting…" forever while
+    // the turn kept running — and kept billing — with nothing to say otherwise.
+    // Success needs no note: the core answers in-band with the
+    // _lifecycle/turn_aborted event the feed already renders.
     m_core->call(QStringLiteral("agent.interrupt"),
                  QJsonObject{{QStringLiteral("threadId"), m_threadId}},
-                 nullptr, this);
+                 [this](const QJsonObject &, const QJsonObject &error) {
+                     if (error.isEmpty()) {
+                         return;
+                     }
+                     addNote(i18n("could not interrupt — the turn is still running: %1",
+                                  error.value(QStringLiteral("message"))
+                                      .toString()
+                                      .toHtmlEscaped()),
+                             QStringLiteral("err"));
+                 },
+                 this);
 }
 
 void AgentPanel::onChangesClicked()
@@ -4411,8 +4593,21 @@ void AgentPanel::onChangesClicked()
                      }
                      const QString diff = result.value(QStringLiteral("diff")).toString();
                      if (diff.trimmed().isEmpty()) {
+                         // HONEST LABELLING (audit F41): an empty diff is not
+                         // evidence that the agent changed nothing. The old
+                         // wording ("has not changed anything yet") asserted
+                         // exactly that, and it was FALSE for the common case
+                         // of an agent that only created new files — the core's
+                         // diff is `git diff HEAD`, tracked files only. The
+                         // core is gaining untracked-file support; this
+                         // sentence stays true either way, because a file
+                         // written outside the project or into a git-ignored
+                         // path is invisible to any diff we can compute.
                          emit statusMessage(
-                             QStringLiteral("Agent %1 has not changed anything yet").arg(tid));
+                             i18n("Nothing to show for %1 — its diff came back empty. "
+                                  "Files written outside the project, or into paths "
+                                  "git ignores, never appear here.",
+                                  tid));
                          return;
                      }
                      emit openDiff(tid + QStringLiteral(" — changes.diff"), diff);
@@ -4435,8 +4630,10 @@ void AgentPanel::onPromoteClicked()
         return;
     }
     m_promoting = true;
+    // Not "its own sandbox" (audit F30) — a worktree separates the agent's
+    // changes from yours, it does not confine the process.
     addNote(QStringLiteral("moving to a private copy — the agent will restart in "
-                           "its own sandbox…"),
+                           "its own git worktree…"),
             QStringLiteral("sys"));
     m_core->call(QStringLiteral("agent.promote"),
                  QJsonObject{{QStringLiteral("threadId"), m_threadId}},
@@ -4634,20 +4831,83 @@ void AgentPanel::showNextPermission()
                          .arg(plan.toHtmlEscaped().replace(QLatin1Char('\n'),
                                                            QLatin1String("<br>"))));
         m_permLabel->setText(m_permBaseHtml);
+        // The plan is already shown in full (clipped only at 1200 chars, and
+        // it is the agent's own prose, not an argument list) — no second view.
+        m_permDetails->setVisible(false);
         m_permBar->setVisible(true);
         startPermCountdown(req);
         return;
     }
-    QString summary = agentkate::permSummary(tool, req.value(QStringLiteral("input")).toObject());
-    if (summary.length() > 240) {
-        summary = summary.left(240) + QChar(0x2026);
-    }
+    const QJsonObject input = req.value(QStringLiteral("input")).toObject();
+    // SECURITY (audit F28): clipped to the bar's budget, and for Bash from the
+    // MIDDLE — the tail of a shell command is where a payload hides and the
+    // truncation point is attacker-controllable. Whatever the clip drops is one
+    // click away in Details… (the raw input is already here in the request).
+    const QString summary = agentkate::permPromptSummary(tool, input, kPermSummaryBudget);
     m_permBaseHtml =
         QStringLiteral("&#128274;&nbsp; Allow the agent to use <b>%1</b>?<br><tt>%2</tt>")
             .arg(tool.toHtmlEscaped(), summary.toHtmlEscaped());
+    // Say whose ellipsis that is. Unmarked, the "…" reads as part of the
+    // command; the human has to know that text was withheld from the line they
+    // are about to approve, and where the rest is (audit F28).
+    if (summary != agentkate::permSummary(tool, input)) {
+        m_permBaseHtml += QStringLiteral("<br><i>")
+            + i18n("shortened to fit — press Details… to read the whole request")
+            + QStringLiteral("</i>");
+    }
     m_permLabel->setText(m_permBaseHtml);
+    m_permDetails->setVisible(!input.isEmpty());
     m_permBar->setVisible(true);
     startPermCountdown(req);
+}
+
+// showPermissionDetails opens the pending request's COMPLETE input — the text
+// the one-line bar had to clip (audit F28). Everything here is agent-authored
+// and possibly hostile, so it is rendered by a read-only QPlainTextEdit: plain
+// text by construction, no HTML, no markdown, no image loads, nothing that
+// could resolve a local path the way a rich document would (audit F15/F21).
+void AgentPanel::showPermissionDetails()
+{
+    if (m_permQueue.isEmpty()) {
+        return;
+    }
+    const QJsonObject req = m_permQueue.constFirst();
+    const QString tool = req.value(QStringLiteral("toolName")).toString();
+    const QJsonObject input = req.value(QStringLiteral("input")).toObject();
+
+    QDialog dlg(this);
+    dlg.setWindowTitle(i18nc("@title:window", "Permission request — %1", tool));
+    auto *layout = new QVBoxLayout(&dlg);
+    auto *intro = new QLabel(
+        i18n("The complete input the agent asked to run. Read it before you approve."),
+        &dlg);
+    intro->setTextFormat(Qt::PlainText);
+    intro->setWordWrap(true);
+    layout->addWidget(intro);
+
+    auto *body = new QPlainTextEdit(&dlg);
+    body->setReadOnly(true);
+    body->setLineWrapMode(QPlainTextEdit::WidgetWidth);
+    QFont mono = body->font();
+    mono.setFamily(QStringLiteral("monospace"));
+    body->setFont(mono);
+    // A Bash command reads as the command, not as a JSON object with the
+    // command buried in it; every other tool gets its whole argument set.
+    const QString command = input.value(QStringLiteral("command")).toString();
+    body->setPlainText(
+        tool == QLatin1String("Bash") && !command.isEmpty()
+            ? command
+            : QString::fromUtf8(QJsonDocument(input).toJson(QJsonDocument::Indented)));
+    layout->addWidget(body, 1);
+
+    // Close only. The decision stays on the bar: a dialog that could approve
+    // would put the risky action behind a default button (audit F31's class).
+    auto *bb = new QDialogButtonBox(QDialogButtonBox::Close, &dlg);
+    connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    connect(bb, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    layout->addWidget(bb);
+    dlg.resize(720, 420);
+    dlg.exec();
 }
 
 void AgentPanel::startPermCountdown(const QJsonObject &req)
@@ -5684,7 +5944,13 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
                     if (full.size() > kToolResultStoreCap) {
                         full.truncate(kToolResultStoreCap);
                     }
-                    m_model->setToolResult(key, shown, full, truncated);
+                    // Did the tool FAIL? Both engines say so on the block:
+                    // claude natively, kimi's translator on a failed tool call
+                    // (core/internal/kimi/translate.go). Never read before, so
+                    // a failure rendered as a ✓ (audit F40).
+                    const bool toolFailed =
+                        b.value(QStringLiteral("is_error")).toBool();
+                    m_model->setToolResult(key, shown, full, truncated, toolFailed);
                     // Image blocks in the result (screenshots and the like)
                     // become clickable thumbnail chips on the tool row. The
                     // bytes go to the cache dir — the transcript model holds
@@ -5961,8 +6227,11 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
         refresh();
 
     } else if (type == QLatin1String("_stderr")) {
+        // The CLI's own error channel, rendered in the error colour rather than
+        // dim (audit F50): this is where a failed prompt, a bad flag or a
+        // provider refusal lands, and dim reads as chatter to skip past.
         addNote(ev.value(QStringLiteral("text")).toString().toHtmlEscaped(),
-                QStringLiteral("dim"));
+                QStringLiteral("err"));
 
     } else if (type == QLatin1String("_lifecycle")) {
         const QString phase = ev.value(QStringLiteral("phase")).toString();
@@ -5973,6 +6242,8 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             m_workdir = ev.value(QStringLiteral("workdir")).toString();
             emit worktreePathChanged(worktreePath());
             m_errored = false; // a clean start clears any prior failure state
+            // The opening prompt reached the agent — it is no longer unsent.
+            m_pendingOpening = QueuedMsg{};
             addNote(detail, QStringLiteral("sys"));
             refresh();
         } else if (phase == QLatin1String("resumed")) {
@@ -6050,11 +6321,11 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
                 // published under it here.
                 updateJobsBar();
             }
-            // A follow-up queued during the failed turn can never drain now —
-            // hand the text back to the composer instead of stranding it.
-            if (!m_sendQueue.isEmpty()) {
-                restoreQueuedToComposer();
-            }
+            // Nothing queued here can ever drain now — and if the fresh start
+            // is what failed, the opening prompt never reached an agent either
+            // (audit F37). Hand every unsent message back to the composer
+            // instead of stranding it in the feed.
+            restoreUnsentToComposer();
             refresh();
         } else if (phase == QLatin1String("exited")
                    || phase == QLatin1String("interrupted")) {
@@ -6085,15 +6356,12 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             // and no authoritative `assistant` will arrive, so settle the
             // partial rows here rather than leaving them raw and claimable.
             resetStreamState();
-            // The session stopped before the queued follow-ups could fire.
-            // Don't discard the human's text — put it back in the composer so
-            // it can be re-sent (into a resumed session) with one keystroke.
-            if (!m_sendQueue.isEmpty()) {
-                restoreQueuedToComposer();
-                addNote(QStringLiteral("agent stopped — your queued message is "
-                                       "back in the composer"),
-                        QStringLiteral("dim"));
-            }
+            // The session stopped before the queued follow-ups could fire (and,
+            // if it died before it ever started, before the opening prompt did
+            // either). Don't discard the human's text — put it back in the
+            // composer so it can be re-sent (into a resumed session) with one
+            // keystroke.
+            restoreUnsentToComposer();
             // The process is gone but the Claude Code session persists — keep
             // the thread id and mark the agent resumable.
             if (!m_threadId.isEmpty()) {

