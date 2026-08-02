@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
+	"sort"
 	"sync"
 	"syscall"
 	"time"
@@ -105,6 +106,31 @@ func NewServer(socketPath string, log *slog.Logger) *Server {
 // Handle registers a handler for a method name. Call before Serve.
 func (s *Server) Handle(method string, h Handler) {
 	s.handlers[method] = h
+}
+
+// Methods lists every registered method name, sorted.
+//
+// SECURITY (audit F34/F36 pass 3): this exists so the authorisation inventory
+// can be enumerated from the REGISTRY rather than from a hand-maintained list
+// of names in a test file. A hand-maintained list only ever describes the
+// handlers somebody remembered to add to it, so a handler registered without an
+// authorisation decision is invisible to it — which is exactly how search.code,
+// session.browse, session.listThreads, cleanup.restore,
+// agent.setCompactStrategy and app.shutdown stayed ungated through a round that
+// was auditing precisely that. With this, cmd/akcore's inventory test can
+// require that EVERY registered method is either explicitly reviewed as
+// agent-reachable or refuses a non-UI caller, so adding a handler without a
+// decision fails the build.
+//
+// Safe to call after Serve: the map is written only by Handle, which the
+// contract above requires to run before Serve.
+func (s *Server) Methods() []string {
+	out := make([]string, 0, len(s.handlers))
+	for m := range s.handlers {
+		out = append(out, m)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // OnBridgeActivity registers the observer for completed agent-bridge requests.
@@ -520,11 +546,18 @@ func (s *Server) Notify(method string, params any) {
 // NotifyUI broadcasts a notification to the connected UI clients only —
 // connections that identified themselves as the UI. An agent bridge never sees
 // it, so a feed about one agent's activity cannot reach another agent.
-func (s *Server) NotifyUI(method string, params any) {
+//
+// It returns HOW MANY UI connections the frame was queued to. Most callers
+// ignore it; the ones that must not are the ones that then BLOCK waiting for
+// the human to answer what they just sent (askHumanPermission's 8-minute
+// window). A zero return is the honest answer "there is nobody to ask", and
+// those callers refuse on the spot instead of parking a connection on a
+// question no window will ever display (audit F35 pass 3).
+func (s *Server) NotifyUI(method string, params any) int {
 	b, err := json.Marshal(params)
 	if err != nil {
 		s.log.Warn("notify-ui marshal failed", "method", method, "err", err)
-		return
+		return 0
 	}
 	f := Frame{JSONRPC: "2.0", Method: method, Params: json.RawMessage(b)}
 
@@ -540,6 +573,23 @@ func (s *Server) NotifyUI(method string, params any) {
 	for _, c := range conns {
 		c.enqueue(&f)
 	}
+	return len(conns)
+}
+
+// HasUI reports whether any connection currently holds the UI role. It exists
+// for MESSAGE SHAPING only — "no Agent Kate window is connected" reads very
+// differently from "the human declined" — and is never the gate itself: the
+// decision is taken from NotifyUI's delivery count, which cannot race a UI
+// disconnecting between the check and the send.
+func (s *Server) HasUI() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for c := range s.conns {
+		if c.getRole() == "ui" {
+			return true
+		}
+	}
+	return false
 }
 
 // NotifyBridge sends a notification to the MCP bridge connections bound to one
@@ -816,6 +866,19 @@ func (t ConnToken) Live() bool {
 //
 // A disconnect clears the role with the connection, so the real UI reconnecting
 // (or a respawned core) always finds the slot free.
+//
+// RECLAIM (audit F13 pass 3). The blast radius of losing this race grew from a
+// handful of Cowork features to every requireUIWindow handler, so "can the slot
+// get stuck?" now matters much more than it did. It cannot get stuck on a dead
+// holder: serveConn's teardown deletes the connection from s.conns before
+// anything else can scan it, and the scan below only ever sees LIVE connections
+// — a holder whose process died, whose socket was closed, or whose core was
+// respawned is gone from the map by the time the next claimant looks. What the
+// refusal genuinely cannot do is dispossess a live same-uid squatter that got
+// here first; that is the self-asserted-role gap documented in
+// docs/security-model.md §2, and the honest handling of it is on the client
+// side — the UI must SAY it was refused rather than come up looking connected
+// (ui/src/ipc/CoreClient.cpp, onSocketConnected).
 func (s *Server) MarkUI(ctx context.Context) bool {
 	ref := ConnFromContext(ctx)
 	if ref == nil {

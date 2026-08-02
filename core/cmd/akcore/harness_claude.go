@@ -69,6 +69,10 @@ func (h *claudeHarness) Capabilities() harness.Capabilities {
 		MintsSessionID:    true,
 		// subagents/agent-<id>.jsonl beside the session transcript.
 		SubagentTranscripts: true,
+		// The reload_skills control request, sent on the live session's stdin
+		// (ReloadSkills below). Keep in lockstep with
+		// ui/src/state/HarnessTraits.cpp claudeDefaults().
+		SkillReload: true,
 		// Both verified against claude 2.1.220 in print mode:
 		// --append-system-prompt reaches the model (a probe persona changed the
 		// reply), and --agents registers custom subagents whose tools AND model

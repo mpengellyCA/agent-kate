@@ -116,6 +116,11 @@ def main():
                                "method": method, "params": params}) + "\n").encode())
         return next_id[0]
 
+    # Identify as the primary UI before anything else: agent.start, agent.stop
+    # and permission.respond are UI-only handlers, so an unidentified connection
+    # is refused ("only be performed from the Agent Kate window").
+    call("handshake", {})
+
     # Writing OUTSIDE the workspace is gated by kimi's permission rules, so the
     # command routes through the ACP permission bridge.
     perm_file = os.path.join(tempfile.gettempdir(), f"ak-perm-kimi-{os.getpid()}.txt")

@@ -105,6 +105,12 @@ func compactTestCore(t *testing.T, fake *compactFake, sessions *session.Store) *
 		t.Fatalf("dial: %v", err)
 	}
 	t.Cleanup(func() { _ = client.Close() })
+	// Speak as the UI. These suites drive the compaction handlers the way the
+	// human's window does, and agent.wait now binds its caller (audit F35) —
+	// the UI is the one caller that need not name a thread it acts for.
+	if err := client.Call("handshake", map[string]any{}, nil); err != nil {
+		t.Fatalf("handshake: %v", err)
+	}
 	return client
 }
 

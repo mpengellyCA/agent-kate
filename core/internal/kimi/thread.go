@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode"
 
 	"agentkate/internal/agent"
 	"agentkate/internal/fsperm"
@@ -1889,7 +1890,7 @@ func (s *Supervisor) onAgentRequest(t *Thread, f acpFrame) {
 	// user's ANSWERS as the options. Answering that by kind would pick one at
 	// random — it needs the human's actual choice.
 	if isQuestionRequest(p.Options) {
-		s.answerQuestion(t, f, input, p.Options)
+		s.answerQuestion(t, f, name, input, p.Options)
 		return
 	}
 
@@ -1898,31 +1899,210 @@ func (s *Supervisor) onAgentRequest(t *Thread, f acpFrame) {
 		allow, _ = s.perm(t.ID, name, input)
 	}
 
-	// Map the boolean decision onto kimi's option set by KIND — option ids are
-	// kimi-specific ("approve_once", "reject"), the kinds are spec-stable.
-	want, fallback := "reject_once", "reject_always"
-	if allow {
-		want, fallback = "allow_once", "allow_always"
-	}
-	optionID := ""
-	for _, o := range p.Options {
-		if o.Kind == want {
-			optionID = o.OptionID
-			break
-		}
-		if o.Kind == fallback && optionID == "" {
-			optionID = o.OptionID
-		}
-	}
+	optionID := selectPermissionOption(allow, p.Options)
 	if optionID == "" {
+		// Fail closed, and say so: kimi answers a cancelled outcome with
+		// "Tool <name> was not run because the approval request was
+		// cancelled", so the turn continues — but from the panel the human's
+		// click would otherwise have done nothing, with no explanation.
 		t.client.respond(f.ID, map[string]any{
 			"outcome": map[string]any{"outcome": "cancelled"},
 		})
+		s.emitLifecycle(t, "notice", scopeRefusalNote(allow, name))
 		return
 	}
 	t.client.respond(f.ID, map[string]any{
 		"outcome": map[string]any{"outcome": "selected", "optionId": optionID},
 	})
+}
+
+// selectPermissionOption maps the human's one-off decision onto kimi's option
+// set by KIND — option ids are kimi-specific ("approve_once", "reject"), the
+// kinds are spec-stable. It returns "" when the once-scoped kind is missing,
+// which the caller answers as `cancelled`.
+//
+// SECURITY (audit F27): the match is scope-EXACT, never a fallback across
+// scope. The UI offers exactly one-off Approve/Deny, so an Approve answered
+// with `allow_always` would install a standing grant the human was never
+// offered and no surface mentions — kimi maps its approve_always id to
+// `{decision: approved, scope: session}`, i.e. a session-runtime allow rule
+// for every later call matching the same matcher. `reject_always` is the
+// mirror: one Deny permanently silencing a prompt class. Refusing the turn is
+// the fail-closed answer; widening the human's authority is not.
+//
+// As of kimi 0.30.0 this is defence in depth, not a live escape: every prompt
+// the CLI mints carries an allow_once. Its CANONICAL_OPTIONS are
+// approve_once/allow_once, approve_always/allow_always, reject/reject_once,
+// and the plan_review branch is one allow_once per plan option (or a single
+// plan_approve) plus the reject_once exits Revise / Reject and Exit — no
+// reject_always kind exists anywhere in the shipped bundle. This guards the
+// day that changes, which we would otherwise never notice.
+func selectPermissionOption(allow bool, opts []permOption) string {
+	want := "reject_once"
+	if allow {
+		want = "allow_once"
+	}
+	for _, o := range opts {
+		if o.Kind == want {
+			return o.OptionID
+		}
+	}
+	return ""
+}
+
+// scopeRefusalNote explains a cancelled permission in the panel feed: the
+// human clicked, nothing ran, and the reason is a property of the CLI's option
+// set rather than anything they did.
+func scopeRefusalNote(allow bool, tool string) string {
+	if allow {
+		return "permission cancelled: this agent offered no one-off approval for " +
+			"the tool it named " + quoteUntrusted(tool) + " — only a standing " +
+			"always-grant, which Agent Kate never takes on your behalf. " +
+			"Nothing was run."
+	}
+	return "permission cancelled: this agent offered no one-off refusal for " +
+		"the tool it named " + quoteUntrusted(tool) + " — only a standing " +
+		"never-rule, which Agent Kate never records on your behalf. " +
+		"Nothing was run."
+}
+
+// maxUntrustedNoteRunes bounds a model-supplied fragment inside a feed row: a
+// tool "name" is a CLI/model-supplied title and has no length contract.
+const maxUntrustedNoteRunes = 80
+
+// zeroWidthJoiner glues emoji into one cluster (U+200D).
+const zeroWidthJoiner = '‍'
+
+// openQuote / closeQuote are the delimiters Agent Kate puts around a fragment
+// it did not write. Named, because quoteUntrusted's whole guarantee is that
+// neither of these two runes can occur inside the span.
+const (
+	openQuote  = '“'
+	closeQuote = '”'
+)
+
+// quoteLookalikes are the runes that RENDER as one of the delimiters above
+// without being it. They cannot forge the span — quoteUntrusted folds the
+// delimiters themselves — but a reader deciding where Agent Kate's voice stops
+// and the agent's begins is reading pixels, not code points, so a fragment
+// containing U+275E ❞ ends the quotation as far as the human is concerned.
+// Folded to a plain '"', which reads as the agent's own punctuation.
+//
+// The list is best-effort and says so (see quoteUntrusted): it is the
+// double-quote confusables of U+201C/U+201D, not a proof. What is NOT
+// best-effort is the delimiter fold and the printable allowlist below.
+var quoteLookalikes = map[rune]bool{
+	'“': true, '”': true, // “ ” — the delimiters themselves
+	'„': true, '‟': true, // „ ‟
+	'″': true, '‶': true, // ″ ‶
+	'〃': true,                       // 〃
+	'〝': true, '〞': true, '〟': true, // 〝 〞 〟
+	'＂': true,            // ＂
+	'❝': true, '❞': true, // ❝ ❞
+	'ʺ': true, '˝': true, 'ˮ': true, // ʺ ˝ ˮ
+	'˶': true, '״': true, '⹂': true, // ˶ ״ ⹂
+	'\U0001F676': true, '\U0001F677': true, '\U0001F678': true, // 🙶 🙷 🙸
+}
+
+// quoteUntrusted wraps CLI/model-supplied text for display inside one of Agent
+// Kate's own notes.
+//
+// SECURITY (audit F27, tightened pass 4): these notes render in the panel's
+// system voice — the dim `sys` row Agent Kate uses to speak for itself. The
+// fragment reaches that row as escaped plain text (ui/src/AgentPanel.cpp calls
+// toHtmlEscaped() on the _lifecycle detail), so this is not injection; it is
+// impersonation. Undelimited, a model-chosen tool "name" reads as the app's own
+// words, and the surrounding sentence attributes it ("the tool it named") so
+// the reader knows whose text it is.
+//
+// Two guarantees, and they are not the same strength — the earlier version of
+// this comment claimed one blanket "cannot be forged", which was true of the
+// delimiters and not of what the human sees:
+//
+//   - GUARANTEED: the outer pair is ours. Both delimiter runes are folded
+//     inside the fragment, so the span cannot be closed from within it, and no
+//     text after a fake close can be read as Agent Kate speaking again.
+//   - BEST-EFFORT: the span LOOKS like one span. Visual confusables of the
+//     delimiters (quoteLookalikes) are folded too, but Unicode confusables are
+//     an open set and a font can always be found that blurs another pair.
+//
+// Everything that is not printable is folded to a space, as an allowlist rather
+// than a blocklist: unicode.IsGraphic admits only L/M/N/P/S/Zs, which excludes
+// control characters (Cc — a newline in a "name" would manufacture a second
+// line in a one-line row), FORMAT characters (Cf — bidi overrides such as
+// U+202E, which reorder the surrounding sentence on screen; zero-width spaces
+// and joiners, which hide word boundaries), line and paragraph separators (Zl,
+// Zp), surrogates and private-use runes. A blocklist here would have to be
+// re-checked against every Unicode release; the allowlist is closed by
+// construction and only ever gets safer.
+func quoteUntrusted(s string) string {
+	s = strings.Map(func(r rune) rune {
+		switch {
+		case quoteLookalikes[r]:
+			return '"'
+		case !unicode.IsGraphic(r):
+			return ' '
+		}
+		return r
+	}, s)
+	return string(openQuote) + clipRunes(s, maxUntrustedNoteRunes) + string(closeQuote)
+}
+
+// clipRunes truncates to at most max runes without splitting a grapheme
+// cluster. A naive rune cut strands a combining mark on its own, or halves a
+// ZWJ emoji sequence or a two-codepoint flag, which renders as garbage in the
+// feed row.
+//
+// Its only caller is quoteUntrusted, which since pass 4 folds every non-graphic
+// rune — the ZWJ and the variation selectors included — so the joiner arms
+// below can no longer fire on that path. They are kept, and tested directly:
+// this is a general-purpose clip, and the next caller may not pre-fold.
+func clipRunes(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	cut := max
+	// Never cut where the first DROPPED rune continues the one kept before it.
+	for cut > 0 && continuesCluster(r[cut]) {
+		cut--
+	}
+	// Never leave a dangling joiner, or half a regional-indicator pair.
+	for cut > 0 && (r[cut-1] == zeroWidthJoiner || (isRegionalIndicator(r[cut-1]) && trailingRegionals(r[:cut])%2 == 1)) {
+		cut--
+	}
+	return string(r[:cut]) + "…"
+}
+
+// continuesCluster reports whether r attaches to the character before it:
+// combining marks, zero-width joiner, variation selectors, emoji skin-tone
+// modifiers and tag characters.
+func continuesCluster(r rune) bool {
+	switch {
+	case unicode.In(r, unicode.Mn, unicode.Me, unicode.Mc):
+		return true
+	case r == zeroWidthJoiner:
+		return true
+	case r >= 0xfe00 && r <= 0xfe0f, r >= 0xe0100 && r <= 0xe01ef:
+		return true
+	case r >= 0x1f3fb && r <= 0x1f3ff:
+		return true
+	case r >= 0xe0020 && r <= 0xe007f:
+		return true
+	}
+	return false
+}
+
+func isRegionalIndicator(r rune) bool { return r >= 0x1f1e6 && r <= 0x1f1ff }
+
+// trailingRegionals counts the regional indicators ending r — a flag is a pair
+// of them, so an odd run means the cut lands inside one.
+func trailingRegionals(r []rune) int {
+	n := 0
+	for i := len(r) - 1; i >= 0 && isRegionalIndicator(r[i]); i-- {
+		n++
+	}
+	return n
 }
 
 // permOption is one choice offered by session/request_permission. For a real
@@ -1968,10 +2148,22 @@ func isQuestionRequest(opts []permOption) bool {
 // degrades multi-select before we see it — so nothing richer can be offered.
 // The CLI's own skip option is kept in the list: dismissing is a first-class
 // answer, and it is the only way to decline without inventing one.
-func (s *Supervisor) answerQuestion(t *Thread, f acpFrame, rawInput json.RawMessage, opts []permOption) {
+//
+// SECURITY (audit F27): always-scoped options are dropped, so no answer on
+// this path can install a standing rule. The question card renders a plain
+// label with no hint that picking it decides every future prompt of the class,
+// and the label is model-chosen, so a "Cancel" wired to `reject_always` would
+// buy a standing refusal with a click that reads as declining once. The filter
+// is a denylist of the two always kinds rather than an allowlist of the once
+// kinds: a future CLI that renames or omits the kind on its answers must still
+// be able to ask a question.
+func (s *Supervisor) answerQuestion(t *Thread, f acpFrame, name string, rawInput json.RawMessage, opts []permOption) {
 	labels := make([]any, 0, len(opts))
 	byLabel := make(map[string]string, len(opts))
 	for _, o := range opts {
+		if isAlwaysScoped(o.Kind) {
+			continue
+		}
 		label := o.Name
 		if label == "" {
 			label = o.OptionID
@@ -1980,6 +2172,15 @@ func (s *Supervisor) answerQuestion(t *Thread, f acpFrame, rawInput json.RawMess
 		if _, dup := byLabel[label]; !dup {
 			byLabel[label] = o.OptionID
 		}
+	}
+	if len(labels) == 0 {
+		// Every answer was a standing decision: there is nothing we can put to
+		// the human that they are able to answer once, so do not prompt at all.
+		t.client.respond(f.ID, map[string]any{
+			"outcome": map[string]any{"outcome": "cancelled"},
+		})
+		s.emitLifecycle(t, "notice", scopeRefusalNote(false, name))
+		return
 	}
 	question := questionText(rawInput)
 	input, _ := json.Marshal(map[string]any{
@@ -2004,9 +2205,13 @@ func (s *Supervisor) answerQuestion(t *Thread, f acpFrame, rawInput json.RawMess
 		optionID = skipOptionID(opts)
 	}
 	if optionID == "" {
+		// No once-scoped way to decline: cancelling is the fail-closed answer,
+		// and the human is told why their dismissal produced nothing (the
+		// permission path above does the same).
 		t.client.respond(f.ID, map[string]any{
 			"outcome": map[string]any{"outcome": "cancelled"},
 		})
+		s.emitLifecycle(t, "notice", scopeRefusalNote(false, name))
 		return
 	}
 	t.client.respond(f.ID, map[string]any{
@@ -2078,14 +2283,33 @@ func answeredLabel(updated json.RawMessage, question string) string {
 }
 
 // skipOptionID returns the option that declines to answer — kimi's q<n>_skip,
-// identified by its reject kind so a renamed id still resolves.
+// identified by its reject kind so a renamed id still resolves. It returns ""
+// when no once-scoped refusal is on offer, which the caller answers as
+// `cancelled`.
+//
+// SECURITY (audit F27): the match is scope-EXACT, the mirror of
+// selectPermissionOption. This is the option Agent Kate picks on the human's
+// behalf when they dismiss a question or answer something no option matches —
+// a `strings.HasPrefix(o.Kind, "reject")` test resolves `reject_always` just
+// as happily, so a dismissal, the most passive act in the UI, would record a
+// standing refusal for the whole prompt class that the human was never offered
+// and no surface mentions. Declining once is what they asked for; declining
+// forever is not.
 func skipOptionID(opts []permOption) string {
 	for _, o := range opts {
-		if strings.HasPrefix(o.Kind, "reject") {
+		if o.Kind == "reject_once" {
 			return o.OptionID
 		}
 	}
 	return ""
+}
+
+// isAlwaysScoped reports whether an option kind records a STANDING decision —
+// kimi maps both onto a session-runtime rule that answers every later matching
+// prompt without asking. Exact kinds, never a prefix: "always" is the whole
+// property being tested for (audit F27).
+func isAlwaysScoped(kind string) bool {
+	return kind == "allow_always" || kind == "reject_always"
 }
 
 // maxStderrTailLines bounds the pre-handshake stderr buffer kept for a failure

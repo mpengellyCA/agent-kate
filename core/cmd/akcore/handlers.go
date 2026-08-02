@@ -96,6 +96,14 @@ type agentSendParams struct {
 	// bridge's send_agent). Empty for UI-driven sends. When set and the target
 	// is outside the caller's own subtree, the human must approve once.
 	FromThreadID string `json:"fromThreadId,omitempty"`
+	// AwaitReply says this send is the first half of send_agent(wait:true) —
+	// the caller will block on agent.wait for the target's reply as soon as
+	// this returns. It exists so ONE human decision covers the whole operation
+	// (audit F35 pass 3): without it the composite asked twice, and the second
+	// ask came after the message had already been delivered. Advisory only; it
+	// widens nothing on its own, since the wait it pre-authorises is a wait the
+	// caller could ask for separately anyway.
+	AwaitReply bool `json:"awaitReply,omitempty"`
 }
 
 type agentStopParams struct {
@@ -240,6 +248,46 @@ func recordAttachments(d handlerDeps, threadID, text string, atts []agent.Attach
 	}
 }
 
+// codeUIOnly is returned when an RPC that only the human's own window may drive
+// is called by anything else.
+//
+// SECURITY (audit F34/F36 pass 3): these refusals used to be reported as
+// codeCoworkDenied (-32010), which is the Cowork consent code. Twenty-six
+// handlers with nothing to do with the desktop — the git mutations, the
+// destructive removals, the transcript reads, the installers — were therefore
+// telling clients "Cowork denied this". The error code is part of the wire
+// contract, and a client that one day branches on it (today ui/src only knows
+// -32000) would branch on a lie. The human-readable text is UNCHANGED, so
+// nothing that matches on the message moves.
+//
+// The Cowork family owns the codes immediately below it and they must stay
+// distinct — codeCoworkDenied (-32010, a consent refusal) and codeCoworkBusy
+// (-32011, transient contention on the shared cursor, retry the same call), both
+// in cowork.go. This code is neither: it is a PERMANENT refusal of an RPC that
+// only the human's window may drive, and a client must not conflate it with a
+// retryable one. Keep new codes in this space unique across cmd/akcore.
+const codeUIOnly = -32012
+
+// uiOnlyRefusal is the one sentence every UI-only gate answers with. Kept as a
+// constant because tests, and the UI, match on it.
+const uiOnlyRefusal = "this action may only be performed from the Agent Kate window"
+
+// requireUIWindow enforces that the caller is the human's own window.
+//
+// It is the same check as Cowork's requireUI (cowork.go) — RequireUI on the
+// connection identity, failing closed for a connection that never identified as
+// anything — under the error code that actually describes it. New UI-only
+// handlers outside the Cowork family should use THIS one; see the inventory
+// test in handlers_inventory_test.go, which fails the build for any registered
+// method that neither carries a gate nor appears in the reviewed
+// agent-reachable set.
+func requireUIWindow(srv *ipc.Server, ctx context.Context) error {
+	if srv.RequireUI(ctx) {
+		return nil
+	}
+	return ipc.Errorf(codeUIOnly, uiOnlyRefusal)
+}
+
 // registerHandlers wires the JSON-RPC methods the core serves.
 func registerHandlers(d handlerDeps) {
 	d.srv.Handle("handshake", func(ctx context.Context, _ json.RawMessage) (any, error) {
@@ -367,7 +415,7 @@ func registerHandlers(d handlerDeps) {
 	// redirect the injected provider token to an endpoint of the caller's
 	// choosing. UI-only, therefore, and not a subset of that: the whole handler.
 	d.srv.Handle("agent.start", func(ctx context.Context, raw json.RawMessage) (any, error) {
-		if err := requireUI(d, ctx); err != nil {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
 			return nil, err
 		}
 		var p agentStartParams
@@ -427,7 +475,7 @@ func registerHandlers(d handlerDeps) {
 	// waking a dormant thread would be re-arming authority the human granted to
 	// a thread they believed was finished.
 	d.srv.Handle("agent.resume", func(ctx context.Context, raw json.RawMessage) (any, error) {
-		if err := requireUI(d, ctx); err != nil {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
 			return nil, err
 		}
 		var p struct {
@@ -475,7 +523,18 @@ func registerHandlers(d handlerDeps) {
 	// agent.transcript returns the Claude Code session transcript for a
 	// thread, as the raw JSONL events. The UI replays these to rebuild the
 	// conversation feed when reopening a dormant thread.
-	d.srv.Handle("agent.transcript", func(_ context.Context, raw json.RawMessage) (any, error) {
+	//
+	// SECURITY (audit F34): UI-only, and it is the same rule as the push side.
+	// F6 made the live event channels UI-only; this is the PULL twin — the
+	// whole raw transcript of ANY thread, tool inputs, the human's own
+	// messages and whatever a tool printed into its output included. The UI
+	// always handshakes before it asks, so the check costs it nothing, while a
+	// bridge or any other local process reading another thread's conversation
+	// off the socket now gets a refusal instead of the file.
+	d.srv.Handle("agent.transcript", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ThreadID string `json:"threadId"`
 		}
@@ -532,7 +591,7 @@ func registerHandlers(d handlerDeps) {
 	// chain, which is the same escalation F1 closed on launch_agent. The MCP
 	// bridge never calls this; the New Agent / roster UI does.
 	d.srv.Handle("agent.fork", func(ctx context.Context, raw json.RawMessage) (any, error) {
-		if err := requireUI(d, ctx); err != nil {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
 			return nil, err
 		}
 		var p struct {
@@ -581,7 +640,7 @@ func registerHandlers(d handlerDeps) {
 	// running thread's authority is pointed, and one that touches the human's
 	// checkout. Not something another connection gets to do to a thread.
 	d.srv.Handle("agent.promote", func(ctx context.Context, raw json.RawMessage) (any, error) {
-		if err := requireUI(d, ctx); err != nil {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
 			return nil, err
 		}
 		var p struct {
@@ -608,7 +667,27 @@ func registerHandlers(d handlerDeps) {
 
 	// session.listThreads returns persisted threads (running and dormant),
 	// optionally filtered to one project, so the UI can offer to resume them.
-	d.srv.Handle("session.listThreads", func(_ context.Context, raw json.RawMessage) (any, error) {
+	//
+	// SECURITY (audit F34 pass 3, reason corrected pass 4): UI-only, and the
+	// reason is NOT the roster metadata the first version of this comment
+	// claimed. agent.list already hands a bridge the project path, the worktree
+	// path and branch, the title, the parent linkage and the role, so gating
+	// those here would protect nothing — a comment that names the wrong reason
+	// is the same defect as a label that names the wrong mechanism, and it is
+	// how a control survives the refactor that makes it pointless.
+	//
+	// What this gate actually withholds is the rest of the RECORD, which
+	// agent.list deliberately never projects: the thread's SystemPrompt (its
+	// persona, verbatim), its Env overlay (variable names, and the values of
+	// anything not caught by redaction), its provider routing (base URL, the
+	// env var the API token is read from), its DisallowedTools / AddDirs /
+	// StrictMCPConfig / MaxBudgetUSD restriction set — i.e. the exact map of
+	// what each thread is allowed to do and where its credentials come from —
+	// and its SessionID, which session.attach turns into a live thread.
+	d.srv.Handle("session.listThreads", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			Project string `json:"project"`
 		}
@@ -625,7 +704,18 @@ func registerHandlers(d handlerDeps) {
 	// user can attach any past conversation — even ones Agent Kate did not
 	// start. A harness whose listing fails is skipped, never fatal: the others
 	// still return.
-	d.srv.Handle("session.browse", func(_ context.Context, _ json.RawMessage) (any, error) {
+	//
+	// SECURITY (audit F34 pass 3): UI-only, same class and same reasoning as
+	// session.preview, which F34 gated. It enumerates EVERY CLI session on the
+	// machine — including conversations Agent Kate never started — and hands
+	// back each one's session id, project path and title. The session id is not
+	// merely descriptive: session.attach turns one into a live thread, so the
+	// listing is also the discovery half of a resume. Its only caller is
+	// ui/src/SessionBrowserDialog.cpp.
+	d.srv.Handle("session.browse", func(ctx context.Context, _ json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var found []harness.BrowsableSession
 		for _, h := range d.harnesses.All() {
 			caps := h.Capabilities()
@@ -670,7 +760,7 @@ func registerHandlers(d handlerDeps) {
 	// agent.resume then launches. Gating start while leaving its two-step
 	// equivalent open would be no gate at all.
 	d.srv.Handle("session.attach", func(ctx context.Context, raw json.RawMessage) (any, error) {
-		if err := requireUI(d, ctx); err != nil {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
 			return nil, err
 		}
 		var p struct {
@@ -728,7 +818,14 @@ func registerHandlers(d handlerDeps) {
 	// session.preview streams the last few turns of a discovered session's
 	// transcript so the user can confirm what they are about to resume without
 	// attaching it first. The whole file is never read into the reply.
-	d.srv.Handle("session.preview", func(_ context.Context, raw json.RawMessage) (any, error) {
+	//
+	// SECURITY (audit F34): UI-only, same data class as agent.transcript — and
+	// wider in reach, because it addresses any session the CLI ever wrote on
+	// this machine, not just threads Agent Kate knows about.
+	d.srv.Handle("session.preview", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			SessionID   string `json:"sessionId"`
 			MaxMessages int    `json:"maxMessages"`
@@ -752,7 +849,14 @@ func registerHandlers(d handlerDeps) {
 	// session.forget deletes a discovered session's transcript from disk. It
 	// refuses to act on a session that is attached as an Agent Kate thread —
 	// the user must remove that agent first, so the thread never dangles.
-	d.srv.Handle("session.forget", func(_ context.Context, raw json.RawMessage) (any, error) {
+	//
+	// SECURITY (audit F36): UI-only. Deleting the human's conversation history
+	// off disk is a decision for the human at the Sessions browser, which is
+	// the only thing that calls it.
+	d.srv.Handle("session.forget", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			SessionID string `json:"sessionId"`
 		}
@@ -785,9 +889,17 @@ func registerHandlers(d handlerDeps) {
 			return nil, err
 		}
 		// Agent-to-agent sends outside the caller's own subtree need one human
-		// approval (UI sends carry no FromThreadID and are never gated).
+		// approval (UI sends carry no FromThreadID and are never gated). When
+		// the caller is going to wait for the reply, the SAME decision covers
+		// the wait: the human is shown one prompt describing the exchange, and
+		// it is shown BEFORE delivery, so declining means nothing was sent
+		// rather than "sent, and the reply discarded" (audit F35 pass 3).
+		var alsoGrant []string
+		if p.AwaitReply {
+			alsoGrant = append(alsoGrant, "wait_agent")
+		}
 		if err := d.authorizeAgentTarget(p.FromThreadID, p.ThreadID, "send_agent",
-			map[string]any{"message": p.Text}); err != nil {
+			map[string]any{"message": p.Text}, alsoGrant...); err != nil {
 			return nil, err
 		}
 		d.turns.TurnQueued(p.ThreadID)
@@ -801,7 +913,15 @@ func registerHandlers(d handlerDeps) {
 		return map[string]any{"ok": true}, nil
 	})
 
-	d.srv.Handle("agent.stop", func(_ context.Context, raw json.RawMessage) (any, error) {
+	// SECURITY (audit F36): UI-only, and the odd one out until now — its
+	// terminal sibling agent.stopClose got the full caller binding while the
+	// plain stop, which ends any thread's process from any connection, got
+	// none. There is no agent-facing tool for it (close_agent routes through
+	// stopClose), so the human's window is its only legitimate caller.
+	d.srv.Handle("agent.stop", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p agentStopParams
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
@@ -895,7 +1015,7 @@ func registerHandlers(d handlerDeps) {
 	// and one the launch gate would never see. The change is persisted too, so
 	// it would survive the resume. Only the human's own pickers may move it.
 	d.srv.Handle("agent.setOption", func(ctx context.Context, raw json.RawMessage) (any, error) {
-		if err := requireUI(d, ctx); err != nil {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
 			return nil, err
 		}
 		var p struct {
@@ -940,7 +1060,13 @@ func registerHandlers(d handlerDeps) {
 	// (or, for a hung tool the CLI can't cancel in-band, escalates to signals and
 	// the thread goes dormant). No hot-compaction here — interrupt is meant to be
 	// instantaneous, and spending a summary turn would defeat the purpose.
-	d.srv.Handle("agent.interrupt", func(_ context.Context, raw json.RawMessage) (any, error) {
+	//
+	// SECURITY (audit F36): UI-only — it is the Esc key, and only the human
+	// presses it. No agent-facing tool interrupts another thread's turn.
+	d.srv.Handle("agent.interrupt", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p agentStopParams
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
@@ -951,7 +1077,17 @@ func registerHandlers(d handlerDeps) {
 		return map[string]any{"ok": true}, nil
 	})
 
-	d.srv.Handle("agent.diff", func(_ context.Context, raw json.RawMessage) (any, error) {
+	// SECURITY (audit F34 pass 4): UI-only. This is FILE CONTENT — the whole
+	// working diff of any thread named on the wire, its worktree's source lines
+	// verbatim — and it was left ungated through the round that gated
+	// search.code and session.browse for exactly the same data class. "Read
+	// another agent's file content" was one RPC name away from where F34 found
+	// it. Its only caller is ui/src/AgentPanel.cpp; an agent that wants a diff
+	// of its OWN worktree runs git in its own shell.
+	d.srv.Handle("agent.diff", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p agentDiffParams
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
@@ -971,7 +1107,16 @@ func registerHandlers(d handlerDeps) {
 		}, nil
 	})
 
-	d.srv.Handle("agent.commit", func(_ context.Context, raw json.RawMessage) (any, error) {
+	// SECURITY (audit F36): the git mutations below (commit / openPR / land, and
+	// their git.* twins further down) are UI-only. Each writes to a thread's
+	// worktree or branch — someone else's worktree, from any connection that
+	// names the id — and openPR reaches OUTWARD, pushing a branch and opening a
+	// pull request through `gh`. All of them are review actions the human takes
+	// after reading a diff; nothing agent-facing calls them.
+	d.srv.Handle("agent.commit", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ThreadID string `json:"threadId"`
 			Message  string `json:"message"`
@@ -990,7 +1135,10 @@ func registerHandlers(d handlerDeps) {
 		return map[string]any{"ok": true, "branch": wt.Branch}, nil
 	})
 
-	d.srv.Handle("agent.openPR", func(_ context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("agent.openPR", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ThreadID string `json:"threadId"`
 			Title    string `json:"title"`
@@ -1011,7 +1159,10 @@ func registerHandlers(d handlerDeps) {
 
 	// agent.land merges a thread's branch into the workspace's main branch — a
 	// local integration, separate from agent.openPR which targets GitHub.
-	d.srv.Handle("agent.land", func(_ context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("agent.land", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ThreadID string `json:"threadId"`
 		}
@@ -1034,6 +1185,22 @@ func registerHandlers(d handlerDeps) {
 		return map[string]any{"branch": rec.Worktree.Branch, "into": target}, nil
 	})
 
+	// agent.list is the roster projection the orchestration tools run on, and
+	// the ONE roster read an agent's own bridge may make (list_agents).
+	//
+	// SECURITY (audit F34 pass 4): the projection IS the boundary, so it is
+	// built field by field from the record rather than by marshalling the
+	// record — and it is kept to what the bridge in mcp.go actually consumes.
+	// The gate on session.listThreads is only worth something while this list
+	// stays short: every field added here is a field an agent can read about
+	// every thread on the machine, its human's own private threads included.
+	// Adding one is a decision, not a convenience; TestAgentListProjectionIsNarrow
+	// fails when the set changes so that the decision has to be made on purpose.
+	//
+	// Deliberately absent, and why: `tags` (the human's own filing labels),
+	// `updated`, `backend` and the resolved `harness` capability struct (which
+	// engine each thread runs — agent.capabilities already answers that
+	// per-engine, without saying who is running what).
 	d.srv.Handle("agent.list", func(_ context.Context, raw json.RawMessage) (any, error) {
 		var p struct {
 			Project string `json:"project"`
@@ -1042,32 +1209,23 @@ func registerHandlers(d handlerDeps) {
 		recs := d.sessions.List(p.Project)
 		out := make([]map[string]any, 0, len(recs))
 		for _, r := range recs {
-			row := map[string]any{
+			out = append(out, map[string]any{
 				"threadId": r.ThreadID,
 				"project":  r.Project,
 				"title":    r.Title,
 				"status":   r.Status,
-				"backend":  r.Backend,
 				"branch":   r.Worktree.Branch,
 				"path":     r.Worktree.Path,
 				"isolated": r.Worktree.Isolated,
 				"number":   r.Worktree.Number,
 				"created":  r.Created,
-				"updated":  r.Updated,
 				"lastTurn": r.LastTurnAt,
 				"model":    r.Model,
-				"tags":     r.Tags,
 				// Orchestration linkage: which thread launched this one (empty
 				// for human-launched threads) and its controller/worker role.
 				"parentThreadId": r.ParentThreadID,
 				"role":           r.Role,
-			}
-			// The record's harness capabilities, resolved (a legacy "" backend
-			// reports the default harness), so a consumer never re-derives them.
-			if h, ok := d.harnesses.Get(r.Backend); ok {
-				row["harness"] = h.Capabilities()
-			}
-			out = append(out, row)
+			})
 		}
 		return map[string]any{"threads": out}, nil
 	})
@@ -1075,7 +1233,14 @@ func registerHandlers(d handlerDeps) {
 	// agent.rename persists a user-chosen title for a thread. No worktree or
 	// process is touched — only the session record's Title field is updated, so
 	// the new name survives restart (session.listThreads reads it back).
-	d.srv.Handle("agent.rename", func(_ context.Context, raw json.RawMessage) (any, error) {
+	//
+	// SECURITY (audit F36): UI-only. The title is roster-facing text the human
+	// reads to tell threads apart; a thread that could retitle its neighbours
+	// could disguise them.
+	d.srv.Handle("agent.rename", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ThreadID string `json:"threadId"`
 			Title    string `json:"title"`
@@ -1104,7 +1269,14 @@ func registerHandlers(d handlerDeps) {
 	// agent.tagsChanged so all roster clients converge.
 
 	// agent.setTags replaces a thread's full tag set.
-	d.srv.Handle("agent.setTags", func(_ context.Context, raw json.RawMessage) (any, error) {
+	//
+	// SECURITY (audit F36): UI-only, and so are addTag/removeTag below. The
+	// audit named setTags; gating it alone would be theatre, since addTag and
+	// removeTag reach the same field with the same authority.
+	d.srv.Handle("agent.setTags", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ThreadID string   `json:"threadId"`
 			Tags     []string `json:"tags"`
@@ -1127,7 +1299,10 @@ func registerHandlers(d handlerDeps) {
 	})
 
 	// agent.addTag adds one tag to a thread, returning the full normalized set.
-	d.srv.Handle("agent.addTag", func(_ context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("agent.addTag", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ThreadID string `json:"threadId"`
 			Tag      string `json:"tag"`
@@ -1151,7 +1326,10 @@ func registerHandlers(d handlerDeps) {
 	})
 
 	// agent.removeTag drops one tag (case-insensitive) from a thread.
-	d.srv.Handle("agent.removeTag", func(_ context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("agent.removeTag", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ThreadID string `json:"threadId"`
 			Tag      string `json:"tag"`
@@ -1184,7 +1362,16 @@ func registerHandlers(d handlerDeps) {
 	// agent.suggestTags runs a one-shot Sonnet pass over a project's threads
 	// and returns proposed tag assignments. It is read-only — it applies
 	// nothing; the UI previews the proposals and applies them via setTags.
+	//
+	// SECURITY (audit F34 pass 4): UI-only, for two reasons. It reads every
+	// thread's record to describe it to a model, so the answer is a digest of
+	// the roster an agent is not otherwise given; and it SPENDS the human's
+	// money on an API turn per call, from a caller who was never asked. Its
+	// only caller is ui/src/AgentDock.cpp.
 	d.srv.Handle("agent.suggestTags", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			Project string `json:"project"`
 		}
@@ -1263,7 +1450,18 @@ func registerHandlers(d handlerDeps) {
 
 	// --- compaction --------------------------------------------------------
 	// Reduces prefix re-cache cost on resume. See package compact.
-	d.srv.Handle("agent.setCompactStrategy", func(_ context.Context, raw json.RawMessage) (any, error) {
+	//
+	// SECURITY (audit F36 pass 3): UI-only, like every other per-thread setting
+	// (agent.rename, agent.setTags, agent.setOption). It writes to ANY thread's
+	// record with no caller binding, and the setting it writes is not cosmetic:
+	// a strategy arms a pass that rewrites the thread's stored context at exit
+	// and reseeds its next resume from the result, so an agent could quietly
+	// arrange for another agent's history to be replaced by a summary. Only the
+	// human's window changes how a thread remembers itself.
+	d.srv.Handle("agent.setCompactStrategy", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ThreadID string `json:"threadId"`
 			Strategy string `json:"strategy"`
@@ -1300,7 +1498,17 @@ func registerHandlers(d handlerDeps) {
 
 	// agent.summaryStatus reports whether a thread has a current compacted
 	// summary on disk, used by the UI to drive the recovery dialog on resume.
-	d.srv.Handle("agent.summaryStatus", func(_ context.Context, raw json.RawMessage) (any, error) {
+	//
+	// SECURITY (audit F36 pass 4): UI-only, the read half of the pair whose
+	// write half (agent.setCompactStrategy) is gated. It answers for ANY thread
+	// named on the wire — whether it has a summary, how many turns went into
+	// it, when it was last compacted and when it last spoke — which is a
+	// per-thread activity trace for the human's own private threads. Its only
+	// caller is ui/src/AgentPanel.cpp.
+	d.srv.Handle("agent.summaryStatus", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ThreadID string `json:"threadId"`
 		}
@@ -1341,7 +1549,19 @@ func registerHandlers(d handlerDeps) {
 	// UI action. model accepts: "hot" / "opus_hot" (inline on the live
 	// thread), "opus", "sonnet", "haiku", "local" (case-insensitive), or a
 	// full claude --model id like "claude-sonnet-4-6".
+	//
+	// SECURITY (audit F36 pass 4): UI-only, and it needed this gate MORE than
+	// agent.setCompactStrategy, which got one a round earlier. The strategy
+	// setting ARMS a rewrite of another thread's stored context; this PERFORMS
+	// one, at once, on any thread named on the wire — it injects a turn into a
+	// live session (the hot path), replaces that thread's history with a
+	// summary the next resume is seeded from, and spends the human's money on
+	// an Opus/Sonnet pass doing it. Gating the setting and not the act was
+	// exactly backwards. Its only caller is ui/src/AgentPanel.cpp.
 	d.srv.Handle("agent.compactNow", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ThreadID string `json:"threadId"`
 			Model    string `json:"model"`
@@ -1612,7 +1832,15 @@ func registerHandlers(d handlerDeps) {
 	// --- per-tool approval -------------------------------------------------
 	// permission.request comes from an agent's MCP bridge and blocks until the
 	// human answers via permission.respond (or an 8-minute safety timeout).
-	d.srv.Handle("permission.request", func(_ context.Context, raw json.RawMessage) (any, error) {
+	//
+	// SECURITY (audit F36): the threadId is the caller's own, not a parameter
+	// it may choose. It decides which panel the dialog opens in and which
+	// thread the human believes is asking, so an unbound id let one thread
+	// raise a prompt in another thread's panel — the human approving a Bash
+	// line they think belongs to the agent they are watching — and let it park
+	// requests against a thread that will never answer. RequireBridge is the
+	// same door bridge.identify authenticated; the UI never calls this.
+	d.srv.Handle("permission.request", func(ctx context.Context, raw json.RawMessage) (any, error) {
 		var p struct {
 			ThreadID string          `json:"threadId"`
 			ToolName string          `json:"toolName"`
@@ -1621,8 +1849,20 @@ func registerHandlers(d handlerDeps) {
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
+		if ok, reason := d.srv.RequireBridge(ctx, p.ThreadID); !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams,
+				"this connection may not request permission for thread "+
+					p.ThreadID+": "+reason)
+		}
 		dec, ok := askHumanPermission(d.srv, d.broker, p.ThreadID, p.ToolName, p.Input)
 		if !ok {
+			// Two ways to get here, and they are worth telling apart in the
+			// log: the human let the 8-minute window lapse, or there was no
+			// window to ask at all (audit F35 pass 3). Both deny — the wire
+			// answer is unchanged — but a headless core denying instantly must
+			// not read as a human who said no.
+			d.log.Warn("tool permission denied without a human answer",
+				"thread", p.ThreadID, "tool", p.ToolName, "uiConnected", d.srv.HasUI())
 			return map[string]any{"allow": false}, nil
 		}
 		res := map[string]any{"allow": dec.Allow}
@@ -1638,7 +1878,7 @@ func registerHandlers(d handlerDeps) {
 	// "Allow" on the primary approval flow of both backends. Same rule as its
 	// Cowork siblings (cowork.respondGrant, cowork.setEnabled).
 	d.srv.Handle("permission.respond", func(ctx context.Context, raw json.RawMessage) (any, error) {
-		if err := requireUI(d, ctx); err != nil {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
 			return nil, err
 		}
 		var p struct {
@@ -1663,7 +1903,15 @@ func registerHandlers(d handlerDeps) {
 	// detects the language server it bundles. It blocks for the duration of
 	// the download; the IPC server dispatches each request on its own
 	// goroutine, so other traffic is unaffected.
+	//
+	// SECURITY (audit F36): UI-only, install and uninstall both. Installing an
+	// extension fetches a third-party archive off the network and unpacks
+	// executable content into the user's Agent Kate directory — a choice for
+	// the human at the Extensions dialog, which is its only caller.
 	d.srv.Handle("vsix.install", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ExtensionID string `json:"extensionId"`
 		}
@@ -1705,7 +1953,10 @@ func registerHandlers(d handlerDeps) {
 	// vsix.uninstall deletes an installed extension from the cache. The id is
 	// validated and resolved under the cache dir inside Manager.Remove, so a
 	// crafted id can never delete anything outside it.
-	d.srv.Handle("vsix.uninstall", func(_ context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("vsix.uninstall", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ExtensionID string `json:"extensionId"`
 		}
@@ -1862,7 +2113,17 @@ func registerHandlers(d handlerDeps) {
 		return map[string]any{"installed": list}, nil
 	})
 
-	d.srv.Handle("skills.install", func(_ context.Context, raw json.RawMessage) (any, error) {
+	// SECURITY (audit F36): the three mutating skill handlers (install,
+	// uninstall, create) are UI-only. A skill is instruction text every agent
+	// in the target directory loads, so writing one is writing into every
+	// future agent's prompt — the one thing a prompt-injected agent would most
+	// like to do, and it hot-reloads into live threads (reloadSkillsEverywhere)
+	// without anyone restarting anything. create is gated alongside the two the
+	// audit named because it reaches the same directory by another door.
+	d.srv.Handle("skills.install", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			Name   string `json:"name"`
 			Target string `json:"target"`
@@ -1879,7 +2140,10 @@ func registerHandlers(d handlerDeps) {
 		return map[string]any{"path": path, "reloaded": reloaded}, nil
 	})
 
-	d.srv.Handle("skills.uninstall", func(_ context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("skills.uninstall", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			Name   string `json:"name"`
 			Target string `json:"target"`
@@ -1898,7 +2162,17 @@ func registerHandlers(d handlerDeps) {
 	// skills.read returns the full markdown of a catalog skill for the detail
 	// pane. Content is capped inside the catalog so a huge file cannot bloat
 	// the reply.
-	d.srv.Handle("skills.read", func(_ context.Context, raw json.RawMessage) (any, error) {
+	//
+	// SECURITY (audit F34 pass 4): UI-only. It is a FILE-CONTENT read keyed by
+	// a caller-chosen name — the same shape as search.code, which was gated a
+	// round earlier for the same reason. An agent that is meant to have a skill
+	// already has it on disk in its own session; this endpoint is the human's
+	// skill browser (ui/src/SkillsDialog.cpp), and skills.listCatalog stays
+	// open for the listing.
+	d.srv.Handle("skills.read", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		if err := d.skills.EnsureDir(); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
 		}
@@ -1917,7 +2191,10 @@ func registerHandlers(d handlerDeps) {
 
 	// skills.create scaffolds a new directory skill (SKILL.md + frontmatter) in
 	// the catalog. Invalid or duplicate names are rejected by the catalog.
-	d.srv.Handle("skills.create", func(_ context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("skills.create", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		if err := d.skills.EnsureDir(); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
 		}
@@ -1937,10 +2214,35 @@ func registerHandlers(d handlerDeps) {
 	})
 
 	// --- git status (read-only) -------------------------------------------
+	//
+	// SECURITY (audit F34 pass 4): the whole git READ family below is UI-only,
+	// and this is the block decision the DEFERRED list in
+	// handlers_inventory_test.go stood in for. "Read-only" was doing the work
+	// of "harmless" here, and the two are not the same thing: git.file,
+	// git.diff, git.blame and git.commit.diff return FILE CONTENT, at a
+	// caller-chosen path or revision, out of a caller-chosen repo root —
+	// precisely the data class F34 gated agent.transcript and search.code for,
+	// reachable by a different verb. git.log, git.branches, git.commit.detail
+	// and git.snapshot are the metadata around it (who committed what, when,
+	// which branch every thread in the arena sits on, which files are dirty).
+	// git.prDraft and git.suggestCommitMessage derive text from another
+	// thread's branch, and the latter spends the human's money doing it.
+	//
+	// Nothing agent-facing calls any of them: every caller is a widget
+	// (ui/src/git/*, WorktreeDashboard, ProjectTree, AgentDock). An agent that
+	// wants its own repo's history runs git in its own shell, inside its own
+	// worktree, under its own tool permissions — which is the boundary the
+	// human actually set for it. Each handler carries the gate itself rather
+	// than a shared wrapper so that a new sibling registered into this block
+	// does not inherit an approval by proximity.
+	//
 	// git.snapshot returns every registered thread's worktree status, drawn
 	// from the cache. The UI polls this at ~1 Hz to drive the worktree
 	// dashboard.
-	d.srv.Handle("git.snapshot", func(_ context.Context, _ json.RawMessage) (any, error) {
+	d.srv.Handle("git.snapshot", func(ctx context.Context, _ json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		// The fs watcher keeps the cache honest, so polling just reads —
 		// only stale entries pay the recompute cost.
 		snaps := d.gitCache.Snapshots()
@@ -1968,7 +2270,10 @@ func registerHandlers(d handlerDeps) {
 	// git.prDraft returns a suggested PR title and body for the thread's
 	// branch, drawn from its commit history since the fork point. Pure
 	// read; no network. The UI uses it to prefill the PR dialog.
-	d.srv.Handle("git.prDraft", func(_ context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("git.prDraft", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ThreadID string `json:"threadId"`
 		}
@@ -1989,7 +2294,19 @@ func registerHandlers(d handlerDeps) {
 	// git.openPR pushes the thread's branch and opens a GitHub pull
 	// request, accepting an edited title / body (and a draft flag) from
 	// the UI. agent.openPR remains as the title-only shortcut.
-	d.srv.Handle("git.openPR", func(_ context.Context, raw json.RawMessage) (any, error) {
+	//
+	// SECURITY (audit F36): UI-only, and so is every mutating git.* handler
+	// from here down (openPR, land, discardChanges, removeWorktree,
+	// abortMerge, finalizeMerge, openConflictTool, commit). The audit named
+	// discardChanges and removeWorktree; the rest are the same authority
+	// through a different door — this one is the full-form twin of the gated
+	// agent.openPR, and gating one while the other stayed open would be a
+	// boundary in name only. The read-only git.* queries below (diff, log,
+	// blame, file, branches, commit detail) are deliberately NOT gated.
+	d.srv.Handle("git.openPR", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ThreadID string `json:"threadId"`
 			Title    string `json:"title"`
@@ -2018,7 +2335,10 @@ func registerHandlers(d handlerDeps) {
 	// branch. Always takes keepConflicts: the UI passes true so conflicts
 	// surface as a banner instead of silently rolling back. agent.land
 	// remains the always-rollback shortcut for callers that want that.
-	d.srv.Handle("git.land", func(_ context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("git.land", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ThreadID      string `json:"threadId"`
 			KeepConflicts bool   `json:"keepConflicts"`
@@ -2051,7 +2371,10 @@ func registerHandlers(d handlerDeps) {
 	// worktree (git reset --hard HEAD + git clean -fd). DESTRUCTIVE: the UI
 	// gates this behind an explicit confirmation. Guard: refuse while the
 	// agent is live, so we never yank files out from under a running session.
-	d.srv.Handle("git.discardChanges", func(_ context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("git.discardChanges", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ThreadID string `json:"threadId"`
 		}
@@ -2078,7 +2401,10 @@ func registerHandlers(d handlerDeps) {
 	// DESTRUCTIVE: the UI confirms first. Guards: only isolated worktrees can
 	// be removed (never the shared workspace), and never while the agent is
 	// live.
-	d.srv.Handle("git.removeWorktree", func(_ context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("git.removeWorktree", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ThreadID string `json:"threadId"`
 		}
@@ -2120,7 +2446,10 @@ func registerHandlers(d handlerDeps) {
 
 	// git.abortMerge rolls back an in-progress merge in the thread's
 	// workspace, restoring it to pre-merge state.
-	d.srv.Handle("git.abortMerge", func(_ context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("git.abortMerge", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ThreadID string `json:"threadId"`
 		}
@@ -2141,7 +2470,10 @@ func registerHandlers(d handlerDeps) {
 	// git.finalizeMerge commits the in-progress merge in the thread's
 	// workspace using git's default merge message. Fails if any conflict
 	// markers are still present.
-	d.srv.Handle("git.finalizeMerge", func(_ context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("git.finalizeMerge", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ThreadID string `json:"threadId"`
 		}
@@ -2162,7 +2494,10 @@ func registerHandlers(d handlerDeps) {
 	// git.openConflictTool spawns KDiff3 (via git mergetool) for every
 	// unmerged path in the thread's workspace, detached so akcore doesn't
 	// wait. The fs watcher catches each save and keeps the dashboard fresh.
-	d.srv.Handle("git.openConflictTool", func(_ context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("git.openConflictTool", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ThreadID string `json:"threadId"`
 		}
@@ -2182,7 +2517,10 @@ func registerHandlers(d handlerDeps) {
 	// git.workspaceMergeStatus tells the UI whether the workspace is mid-
 	// merge and which paths are still unresolved. Polled by the conflict
 	// banner so it can dismiss itself once the human finishes in KDiff3.
-	d.srv.Handle("git.workspaceMergeStatus", func(_ context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("git.workspaceMergeStatus", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ThreadID string `json:"threadId"`
 		}
@@ -2199,7 +2537,10 @@ func registerHandlers(d handlerDeps) {
 	// git.commit stages a subset of paths (or everything when paths is
 	// empty) and commits them to the thread's branch. agent.commit is kept
 	// as the "commit everything with this message" shortcut.
-	d.srv.Handle("git.commit", func(_ context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("git.commit", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ThreadID string   `json:"threadId"`
 			Message  string   `json:"message"`
@@ -2224,6 +2565,9 @@ func registerHandlers(d handlerDeps) {
 	// Long-running (one Claude turn); the IPC dispatcher already runs each
 	// handler on its own goroutine so this does not block the bus.
 	d.srv.Handle("git.suggestCommitMessage", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ThreadID string `json:"threadId"`
 			Model    string `json:"model"`
@@ -2245,7 +2589,10 @@ func registerHandlers(d handlerDeps) {
 	// git.diff returns a unified patch of the worktree vs HEAD, scoped to a
 	// single path when one is given. Untracked files are folded in as full
 	// new-file diffs, and the index is never touched.
-	d.srv.Handle("git.diff", func(_ context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("git.diff", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ThreadID string `json:"threadId"`
 			Path     string `json:"path"`
@@ -2271,7 +2618,10 @@ func registerHandlers(d handlerDeps) {
 	// path. The path is resolved against registered worktrees the same way
 	// git.file does it, so an open editor file maps to its owning agent's
 	// branch without the UI having to know the thread id.
-	d.srv.Handle("git.blame", func(_ context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("git.blame", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			Path     string `json:"path"`
 			ThreadID string `json:"threadId"`
@@ -2337,7 +2687,10 @@ func registerHandlers(d handlerDeps) {
 
 	// git.file returns line-level hunks for one absolute file path vs the
 	// owning worktree's HEAD. The UI's gutter polls this per open buffer.
-	d.srv.Handle("git.file", func(_ context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("git.file", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			Path     string `json:"path"`
 			ThreadID string `json:"threadId"` // optional hint
@@ -2402,7 +2755,10 @@ func registerHandlers(d handlerDeps) {
 	// pagination; Path narrows the view to a file's history (and disables the
 	// graph, since the parent edges between filtered commits would be
 	// synthetic).
-	d.srv.Handle("git.log", func(_ context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("git.log", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ThreadID string `json:"threadId"`
 			RepoRoot string `json:"repoRoot"` // workspace fallback when no thread
@@ -2461,7 +2817,10 @@ func registerHandlers(d handlerDeps) {
 	// viewer's branch selector can scope the history to any of them. Read-only:
 	// it never checks anything out. Resolves the source (thread worktree or
 	// workspace repo root) exactly like git.log.
-	d.srv.Handle("git.branches", func(_ context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("git.branches", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ThreadID string `json:"threadId"`
 			RepoRoot string `json:"repoRoot"` // workspace fallback when no thread
@@ -2485,7 +2844,10 @@ func registerHandlers(d handlerDeps) {
 
 	// git.commit.detail returns one commit's metadata + per-file change list
 	// for the right-hand pane of the log viewer.
-	d.srv.Handle("git.commit.detail", func(_ context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("git.commit.detail", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ThreadID string `json:"threadId"`
 			RepoRoot string `json:"repoRoot"` // workspace fallback when no thread
@@ -2507,7 +2869,10 @@ func registerHandlers(d handlerDeps) {
 
 	// git.commit.diff returns the unified diff for one commit, optionally
 	// scoped to a single file.
-	d.srv.Handle("git.commit.diff", func(_ context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("git.commit.diff", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ThreadID string `json:"threadId"`
 			RepoRoot string `json:"repoRoot"` // workspace fallback when no thread
@@ -2534,7 +2899,17 @@ func registerHandlers(d handlerDeps) {
 	// is advisory to the UI; the server RE-DERIVES it in cleanup.archiveAndRemove
 	// before anything destructive happens, so a stale client can never bypass
 	// the gate.
+	//
+	// SECURITY (audit F36 pass 4): UI-only, like the two verbs it feeds
+	// (cleanup.archiveAndRemove, cleanup.restore). It enumerates every worktree
+	// in a caller-chosen project with its path, branch, dirty state and
+	// provenance verdict — the map of what is destroyable and what is not —
+	// and with `advise` set it also spends an API turn per call. Its only
+	// caller is ui/src/CleanupDialog.cpp.
 	d.srv.Handle("cleanup.analyze", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			Project string `json:"project"`
 			Advise  bool   `json:"advise"`
@@ -2562,7 +2937,14 @@ func registerHandlers(d handlerDeps) {
 	// any blocker, and refuses on warnings unless confirmDestroy is set. The
 	// record is archived (reversibly, transcript left on disk) BEFORE git is
 	// touched, so a failed Remove still preserves the record.
-	d.srv.Handle("cleanup.archiveAndRemove", func(_ context.Context, raw json.RawMessage) (any, error) {
+	//
+	// SECURITY (audit F36): and it is UI-only. The server-side re-analysis
+	// above says WHETHER a removal is safe; it never said WHO asked. Only the
+	// human at the Cleanup dialog does.
+	d.srv.Handle("cleanup.archiveAndRemove", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ThreadID       string `json:"threadId"`
 			ConfirmDestroy bool   `json:"confirmDestroy"`
@@ -2650,7 +3032,15 @@ func registerHandlers(d handlerDeps) {
 	})
 
 	// cleanup.listArchived returns archived records newest-first.
-	d.srv.Handle("cleanup.listArchived", func(_ context.Context, _ json.RawMessage) (any, error) {
+	//
+	// SECURITY (audit F34 pass 4): UI-only. An ArchiveRecord embeds the whole
+	// session.Record, so this is session.listThreads for retired threads —
+	// system prompts, env overlays, provider routing and all — under a
+	// different verb. Its only caller is ui/src/CleanupDialog.cpp.
+	d.srv.Handle("cleanup.listArchived", func(ctx context.Context, _ json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		arch := d.sessions.ListArchived()
 		if arch == nil {
 			arch = []session.ArchiveRecord{}
@@ -2660,7 +3050,17 @@ func registerHandlers(d handlerDeps) {
 
 	// cleanup.restore moves an archived record back as a dormant, non-isolated
 	// thread. Its worktree is gone, so it can only resume in the workspace.
-	d.srv.Handle("cleanup.restore", func(_ context.Context, raw json.RawMessage) (any, error) {
+	//
+	// SECURITY (audit F36 pass 3): UI-only, the twin of the gated
+	// cleanup.archiveAndRemove — the roster is the human's, in both directions.
+	// Restoring puts a thread the human retired back where agent.resume can
+	// reach it, IN THE WORKSPACE rather than the isolated worktree it was
+	// archived from, which is a quiet widening of where that thread's next
+	// session may write. Its only caller is ui/src/CleanupDialog.cpp.
+	d.srv.Handle("cleanup.restore", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			ThreadID string `json:"threadId"`
 		}
@@ -2675,8 +3075,21 @@ func registerHandlers(d handlerDeps) {
 
 	// --- code search ----------------------------------------------------------
 	// search.code runs a filtered ripgrep across a project root. The UI calls
-	// it from its global search panel.
-	d.srv.Handle("search.code", func(_ context.Context, raw json.RawMessage) (any, error) {
+	// it from its global search panel (ui/src/SearchPanel.cpp), and nothing
+	// else does.
+	//
+	// SECURITY (audit F34 pass 3): UI-only, because this is the SAME data class
+	// F34 gated on agent.transcript reached by a different verb. `root` is
+	// caller-chosen and unconstrained, and a match returns the matching LINES —
+	// so an agent bridge could ask for the human's ~/.ssh, ~/.config or another
+	// project's worktree and read file CONTENT out of it, with no thread
+	// binding, no approval and no trace in anyone's panel. Gating the read that
+	// is named "transcript" while leaving the read that is named "search" open
+	// is not a boundary.
+	d.srv.Handle("search.code", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			Query         string   `json:"query"`
 			Root          string   `json:"root"`
@@ -2846,15 +3259,28 @@ const permissionTimeout = 8 * time.Minute
 // passed — so broadcasting it handed every other agent's bridge a live feed of
 // one agent's tool arguments plus the id needed to answer the prompt. The
 // human's question goes to the human's client and nowhere else.
+//
+// NOBODY TO ASK (audit F35 pass 3). The old version pushed the notification and
+// then parked on the 8-minute timer regardless of whether any window received
+// it. With no UI connected that is eight minutes of a bridge connection held
+// open on a question nothing will ever display, ending in the same refusal it
+// could have given immediately — a hang where a one-second "no" is both correct
+// and far more honest. NotifyUI's delivery count is the authority here, not a
+// separate HasUI() check: taken from the same snapshot as the send, it cannot
+// race a UI that disconnects in between. Still FAIL CLOSED — no window means no
+// approval — only promptly.
 func askHumanPermission(srv *ipc.Server, broker *permission.Broker, threadID, toolName string, input json.RawMessage) (permission.Decision, bool) {
 	id, ch := broker.Open()
-	srv.NotifyUI("permission.requested", map[string]any{
+	if srv.NotifyUI("permission.requested", map[string]any{
 		"threadId":       threadID,
 		"requestId":      id,
 		"toolName":       toolName,
 		"input":          input,
 		"timeoutSeconds": int(permissionTimeout / time.Second),
-	})
+	}) == 0 {
+		broker.Close(id)
+		return permission.Decision{}, false
+	}
 	select {
 	case dec := <-ch:
 		return dec, true
@@ -2879,19 +3305,50 @@ const skillReloadFanout = 16
 // thread that a user-level install actually affects. The request is cheap and
 // idempotent — a thread with nothing new to find re-reads and moves on — so
 // over-sending is strictly safer than under-sending here.
+//
+// A running thread whose harness CANNOT reload (Capabilities().SkillReload is
+// false — kimi, whose CLI resolves skills once at session/new) gets a notice
+// too (audit F50). It used to get nothing at all: it was dropped while the
+// target list was built, and the notice loop only ran over threads whose reload
+// succeeded. The human installed a skill, saw it confirmed, and had no way to
+// learn that the agent they were about to give the work to would never see it.
+// A silent capability gap is worse than an unsupported one, because the human
+// makes a decision on it.
 func reloadSkillsEverywhere(d handlerDeps, reason string) []string {
 	type target struct {
 		threadID string
 		reloader skillReloader
 	}
 	var targets []target
+	var skipped []string
 	for _, rec := range d.sessions.List("") {
 		if !d.agentRunning(rec.ThreadID) {
 			continue
 		}
-		if r, ok := d.harnessFor(rec.ThreadID).(skillReloader); ok {
+		// BOTH conditions, and the capability is the one that speaks for the
+		// engine: the interface assertion is how the reload is CALLED, the
+		// capability is what the harness DECLARES (and what the UI's traits
+		// table mirrors). A harness that grew the method without declaring it
+		// would otherwise reload while the UI said it could not, and one that
+		// declares it without the method would be dropped without a word —
+		// the same silence F50 is about.
+		r, hasMethod := d.harnessFor(rec.ThreadID).(skillReloader)
+		declared := d.capsFor(rec.ThreadID).SkillReload
+		if hasMethod && declared {
 			targets = append(targets, target{rec.ThreadID, r})
+			continue
 		}
+		// A HALF-wired harness is a bug in this tree, not a property of the
+		// engine, and it fails closed into the same "restart this agent" notice
+		// as an engine that genuinely cannot reload — which is the right answer
+		// for the human and a silent one for us. Say it in the log, once per
+		// affected thread, so the drift is findable (audit F50 pass 4).
+		if hasMethod != declared {
+			d.log.Warn("harness disagrees with itself about skill reload",
+				"thread", rec.ThreadID, "harness", d.capsFor(rec.ThreadID).ID,
+				"hasReloadSkillsMethod", hasMethod, "declaresSkillReload", declared)
+		}
+		skipped = append(skipped, rec.ThreadID)
 	}
 
 	// Fan out. Each ReloadSkills is a control request that blocks until the CLI
@@ -2928,8 +3385,19 @@ func reloadSkillsEverywhere(d handlerDeps, reason string) []string {
 		emitLifecycle(d, tg.threadID, "notice",
 			"skills reloaded — you "+reason+" while this agent was running", nil)
 	}
-	if len(reloaded) > 0 {
-		d.log.Info("skills reloaded on running threads", "threads", len(reloaded))
+	// The engines that cannot reload say so, in their own panel, in the same
+	// place the reloaded threads say they did (audit F50). Same wording shape,
+	// so a fleet-wide install reads as one event with two outcomes rather than
+	// as a list with holes in it.
+	for _, threadID := range skipped {
+		emitLifecycle(d, threadID, "notice",
+			"you "+reason+" while this agent was running, but "+
+				d.capsFor(threadID).DisplayName+" agents read their skills only "+
+				"at start — restart this agent to pick them up", nil)
+	}
+	if len(reloaded) > 0 || len(skipped) > 0 {
+		d.log.Info("skill reload broadcast", "reloaded", len(reloaded),
+			"skipped", len(skipped))
 	}
 	return reloaded
 }

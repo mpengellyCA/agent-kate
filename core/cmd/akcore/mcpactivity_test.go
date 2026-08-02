@@ -723,7 +723,7 @@ func TestBridgeErrorsCarryNoSecrets(t *testing.T) {
 		"launch: empty prompt": {"agent.launchWorker", map[string]any{
 			"parentThreadId": "t-parent", "prompt": "", "title": secret}},
 		"wait: unknown thread": {"agent.wait", map[string]any{
-			"threadId": "t-ghost", "text": secret}},
+			"fromThreadId": "t-parent", "threadId": "t-ghost", "text": secret}},
 	} {
 		err := client.Call(call.method, call.params, nil)
 		if err == nil {

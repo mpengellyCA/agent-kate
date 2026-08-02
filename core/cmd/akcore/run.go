@@ -358,6 +358,12 @@ func runCore() {
 		func(threadID, toolName string, input json.RawMessage) (bool, json.RawMessage) {
 			dec, ok := askHumanPermission(srv, broker, threadID, toolName, input)
 			if !ok {
+				// Denied, and worth logging WHY: the human let the window
+				// lapse, or there was no window connected to ask at all — in
+				// which case this returns in about a millisecond rather than
+				// after eight minutes (audit F35 pass 3).
+				log.Warn("kimi tool permission denied without a human answer",
+					"thread", threadID, "tool", toolName, "uiConnected", srv.HasUI())
 				return false, nil
 			}
 			// UpdatedInput matters beyond permissions: it is how an answered
@@ -479,22 +485,7 @@ func runCore() {
 		})
 	}
 
-	// app.shutdown lets the UI request a graceful, observable teardown while the
-	// IPC server is still alive, so it can stream shutdown.progress to a dialog.
-	// When done it cancels the serve context, which exits the process; the
-	// fallback path below then re-invokes gracefulShutdown as a guarded no-op.
-	srv.Handle("app.shutdown", func(_ context.Context, _ json.RawMessage) (any, error) {
-		gracefulShutdown(func(phase, detail string, index, total int) {
-			srv.Notify("shutdown.progress", map[string]any{
-				"phase":  phase,
-				"detail": detail,
-				"index":  index,
-				"total":  total,
-			})
-		})
-		stop()
-		return map[string]any{"ok": true}, nil
-	})
+	registerShutdownHandler(srv, gracefulShutdown, stop)
 
 	// Rehydrate the git cache and thread registry with every persisted thread
 	// that still has a worktree on disk, so the dashboard shows dormant threads
@@ -525,4 +516,39 @@ func runCore() {
 		os.Exit(1)
 	}
 	log.Info("akcore stopped")
+}
+
+// registerShutdownHandler wires app.shutdown: the UI asking for a graceful,
+// observable teardown while the IPC server is still alive, so it can stream
+// shutdown.progress to its dialog. When done it cancels the serve context,
+// which exits the process; runCore's fallback path then re-invokes
+// gracefulShutdown as a guarded no-op.
+//
+// SECURITY (audit F36 pass 3): UI-only. This is the single most powerful RPC
+// the core serves — it stops every agent in the arena and exits the process —
+// and it was ungated, so any connection, including an agent's own bridge,
+// could end every OTHER agent's work mid-turn. Its only caller is
+// ui/src/ShutdownDialog.cpp.
+//
+// It lives in its own function (rather than inline in runCore) so the
+// authorisation inventory test can register it on a test server and see it:
+// a privileged method that no test can even enumerate is a method no test can
+// notice going ungated.
+func registerShutdownHandler(srv *ipc.Server, gracefulShutdown func(shutdownProgressFn),
+	stop func()) {
+	srv.Handle("app.shutdown", func(ctx context.Context, _ json.RawMessage) (any, error) {
+		if err := requireUIWindow(srv, ctx); err != nil {
+			return nil, err
+		}
+		gracefulShutdown(func(phase, detail string, index, total int) {
+			srv.Notify("shutdown.progress", map[string]any{
+				"phase":  phase,
+				"detail": detail,
+				"index":  index,
+				"total":  total,
+			})
+		})
+		stop()
+		return map[string]any{"ok": true}, nil
+	})
 }

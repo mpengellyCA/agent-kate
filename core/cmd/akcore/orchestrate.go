@@ -10,6 +10,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -162,6 +163,92 @@ func requireCallerThread(d handlerDeps, ctx context.Context, fromThreadID string
 	return nil
 }
 
+// --- what the human is actually asked, for a COMPOSITE ----------------------
+
+// orchActionGloss says, in plain words, what each cooperation verb does TO the
+// target thread. The verb names are the grant ledger's keys and the MCP tool
+// names; they are not a sentence a human should have to decode at a decision
+// point, and "wait_agent" in particular hides the only thing about it that
+// matters — that it reads the other thread's reply into the caller's context.
+var orchActionGloss = map[string]string{
+	"send_agent":    "send it a message",
+	"wait_agent":    "wait for it, and READ its reply",
+	"close_agent":   "stop it and archive it",
+	"discard_agent": "delete it, worktree and all",
+}
+
+func actionGloss(action string) string {
+	if g, ok := orchActionGloss[action]; ok {
+		return g
+	}
+	// A verb with no gloss is named rather than described. Better a bare name
+	// than an invented description of what it does.
+	return "perform " + clipTo(action, 40)
+}
+
+// compositeApprovalTool is the name the permission bar prints in "Allow the
+// agent to use <name>?" for a multi-action ask, and — load-bearing — the name
+// the UI's summariser dispatches on.
+//
+// SECURITY (audit F35 pass 4): it is deliberately NOT
+// "mcp__cooperation__send_agent". Under that name ui/src/AgentChatHelpers.cpp
+// digests the payload with its `send_agent` branch, which prints the target and
+// the message and NOTHING ELSE — so the extra action the same click grants
+// (`alsoGrant`, consumed in authorizeAgentTarget below) never reached the human
+// at all. The composite was one decision, correctly; it was one decision
+// described as half of itself, which is the same defect class as F27 and F32: a
+// recorded authority wider than the one displayed. Under a name the digest does
+// not claim, permSummary falls through to its generic key scan (file_path,
+// path, pattern, description) and prints our `description` verbatim. The keys
+// this payload uses must therefore avoid file_path/path/pattern, and
+// `description` must stay present — TestCompositeApprovalPromptNamesBothActions
+// pins both against a port of the UI's own summariser. Same trick, and same
+// reason, as launchApprovalTool in authority.go.
+func compositeApprovalTool(action string, alsoGrant []string) string {
+	names := append([]string{clipTo(action, 40)}, alsoGrant...)
+	for i := range names {
+		names[i] = clipTo(names[i], 40)
+	}
+	return strings.Join(names, " + ") + " (one approval, several actions)"
+}
+
+// compositeApprovalSummary is the sentence the human decides on when one call
+// asks for several actions. Built to the bar's 240-character budget rather than
+// trimmed by it (escalationSummaryLimit, authority.go), facts first:
+//
+//  1. that approving covers MORE THAN ONE action, counted;
+//  2. what each of them does, in plain words, in the order they happen;
+//  3. which thread they happen to, and who is asking;
+//  4. the message body — the agent's own words, and therefore last and fitted.
+func compositeApprovalSummary(fromID, targetID string, actions []string, message string) string {
+	const (
+		idCap          = 40
+		messageReserve = 32
+	)
+	glossed := make([]string, 0, len(actions))
+	for i, a := range actions {
+		glossed = append(glossed, fmt.Sprintf("(%d) %s", i+1, actionGloss(a)))
+	}
+	parts := []string{
+		fmt.Sprintf("Approve = %d actions on one thread, not 1: %s.",
+			len(actions), strings.Join(glossed, "; ")),
+		"Thread " + clipTo(targetID, idCap) + ", which is outside " +
+			clipTo(fromID, idCap) + "'s own workers.",
+	}
+	used := len(strings.Join(parts, " "))
+	if msg := strings.TrimSpace(message); msg != "" {
+		room := escalationSummaryLimit - used - len(" Message: ")
+		if room >= messageReserve {
+			parts = append(parts, "Message: "+clipTo(msg, room))
+		}
+	}
+	// Backstop, so the bar's own elision never gets to choose what the human
+	// does not read: with more actions than today's two the lead alone could
+	// outgrow the budget, and the cut has to land on the agent's text, which is
+	// last, rather than wherever 240 characters happens to fall.
+	return clipTo(strings.Join(parts, " "), escalationSummaryLimit)
+}
+
 // authorizeAgentTarget gates one agent acting on another thread. UI-driven
 // calls (empty fromID) are never gated; a target inside the caller's own
 // subtree is always allowed; anything else needs one human approval per
@@ -171,29 +258,76 @@ func requireCallerThread(d handlerDeps, ctx context.Context, fromThreadID string
 // fromID must already have been bound to the calling connection by
 // requireCallerThread. This function TRUSTS it: on its own it is arithmetic on
 // two thread ids, not an authentication.
-func (d handlerDeps) authorizeAgentTarget(fromID, targetID, action string, detail map[string]any) error {
+//
+// alsoGrant names the FURTHER actions this one call is going to perform on the
+// same target, so a composite operation costs ONE human decision (audit F35
+// pass 3). send_agent(wait:true) is the case that forced it: it asks for
+// `send_agent`, delivers, and then waits — which used to ask a second time, for
+// `wait_agent`, because a grant keys on (from, target, ACTION). Two prompts for
+// one operation trains the human to click through, and the second prompt came
+// AFTER delivery, so a human who approved the send and then declined the wait
+// had the message delivered and the reply thrown away — the worst of both
+// answers. Every named action must be covered before the operation starts;
+// otherwise the human is asked once, up front, for the whole of it, and all of
+// them are granted together. Note this NEVER weakens a standalone verb: a bare
+// wait_agent names no extras and is gated exactly as F35 left it.
+func (d handlerDeps) authorizeAgentTarget(fromID, targetID, action string,
+	detail map[string]any, alsoGrant ...string) error {
 	if fromID == "" {
 		return nil
 	}
 	if d.inSubtree(fromID, targetID) {
 		return nil
 	}
-	if d.orchGrants.has(fromID, targetID, action) {
+	// has() slides a live grant's window, so ask for every action the call will
+	// take before deciding — a partially covered composite must still reach the
+	// human for the part that is not covered.
+	covered := d.orchGrants.has(fromID, targetID, action)
+	for _, extra := range alsoGrant {
+		if !d.orchGrants.has(fromID, targetID, extra) {
+			covered = false
+		}
+	}
+	if covered {
 		return nil
 	}
 	input := map[string]any{"targetThreadId": targetID}
 	for k, v := range detail {
 		input[k] = v
 	}
+	// The human is told what the WHOLE operation does, not just its first verb.
+	//
+	// A single-action ask keeps the tool name the UI digests, because for those
+	// the digest already IS the whole truth: the verb is the name on the bar and
+	// the target (and, for a send, the message) is the summary. A composite has
+	// nowhere in that digest for its second action to appear, so it moves to the
+	// generic renderer with a sentence we build (audit F35 pass 4).
+	promptTool := "mcp__cooperation__" + action
+	if len(alsoGrant) > 0 {
+		input["alsoPerforms"] = alsoGrant
+		msg, _ := detail["message"].(string)
+		input["description"] = compositeApprovalSummary(fromID, targetID,
+			append([]string{action}, alsoGrant...), msg)
+		promptTool = compositeApprovalTool(action, alsoGrant)
+	}
 	rawInput, _ := json.Marshal(input)
-	dec, ok := askHumanPermission(d.srv, d.broker, fromID,
-		"mcp__cooperation__"+action, rawInput)
+	dec, ok := askHumanPermission(d.srv, d.broker, fromID, promptTool, rawInput)
 	if !ok || !dec.Allow {
+		why := "(the target is outside your own worker subtree)"
+		if !d.srv.HasUI() {
+			// Fail-closed, but say which closed door this is: no Agent Kate
+			// window is connected, so there was nobody to ask (audit F35
+			// pass 3). Refused in about a millisecond rather than after the
+			// 8-minute permission window.
+			why = "(no Agent Kate window is connected, so nobody could be asked)"
+		}
 		return ipc.Errorf(ipc.CodeInvalidParams,
-			action+" on thread "+targetID+" was not approved by the human "+
-				"(the target is outside your own worker subtree)")
+			action+" on thread "+targetID+" was not approved by the human "+why)
 	}
 	d.orchGrants.grant(fromID, targetID, action)
+	for _, extra := range alsoGrant {
+		d.orchGrants.grant(fromID, targetID, extra)
+	}
 	return nil
 }
 
@@ -302,10 +436,21 @@ func registerOrchestrationHandlers(d handlerDeps) {
 	// process ended) or the timeout fires, and returns the thread's last
 	// assistant text. Backed by the turn tracker's broadcast wait — the IPC
 	// handler simply blocks; no polling anywhere.
+	//
+	// SECURITY (audit F35): wait_agent is a READ, and it was the one
+	// orchestration handler that never asked who was reading. It hands back the
+	// target thread's last assistant message, so an agent that named any id in
+	// any workspace — the human's own private threads included — pulled that
+	// text into its own context with nobody in the chain. Its siblings
+	// agent.send and agent.stopClose have bound the caller since F13; this one
+	// now uses exactly the same pair, so a target inside the caller's own
+	// worker subtree stays free and anything else costs one human approval
+	// (remembered per (caller, target, wait_agent) by the grant TTL).
 	d.srv.Handle("agent.wait", func(ctx context.Context, raw json.RawMessage) (any, error) {
 		var p struct {
-			ThreadID   string `json:"threadId"`
-			TimeoutSec int    `json:"timeoutSec"`
+			ThreadID     string `json:"threadId"`
+			FromThreadID string `json:"fromThreadId"`
+			TimeoutSec   int    `json:"timeoutSec"`
 		}
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
@@ -313,8 +458,34 @@ func registerOrchestrationHandlers(d handlerDeps) {
 		if p.ThreadID == "" {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "threadId is required")
 		}
+		// WHO is waiting, before WHOM they may wait on — in that order, because
+		// authorizeAgentTarget is arithmetic on two ids and proves nothing
+		// about the speaker.
+		if err := requireCallerThread(d, ctx, p.FromThreadID); err != nil {
+			return nil, err
+		}
+		// Existence before approval, deliberately: a thread that does not exist
+		// is a typo, not a decision, and putting the ask second keeps the human
+		// from being prompted about ids that name nothing.
+		//
+		// The trade this makes is REAL and is accepted with its eyes open
+		// (audit F35 pass 3): the ordering is an oracle, so an unauthorised
+		// caller can tell a nonexistent id (answered instantly, silently) from
+		// a live one (a visible prompt in the caller's own panel). What it buys
+		// the attacker is thread-id enumeration; what it costs them is one
+		// human-visible approval dialog PER POSITIVE HIT, in their own panel,
+		// naming them. Thread ids are not secrets — agent.list hands the roster
+		// to any bridge by design — so the leak is small, while the alternative
+		// (ask first, then answer "unknown thread") would train the human to
+		// dismiss orchestration prompts that turn out to mean nothing, which
+		// devalues the one prompt that does. If thread ids ever become
+		// capability-bearing, this ordering must be revisited.
 		if _, ok := d.sessions.Get(p.ThreadID); !ok && !d.agentRunning(p.ThreadID) {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		}
+		if err := d.authorizeAgentTarget(p.FromThreadID, p.ThreadID,
+			"wait_agent", nil); err != nil {
+			return nil, err
 		}
 		timeout := waitDefaultTimeout
 		if p.TimeoutSec > 0 {

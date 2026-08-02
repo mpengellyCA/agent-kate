@@ -44,6 +44,12 @@ func (h *kimiHarness) Capabilities() harness.Capabilities {
 		// One wire log per subagent under <session-dir>/agents/<id>/, probed
 		// on 0.30.0 — the viewer translates its event shapes.
 		SubagentTranscripts: true,
+		// SkillReload stays false: ACP has no reload-skills request and `kimi
+		// acp` resolves its skill directories once, at session/new. A skill the
+		// human installs while a kimi thread is running does not reach it until
+		// that thread is restarted — a fact reloadSkillsEverywhere now SAYS in
+		// the thread's own panel instead of skipping it in silence (audit F50).
+		// LOCKSTEP with ui/src/state/HarnessTraits.cpp kimiDefaults().
 		// `/compact` sent as ordinary prompt text performs a real in-session
 		// compaction (probed on 0.30.0). It is a live-thread mechanism that
 		// produces no summary text — see Compact for what that costs callers.

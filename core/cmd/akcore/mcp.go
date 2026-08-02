@@ -682,10 +682,21 @@ func (b *mcpBridge) runTool(name string, args json.RawMessage) (string, error) {
 		}
 		// A target outside this agent's own subtree needs one human approval,
 		// which can take minutes — the long timeout mirrors request_permission.
+		//
+		// awaitReply declares the SECOND half of this call up front (audit F35
+		// pass 3). send_agent(wait:true) is one operation to the human and to
+		// the model, but it used to be two grants — `send_agent` here and
+		// `wait_agent` inside waitAgent below — so it raised two prompts, the
+		// second of them only AFTER the message had been delivered. Declaring
+		// it means the human sees one prompt, before delivery, describing what
+		// actually happens; the paired wait then finds the grant already
+		// standing. A plain send_agent (wait:false) declares nothing and
+		// pre-authorises nothing.
 		if err := b.client.CallTimeout("agent.send", map[string]any{
 			"threadId":     a.ThreadID,
 			"text":         a.Message,
 			"fromThreadId": b.thread,
+			"awaitReply":   a.Wait,
 		}, nil, 10*time.Minute); err != nil {
 			return "", err
 		}
@@ -802,6 +813,12 @@ func (b *mcpBridge) runTool(name string, args json.RawMessage) (string, error) {
 // (or the timeout fires) and formats the outcome for the calling agent.
 // timeoutSec <= 0 uses the core's default (5 minutes). The IPC timeout is the
 // wait timeout plus slack, so the blocking RPC itself never races the wait.
+//
+// fromThreadId names this bridge's own thread, the way send_agent and
+// close_agent already do (audit F35): waiting returns the target's last
+// assistant text, so a target outside this agent's subtree needs one human
+// approval — which can take minutes, hence the extra slack below matching
+// request_permission's patience.
 func (b *mcpBridge) waitAgent(threadID string, timeoutSec int) (string, error) {
 	effective := timeoutSec
 	if effective <= 0 {
@@ -812,8 +829,9 @@ func (b *mcpBridge) waitAgent(threadID string, timeoutSec int) (string, error) {
 		LastText string `json:"lastText"`
 	}
 	if err := b.client.CallTimeout("agent.wait",
-		map[string]any{"threadId": threadID, "timeoutSec": timeoutSec},
-		&res, time.Duration(effective)*time.Second+30*time.Second); err != nil {
+		map[string]any{"threadId": threadID, "fromThreadId": b.thread,
+			"timeoutSec": timeoutSec},
+		&res, time.Duration(effective)*time.Second+10*time.Minute); err != nil {
 		return "", err
 	}
 	var sb strings.Builder

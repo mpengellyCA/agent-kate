@@ -108,6 +108,18 @@ type Capabilities struct {
 	// UI can tail (agent.subagentTranscripts). False = a thread's delegations
 	// are only visible in its own transcript.
 	SubagentTranscripts bool `json:"subagentTranscripts"`
+	// SkillReload: a RUNNING session can be told to re-read its skill
+	// directories (claude's reload_skills control request), so a skill the
+	// human installs mid-session reaches an agent that is already working.
+	//
+	// False means the session reads its skills once, at start, and nothing can
+	// change that without a relaunch — which is a fact the HUMAN has to be
+	// told (audit F50): they install a skill, the fleet-wide reload reports
+	// success, and the agent they were about to hand the work to silently does
+	// not have it. reloadSkillsEverywhere therefore drops a notice in the
+	// panels of the running threads it had to SKIP, instead of skipping them
+	// silently. Keep in lockstep with ui/src/state/HarnessTraits.cpp.
+	SkillReload bool `json:"skillReload"`
 
 	ModelPicker string `json:"modelPicker"` // ModelPickerTiers | ModelPickerDiscovered
 	// PermissionModes / Efforts: the harness's static vocabularies (values

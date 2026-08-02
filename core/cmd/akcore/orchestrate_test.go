@@ -324,7 +324,12 @@ func TestAgentWaitRPC(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	client, _ := orchTestCore(t, sessions, turns)
+	client, secrets := orchTestCore(t, sessions, turns)
+	// agent.wait binds its caller like every other per-thread handler (audit
+	// F35), so speak as t-idle's own bridge: the thread waiting on itself is
+	// inside its own subtree and never troubles the human. The gate's own
+	// suite is TestWaitAgentBindsTheCaller.
+	asBridge(t, secrets, client, "t-idle")
 
 	var res struct {
 		Status   string `json:"status"`
@@ -332,7 +337,7 @@ func TestAgentWaitRPC(t *testing.T) {
 	}
 	// Dormant + no turn in flight: returns at once; no process = "exited".
 	if err := client.Call("agent.wait",
-		map[string]any{"threadId": "t-idle"}, &res); err != nil {
+		map[string]any{"threadId": "t-idle", "fromThreadId": "t-idle"}, &res); err != nil {
 		t.Fatalf("agent.wait: %v", err)
 	}
 	if res.Status != "exited" {
@@ -342,7 +347,8 @@ func TestAgentWaitRPC(t *testing.T) {
 	// A queued turn holds the wait until its result lands.
 	turns.TurnQueued("t-idle")
 	if err := client.Call("agent.wait",
-		map[string]any{"threadId": "t-idle", "timeoutSec": 1}, &res); err != nil {
+		map[string]any{"threadId": "t-idle", "fromThreadId": "t-idle",
+			"timeoutSec": 1}, &res); err != nil {
 		t.Fatalf("agent.wait(timeout): %v", err)
 	}
 	if res.Status != "timeout" {
@@ -352,7 +358,8 @@ func TestAgentWaitRPC(t *testing.T) {
 	go func() {
 		defer close(done)
 		if err := client.Call("agent.wait",
-			map[string]any{"threadId": "t-idle", "timeoutSec": 30}, &res); err != nil {
+			map[string]any{"threadId": "t-idle", "fromThreadId": "t-idle",
+				"timeoutSec": 30}, &res); err != nil {
 			t.Errorf("agent.wait: %v", err)
 		}
 	}()
@@ -369,7 +376,7 @@ func TestAgentWaitRPC(t *testing.T) {
 	}
 
 	if err := client.Call("agent.wait",
-		map[string]any{"threadId": "t-nope"}, &res); err == nil {
+		map[string]any{"threadId": "t-nope", "fromThreadId": "t-idle"}, &res); err == nil {
 		t.Fatal("agent.wait accepted an unknown thread")
 	}
 }
@@ -910,5 +917,256 @@ func TestOrchGrantExpires(t *testing.T) {
 	now = now.Add(orchGrantTTL)
 	if g.has("t-a", "t-b", "close_agent") {
 		t.Fatal("a grant exactly at its deadline was treated as live")
+	}
+}
+
+// --- what the human reads when ONE click grants SEVERAL actions --------------
+
+// sendAgentDigest is a port of mcpSummary's `send_agent` branch
+// (ui/src/AgentChatHelpers.cpp:77-80): target, then the message's first line.
+// renderPermSummary in authority_test.go ports only the launch_agent branch —
+// the one F1 needed — so this stands in for the branch F35 needs, and for the
+// same reason: the core has to be able to prove what its approval payload turns
+// into on screen. Keep it in step with the C++ if that file changes.
+func sendAgentDigest(input map[string]any) string {
+	str := func(k string) string {
+		s, _ := input[k].(string)
+		return s
+	}
+	target := str("thread_id")
+	if target == "" {
+		target = str("targetThreadId")
+	}
+	msg := str("message")
+	if i := strings.IndexAny(msg, "\r\n"); i >= 0 {
+		msg = msg[:i]
+	}
+	if strings.TrimSpace(msg) == "" {
+		return target
+	}
+	return target + ": " + msg
+}
+
+// renderedBar is permBarText with mcpSummary's send_agent branch restored.
+// Without it the port falls through to the generic `description` scan for EVERY
+// tool name, which would let the composite pass this test under the very name
+// that hides it — the port's own incompleteness marking the fix as done.
+func renderedBar(tool string, input map[string]any) string {
+	if strings.HasPrefix(tool, "mcp__cooperation__send_agent") {
+		sum := sendAgentDigest(input)
+		if n := []rune(sum); len(n) > escalationSummaryLimit {
+			sum = string(n[:escalationSummaryLimit]) + "…"
+		}
+		return "Allow the agent to use " + tool + "? " + sum
+	}
+	return permBarText(tool, input)
+}
+
+// capturedAsk is one permission.requested frame, as the UI receives it.
+type capturedAsk struct {
+	tool  string
+	input map[string]any
+}
+
+// permCapturingResponder is permAutoResponder with the payload kept. The
+// distinction matters: permAutoResponder counts asks, which is what
+// TestCompositeSendAndWaitCostsOneApproval needs, but "how many times was the
+// human asked" says nothing about WHAT they were shown — and F35 pass 4 is
+// exactly a case where the count was right and the text was not.
+func permCapturingResponder(t *testing.T, srv *ipc.Server, sock string,
+	broker *permission.Broker, allow *atomic.Bool) func() []capturedAsk {
+	t.Helper()
+	srv.Handle("test.markUI.capture", func(ctx context.Context, _ json.RawMessage) (any, error) {
+		if !srv.MarkUI(ctx) {
+			return nil, ipc.Errorf(ipc.CodeInvalidRequest, "UI role refused")
+		}
+		return map[string]any{"ok": true}, nil
+	})
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatalf("responder dial: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	var mu sync.Mutex
+	var asks []capturedAsk
+	accepted := make(chan struct{})
+	go func() {
+		barriered := false
+		sc := bufio.NewScanner(conn)
+		sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+		for sc.Scan() {
+			var f ipc.Frame
+			if json.Unmarshal(sc.Bytes(), &f) != nil {
+				continue
+			}
+			if f.Method == "" {
+				if !barriered {
+					barriered = true
+					close(accepted)
+				}
+				continue
+			}
+			if f.Method != "permission.requested" {
+				continue
+			}
+			var p struct {
+				RequestID string         `json:"requestId"`
+				ToolName  string         `json:"toolName"`
+				Input     map[string]any `json:"input"`
+			}
+			if json.Unmarshal(f.Params, &p) != nil || p.RequestID == "" {
+				continue
+			}
+			mu.Lock()
+			asks = append(asks, capturedAsk{tool: p.ToolName, input: p.Input})
+			mu.Unlock()
+			broker.Resolve(p.RequestID, permission.Decision{Allow: allow.Load()})
+		}
+	}()
+	if _, err := conn.Write([]byte(
+		`{"jsonrpc":"2.0","id":1,"method":"test.markUI.capture"}` + "\n")); err != nil {
+		t.Fatalf("responder barrier: %v", err)
+	}
+	select {
+	case <-accepted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("responder connection was never accepted by the server")
+	}
+	return func() []capturedAsk {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]capturedAsk(nil), asks...)
+	}
+}
+
+// TestCompositeApprovalPromptNamesBothActions (audit F35 pass 4) is the
+// honest-labelling half of the composite grant. Pass 3 made send_agent(wait)
+// cost ONE approval instead of two, which was right; but the prompt it showed
+// was still `send_agent`'s, whose digest prints the target and the message and
+// nothing else. The human was shown a sentence about the SEND and, by the same
+// click, granted the WAIT — a read of the target thread's reply that no surface
+// mentioned. A decision whose recorded authority is wider than the one
+// displayed is not an informed decision.
+//
+// It asserts on the RENDERED bar text, through a port of the UI's own
+// summariser (renderedBar, over renderPermSummary/permBarText in
+// authority_test.go plus the send_agent digest), because the payload was
+// already "correct" — `alsoPerforms` was in it — while the dialog said nothing
+// about it. Asserting on the payload is how this shipped.
+func TestCompositeApprovalPromptNamesBothActions(t *testing.T) {
+	sock, secrets, broker, srv := pass2Core(t, []session.Record{
+		{ThreadID: "t-a"},
+		{ThreadID: "t-x", Status: session.StatusDormant}, // outside t-a's subtree
+		{ThreadID: "t-y", Status: session.StatusDormant}, // ditto, for the contrast
+	})
+	var allow atomic.Bool
+	allow.Store(true)
+	read := permCapturingResponder(t, srv, sock, broker, &allow)
+
+	client, err := ipc.Dial(sock)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	asBridge(t, secrets, client, "t-a")
+
+	// The composite. The send itself fails (t-x has no live process); the
+	// AUTHORISATION happens first and is what this measures.
+	_ = client.CallTimeout("agent.send", map[string]any{
+		"threadId": "t-x", "fromThreadId": "t-a",
+		"text": "status?", "awaitReply": true,
+	}, nil, 30*time.Second)
+
+	asks := read()
+	if len(asks) != 1 {
+		t.Fatalf("the composite asked %d times, want exactly 1: %+v", len(asks), asks)
+	}
+	ask := asks[0]
+	rendered := renderedBar(ask.tool, ask.input)
+
+	// THE FINDING: the second action, in words, in the sentence the human reads.
+	for _, want := range []string{
+		"2 actions",         // that it is more than one, counted
+		"send it a message", // action 1, in plain words
+		"READ its reply",    // action 2 — the one that used to be invisible
+		"wait_agent",        // ...and named, since that is the grant recorded
+		"t-x",               // which thread it happens to
+		"t-a",               // who is asking
+		"status?",           // the agent's own words, last
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("the bar never says %q.\nrendered: %s", want, rendered)
+		}
+	}
+	// ...and it fits, so nothing was elided off the end of the dialog.
+	summary := strings.TrimPrefix(renderedBar(ask.tool, ask.input),
+		"Allow the agent to use "+ask.tool+"? ")
+	if n := len([]rune(summary)); n > escalationSummaryLimit {
+		t.Errorf("summary is %d characters, so the bar elides a fact:\n%s", n, summary)
+	}
+
+	// The regression itself, pinned in both directions.
+	//
+	// (a) The payload alone was never the fix. Run this exact input through the
+	//     digest the composite USED to be shown under, and the wait vanishes —
+	//     `alsoPerforms` is in the payload and simply has nowhere to appear.
+	//     What saves it is the NAME.
+	if got := sendAgentDigest(ask.input); got != "t-x: status?" {
+		t.Fatalf("the send_agent digest changed (%q); re-check sendAgentDigest "+
+			"against ui/src/AgentChatHelpers.cpp", got)
+	} else if strings.Contains(got, "wait") {
+		t.Fatal("the send_agent digest now mentions the wait; this pin is stale")
+	}
+	// (b) ...so the composite must NOT be asked under a digested name.
+	if strings.HasPrefix(ask.tool, "mcp__") {
+		t.Errorf("the composite is asked under %q, which the UI digests — the "+
+			"second action disappears again", ask.tool)
+	}
+
+	// The contrast, which keeps this from becoming "every prompt is a paragraph":
+	// a single-action ask keeps the digested name, because for those the digest
+	// already says the whole of it.
+	before := len(read())
+	_ = client.CallTimeout("agent.send", map[string]any{
+		"threadId": "t-y", "fromThreadId": "t-a", "text": "fyi",
+	}, nil, 30*time.Second)
+	asks = read()
+	if len(asks) != before+1 {
+		t.Fatalf("the plain send asked %d times, want 1", len(asks)-before)
+	}
+	plain := asks[len(asks)-1]
+	if plain.tool != "mcp__cooperation__send_agent" {
+		t.Errorf("a single-action ask is named %q, want the digested tool name", plain.tool)
+	}
+	if _, ok := plain.input["alsoPerforms"]; ok {
+		t.Error("a plain send declared an extra action it does not perform")
+	}
+	if got := sendAgentDigest(plain.input); got != "t-y: fyi" {
+		t.Errorf("the plain send digests to %q, want the target and the message", got)
+	}
+}
+
+// TestCompositeApprovalSummaryFitsTheBar: the message body is the agent's own
+// text, so its length is the agent's choice. It must never push a fact past the
+// bar's 240-character elision point — the same budget discipline as F1's
+// escalation prompt (TestEscalationSummaryFitsTheBar).
+func TestCompositeApprovalSummaryFitsTheBar(t *testing.T) {
+	got := compositeApprovalSummary(
+		strings.Repeat("from", 100), strings.Repeat("target", 100),
+		[]string{"send_agent", "wait_agent"}, strings.Repeat("filler ", 500))
+	if n := len([]rune(got)); n > escalationSummaryLimit {
+		t.Errorf("summary is %d characters, over the bar's budget:\n%s", n, got)
+	}
+	// The facts survive the squeeze; only the agent's own text is cut.
+	for _, want := range []string{"2 actions", "send it a message", "READ its reply"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the budget ate %q:\n%s", want, got)
+		}
+	}
+	// An unglossed verb is NAMED, never described with an invented meaning —
+	// the failure mode this whole round is about.
+	if s := compositeApprovalSummary("t-a", "t-b", []string{"send_agent", "teleport_agent"}, ""); !strings.Contains(s, "teleport_agent") {
+		t.Errorf("an unknown action is not named in the prompt:\n%s", s)
 	}
 }
