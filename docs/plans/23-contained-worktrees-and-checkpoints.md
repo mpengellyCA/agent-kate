@@ -143,6 +143,55 @@ hyperfine 'bwrap … -- true' 'podman run --rm alpine true' 'true'
 mutually exclusive, gated in the UI with an explanation, and the user picks per
 agent. That is an acceptable outcome and must be planned for, not discovered.
 
+## Phase 1 RESULT — spiked 2026-08-02: **bubblewrap, confirmed**
+
+All six success criteria pass on this box (CachyOS, kernel 7.1.5). A real
+`claude` 2.1.220 thread ran to completion inside the sandbox — authenticated,
+used Bash, and reported `ls ..` as exactly `t-alpha` — for $0.092. Overhead is
+**7 ms** per spawn against a 30 ms budget. `kimi` runs inside with
+`KIMI_CODE_HOME` already under the containment root, so it costs no extra
+binds. **Criterion 4 (Cowork) passed**, which this plan expected might fail —
+so the mutually-exclusive fallback does not need building.
+
+**But the mount set as drafted is wrong in ways that are worse than no
+containment**, because each omission breaks the product rather than the
+boundary, and a containment that breaks the product gets turned off:
+
+- **`--ro-bind-try /run/systemd/resolve` is missing.** Without it there is no
+  DNS at all: every agent fails to reach the API with curl code 000. This is
+  the single most likely "containment broke everything" report.
+- **`~/.claude` must be bound rw** or the agent reports `Not logged in`.
+- **`--disable-userns --assert-userns-disabled` is missing.** Without it the
+  agent can `unshare -Ur` to root of a nested namespace and hold
+  CAP_SYS_ADMIN. This also means spelling `--unshare-user` explicitly rather
+  than relying on `--unshare-all`, which rejects the flag.
+- **`.git` needs masking, not just binding**: `--tmpfs` over `.git/hooks` and
+  `.git/worktrees`, or a contained agent writes hooks that run unconfined.
+- **Invariant 1 is inverted.** `--unshare-pid` does not break `Interrupt`;
+  `kill(-pgid, SIGINT)` reaches the sandbox leader gracefully, and it *closes*
+  an existing leak where a `setsid`'d tool survives the kill ladder entirely.
+
+**The landlock-only fallback does not work and must not ship transparently.**
+Deny-mode makes `git commit` fail outright (`fatal: unknown error occurred
+while reading the configuration files`). If it ships at all it is an explicitly
+labelled reduced tier with its own dotfile allow-list — and a thread that asked
+for `contained` must fail rather than silently receive something weaker.
+
+**The residual escape surface, stated plainly so no label overstates it:** the
+shared `.git` object store. A contained agent can still write any object and
+move any ref in the project's store. Containment bounds the *working tree*, not
+the repository. Say exactly that in the UI — this plan exists partly because
+the previous label ("sandbox") claimed more than a git worktree delivered.
+
+**Cowork widens the boundary materially.** Binding `$XDG_RUNTIME_DIR/bus` hands
+the agent the full KDE session bus — KWin, the portal, everything on it. That
+is not a filesystem question and the consent text must say so.
+
+**Recommendation:** ship bubblewrap as `TierContained` and make it the default
+as planned, with the hardened mount set above. Keep podman as an opt-in `hard`
+tier. Keep `--add-dir` as an advisory layer *inside* the sandbox, never as the
+boundary.
+
 ## Phase 2 — The containment layer (core)
 
 New package **`core/internal/contain/`**. It knows nothing about agents; it

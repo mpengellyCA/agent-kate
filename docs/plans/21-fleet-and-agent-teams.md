@@ -144,6 +144,49 @@ All five must hold; any single failure is a "no":
 Whatever the verdict, **Phase 2 onwards is unblocked** — the fleet panel does
 not depend on it.
 
+## Phase 1 RESULT — spiked 2026-08-02: **stay independent**
+
+The verdict is not a judgement call. **The CLI only initialises a session team
+when the process is interactive**, and AgentKate's `claude` child is
+non-interactive on two independent counts: it passes `--print`, and its stdout
+is a pipe rather than a TTY. Success criterion 1 ("reachable headlessly") fails
+at the code level, and by this phase's own rule — any single failure is a no —
+that ends the question. Criteria 2 and 5 fail independently.
+
+Reaching native teams would mean allocating a PTY for the child and driving the
+TUI, which contradicts this project's standing decision to use the documented
+headless stream-json interface. **New non-goal: AgentKate will not allocate a
+PTY in order to reach agent teams.**
+
+Consequences:
+
+- **Plan 16's orchestration MCP tools stay the model, unchanged.** They do not
+  become a compatibility shim; there is nothing headlessly reachable to shim.
+- **Do not add `Capabilities.NativeTeams`.** A flag that is false on kimi and
+  unreachable on claude is a lie in both columns.
+- **Phase 4's coordinator/teammate grouping gets cheaper and more reliable.**
+  Read `<CLAUDE_CONFIG_DIR>/teams/*/config.json` (`members[].agentId/name/
+  agentType/cwd`, plus `leadAgentId`/`leadSessionId`) instead of inferring
+  structure from `claude agents --json`. Read-only interop: a user driving
+  teams in a terminal sees them grouped in AgentKate, and we own none of it.
+
+**Corrections to this document, to be applied before Phase 2 is costed:**
+`teammateMode` values are `auto`/`tmux`/`iterm2`/`in-process` — kitty, wezterm
+and vscode do not exist. The "fork" string cited earlier is the `/fork` slash
+command's error branch, not a `--fork-session` flag.
+
+**Phase 2 must tolerate a false empty.** `claude agents --json` returned `[]`
+with a live claude process on the box. The `Reactive<QList<FleetRow>>` guard
+must not treat an empty reply as authoritative absence, or the panel will blink
+agents out of existence.
+
+**Caveat recorded honestly:** criterion 1 was read from minified bundle JS, not
+from a live run — nested `claude -p` invocations were blocked during the spike.
+The conclusion is over-determined by three independent triggers, but it is
+inference from source, not observation. The gate is also remotely revocable in
+both directions, so this verdict has a shelf life; re-probe before building on
+its absence.
+
 ## Phase 2 — The fleet feed (core)
 
 A harness-level query that takes no `threadID`. This is the same shape plan 26

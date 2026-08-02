@@ -152,6 +152,24 @@ graph TD
 Solid arrows are hard dependencies. Dotted arrows are *conventions* — work that
 is not blocked, but that will need retrofitting if done in the wrong order.
 
+## Spike results (2026-08-02) — what the three investigations settled
+
+All three step-1 spikes have run. Each verdict is recorded in full in its own
+plan; the program-level consequences are:
+
+| Spike | Verdict | Effect on this program |
+|---|---|---|
+| **21 §1 — agent teams** | **Stay independent.** The CLI initialises a team only when the process is *interactive*; our claude child fails that on two counts (`--print`, and stdout is a pipe). Structurally unreachable headlessly. | Plan 16's orchestration tools stay the model. Plan 21 shrinks to the fleet panel plus read-only interop that groups the tree from `<CLAUDE_CONFIG_DIR>/teams/*/config.json`. No `NativeTeams` capability. The teams half of plan 21 drops from "anything up to L" to S. |
+| **23 §1 — containment** | **Bubblewrap, confirmed** — all six criteria pass, 7 ms overhead, a real claude thread ran contained for $0.092, and Cowork works inside. But the drafted mount set is wrong in four ways that each break the product, and the landlock fallback does not work at all. | Plan 23 §2–4 proceed with the hardened mount set. The mutually-exclusive Cowork fallback is not built. The honest label is settled: containment bounds the **working tree**, not the repository — the shared `.git` object store remains writable. |
+| **25 §1 — kimi fork** | **A fourth mechanism wins**: kimi implements fork itself, reachable over its local HTTP server. Full fidelity, source byte-verified untouched. | Plan 25 gains a Phase 1b (worktree relocation + a credentialed recall round-trip) that gates flipping `Capabilities.Fork`. `ExportSession` is independent and shippable immediately. The ordering of 25 before 23 holds. |
+
+Two corrections that outlive the spikes: **the installed kimi CLI is 0.31.1**,
+not the 0.30 several plans and the project memory assume — re-stamp any
+0.30-vintage fact before relying on it; and the product currently has **no
+user-customisable shortcut surface at all** (no `KActionCollection`, no
+`setupGUI`, no `KShortcutsDialog`, no persisted bindings), so plan 27 §1 is
+greenfield construction rather than a migration.
+
 ## Recommended execution order
 
 **0. Plan 27 §1 — the KActionCollection / KXmlGui refactor. Do this first.**

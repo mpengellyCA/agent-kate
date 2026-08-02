@@ -129,6 +129,56 @@ Append a *Result* subsection here. If a candidate wins, set
 `Capabilities.Fork: true` for kimi and add `Capabilities.ForkFidelity` (`"full"`
 | `"summary"`) so the UI can warn precisely instead of lying by omission.
 
+## Phase 1 RESULT — spiked 2026-08-02: **a fourth mechanism wins**
+
+None of the three candidates below survives. kimi implements fork itself, and
+it is reachable: **`POST /api/v1/sessions/<id>:fork`** (AIP-style colon, not a
+slash) against a `kimi web` server bound to 127.0.0.1 produces a real,
+full-fidelity fork. Run end-to-end, warm and cold, with the source
+byte-verified as untouched.
+
+**First, a correction that colours the whole document: the installed CLI is
+0.31.1, not the 0.30 this plan and the project memory assume.** Re-stamp the
+Verified-facts table. Also: `state.json` *does* carry the session id at
+`version: 2` — the table describes the v1 shape.
+
+The mechanism: spawn `kimi web --port <ephemeral> --no-open` with the thread's
+`KIMI_CODE_HOME`, read the bearer token from `<home>/server.token`, call the
+fork endpoint, shut the server down.
+
+**Phase 1b, which this plan does not currently have and which gates everything:
+worktree relocation.** kimi's fork lands in the *source's* workspace bucket,
+and ACP resume ignores `cwd` — so the forked session must be moved into the
+fork thread's own bucket (move the directory, rewrite `state.json`). Without
+it, two AgentKate threads share one worktree while the UI claims each fork has
+its own. That is a containment-labelling failure, not a fidelity one, and it is
+the reason **`Capabilities.Fork` must not be flipped for kimi yet.**
+
+**Interface consequences.** Do *not* add `ForkSession` to the harness
+interface: `StartSpec.ForkSession` (harness.go:187) is already the neutral
+seam, and the kimi adapter should honour it inside `Launch`, returning the new
+id in `Launched.SessionID`. Add `Capabilities.ForkFlavors []string` alongside
+`ForkFidelity` — because summary-seeded fork is universal and user-selectable
+per the owner's answer to open question 1, a single fidelity scalar cannot
+express "this engine offers both".
+
+**Two risks to carry into Phase 1b.** The model-recall leg is unverified: the
+fork is a byte-faithful copy of the wire journal plus a `forked` boundary, but
+whether the forked session *recalls* the parent conversation was not proven —
+run the codeword round-trip in a credentialed throwaway home, which this plan
+already names as the proof. And forking a *running* thread can silently
+truncate the fork's tail, because the source's wire is flushed only when its
+handle is live in the forking process.
+
+**Reaching fork means running a local HTTP server far more powerful than the
+job** — `kimi web` exposes full session control plus `/terminals/*` and
+`/files/*` behind one bearer token readable by any same-uid process. Bind
+127.0.0.1, use an ephemeral port, and shut it down immediately.
+
+**Sequencing:** Phase 1b (relocation + credentialed round-trip) → Phase 2
+`ExportSession`, which is independent of all this and shippable immediately →
+Phase 4 fork. This holds plan 20's ordering of 25 before 23.
+
 ## Phase 2 — `ExportSession` on the harness
 
 **`core/internal/harness/harness.go`:**
