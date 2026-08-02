@@ -36,6 +36,7 @@ daily dogfooding. Each item has its own grounded plan file with the relevant
 | 27 | KDE presence — one KActionCollection, a system tray item, and global shortcuts | UI (C++) | [27-kde-presence.md](27-kde-presence.md) | M–L |
 | 28 | Native scheduling & resume — persistent timers, rate-window auto-resume, gated agent-requested schedules | Core (Go) + UI (C++) | [28-scheduling-and-autonomy.md](28-scheduling-and-autonomy.md) | L |
 | 29 | Pass-2 remediation — consent quality, honest labelling, destructive actions, first-run friction (F25–F50) | Core (Go) + UI (C++) | [29-pass2-remediation.md](29-pass2-remediation.md) | M (3 rounds) |
+| 30 | Pass-3 remediation — lifecycle correctness, bounded reads, hot-path scaling (F51–F67, internal audit of the perf/stability/multi-agent refactor) | Core (Go) + UI (C++) | [30-pass3-remediation.md](30-pass3-remediation.md) | M (4 rounds) |
 
 Size key: **S** ≈ <½ day, **M** ≈ 1–2 days, **L** ≈ 3–5 days, **XL** ≈ a release of its own.
 
@@ -47,8 +48,13 @@ Its headline is that **plan 27 §1 (the KActionCollection refactor) should land 
 anything else in that set** — five of the seven clusters add actions, and every action
 born outside the collection has to be retrofitted later.
 
-**Status: 20–28 are planned, not started.** No code for them is in the tree; 19 is the
-last plan with an implementation. The source list is [IDEAS.md](../IDEAS.md), where each
+**Status (2026-08-02): the program is started.** Landed so far: plan 27 §1 (the
+KActionCollection refactor, `18d9f6f`), plan 28 Phase 2 (rate-window auto-resume,
+`0749ed2`), and all three step-1 spikes with verdicts recorded in plans 21/23/25.
+Plan 24's question channel landed earlier under a different design than the plan
+describes (kimi `isQuestionRequest` + the in-panel question form); its hooks half is
+untouched. Plans 21, 22, 23, 25, 26 and the rest of 27/28 are not started. The source
+list is [IDEAS.md](../IDEAS.md), where each
 item carries its approval and, where the user gave one, a recorded decision that shapes
 the plan rather than being a preference on top of it:
 
