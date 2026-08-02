@@ -1,11 +1,43 @@
 # 27 — KDE presence: one action model, a tray item, and global shortcuts
 
-**Status: PLANNED.** Covers IDEAS #12 (system tray + close-to-tray) and #13
-(global shortcuts), plus the KActionCollection / KXmlGui refactor #13 depends on
-and the whole program benefits from. Program context:
+**Status: PHASE 1 LANDED; PHASES 2–4 PLANNED.** Covers IDEAS #12 (system tray +
+close-to-tray) and #13 (global shortcuts), plus the KActionCollection / KXmlGui
+refactor #13 depends on and the whole program benefits from. Program context:
 [20-approved-features-program.md](20-approved-features-program.md).
 
 **Size: M–L.** §1 is S–M, §2 is M, §3 is S.
+
+> **Phase 1 landed** as step 0 of the program. What exists now:
+> `ui/src/shell/ActionIds.h` (the frozen name table and the contract comment),
+> `MainWindow::m_actions` with `registerAction()` as the single path in,
+> `configureShortcuts()` opening `KShortcutsDialog` over both this collection
+> and the editor part's, `registerCommands()` as the seam panels publish
+> through (first user: `ProblemsPanel::commands()`), and a command palette that
+> walks the collection rather than the menu bar. Pinned by
+> `ui/tests/ActionIdsTest.cpp` and `ui/tests/CommandPaletteTest.cpp`.
+>
+> Three findings from doing it, each of which changed the design:
+>
+> 1. **`QAction::setVisible(false)` clears `enabled` as a side effect.** Simple
+>    mode hides actions, so a hidden action always answers "disabled" and cannot
+>    be asked whether it would actually run. Dropping hidden actions is what
+>    made Simple mode a wall; listing them unconditionally would have let the
+>    palette run `agent_create_pull_request` on an agent with no branch —
+>    `QAction::trigger()` does not re-check enablement, so the palette would
+>    have been a second door through the gate `AgentActions::compute` holds.
+>    `CommandPalette::Entry` therefore carries an explicit `available`, which
+>    `MainWindow` answers by flipping visibility with signals blocked.
+> 2. **`refreshPanelTooltips()` and `PanelInfo::help` were NOT deleted**, and
+>    the old comment saying the refactor "takes this whole method with it" was
+>    half right. The binding hint is superseded — it now reads the *active*
+>    sequence off the registered action, so a rebound Alt+3 no longer produces a
+>    tooltip naming the binding the user just replaced. The plain-language
+>    description is not superseded by anything: a collection lists commands and
+>    has no concept of a panel.
+> 3. **The `EditorArea` Ctrl+S blanking stays.** The dialog now lists both
+>    collections, which is where the conflict becomes visible and resolvable;
+>    removing the workaround would reintroduce the ambiguity for every user in
+>    order to serve the few who want to rebind.
 
 **Phase 1 of this plan is the first thing the whole program should do.** Not
 because global shortcuts are urgent, but because five of the seven clusters add
@@ -57,7 +89,7 @@ where finding things by name matters most.
 All four are one problem wearing four hats: **there is no single registry of
 what this application can do.**
 
-## Phase 1 — One `KActionCollection` (the prerequisite)
+## Phase 1 — One `KActionCollection` (the prerequisite) — **LANDED**
 
 `KF6::XmlGui` is already linked (`ui/CMakeLists.txt`), so this is a refactor,
 not a dependency.

@@ -366,6 +366,35 @@ if(Qt6Test_FOUND)
     set_tests_properties(AgentActionsTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
+    # Plan 27 §1: the one KActionCollection and its FROZEN name table. An
+    # action's id is the KConfig key its shortcut is stored under, so renaming
+    # one silently discards every user's customisation — this freezes the
+    # catalogue so that shows up as a failing test. It also scans MainWindow.cpp
+    # (which no test binary can link) for the three regressions the refactor
+    # invites: an id declared but never registered, a shortcut bound behind the
+    # collection's back, and a per-agent gate that stopped deriving from
+    # AgentActions::compute. ActionIds.h is header-only, hence no extra sources.
+    add_executable(ActionIdsTest tests/ActionIdsTest.cpp)
+    target_include_directories(ActionIdsTest PRIVATE src)
+    target_link_libraries(ActionIdsTest PRIVATE Qt6::Core Qt6::Test)
+    add_test(NAME ActionIdsTest COMMAND ActionIdsTest)
+    set_tests_properties(ActionIdsTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    # Plan 27 §1: which commands the palette will show. It used to drop every
+    # invisible action, so in Simple mode — the mode where finding things by
+    # name matters most — searching for a hidden command returned nothing, and
+    # the escape hatch out of Simple mode became a second wall. Hidden commands
+    # are now listed and tagged; disabled ones are still dropped.
+    add_executable(CommandPaletteTest tests/CommandPaletteTest.cpp
+        src/CommandPalette.cpp)
+    target_include_directories(CommandPaletteTest PRIVATE src)
+    target_link_libraries(CommandPaletteTest PRIVATE Qt6::Widgets Qt6::Test
+        KF6::I18n)
+    add_test(NAME CommandPaletteTest COMMAND CommandPaletteTest)
+    set_tests_properties(CommandPaletteTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
     # Plan 19: attaching a screenshot is attaching a temp file that gets reaped.
     # Guards the durable copy (survives the origin, never displaces it) and the
     # total attachment budget, whose absence let a send kill the IPC connection.

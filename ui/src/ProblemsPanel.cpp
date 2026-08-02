@@ -48,6 +48,8 @@ ProblemsPanel::ProblemsPanel(LspManager *lsp, QWidget *parent)
     m_showErrors = addFilter(QStringLiteral("dialog-error"), i18n("Show errors"));
     m_showWarnings = addFilter(QStringLiteral("dialog-warning"), i18n("Show warnings"));
     m_showInfo = addFilter(QStringLiteral("dialog-information"), i18n("Show information"));
+    // Parented to `this`, so a destroyed panel takes them with it — which is
+    // exactly what the palette's QPointer entries are guarding against.
 
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
@@ -64,6 +66,11 @@ ProblemsPanel::ProblemsPanel(LspManager *lsp, QWidget *parent)
     });
 
     rebuild();
+}
+
+QList<QAction *> ProblemsPanel::commands() const
+{
+    return {m_showErrors, m_showWarnings, m_showInfo};
 }
 
 void ProblemsPanel::rebuild()

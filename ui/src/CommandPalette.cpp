@@ -35,11 +35,23 @@
 
 namespace {
 
-// Roles we stash on each list item so the delegate can paint command text and a
-// right-aligned, muted shortcut, and so triggerCurrent() can recover the source
-// command index.
-constexpr int kShortcutRole = Qt::UserRole + 1;
-constexpr int kCommandIndexRole = Qt::UserRole + 2;
+// Roles we stash on each list item so the delegate can paint command text, its
+// "Advanced" tag and a right-aligned, muted shortcut, and so triggerCurrent()
+// can recover the source command index. Declared in the header so tests can
+// read back what the palette decided.
+constexpr int kShortcutRole = CommandPalette::ShortcutRole;
+constexpr int kCommandIndexRole = CommandPalette::CommandIndexRole;
+constexpr int kAdvancedRole = CommandPalette::AdvancedRole;
+
+// The tag painted after a command the app is currently hiding. Not a suffix on
+// the display text: the text is what the fuzzy matcher searches, and folding the
+// word "Advanced" into it would make every hidden command match the query
+// "advanced" for no reason.
+QString advancedTag()
+{
+    return i18nc("@label:listbox tag on a command hidden by Simple mode",
+                 "Advanced");
+}
 
 // Strip Qt mnemonic ampersands from an action's text. "&File" -> "File",
 // "Save && Close" -> "Save & Close". We collapse a doubled "&&" to a single
@@ -216,6 +228,19 @@ public:
             rightReserved = scWidth + 16; // gap before the command text ends
         }
 
+        // "Advanced" sits between the command and its shortcut, in the same
+        // muted colour: present enough to explain why the command is not in a
+        // menu right now, quiet enough not to compete with the command itself.
+        if (index.data(kAdvancedRole).toBool()) {
+            const QString tag = advancedTag();
+            const int tagWidth = fm.horizontalAdvance(tag);
+            const QRect tagRect(textRect.right() - rightReserved - tagWidth,
+                                textRect.top(), tagWidth, textRect.height());
+            painter->setPen(shortcutColor);
+            painter->drawText(tagRect, Qt::AlignVCenter | Qt::AlignRight, tag);
+            rightReserved += tagWidth + 16;
+        }
+
         QRect cmdRect = textRect;
         cmdRect.setRight(textRect.right() - rightReserved);
         const QString elided =
@@ -323,22 +348,37 @@ CommandPalette::CommandPalette(QWidget *parent)
     m_search->installEventFilter(this);
 }
 
-void CommandPalette::setActions(const QList<QAction *> &actions)
+void CommandPalette::setActions(const QList<Entry> &entries)
 {
     m_commands.clear();
-    m_commands.reserve(actions.size());
+    m_commands.reserve(entries.size());
 
     // De-duplicate by (display text, shortcut) so the same command surfaced via
     // both a menu and a toolbar appears once.
     QSet<QString> seen;
-    for (QAction *action : actions) {
-        if (!action || action->isSeparator() || !action->isVisible()
-            || !action->isEnabled()) {
+    for (const Entry &entry : entries) {
+        QAction *action = entry.action;
+        if (!action || action->isSeparator()) {
             continue;
         }
-        const QString display = stripMnemonics(action->text());
+        // A command that cannot run is dropped: offering it is a dead end, and
+        // for the gated agent actions it would be worse than that. A command
+        // that is merely HIDDEN is kept and tagged — reaching it by name is the
+        // entire reason the palette exists. Which question to ask depends on
+        // visibility; see Entry::available for why the action cannot answer for
+        // itself once it is hidden.
+        const bool usable =
+            action->isVisible() ? action->isEnabled() : entry.available;
+        if (!usable) {
+            continue;
+        }
+        QString display = stripMnemonics(action->text());
         if (display.isEmpty()) {
             continue;
+        }
+        if (!entry.group.isEmpty()) {
+            display = i18nc("@item:inlistbox <panel>: <command>", "%1: %2",
+                            entry.group, display);
         }
         const QString shortcut =
             action->shortcut().toString(QKeySequence::NativeText);
@@ -353,6 +393,7 @@ void CommandPalette::setActions(const QList<QAction *> &actions)
         cmd.text = display;
         cmd.shortcut = shortcut;
         cmd.lowerText = display.toLower();
+        cmd.advanced = entry.advanced || !action->isVisible();
         cmd.action = action;
         m_commands.append(cmd);
     }
@@ -440,11 +481,17 @@ void CommandPalette::rebuildList(const QString &query)
         auto *item = new QListWidgetItem(cmd.text, m_list);
         item->setData(kShortcutRole, cmd.shortcut);
         item->setData(kCommandIndexRole, s.commandIndex);
+        item->setData(kAdvancedRole, cmd.advanced);
         if (cmd.action && !cmd.action->icon().isNull()) {
             item->setIcon(cmd.action->icon());
         }
-        // Tooltip surfaces the full text even when the row elides.
+        // Tooltip surfaces the full text even when the row elides — and the
+        // tag, which a screen reader would otherwise never reach: the delegate
+        // paints it, and painted text is invisible to accessibility.
         QString tip = cmd.text;
+        if (cmd.advanced) {
+            tip += QStringLiteral("  [%1]").arg(advancedTag());
+        }
         if (!cmd.shortcut.isEmpty()) {
             tip += QStringLiteral("  (%1)").arg(cmd.shortcut);
         }

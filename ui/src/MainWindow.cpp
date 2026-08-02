@@ -25,6 +25,7 @@
 #include "CooperationPanel.h"
 #include "cowork/CoworkPanel.h"
 #include "cowork/CoworkPortal.h"
+#include "shell/ActionIds.h"
 #include "shell/ShellLayout.h"
 #include "shell/SideBar.h"
 #include "git/BlameController.h"
@@ -45,6 +46,7 @@
 #include "lsp/WorkspaceSymbolDialog.h"
 
 #include <KAboutData>
+#include <KActionCollection>
 #include <KMultiTabBar>
 #include <KConfigGroup>
 #include <KHamburgerMenu>
@@ -52,6 +54,7 @@
 #include <KLocalizedString>
 #include <KMessageWidget>
 #include <KSharedConfig>
+#include <KShortcutsDialog>
 #include <KStandardAction>
 #include <KToggleAction>
 #include <KToolBar>
@@ -83,7 +86,6 @@
 #include <QLineEdit>
 #include <QToolButton>
 #include <QPlainTextEdit>
-#include <QShortcut>
 #include <QSplitter>
 #include <QStackedWidget>
 #include <QStatusBar>
@@ -108,14 +110,29 @@ MainWindow::MainWindow(const QString &openPath, QWidget *parent)
         KSharedConfig::openConfig()->group(QStringLiteral("View"))
             .readEntry("schema", 0) == 0;
 
+    // The one action collection, created before anything that builds an action.
+    // Its display name is what Settings ▸ Configure Shortcuts titles the group,
+    // so it is the product name rather than the binary name.
+    m_actions = new KActionCollection(this);
+    m_actions->setComponentDisplayName(i18n("Agent Kate"));
+
     setupUi();
     setupActions();
+    // Before setupTopToolbar: the toolbar's "Layout ▾" menu now reuses the very
+    // same perspective actions the View ▸ Layout submenu holds, rather than
+    // building a second, unregistered copy of each that could drift.
+    setupPerspectives();
     setupTopToolbar();
     setupHamburger();
     setupShellShortcuts();
-    setupPerspectives();
     setupCore();
     setupExperience();
+    // Every action exists now. Lay the user's customised bindings from
+    // [Shortcuts] over the declared defaults — this is the read half of what
+    // KShortcutsDialog writes, and without it a rebind survives only until the
+    // next launch. Then rebuild the rail hints, which name the ACTIVE binding.
+    m_actions->readSettings();
+    refreshPanelTooltips();
     // Before the first project, before the first task: say it if no agent CLI
     // is installed (audit F37). The registry serves its built-in engine list
     // immediately, so this is answerable without waiting for the core.
@@ -318,6 +335,10 @@ void MainWindow::setupUi()
                   i18n("References"), references, QStringLiteral("bottom"));
     registerPanel(m_keyProblems, QIcon::fromTheme(QStringLiteral("dialog-warning")),
                   i18n("Problems"), problems, QStringLiteral("bottom"));
+    // First user of the panel-command seam: three icon-only toolbar toggles that
+    // appear in no menu and so were invisible to the palette (plan 27 §1).
+    registerCommands(i18nc("@item command-palette group", "Problems"),
+                     problems->commands());
     auto *coreLogView = new QPlainTextEdit(this);
     coreLogView->setReadOnly(true);
     coreLogView->setMaximumBlockCount(5000);
@@ -755,18 +776,75 @@ void MainWindow::setupUi()
             });
 }
 
+QAction *MainWindow::registerAction(const QString &id, QAction *act,
+                                    const QList<QKeySequence> &defaults)
+{
+    if (!act || !m_actions) {
+        return act;
+    }
+    m_actions->addAction(id, act);
+    if (!defaults.isEmpty()) {
+        // setDefaultShortcuts, not setShortcuts: it records the sequence as the
+        // action's DEFAULT and applies it, so "Reset to Defaults" in the
+        // shortcuts dialog has something to reset to and a user override is a
+        // deviation the dialog can show rather than an invisible overwrite.
+        KActionCollection::setDefaultShortcuts(act, defaults);
+    }
+    return act;
+}
+
+void MainWindow::registerCommands(const QString &group,
+                                  const QList<QAction *> &actions)
+{
+    for (QAction *act : actions) {
+        if (act) {
+            m_panelCommands.append({group, QPointer<QAction>(act)});
+        }
+    }
+}
+
+void MainWindow::configureShortcuts()
+{
+    // Stack-allocated and modal: the dialog holds raw KActionCollection
+    // pointers, and the editor part's collection belongs to whichever view is
+    // current — blocking here is what guarantees that view cannot be closed out
+    // from under it.
+    KShortcutsDialog dlg(this);
+    dlg.addCollection(m_actions, i18nc("@title:group shortcut list", "Agent Kate"));
+    // Feed the embedded editor's own collection in too. EditorArea blanks the
+    // part's file_save / file_save_as bindings to stop Qt disabling Ctrl+S with
+    // an "Ambiguous shortcut overload" — a code-level workaround that leaves the
+    // user no way to see what happened or to choose differently. Listing both
+    // collections here is the surface where that conflict becomes visible and
+    // resolvable. (The blanking stays: it is what makes Ctrl+S work out of the
+    // box, and removing it would reintroduce the ambiguity for every user in
+    // order to serve the few who want to rebind.)
+    if (KTextEditor::View *view = m_editor ? m_editor->currentView() : nullptr) {
+        if (KActionCollection *ac = view->actionCollection()) {
+            dlg.addCollection(ac, i18nc("@title:group shortcut list", "Text Editor"));
+        }
+    }
+    // configure(true) saves accepted changes into [Shortcuts]; the constructor
+    // read that back at startup.
+    dlg.configure(/*saveSettings=*/true);
+    // A rebound rail accelerator changes what the tab hints should say.
+    refreshPanelTooltips();
+}
+
 void MainWindow::setupActions()
 {
     QMenu *fileMenu = menuBar()->addMenu(i18n("&File"));
 
     auto *openAct = new QAction(QIcon::fromTheme(QStringLiteral("folder-open")),
                                 i18n("&Open Project…"), this);
-    openAct->setShortcut(QKeySequence::Open);
+    registerAction(QLatin1String(ActionIds::FileOpenProject), openAct,
+                   {QKeySequence(QKeySequence::Open)});
     connect(openAct, &QAction::triggered, this, [this] { m_agent->openProjectDialog(); });
     fileMenu->addAction(openAct);
 
     auto *welcomeAct = new QAction(QIcon::fromTheme(QStringLiteral("go-home")),
                                    i18n("&Welcome Screen…"), this);
+    registerAction(QLatin1String(ActionIds::FileWelcomeScreen), welcomeAct);
     welcomeAct->setToolTip(i18n("Pick a recent project, open a folder, or start a new one."));
     connect(welcomeAct, &QAction::triggered, this, [this] {
         WelcomeDialog dlg(this);
@@ -785,6 +863,7 @@ void MainWindow::setupActions()
 
     auto *resumeAct = new QAction(QIcon::fromTheme(QStringLiteral("document-open-recent")),
                                   i18n("&Resume a Session…"), this);
+    registerAction(QLatin1String(ActionIds::FileResumeSession), resumeAct);
     connect(resumeAct, &QAction::triggered, this, [this] {
         auto *dlg = new SessionBrowserDialog(m_core, this);
         dlg->setAttribute(Qt::WA_DeleteOnClose);
@@ -794,7 +873,11 @@ void MainWindow::setupActions()
     });
     fileMenu->addAction(resumeAct);
 
+    // KStandardAction already declares Ctrl+S as this action's default, so it
+    // only needs the collection id — which is the same "file_save" the standard
+    // action names itself, kept in ActionIds so the frozen catalogue is complete.
     QAction *saveAct = KStandardAction::save(this, &MainWindow::onSave, this);
+    registerAction(QLatin1String(ActionIds::FileSave), saveAct);
     // Own Ctrl+S at the application level so it fires no matter which widget has
     // focus. Paired with EditorArea clearing the KTextEditor view's internal
     // file_save binding, this resolves the "Ambiguous shortcut overload" that
@@ -806,12 +889,14 @@ void MainWindow::setupActions()
     // by hand with the conventional icon and Ctrl+Shift+S shortcut.
     auto *saveAllAct = new QAction(QIcon::fromTheme(QStringLiteral("document-save-all")),
                                    i18n("Save A&ll"), this);
-    saveAllAct->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_S));
+    registerAction(QLatin1String(ActionIds::FileSaveAll), saveAllAct,
+                   {QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_S)});
     connect(saveAllAct, &QAction::triggered, this, &MainWindow::onSaveAll);
     fileMenu->addAction(saveAllAct);
 
     fileMenu->addSeparator();
-    fileMenu->addAction(KStandardAction::quit(this, &QWidget::close, this));
+    fileMenu->addAction(registerAction(QLatin1String(ActionIds::FileQuit),
+                                       KStandardAction::quit(this, &QWidget::close, this)));
 
     // The Agent menu sits right after File — agents are the primary thing this
     // app is about, and its actions were previously buried in roster right-clicks.
@@ -820,8 +905,10 @@ void MainWindow::setupActions()
     QMenu *optionsMenu = menuBar()->addMenu(i18n("&Options"));
     QMenu *grouping = optionsMenu->addMenu(i18n("Editor Tabs Grouped By"));
     auto *groupingActs = new QActionGroup(this);
-    QAction *byProject = grouping->addAction(i18n("Project"));
-    QAction *byAgent = grouping->addAction(i18n("Agent"));
+    QAction *byProject = registerAction(QLatin1String(ActionIds::OptionsTabsByProject),
+                                        grouping->addAction(i18n("Project")));
+    QAction *byAgent = registerAction(QLatin1String(ActionIds::OptionsTabsByAgent),
+                                      grouping->addAction(i18n("Agent")));
     byProject->setCheckable(true);
     byAgent->setCheckable(true);
     groupingActs->addAction(byProject);
@@ -834,7 +921,9 @@ void MainWindow::setupActions()
     const KConfigGroup agentCfg =
         KSharedConfig::openConfig()->group(QStringLiteral("Agent"));
 
-    auto *enterSendsAct = optionsMenu->addAction(i18n("&Enter Sends the Message"));
+    auto *enterSendsAct = registerAction(
+        QLatin1String(ActionIds::OptionsEnterSends),
+        optionsMenu->addAction(i18n("&Enter Sends the Message")));
     enterSendsAct->setCheckable(true);
     enterSendsAct->setChecked(agentCfg.readEntry("enterSends", true));
     enterSendsAct->setToolTip(i18n("On: Enter sends, Shift+Enter starts a new line. "
@@ -846,7 +935,9 @@ void MainWindow::setupActions()
         m_agent->applyChatSettings();
     });
 
-    auto *showToolsAct = optionsMenu->addAction(i18n("Show &Tool Calls"));
+    auto *showToolsAct = registerAction(
+        QLatin1String(ActionIds::OptionsShowToolCalls),
+        optionsMenu->addAction(i18n("Show &Tool Calls")));
     showToolsAct->setCheckable(true);
     showToolsAct->setChecked(agentCfg.readEntry("showTools", true));
     connect(showToolsAct, &QAction::toggled, this, [this](bool on) {
@@ -861,7 +952,8 @@ void MainWindow::setupActions()
     const KConfigGroup editorCfg =
         KSharedConfig::openConfig()->group(QStringLiteral("Editor"));
     const bool autosaveOn = editorCfg.readEntry("autosave", true);
-    auto *autosaveAct = optionsMenu->addAction(i18n("&Autosave files"));
+    auto *autosaveAct = registerAction(QLatin1String(ActionIds::OptionsAutosave),
+                                       optionsMenu->addAction(i18n("&Autosave files")));
     autosaveAct->setCheckable(true);
     autosaveAct->setChecked(autosaveOn);
     autosaveAct->setToolTip(i18n("Automatically save your edits shortly after you "
@@ -879,7 +971,9 @@ void MainWindow::setupActions()
     }
 
     optionsMenu->addSeparator();
-    auto *providersAct = optionsMenu->addAction(i18n("Configure API &Providers…"));
+    auto *providersAct = registerAction(
+        QLatin1String(ActionIds::OptionsConfigureProviders),
+        optionsMenu->addAction(i18n("Configure API &Providers…")));
     providersAct->setToolTip(i18n(
         "Configure third-party, Anthropic-compatible API providers (Fireworks, "
         "OpenRouter, …) that an agent can use in place of Anthropic."));
@@ -891,9 +985,11 @@ void MainWindow::setupActions()
     });
 
     optionsMenu->addSeparator();
-    auto *appearanceAct = optionsMenu->addAction(
-        QIcon::fromTheme(QStringLiteral("preferences-desktop-color")),
-        i18n("&Appearance…"));
+    auto *appearanceAct = registerAction(
+        QLatin1String(ActionIds::OptionsAppearance),
+        optionsMenu->addAction(
+            QIcon::fromTheme(QStringLiteral("preferences-desktop-color")),
+            i18n("&Appearance…")));
     appearanceAct->setToolTip(i18n(
         "Give Agent Kate its own look — a signature theme or any KDE colour "
         "scheme — independent of the rest of your desktop."));
@@ -907,8 +1003,10 @@ void MainWindow::setupActions()
     QMenu *expMenu = optionsMenu->addMenu(QIcon::fromTheme(QStringLiteral("games-difficult")),
                                           i18n("E&xperience Level"));
     auto *expGroup = new QActionGroup(this);
-    m_simpleAct = expMenu->addAction(i18n("&Simple — just the essentials"));
-    m_advancedAct = expMenu->addAction(i18n("&Advanced — every developer tool"));
+    m_simpleAct = registerAction(QLatin1String(ActionIds::OptionsExperienceSimple),
+                                 expMenu->addAction(i18n("&Simple — just the essentials")));
+    m_advancedAct = registerAction(QLatin1String(ActionIds::OptionsExperienceAdvanced),
+                                   expMenu->addAction(i18n("&Advanced — every developer tool")));
     for (QAction *a : {m_simpleAct, m_advancedAct}) {
         a->setCheckable(true);
         expGroup->addAction(a);
@@ -923,20 +1021,23 @@ void MainWindow::setupActions()
 
     QMenu *viewMenu = menuBar()->addMenu(i18n("&View"));
 
-    auto *paletteAct = viewMenu->addAction(
-        QIcon::fromTheme(QStringLiteral("show-menu")), i18n("&Command Palette…"));
     // Ctrl+Shift+P is the convention; Ctrl+P is a friendly second binding since
     // Agent Kate has no print action to clash with.
-    paletteAct->setShortcuts({QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_P),
-                              QKeySequence(Qt::CTRL | Qt::Key_P)});
+    auto *paletteAct = registerAction(
+        QLatin1String(ActionIds::ViewCommandPalette),
+        viewMenu->addAction(QIcon::fromTheme(QStringLiteral("show-menu")),
+                            i18n("&Command Palette…")),
+        {QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_P),
+         QKeySequence(Qt::CTRL | Qt::Key_P)});
     paletteAct->setToolTip(
         i18n("Search and run any command by name — the fastest way to reach "
              "every feature."));
     connect(paletteAct, &QAction::triggered, this, &MainWindow::showCommandPalette);
     viewMenu->addSeparator();
-    m_blameToggle = viewMenu->addAction(i18n("Show Git &Blame"));
+    m_blameToggle = registerAction(QLatin1String(ActionIds::ViewGitBlame),
+                                   viewMenu->addAction(i18n("Show Git &Blame")),
+                                   {QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_B)});
     m_blameToggle->setCheckable(true);
-    m_blameToggle->setShortcut(Qt::CTRL | Qt::SHIFT | Qt::Key_B);
     m_blameToggle->setToolTip(
         i18n("Show per-line author / sha annotations for the active editor."));
     connect(m_blameToggle, &QAction::toggled, this, [this](bool on) {
@@ -963,8 +1064,10 @@ void MainWindow::setupActions()
         m_blameToggle->setEnabled(bc != nullptr);
     });
     viewMenu->addSeparator();
-    m_toggleBottomAct = viewMenu->addAction(i18n("Toggle &Bottom Panel"));
-    m_toggleBottomAct->setShortcut(Qt::CTRL | Qt::Key_J);
+    m_toggleBottomAct = registerAction(
+        QLatin1String(ActionIds::ViewToggleBottomPanel),
+        viewMenu->addAction(i18n("Toggle &Bottom Panel")),
+        {QKeySequence(Qt::CTRL | Qt::Key_J)});
     m_toggleBottomAct->setToolTip(
         i18n("Show or hide the Terminal / References / Problems strip."));
     connect(m_toggleBottomAct, &QAction::triggered, this, [this] {
@@ -980,10 +1083,11 @@ void MainWindow::setupActions()
         }
     });
 
-    auto *findInProjAct = viewMenu->addAction(
-        QIcon::fromTheme(QStringLiteral("edit-find")),
-        i18n("Find in &Project…"));
-    findInProjAct->setShortcut(Qt::CTRL | Qt::SHIFT | Qt::Key_F);
+    auto *findInProjAct = registerAction(
+        QLatin1String(ActionIds::ViewFindInProject),
+        viewMenu->addAction(QIcon::fromTheme(QStringLiteral("edit-find")),
+                            i18n("Find in &Project…")),
+        {QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_F)});
     findInProjAct->setToolTip(
         i18n("Search the active project with filters (case, regex, globs)."));
     connect(findInProjAct, &QAction::triggered, this, [this] {
@@ -997,16 +1101,18 @@ void MainWindow::setupActions()
     // F3 / Shift+F3 step through the project-search results, opening each in
     // turn. Scoped to the SearchPanel (WidgetWithChildrenShortcut) so they never
     // clash with KTextEditor's own find-next while a code editor has focus.
-    auto *nextMatchAct = new QAction(i18n("Next Search Match"), this);
-    nextMatchAct->setShortcut(Qt::Key_F3);
+    auto *nextMatchAct = registerAction(QLatin1String(ActionIds::ViewNextSearchMatch),
+                                        new QAction(i18n("Next Search Match"), this),
+                                        {QKeySequence(Qt::Key_F3)});
     nextMatchAct->setShortcutContext(Qt::WidgetWithChildrenShortcut);
     connect(nextMatchAct, &QAction::triggered, this, [this] {
         if (m_search) {
             m_search->focusNextResult();
         }
     });
-    auto *prevMatchAct = new QAction(i18n("Previous Search Match"), this);
-    prevMatchAct->setShortcut(Qt::SHIFT | Qt::Key_F3);
+    auto *prevMatchAct = registerAction(QLatin1String(ActionIds::ViewPreviousSearchMatch),
+                                        new QAction(i18n("Previous Search Match"), this),
+                                        {QKeySequence(Qt::SHIFT | Qt::Key_F3)});
     prevMatchAct->setShortcutContext(Qt::WidgetWithChildrenShortcut);
     connect(prevMatchAct, &QAction::triggered, this, [this] {
         if (m_search) {
@@ -1020,9 +1126,11 @@ void MainWindow::setupActions()
 
     viewMenu->addSeparator();
     const bool termOk = m_terminal && m_terminal->isAvailable();
-    auto *newTermAct = viewMenu->addAction(
-        QIcon::fromTheme(QStringLiteral("utilities-terminal")), i18n("&New Terminal"));
-    newTermAct->setShortcut(Qt::CTRL | Qt::SHIFT | Qt::Key_T);
+    auto *newTermAct = registerAction(
+        QLatin1String(ActionIds::ViewNewTerminal),
+        viewMenu->addAction(QIcon::fromTheme(QStringLiteral("utilities-terminal")),
+                            i18n("&New Terminal")),
+        {QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_T)});
     newTermAct->setEnabled(termOk);
     connect(newTermAct, &QAction::triggered, this, [this] {
         if (!m_terminal) {
@@ -1032,8 +1140,10 @@ void MainWindow::setupActions()
         m_terminal->newTerminal();
     });
 
-    auto *focusTermAct = viewMenu->addAction(i18n("&Focus Terminal"));
-    focusTermAct->setShortcut(Qt::CTRL | Qt::Key_QuoteLeft);
+    auto *focusTermAct = registerAction(
+        QLatin1String(ActionIds::ViewFocusTerminal),
+        viewMenu->addAction(i18n("&Focus Terminal")),
+        {QKeySequence(Qt::CTRL | Qt::Key_QuoteLeft)});
     focusTermAct->setEnabled(termOk);
     connect(focusTermAct, &QAction::triggered, this, [this] {
         if (!m_terminal) {
@@ -1043,8 +1153,10 @@ void MainWindow::setupActions()
         m_terminal->focusActiveTerminal();
     });
 
-    auto *nextTermAct = viewMenu->addAction(i18n("Next Terminal"));
-    nextTermAct->setShortcut(Qt::CTRL | Qt::Key_PageDown);
+    auto *nextTermAct = registerAction(
+        QLatin1String(ActionIds::ViewNextTerminal),
+        viewMenu->addAction(i18n("Next Terminal")),
+        {QKeySequence(Qt::CTRL | Qt::Key_PageDown)});
     nextTermAct->setEnabled(termOk);
     connect(nextTermAct, &QAction::triggered, this, [this] {
         if (m_terminal) {
@@ -1052,8 +1164,10 @@ void MainWindow::setupActions()
         }
     });
 
-    auto *prevTermAct = viewMenu->addAction(i18n("Previous Terminal"));
-    prevTermAct->setShortcut(Qt::CTRL | Qt::Key_PageUp);
+    auto *prevTermAct = registerAction(
+        QLatin1String(ActionIds::ViewPreviousTerminal),
+        viewMenu->addAction(i18n("Previous Terminal")),
+        {QKeySequence(Qt::CTRL | Qt::Key_PageUp)});
     prevTermAct->setEnabled(termOk);
     connect(prevTermAct, &QAction::triggered, this, [this] {
         if (m_terminal) {
@@ -1063,11 +1177,14 @@ void MainWindow::setupActions()
 
     // Text + tooltip track the active agent's isolation (onAgentActivated): the
     // folder this opens is only a "worktree" when the agent has a private copy.
-    m_openWorktreeTerminalAct = viewMenu->addAction(
-        QIcon::fromTheme(QStringLiteral("utilities-terminal")),
-        AgentActions::terminalActionLabel(/*isolated=*/false));
-    // Ctrl+Shift+T is "New Terminal" here; Ctrl+Alt+T is free.
-    m_openWorktreeTerminalAct->setShortcut(Qt::CTRL | Qt::ALT | Qt::Key_T);
+    // Ctrl+Shift+T is "New Terminal" here; Ctrl+Alt+T is free — and now, being a
+    // declared default rather than a literal, a user whose desktop already owns
+    // Ctrl+Alt+T can move it instead of losing the action.
+    m_openWorktreeTerminalAct = registerAction(
+        QLatin1String(ActionIds::ViewAgentTerminal),
+        viewMenu->addAction(QIcon::fromTheme(QStringLiteral("utilities-terminal")),
+                            AgentActions::terminalActionLabel(/*isolated=*/false)),
+        {QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_T)});
     m_openWorktreeTerminalAct->setToolTip(
         AgentActions::terminalActionTooltip(/*isolated=*/false));
     m_openWorktreeTerminalAct->setEnabled(false);
@@ -1097,24 +1214,28 @@ void MainWindow::setupActions()
 
     m_codeMenu = menuBar()->addMenu(i18n("&Code"));
     QMenu *codeMenu = m_codeMenu;
-    QAction *defAct = codeMenu->addAction(i18n("Go to &Definition"));
-    defAct->setShortcut(Qt::Key_F12);
+    QAction *defAct = registerAction(QLatin1String(ActionIds::CodeGotoDefinition),
+                                     codeMenu->addAction(i18n("Go to &Definition")),
+                                     {QKeySequence(Qt::Key_F12)});
     connect(defAct, &QAction::triggered, this, [this] {
         if (KTextEditor::View *view = m_editor->currentView()) {
             m_lsp->gotoDefinition(view);
         }
     });
-    QAction *refAct = codeMenu->addAction(i18n("Find &References"));
-    refAct->setShortcut(Qt::SHIFT | Qt::Key_F12);
+    QAction *refAct = registerAction(QLatin1String(ActionIds::CodeFindReferences),
+                                     codeMenu->addAction(i18n("Find &References")),
+                                     {QKeySequence(Qt::SHIFT | Qt::Key_F12)});
     connect(refAct, &QAction::triggered, this, [this] {
         if (KTextEditor::View *view = m_editor->currentView()) {
             m_lsp->findReferences(view);
         }
     });
 
-    QAction *symbolAct = codeMenu->addAction(QIcon::fromTheme(QStringLiteral("code-context")),
-                                             i18n("Go to &Symbol in Workspace…"));
-    symbolAct->setShortcut(Qt::CTRL | Qt::Key_T);
+    QAction *symbolAct = registerAction(
+        QLatin1String(ActionIds::CodeGotoSymbol),
+        codeMenu->addAction(QIcon::fromTheme(QStringLiteral("code-context")),
+                            i18n("Go to &Symbol in Workspace…")),
+        {QKeySequence(Qt::CTRL | Qt::Key_T)});
     connect(symbolAct, &QAction::triggered, this, [this] {
         auto *dlg = new WorkspaceSymbolDialog(m_lsp, this);
         dlg->setAttribute(Qt::WA_DeleteOnClose);
@@ -1128,32 +1249,37 @@ void MainWindow::setupActions()
 
     codeMenu->addSeparator();
 
-    QAction *quickFixAct = codeMenu->addAction(QIcon::fromTheme(QStringLiteral("tools-wizard")),
-                                               i18n("&Quick Fix…"));
-    quickFixAct->setShortcut(Qt::CTRL | Qt::Key_Period);
+    QAction *quickFixAct = registerAction(
+        QLatin1String(ActionIds::CodeQuickFix),
+        codeMenu->addAction(QIcon::fromTheme(QStringLiteral("tools-wizard")),
+                            i18n("&Quick Fix…")),
+        {QKeySequence(Qt::CTRL | Qt::Key_Period)});
     connect(quickFixAct, &QAction::triggered, this, [this] {
         if (KTextEditor::View *view = m_editor->currentView()) {
             m_lsp->requestCodeActions(view);
         }
     });
 
-    QAction *renameAct = codeMenu->addAction(i18n("Rena&me Symbol"));
-    renameAct->setShortcut(Qt::Key_F2);
+    QAction *renameAct = registerAction(QLatin1String(ActionIds::CodeRenameSymbol),
+                                        codeMenu->addAction(i18n("Rena&me Symbol")),
+                                        {QKeySequence(Qt::Key_F2)});
     connect(renameAct, &QAction::triggered, this, [this] {
         if (KTextEditor::View *view = m_editor->currentView()) {
             m_lsp->renameSymbol(view);
         }
     });
 
-    QAction *formatAct = codeMenu->addAction(i18n("&Format Document"));
-    formatAct->setShortcut(Qt::CTRL | Qt::ALT | Qt::Key_L);
+    QAction *formatAct = registerAction(QLatin1String(ActionIds::CodeFormatDocument),
+                                        codeMenu->addAction(i18n("&Format Document")),
+                                        {QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_L)});
     connect(formatAct, &QAction::triggered, this, [this] {
         if (KTextEditor::View *view = m_editor->currentView()) {
             m_lsp->formatDocument(view);
         }
     });
 
-    m_formatOnSave = codeMenu->addAction(i18n("Format on &Save"));
+    m_formatOnSave = registerAction(QLatin1String(ActionIds::CodeFormatOnSave),
+                                    codeMenu->addAction(i18n("Format on &Save")));
     m_formatOnSave->setCheckable(true);
     m_formatOnSave->setChecked(KSharedConfig::openConfig()
                                    ->group(QStringLiteral("CodeIntelligence"))
@@ -1164,32 +1290,37 @@ void MainWindow::setupActions()
             .writeEntry("formatOnSave", on);
     });
 
-    QAction *sigAct = codeMenu->addAction(i18n("Show Signature &Help"));
-    sigAct->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_Space));
+    QAction *sigAct = registerAction(QLatin1String(ActionIds::CodeSignatureHelp),
+                                     codeMenu->addAction(i18n("Show Signature &Help")),
+                                     {QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_Space)});
     connect(sigAct, &QAction::triggered, this, [this] {
         if (KTextEditor::View *view = m_editor->currentView()) {
             m_lsp->requestSignatureHelp(view);
         }
     });
 
-    QAction *nextProbAct = codeMenu->addAction(i18n("&Next Problem"));
-    nextProbAct->setShortcut(Qt::Key_F8);
+    QAction *nextProbAct = registerAction(QLatin1String(ActionIds::CodeNextProblem),
+                                          codeMenu->addAction(i18n("&Next Problem")),
+                                          {QKeySequence(Qt::Key_F8)});
     connect(nextProbAct, &QAction::triggered, this, [this] {
         if (KTextEditor::View *view = m_editor->currentView()) {
             m_lsp->nextProblem(view);
         }
     });
 
-    QAction *prevProbAct = codeMenu->addAction(i18n("&Previous Problem"));
-    prevProbAct->setShortcut(Qt::SHIFT | Qt::Key_F8);
+    QAction *prevProbAct = registerAction(QLatin1String(ActionIds::CodePreviousProblem),
+                                          codeMenu->addAction(i18n("&Previous Problem")),
+                                          {QKeySequence(Qt::SHIFT | Qt::Key_F8)});
     connect(prevProbAct, &QAction::triggered, this, [this] {
         if (KTextEditor::View *view = m_editor->currentView()) {
             m_lsp->prevProblem(view);
         }
     });
 
-    QAction *restartAct = codeMenu->addAction(QIcon::fromTheme(QStringLiteral("view-refresh")),
-                                              i18n("&Restart Language Server"));
+    QAction *restartAct = registerAction(
+        QLatin1String(ActionIds::CodeRestartLanguageServer),
+        codeMenu->addAction(QIcon::fromTheme(QStringLiteral("view-refresh")),
+                            i18n("&Restart Language Server")));
     connect(restartAct, &QAction::triggered, this, [this] {
         if (!m_activeFilePath.isEmpty()) {
             m_lsp->restartServersForCurrentFile(m_activeFilePath);
@@ -1203,8 +1334,10 @@ void MainWindow::setupActions()
     // move out rather than being duplicated: skills to the Agent menu (they are
     // an agent capability), language extensions to Options (they configure the
     // editor). Both menus are visible at every experience level.
-    auto *extAct = new QAction(QIcon::fromTheme(QStringLiteral("install")),
-                               i18n("Manage Language &Extensions…"), this);
+    auto *extAct = registerAction(
+        QLatin1String(ActionIds::OptionsLanguageExtensions),
+        new QAction(QIcon::fromTheme(QStringLiteral("install")),
+                    i18n("Manage Language &Extensions…"), this));
     extAct->setToolTip(i18n("Add language support — syntax, completion and error "
                             "checking for more file types."));
     connect(extAct, &QAction::triggered, this, [this] {
@@ -1217,8 +1350,10 @@ void MainWindow::setupActions()
     optionsMenu->addSeparator();
     optionsMenu->addAction(extAct);
 
-    auto *skillsAct = new QAction(QIcon::fromTheme(QStringLiteral("preferences-plugin")),
-                                  i18n("Manage Agent &Skills…"), this);
+    auto *skillsAct = registerAction(
+        QLatin1String(ActionIds::AgentManageSkills),
+        new QAction(QIcon::fromTheme(QStringLiteral("preferences-plugin")),
+                    i18n("Manage Agent &Skills…"), this));
     skillsAct->setToolTip(
         i18n("Install skills — reusable instructions that teach your agents how "
              "to do a particular job."));
@@ -1234,6 +1369,13 @@ void MainWindow::setupActions()
         m_agentMenu->addSeparator();
         m_agentMenu->addAction(skillsAct);
     }
+
+    // Settings ▸ Configure Shortcuts, the surface the whole collection exists
+    // for. It goes last in Options so it sits below the things it configures.
+    optionsMenu->addSeparator();
+    optionsMenu->addAction(registerAction(
+        QLatin1String(ActionIds::OptionsConfigureKeyBinding),
+        KStandardAction::keyBindings(this, &MainWindow::configureShortcuts, this)));
 
     auto *helpMenu = new KHelpMenu(this, KAboutData::applicationData());
     menuBar()->addMenu(helpMenu->menu());
@@ -1293,40 +1435,103 @@ void MainWindow::showCommandPalette()
     if (!m_commandPalette) {
         m_commandPalette = new CommandPalette(this);
     }
-    // Gather every leaf action reachable from the menu bar. Because the menu
-    // bar is the single source of truth (the hamburger mirrors it), this one
-    // walk surfaces File/Options/View/Code/Help plus perspectives and the
-    // centre-mode toggles — the whole feature surface, searchable by name.
-    QList<QAction *> actions;
+    // THE COLLECTION FIRST, not the menu bar (plan 27 §1). The old walk started
+    // from menuBar() and could therefore only ever list what was in a menu: the
+    // twenty rail accelerators, the three centre-mode toolbar buttons and every
+    // panel-local command were absent, and CommandPalette's own header claimed
+    // it listed "every command in the application" while listing a fraction.
+    // The collection is the registry those actions are now born into.
+    QList<CommandPalette::Entry> entries;
     QSet<QAction *> seen;
+
+    // Simple mode hides commands two ways: individually (m_advancedActions) and
+    // wholesale (the Code menu's menuAction, which leaves its CHILDREN visible).
+    // Both are "advanced" to the palette, which lists them tagged rather than
+    // dropping them — see CommandPalette::Entry.
+    QSet<QAction *> advanced;
+    for (QAction *a : std::as_const(m_advancedActions)) {
+        if (a) {
+            advanced.insert(a);
+        }
+    }
+    const bool codeMenuHidden =
+        m_codeMenu && !m_codeMenu->menuAction()->isVisible();
+    if (codeMenuHidden) {
+        const auto codeActions = m_codeMenu->actions();
+        for (QAction *a : codeActions) {
+            advanced.insert(a);
+        }
+    }
+
+    // Whether a command can actually run. For a visible action the action is
+    // the authority. For a HIDDEN one it is not: QAction::setVisible(false)
+    // clears `enabled` as a side effect and setVisible(true) recomputes it from
+    // the enablement the application really asked for — so the truth is in
+    // there, just not readable. Flip it back for the length of the question,
+    // with signals blocked so no menu relayouts and no handler observes the
+    // flicker. Getting this wrong in the permissive direction would let the
+    // palette run Create Pull Request on an agent with no branch, which is
+    // exactly the gate AgentActions::compute exists to hold.
+    const auto available = [](QAction *a) {
+        if (a->isVisible()) {
+            return a->isEnabled();
+        }
+        const QSignalBlocker block(a);
+        a->setVisible(true);
+        const bool ok = a->isEnabled();
+        a->setVisible(false);
+        return ok;
+    };
+
+    const auto collected = m_actions->actions();
+    for (QAction *a : collected) {
+        if (!a || seen.contains(a)) {
+            continue;
+        }
+        seen.insert(a);
+        entries.append({a, QString(), advanced.contains(a), available(a)});
+    }
+
+    // Then the menu-bar walk, merged. It is not redundant: KHelpMenu builds its
+    // own actions and hands us a menu, never a collection, so About / Handbook /
+    // Report Bug reach the palette only this way.
     std::function<void(QMenu *)> walk = [&](QMenu *menu) {
         for (QAction *a : menu->actions()) {
             if (a->isSeparator()) {
                 continue;
             }
             if (a->menu()) {
-                if (a->isVisible()) { // skip menus hidden by Simple mode
-                    walk(a->menu());
-                }
+                walk(a->menu());
                 continue;
             }
             if (!seen.contains(a)) {
                 seen.insert(a);
-                actions << a;
+                entries.append({a, QString(), advanced.contains(a), available(a)});
             }
         }
     };
-    for (QAction *top : menuBar()->actions()) {
+    const auto topLevel = menuBar()->actions();
+    for (QAction *top : topLevel) {
         if (top->menu()) {
-            if (top->isVisible()) {
-                walk(top->menu());
-            }
+            walk(top->menu());
         } else if (!top->isSeparator() && !seen.contains(top)) {
             seen.insert(top);
-            actions << top;
+            entries.append({top, QString(), advanced.contains(top), available(top)});
         }
     }
-    m_commandPalette->setActions(actions);
+
+    // Finally the commands panels published for themselves (registerCommands).
+    // Guarded pointers: a panel destroyed since it registered simply drops out.
+    for (const PanelCommand &pc : std::as_const(m_panelCommands)) {
+        QAction *a = pc.action.data();
+        if (!a || seen.contains(a)) {
+            continue;
+        }
+        seen.insert(a);
+        entries.append({a, pc.group, false, available(a)});
+    }
+
+    m_commandPalette->setActions(entries);
     m_commandPalette->showPalette();
 }
 
@@ -1336,33 +1541,43 @@ void MainWindow::setupAgentMenu()
 {
     m_agentMenu = menuBar()->addMenu(i18n("&Agent"));
 
-    auto *newAct = m_agentMenu->addAction(
-        QIcon::fromTheme(QStringLiteral("list-add")), i18n("&New Agent"));
+    auto *newAct = registerAction(
+        QLatin1String(ActionIds::AgentNew),
+        m_agentMenu->addAction(QIcon::fromTheme(QStringLiteral("list-add")),
+                               i18n("&New Agent")));
     newAct->setToolTip(i18n("Describe a task and start a fresh agent in the current project."));
     connect(newAct, &QAction::triggered, this,
             [this] { m_agent->newAgentInActiveProjectGuided(); });
 
-    m_agentRenameAct = m_agentMenu->addAction(
-        QIcon::fromTheme(QStringLiteral("document-edit")), i18n("&Rename Agent…"));
+    m_agentRenameAct = registerAction(
+        QLatin1String(ActionIds::AgentRename),
+        m_agentMenu->addAction(QIcon::fromTheme(QStringLiteral("document-edit")),
+                               i18n("&Rename Agent…")));
     connect(m_agentRenameAct, &QAction::triggered, this,
             [this] { m_agent->renameActiveAgent(); });
 
-    m_agentResumeAct = m_agentMenu->addAction(
-        QIcon::fromTheme(QStringLiteral("media-playback-start")), i18n("Res&ume Agent"));
+    m_agentResumeAct = registerAction(
+        QLatin1String(ActionIds::AgentResume),
+        m_agentMenu->addAction(QIcon::fromTheme(QStringLiteral("media-playback-start")),
+                               i18n("Res&ume Agent")));
     m_agentResumeAct->setToolTip(i18n("Relaunch a paused agent and continue its conversation."));
     connect(m_agentResumeAct, &QAction::triggered, this,
             [this] { m_agent->resumeActiveAgent(); });
 
     m_agentMenu->addSeparator();
 
-    m_agentAttachAct = m_agentMenu->addAction(
-        QIcon::fromTheme(QStringLiteral("mail-attachment")), i18n("&Attach Files…"));
+    m_agentAttachAct = registerAction(
+        QLatin1String(ActionIds::AgentAttachFiles),
+        m_agentMenu->addAction(QIcon::fromTheme(QStringLiteral("mail-attachment")),
+                               i18n("&Attach Files…")));
     m_agentAttachAct->setToolTip(i18n("Give the active agent files as context for its next message."));
     connect(m_agentAttachAct, &QAction::triggered, this,
             [this] { m_agent->attachToActiveAgent(); });
 
-    m_agentChangesAct = m_agentMenu->addAction(
-        QIcon::fromTheme(QStringLiteral("vcs-diff")), i18n("Show &Changes"));
+    m_agentChangesAct = registerAction(
+        QLatin1String(ActionIds::AgentShowChanges),
+        m_agentMenu->addAction(QIcon::fromTheme(QStringLiteral("vcs-diff")),
+                               i18n("Show &Changes")));
     m_agentChangesAct->setToolTip(i18n("Review the changes the active agent has made."));
     connect(m_agentChangesAct, &QAction::triggered, this,
             [this] { m_agent->showActiveAgentChanges(); });
@@ -1374,17 +1589,20 @@ void MainWindow::setupAgentMenu()
     //
     // It is no longer called "Merge into Local Main": agent.land merges into
     // the workspace's CURRENT branch, whatever that is (audit F50).
-    m_agentMergeAct = m_agentMenu->addAction(
-        QIcon::fromTheme(QStringLiteral("vcs-merge")),
-        i18n("&Merge the Agent's Changes…"));
+    m_agentMergeAct = registerAction(
+        QLatin1String(ActionIds::AgentMergeChanges),
+        m_agentMenu->addAction(QIcon::fromTheme(QStringLiteral("vcs-merge")),
+                               i18n("&Merge the Agent's Changes…")));
     m_agentMergeAct->setToolTip(
         i18n("Bring this agent's work out of its private copy and into your "
              "project's current branch."));
     connect(m_agentMergeAct, &QAction::triggered, this,
             [this] { m_agent->mergeActiveAgent(); });
 
-    m_agentStopAct = m_agentMenu->addAction(
-        QIcon::fromTheme(QStringLiteral("process-stop")), i18n("&Stop Agent"));
+    m_agentStopAct = registerAction(
+        QLatin1String(ActionIds::AgentStop),
+        m_agentMenu->addAction(QIcon::fromTheme(QStringLiteral("process-stop")),
+                               i18n("&Stop Agent")));
     m_agentStopAct->setToolTip(i18n("Stop the running agent (it stays available to resume)."));
     connect(m_agentStopAct, &QAction::triggered, this,
             [this] { m_agent->stopActiveAgent(); });
@@ -1393,35 +1611,46 @@ void MainWindow::setupAgentMenu()
 
     // Git / worktree lifecycle — hidden in Simple mode (added to m_advancedActions
     // in setupActions, which runs after this).
-    m_agentCommitAct = m_agentMenu->addAction(i18n("&Commit Changes…"));
+    m_agentCommitAct = registerAction(QLatin1String(ActionIds::AgentCommit),
+                                      m_agentMenu->addAction(i18n("&Commit Changes…")));
     connect(m_agentCommitAct, &QAction::triggered, this,
             [this] { m_agent->commitActiveAgent(); });
-    m_agentPrAct = m_agentMenu->addAction(i18n("Create &Pull Request…"));
+    m_agentPrAct = registerAction(QLatin1String(ActionIds::AgentCreatePullRequest),
+                                  m_agentMenu->addAction(i18n("Create &Pull Request…")));
     connect(m_agentPrAct, &QAction::triggered, this,
             [this] { m_agent->createPullRequestForActiveAgent(); });
     // Text + tooltip are re-derived per agent in updateAgentActions (the folder
-    // is only a "worktree" when the agent is isolated).
-    m_agentTerminalAct = m_agentMenu->addAction(
-        QIcon::fromTheme(QStringLiteral("utilities-terminal")),
-        AgentActions::terminalActionLabel(/*isolated=*/false));
+    // is only a "worktree" when the agent is isolated). The COLLECTION ID does
+    // not change with the label — a user who rebinds this keeps that binding
+    // when they switch to a workspace-mode agent and the wording changes.
+    m_agentTerminalAct = registerAction(
+        QLatin1String(ActionIds::AgentOpenTerminal),
+        m_agentMenu->addAction(QIcon::fromTheme(QStringLiteral("utilities-terminal")),
+                               AgentActions::terminalActionLabel(/*isolated=*/false)));
     connect(m_agentTerminalAct, &QAction::triggered, this,
             [this] { m_agent->openActiveAgentTerminal(); });
 
     m_agentMenu->addSeparator();
 
-    m_agentTagsAct = m_agentMenu->addAction(
-        QIcon::fromTheme(QStringLiteral("tag")), i18n("Edit &Tags…"));
+    m_agentTagsAct = registerAction(
+        QLatin1String(ActionIds::AgentEditTags),
+        m_agentMenu->addAction(QIcon::fromTheme(QStringLiteral("tag")),
+                               i18n("Edit &Tags…")));
     connect(m_agentTagsAct, &QAction::triggered, this,
             [this] { m_agent->editActiveAgentTags(); });
 
-    m_agentDiscardAct =
-        m_agentMenu->addAction(AgentActions::discardActionLabel(/*isolated=*/false));
+    // Same rule as the terminal action: the label swings between "Discard
+    // Worktree" and "Delete Agent" with the agent's isolation, the id does not.
+    m_agentDiscardAct = registerAction(
+        QLatin1String(ActionIds::AgentDiscard),
+        m_agentMenu->addAction(AgentActions::discardActionLabel(/*isolated=*/false)));
     m_agentDiscardAct->setToolTip(
         AgentActions::discardActionTooltip(/*isolated=*/false));
     connect(m_agentDiscardAct, &QAction::triggered, this,
             [this] { m_agent->discardActiveAgentWorktree(); });
 
-    m_agentCloseAct = m_agentMenu->addAction(i18n("&Close Agent"));
+    m_agentCloseAct = registerAction(QLatin1String(ActionIds::AgentClose),
+                                     m_agentMenu->addAction(i18n("&Close Agent")));
     connect(m_agentCloseAct, &QAction::triggered, this,
             [this] { m_agent->closeActiveAgent(); });
 
@@ -1577,46 +1806,72 @@ void MainWindow::setPanelTabVisible(const QString &key, bool visible)
 
 // setupShellShortcuts wires the JetBrains-style raise-by-ordinal accelerators
 // for the left/right strips, plus Ctrl+E / Ctrl+Shift+E perspective toggles.
+//
+// These were raw QShortcuts until plan 27 §1. A QShortcut is invisible to every
+// configuration surface there is — it has no name, no text, no icon and no entry
+// in any collection — so twenty of this application's bindings could not be
+// listed, searched, rebound or even discovered, and the only thing that ever
+// said they existed was a hand-built tooltip. They are ordinary named actions
+// now; each is added to the window as well as the collection, because an action
+// in no menu needs a widget to make its shortcut live.
 void MainWindow::setupShellShortcuts()
 {
-    auto bindRaise = [this](SideBar *bar, QKeyCombination base) {
-        for (int i = 0; i < 9; ++i) {
-            const QKeySequence seq(
-                QKeyCombination(base.keyboardModifiers(),
-                                static_cast<Qt::Key>(Qt::Key_1 + i)));
-            auto *sc = new QShortcut(seq, this);
-            connect(sc, &QShortcut::activated, this, [bar, i] {
+    auto bindRaise = [this](SideBar *bar, bool leftBar, Qt::KeyboardModifiers mods) {
+        const QString stripName = leftBar
+            ? i18nc("@item the left activity rail", "Left Sidebar")
+            : i18nc("@item the right activity rail", "Right Sidebar");
+        for (int i = 0; i < ActionIds::kRailOrdinals; ++i) {
+            auto *act = registerAction(
+                ActionIds::railRaise(leftBar, i + 1),
+                new QAction(i18nc("@action raise the Nth panel of a sidebar",
+                                  "Raise %1 Panel %2", stripName, i + 1),
+                            this),
+                {QKeySequence(QKeyCombination(mods,
+                                              static_cast<Qt::Key>(Qt::Key_1 + i)))});
+            connect(act, &QAction::triggered, this, [bar, i] {
                 const int id = bar->panelIdAt(i);
                 if (id >= 0) {
                     bar->setRaisedId(bar->raisedId() == id ? -1 : id);
                 }
             });
+            addAction(act);
         }
-        const QKeySequence collapseSeq(
-            QKeyCombination(base.keyboardModifiers(), Qt::Key_0));
-        auto *collapse = new QShortcut(collapseSeq, this);
-        connect(collapse, &QShortcut::activated, this,
+        auto *collapse = registerAction(
+            ActionIds::railCollapse(leftBar),
+            new QAction(i18nc("@action collapse a whole sidebar",
+                              "Collapse %1", stripName), this),
+            {QKeySequence(QKeyCombination(mods, Qt::Key_0))});
+        connect(collapse, &QAction::triggered, this,
                 [bar] { bar->setRaisedId(-1); });
+        addAction(collapse);
     };
-    bindRaise(m_leftBar, QKeyCombination(Qt::AltModifier, Qt::Key_0));
-    bindRaise(m_rightBar,
-              QKeyCombination(Qt::ControlModifier | Qt::AltModifier, Qt::Key_0));
+    bindRaise(m_leftBar, /*leftBar=*/true, Qt::AltModifier);
+    bindRaise(m_rightBar, /*leftBar=*/false,
+              Qt::ControlModifier | Qt::AltModifier);
 
     // Ctrl+E toggles between editor-only and split; Ctrl+Shift+E toggles
     // between chat-only and split. Both route through applyCentreMode so the
     // top-toolbar buttons stay in sync.
-    auto *focusEditor = new QShortcut(Qt::CTRL | Qt::Key_E, this);
-    connect(focusEditor, &QShortcut::activated, this, [this] {
+    auto *focusEditor = registerAction(
+        QLatin1String(ActionIds::ViewFocusEditor),
+        new QAction(i18nc("@action", "Focus the Editor"), this),
+        {QKeySequence(Qt::CTRL | Qt::Key_E)});
+    connect(focusEditor, &QAction::triggered, this, [this] {
         applyCentreMode(m_centreMode == QLatin1String("editor")
                             ? QStringLiteral("split")
                             : QStringLiteral("editor"));
     });
-    auto *focusAgent = new QShortcut(Qt::CTRL | Qt::SHIFT | Qt::Key_E, this);
-    connect(focusAgent, &QShortcut::activated, this, [this] {
+    addAction(focusEditor);
+    auto *focusAgent = registerAction(
+        QLatin1String(ActionIds::ViewFocusAgent),
+        new QAction(i18nc("@action", "Focus the Agent Conversation"), this),
+        {QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_E)});
+    connect(focusAgent, &QAction::triggered, this, [this] {
         applyCentreMode(m_centreMode == QLatin1String("chat")
                             ? QStringLiteral("split")
                             : QStringLiteral("chat"));
     });
+    addAction(focusAgent);
 }
 
 // setupPerspectives adds a small menu of named layout snapshots — Code Focus,
@@ -1642,25 +1897,27 @@ void MainWindow::setupPerspectives()
     }
     m_perspectivesMenu = new QMenu(i18n("&Layout"), viewMenu);
     m_perspectivesMenu->setIcon(QIcon::fromTheme(QStringLiteral("view-multiple-objects")));
-    auto add = [this](const QString &label, const QString &key, const QString &tip,
-                      const QKeySequence &shortcut = QKeySequence()) {
-        QAction *act = m_perspectivesMenu->addAction(label);
+    auto add = [this](const QString &id, const QString &label, const QString &key,
+                      const QString &tip, const QKeySequence &shortcut) {
+        QAction *act = registerAction(id, m_perspectivesMenu->addAction(label),
+                                      {shortcut});
         act->setToolTip(tip);
-        if (!shortcut.isEmpty()) {
-            act->setShortcut(shortcut);
-        }
         connect(act, &QAction::triggered, this, [this, key] { applyPerspective(key); });
     };
-    add(i18n("&Converse"), QStringLiteral("converse"),
+    add(QLatin1String(ActionIds::LayoutConverse), i18n("&Converse"),
+        QStringLiteral("converse"),
         i18n("Focus the conversation with your agent."),
         Qt::CTRL | Qt::SHIFT | Qt::Key_1);
-    add(i18n("&Build"), QStringLiteral("build"),
+    add(QLatin1String(ActionIds::LayoutBuild), i18n("&Build"),
+        QStringLiteral("build"),
         i18n("Focus the code editor and files."),
         Qt::CTRL | Qt::SHIFT | Qt::Key_2);
-    add(i18n("&Review"), QStringLiteral("review"),
+    add(QLatin1String(ActionIds::LayoutReview), i18n("&Review"),
+        QStringLiteral("review"),
         i18n("Editor and agent side by side, with changes and history."),
         Qt::CTRL | Qt::SHIFT | Qt::Key_3);
-    add(i18n("&Side by Side"), QStringLiteral("split"),
+    add(QLatin1String(ActionIds::LayoutSplit), i18n("&Side by Side"),
+        QStringLiteral("split"),
         i18n("A balanced split of the editor and the agent."),
         Qt::CTRL | Qt::SHIFT | Qt::Key_4);
 
@@ -1808,13 +2065,23 @@ int MainWindow::registerPanel(const QString &key, const QIcon &icon,
 }
 
 // refreshPanelTooltips rebuilds every rail tab's hover text: what the panel is
-// for, plus the raise-by-ordinal accelerator that reaches it.
+// for, plus the accelerator that raises it.
 //
-// The accelerators (setupShellShortcuts) are raw QShortcuts — they appear in no
-// menu, so the command palette, which walks the menu bar, cannot surface them
-// either, and nothing else on screen says they exist (audit F50). The tooltip
-// is the interim answer; plan 27 §1's KActionCollection refactor is the real
-// one and takes this whole method with it.
+// PLAN 27 §1 CONFIRMATION. The old comment here said the KActionCollection
+// refactor would "take this whole method with it". Half of that is right and
+// half is not, so only half was done:
+//
+//   * The BINDING HINT was the interim answer to raw QShortcuts being invisible
+//     (audit F50), and the collection does supersede it as the mechanism —
+//     which is why the sequence is now read back off the registered action
+//     instead of being recomputed from Alt+ordinal. That matters: a user who
+//     rebinds Alt+3 in Settings ▸ Configure Shortcuts used to get a tooltip
+//     confidently naming the binding they had just replaced.
+//   * The DESCRIPTION ("what this panel is for", PanelInfo::help) is not
+//     superseded by anything. A collection lists commands; it has no concept of
+//     a panel and nothing in it explains what the Cowork rail tab does. Deleting
+//     help would delete the one thing that makes an icon-only rail readable to a
+//     newcomer, in exchange for nothing. So it stays.
 //
 // It has to be a method rather than a one-shot at construction because the
 // ordinal is a POSITION in the strip: moving or detaching one panel renumbers
@@ -1823,8 +2090,8 @@ int MainWindow::registerPanel(const QString &key, const QIcon &icon,
 void MainWindow::refreshPanelTooltips()
 {
     const auto railShortcut = [this](SideBar *bar, int id) -> QString {
-        if (bar != m_leftBar && bar != m_rightBar) {
-            return QString(); // the bottom strip has no ordinal binding
+        if (!m_actions || (bar != m_leftBar && bar != m_rightBar)) {
+            return QString(); // no collection yet, or the bottom strip (unbound)
         }
         int index = -1;
         for (int i = 0; i < bar->panelCount(); ++i) {
@@ -1833,15 +2100,14 @@ void MainWindow::refreshPanelTooltips()
                 break;
             }
         }
-        if (index < 0 || index > 8) {
-            return QString(); // bindRaise only binds 1…9
+        if (index < 0 || index >= ActionIds::kRailOrdinals) {
+            return QString(); // bindRaise only binds the first kRailOrdinals
         }
-        const Qt::KeyboardModifiers mods = (bar == m_leftBar)
-            ? Qt::KeyboardModifiers(Qt::AltModifier)
-            : Qt::KeyboardModifiers(Qt::ControlModifier | Qt::AltModifier);
-        return QKeySequence(QKeyCombination(mods,
-                                            static_cast<Qt::Key>(Qt::Key_1 + index)))
-            .toString(QKeySequence::NativeText);
+        // The ACTIVE sequence, not the default: this text exists to tell the
+        // truth about the key that works right now.
+        QAction *act =
+            m_actions->action(ActionIds::railRaise(bar == m_leftBar, index + 1));
+        return act ? act->shortcut().toString(QKeySequence::NativeText) : QString();
     };
     for (auto it = m_panels.constBegin(); it != m_panels.constEnd(); ++it) {
         if (it->help.isEmpty() || !it->bar || it->barId < 0) {
@@ -2607,7 +2873,11 @@ void MainWindow::setupHamburger()
                 ->group(QStringLiteral("View"))
                 .writeEntry("menubar", on);
         }, this);
-    showMenubarAct->setShortcut(Qt::CTRL | Qt::Key_M);
+    // KStandardAction defaults this to Ctrl+M already, but say so through the
+    // collection rather than setShortcut: the point is that it is a DEFAULT the
+    // user may override, not a literal.
+    registerAction(QLatin1String(ActionIds::OptionsShowMenubar), showMenubarAct,
+                   {QKeySequence(Qt::CTRL | Qt::Key_M)});
 
     const bool wantMenubar = KSharedConfig::openConfig()
         ->group(QStringLiteral("View"))
@@ -2659,14 +2929,16 @@ void MainWindow::setupTopToolbar()
     m_layoutButton->setAutoRaise(true);
     m_layoutButton->setToolTip(i18n("Reshape the whole workspace for the task at hand."));
     auto *layoutMenu = new QMenu(m_layoutButton);
-    auto addLayoutItem = [this, layoutMenu](const QString &key) {
-        QAction *a = layoutMenu->addAction(layoutDisplayName(key));
-        connect(a, &QAction::triggered, this, [this, key] { applyPerspective(key); });
-    };
-    addLayoutItem(QStringLiteral("converse"));
-    addLayoutItem(QStringLiteral("build"));
-    addLayoutItem(QStringLiteral("split"));
-    addLayoutItem(QStringLiteral("review"));
+    // The SAME actions the View ▸ Layout submenu holds (setupPerspectives runs
+    // first). A second set built here would be a second thing to keep in step —
+    // and, being outside the collection, would show no shortcut and honour no
+    // rebinding while sitting next to one that does.
+    for (const char *id : {ActionIds::LayoutConverse, ActionIds::LayoutBuild,
+                           ActionIds::LayoutSplit, ActionIds::LayoutReview}) {
+        if (QAction *a = m_actions->action(QLatin1String(id))) {
+            layoutMenu->addAction(a);
+        }
+    }
     m_layoutButton->setMenu(layoutMenu);
     toolbar->addWidget(m_layoutButton);
     toolbar->addSeparator();
@@ -2676,13 +2948,21 @@ void MainWindow::setupTopToolbar()
     // the inactive halves of the centre split and persists the choice.
     auto *modeGroup = new QActionGroup(this);
     modeGroup->setExclusive(true);
-    m_centreEditorAct = new QAction(
-        QIcon::fromTheme(QStringLiteral("document-edit")), i18n("Editor"), this);
-    m_centreSplitAct = new QAction(
-        QIcon::fromTheme(QStringLiteral("view-split-left-right")),
-        i18n("Split"), this);
-    m_centreChatAct = new QAction(
-        QIcon::fromTheme(QStringLiteral("im-user")), i18n("Chat"), this);
+    // Toolbar-only until plan 27 §1 — and therefore unfindable, because the
+    // palette walked the menu bar. They are in the collection now, which is what
+    // makes "Chat" reachable by typing its name.
+    m_centreEditorAct = registerAction(
+        QLatin1String(ActionIds::ViewCentreEditor),
+        new QAction(QIcon::fromTheme(QStringLiteral("document-edit")),
+                    i18n("Editor"), this));
+    m_centreSplitAct = registerAction(
+        QLatin1String(ActionIds::ViewCentreSplit),
+        new QAction(QIcon::fromTheme(QStringLiteral("view-split-left-right")),
+                    i18n("Split"), this));
+    m_centreChatAct = registerAction(
+        QLatin1String(ActionIds::ViewCentreChat),
+        new QAction(QIcon::fromTheme(QStringLiteral("im-user")),
+                    i18n("Chat"), this));
     for (QAction *a : { m_centreEditorAct, m_centreSplitAct, m_centreChatAct }) {
         a->setCheckable(true);
         modeGroup->addAction(a);

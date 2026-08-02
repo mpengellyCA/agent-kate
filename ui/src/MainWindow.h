@@ -2,6 +2,9 @@
 
 #include <KMainWindow>
 #include <QHash>
+#include <QKeySequence>
+#include <QList>
+#include <QPointer>
 #include <QSet>
 #include <QString>
 
@@ -12,6 +15,7 @@ class View;
 class GutterController;
 class BlameController;
 
+class KActionCollection;
 class CoreClient;
 class EditorArea;
 class ProjectTree;
@@ -54,6 +58,19 @@ public:
     // already set" (or that there is none).
     void raiseAndActivate(const QString &xdgActivationToken = QString());
 
+    // Publish a panel's own commands to the command palette (plan 27 §1).
+    //
+    // A panel's toolbar toggles and local actions live nowhere the menu bar can
+    // see, so before this they were unreachable by name — CommandPalette's own
+    // header claimed to list "every command in the application" while listing
+    // only the menus. `group` is the panel's display name and prefixes each
+    // entry ("Problems: Show warnings") so the palette reads as one namespaced
+    // list rather than a pile of similar verbs.
+    //
+    // The palette holds these under QPointer, so a panel that is destroyed
+    // simply drops out; callers do not have to unregister.
+    void registerCommands(const QString &group, const QList<QAction *> &actions);
+
 protected:
     void closeEvent(QCloseEvent *event) override;
     bool eventFilter(QObject *watched, QEvent *event) override;
@@ -66,6 +83,24 @@ private:
     void setupShellShortcuts();
     void setupPerspectives();
     void setupCore();
+
+    // Put `act` into the window's one KActionCollection under a stable id from
+    // ActionIds.h, declaring `defaults` as its DEFAULT shortcut rather than
+    // setting the shortcut directly. The distinction is the whole point of the
+    // refactor: a default is what "Reset to defaults" restores and what the user
+    // is allowed to override, whereas a plain setShortcut() is a literal the
+    // configuration dialog cannot see and the user cannot change.
+    //
+    // Returns `act` so call sites can chain. Never call m_actions->addAction()
+    // or QAction::setShortcut() directly — ActionIdsTest scans this file for
+    // both.
+    QAction *registerAction(const QString &id, QAction *act,
+                            const QList<QKeySequence> &defaults = {});
+    // Settings ▸ Configure Shortcuts. Opens KShortcutsDialog over the window's
+    // collection AND the embedded editor part's, so a conflict between the two
+    // is visible and resolvable instead of being worked around in code.
+    void configureShortcuts();
+
     // Agent Kate contains no model: every agent is an external CLI akcore
     // spawns off $PATH. If NOT ONE of them is installed the app is inert, and
     // the user currently finds out only after writing and sending their first
@@ -121,9 +156,9 @@ private:
     int panelId(const QString &key) const;
     SideBar *panelBar(const QString &key) const;
     void raisePanelByKey(const QString &key); // raise it (and re-attach if floating)
-    // Rebuild every rail tab's hover text (what the panel is for + its Alt+N
-    // accelerator). Must run again after any move/detach: the accelerator is a
-    // POSITION in the strip, so moving one panel renumbers the rest.
+    // Rebuild every rail tab's hover text (what the panel is for + the binding
+    // that raises it). Must run again after any move/detach: the binding is
+    // owned by a POSITION in the strip, so moving one panel renumbers the rest.
     void refreshPanelTooltips();
     void updateCursorStatus();
     void updateBreadcrumb(const QString &path);
@@ -164,6 +199,21 @@ private:
     bool adoptPendingEditorGroup(int agentId, const QString &projectPath,
                                  const QString &threadId);
     void restoreEditorSession(const QString &projectPath, const QString &worktreePath);
+
+    // The one action collection. Every user-visible action in the window is in
+    // it, under a stable id from ActionIds.h — that is what makes shortcuts
+    // configurable (KShortcutsDialog), persistent (KConfig, keyed by id) and
+    // findable (the command palette walks this, not the menu bar).
+    KActionCollection *m_actions = nullptr;
+    // Panel-published commands (registerCommands): actions that exist only on a
+    // panel's own toolbar and so appear in no menu. Guarded because the panel
+    // owns them and can outlive nothing — a destroyed panel's entries go null
+    // and are skipped rather than dangling.
+    struct PanelCommand {
+        QString group;
+        QPointer<QAction> action;
+    };
+    QList<PanelCommand> m_panelCommands;
 
     CoreClient *m_core = nullptr;
     // Set once the graceful stop-and-compact shutdown has run, so the re-entered
