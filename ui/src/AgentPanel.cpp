@@ -3321,16 +3321,20 @@ void AgentPanel::runFind(int direction)
         return;
     }
     // Recompute the matching rows. Every row kind is scanned through the model's
-    // own searchText — notes, tool names/commands/results and reasoning included
+    // own search text — notes, tool names/commands/results and reasoning included
     // (audit F48): the error text the user is staring at lives in a note, and
-    // scanning message prose alone answered "No matches" for it. The delegate
+    // scanning message prose alone answered "No matches" for it. The scan goes
+    // through the model's CACHED lowercased text (audit F58): searchText()
+    // re-joined a Tool row's name + summary + detail + full retained result —
+    // up to 128 KB — into a fresh QString per row per keystroke. The delegate
     // paints the per-row highlight from the model's find state (messages and
     // notes; a matched tool/thinking row is scrolled to and counted but not
     // highlighted — its body is behind a collapsed header), so no HTML
     // rewriting happens here.
     m_findHits.clear();
+    const QString needleLower = needle.toLower();
     for (int row = 0; row < m_model->count(); ++row) {
-        if (m_model->searchText(row).contains(needle, Qt::CaseInsensitive)) {
+        if (m_model->searchTextLower(row).contains(needleLower)) {
             m_findHits.append(row);
         }
     }
@@ -3570,11 +3574,17 @@ void AgentPanel::onSendClicked()
         m_pendingOpening = QueuedMsg{text, attachments};
         m_core->call(QStringLiteral("agent.start"), startParams,
                      [this](const QJsonObject &result, const QJsonObject &error) {
-                         if (!error.isEmpty()) {
+                         // A "success" without a threadId fails the same way an
+                         // error does (audit F67): with an empty id the panel
+                         // drops every notification, no _lifecycle/started can
+                         // ever arrive, and m_pendingOpening would stay latched
+                         // forever — so the prompt goes back to the composer
+                         // here too, not only on `error`.
+                         const QString failure =
+                             agentkate::startFailureReason(result, error);
+                         if (!failure.isEmpty()) {
                              addNote(QStringLiteral("Failed to start agent: %1")
-                                         .arg(error.value(QStringLiteral("message"))
-                                                  .toString()
-                                                  .toHtmlEscaped()),
+                                         .arg(failure.toHtmlEscaped()),
                                      QStringLiteral("err"));
                              restoreUnsentToComposer();
                              return;

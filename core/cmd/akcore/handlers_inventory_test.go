@@ -417,11 +417,15 @@ var agentReachable = map[string]reachDecision{
 // consent path it is.
 func sharedBoard(what string) reachDecision {
 	return reachDecision{Basis: basisSharedBoard,
-		// The board names its writer with a free-text owner/author, not with a
-		// bound thread id, and that openness IS the claim being made here — so
-		// the cross probe proves it rather than the entry asserting it. A coop
-		// handler that grew a caller binding would fail this and belong under
-		// basisCallerBound, which is a better place for it.
+		// The board is open — a bridge for any thread is SERVED, which is what
+		// the cross probe proves rather than the entry asserting it. But since
+		// F63 the writer's NAME is not the payload's to choose: a bridge's
+		// writes are attributed as its bound thread whatever owner/author it
+		// supplied ("human" is reserved for the UI role). Overriding is not
+		// refusing, so the openness claim below still holds; the attribution
+		// binding has its own test, TestCoopWritesAreAttributedToTheCaller.
+		// A coop handler that started REFUSING foreign bridges would fail this
+		// and belong under basisCallerBound instead.
 		Cross: map[string]any{"owner": probeSelf, "author": probeSelf,
 			"thread": probeSelf, "text": "probe", "summary": "probe"},
 		Why: "the cooperation board is a shared agent workspace by design — " + what}

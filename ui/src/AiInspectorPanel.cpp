@@ -2,6 +2,7 @@
 
 #include "AgentChatHelpers.h"
 #include "ipc/CoreClient.h"
+#include "state/HarnessTraits.h"
 
 #include <KLocalizedString>
 
@@ -204,7 +205,44 @@ void AiInspectorPanel::setActiveThread(const QString &threadId)
     m_modelUsage = QJsonObject();
     m_ctxPromptTokens = 0;
     m_ctxWindow = 0;
+    // Until the thread's record arrives the default engine's traits apply —
+    // "unknown means billed", exactly as the AgentPanel sibling reads it.
+    m_billed = HarnessRegistry::self()->traits(QString()).usageReporting;
+    resolveThreadBackend(threadId);
     updateTotals();
+}
+
+void AiInspectorPanel::resolveThreadBackend(const QString &threadId)
+{
+    if (threadId.isEmpty()) {
+        return;
+    }
+    m_core->call(
+        QStringLiteral("session.listThreads"), QJsonObject{},
+        [this, threadId](const QJsonObject &result, const QJsonObject &error) {
+            if (!error.isEmpty() || threadId != m_threadId) {
+                return; // failed, or the panel has moved on — keep the default
+            }
+            const QJsonArray threads = result.value(QStringLiteral("threads")).toArray();
+            for (const QJsonValue &v : threads) {
+                const QJsonObject rec = v.toObject();
+                if (rec.value(QStringLiteral("threadId")).toString() == threadId) {
+                    setThreadBackend(rec.value(QStringLiteral("backend")).toString());
+                    return;
+                }
+            }
+        },
+        this); // context guard: a late reply must not touch a destroyed panel
+}
+
+void AiInspectorPanel::setThreadBackend(const QString &backend)
+{
+    const bool billed = HarnessRegistry::self()->traits(backend).usageReporting;
+    if (billed == m_billed) {
+        return;
+    }
+    m_billed = billed;
+    updateTotals(); // the totals line labels spend and readout differently
 }
 
 void AiInspectorPanel::handleEvents(const QJsonArray &events)
@@ -234,10 +272,23 @@ void AiInspectorPanel::handleEvent(const QJsonObject &ev)
                     .simplified();
             auto *item = new QTreeWidgetItem(m_timeline, {name, detail, i18n("running…")});
             if (!id.isEmpty()) {
+                item->setData(0, Qt::UserRole, id);
                 m_rows.insert(id, item);
                 m_toolNameById.insert(id, name);
             }
             ++m_toolCalls;
+            // Bounded ring, same discipline as the all-threads feed — and the
+            // evicted row's pending-result lookups go with it, or they would
+            // dangle on the deleted item.
+            while (m_timeline->topLevelItemCount() > kMaxActivityRows) {
+                QTreeWidgetItem *oldest = m_timeline->takeTopLevelItem(0);
+                const QString oldId = oldest->data(0, Qt::UserRole).toString();
+                if (!oldId.isEmpty()) {
+                    m_rows.remove(oldId);
+                    m_toolNameById.remove(oldId);
+                }
+                delete oldest;
+            }
             m_timeline->scrollToItem(item);
         }
         updateTotals();
@@ -252,7 +303,9 @@ void AiInspectorPanel::handleEvent(const QJsonObject &ev)
                 continue;
             }
             const QString id = b.value(QStringLiteral("tool_use_id")).toString();
-            QTreeWidgetItem *item = m_rows.value(id, nullptr);
+            // take, not value: a resolved call needs no further lookups, and a
+            // long session must not keep one hash entry per call ever made.
+            QTreeWidgetItem *item = m_rows.take(id);
             if (!item) {
                 continue;
             }
@@ -270,13 +323,32 @@ void AiInspectorPanel::handleEvent(const QJsonObject &ev)
         updateTotals();
     } else if (type == QLatin1String("result")) {
         const QJsonObject usage = ev.value(QStringLiteral("usage")).toObject();
-        m_inTok += usage.value(QStringLiteral("input_tokens")).toVariant().toLongLong();
-        m_outTok += usage.value(QStringLiteral("output_tokens")).toVariant().toLongLong();
-        m_cacheRead +=
+        const qlonglong inTok =
+            usage.value(QStringLiteral("input_tokens")).toVariant().toLongLong();
+        const qlonglong outTok =
+            usage.value(QStringLiteral("output_tokens")).toVariant().toLongLong();
+        const qlonglong cacheRead =
             usage.value(QStringLiteral("cache_read_input_tokens")).toVariant().toLongLong();
-        m_cacheCreate +=
+        const qlonglong cacheCreate =
             usage.value(QStringLiteral("cache_creation_input_tokens")).toVariant().toLongLong();
-        m_costUsd += ev.value(QStringLiteral("total_cost_usd")).toDouble();
+        const double costUsd = ev.value(QStringLiteral("total_cost_usd")).toDouble();
+        if (m_billed) {
+            // Per-turn spend: sum into the session totals.
+            m_inTok += inTok;
+            m_outTok += outTok;
+            m_cacheRead += cacheRead;
+            m_cacheCreate += cacheCreate;
+            m_costUsd += costUsd;
+        } else {
+            // A cumulative readout (kimi's /usage) repeats most of itself every
+            // turn: the latest snapshot IS the session total, and summing it
+            // grew quadratically (audit F19b/F60).
+            m_inTok = inTok;
+            m_outTok = outTok;
+            m_cacheRead = cacheRead;
+            m_cacheCreate = cacheCreate;
+            m_costUsd = costUsd;
+        }
         // num_turns and modelUsage are session-cumulative in each result —
         // take the latest snapshot; permission_denials arrive per turn.
         const int turns = ev.value(QStringLiteral("num_turns")).toInt();
@@ -334,10 +406,17 @@ void AiInspectorPanel::updateTotals()
         return;
     }
     const QLocale loc;
-    QString line = i18nc("inspector usage summary",
-                         "%1 tool calls · in %2 · out %3 · cache %4",
-                         loc.toString(m_toolCalls), loc.toString(m_inTok),
-                         loc.toString(m_outTok), loc.toString(m_cacheRead + m_cacheCreate));
+    // A non-billed engine's numbers are a context readout, not a spend — call
+    // them what they are (mirrors the AgentPanel sibling's per-turn line).
+    QString line = m_billed
+        ? i18nc("inspector usage summary",
+                "%1 tool calls · in %2 · out %3 · cache %4",
+                loc.toString(m_toolCalls), loc.toString(m_inTok),
+                loc.toString(m_outTok), loc.toString(m_cacheRead + m_cacheCreate))
+        : i18nc("inspector usage summary (cumulative context readout)",
+                "%1 tool calls · context %2 tokens",
+                loc.toString(m_toolCalls),
+                loc.toString(m_inTok + m_cacheRead + m_cacheCreate));
     if (m_costUsd > 0.0) {
         line += i18nc("inspector cost suffix", " · $%1", loc.toString(m_costUsd, 'f', 4));
     }

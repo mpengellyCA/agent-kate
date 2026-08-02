@@ -78,6 +78,11 @@ constexpr int kDocCacheCap = 32;
 constexpr int kAttCacheCap = 512;
 constexpr qint64 kAttStatTtlMs = 1000;
 
+// Find-highlighted body HTML kept between paints (one entry per matching row on
+// screen plus slack). Like the doc caches it exists to save rebuilds, not to
+// hold the transcript: full means "drop them all", they rebuild lazily.
+constexpr int kHighlightCacheCap = 64;
+
 // chipThumbnail returns an attachment's preview icon, decoded AT icon size and
 // kept in QPixmapCache.
 //
@@ -209,30 +214,6 @@ QString highlightedHtml(const QString &plain, const QString &needle, bool curren
         from = at + escNeedle.length();
     }
     return out.replace(QLatin1Char('\n'), QStringLiteral("<br>"));
-}
-
-// Resolve the body HTML for a Message/Note row: the pre-rendered HtmlRole, with
-// the in-conversation find highlight substituted in for a matching Message. Kept
-// as one routine so the painted row and the selection overlay show identical
-// content (same substring highlighting, same glyph flow).
-QString resolveBodyHtml(const QModelIndex &idx)
-{
-    const auto kind = TranscriptModel::Kind(idx.data(TranscriptModel::KindRole).toInt());
-    QString html = idx.data(TranscriptModel::HtmlRole).toString();
-    // Notes highlight like messages (audit F48): a note is where every error,
-    // rate-limit and compaction line lives, so a find that reaches them but
-    // cannot show WHERE the hit is only half-works.
-    if (kind == TranscriptModel::Message || kind == TranscriptModel::Note) {
-        const auto *m = qobject_cast<const TranscriptModel *>(idx.model());
-        if (m && !m->findNeedle().isEmpty()) {
-            const QString plain = idx.data(TranscriptModel::PlainRole).toString();
-            if (plain.contains(m->findNeedle(), Qt::CaseInsensitive)) {
-                html = highlightedHtml(plain, m->findNeedle(),
-                                       idx.row() == m->findCurrentRow());
-            }
-        }
-    }
-    return html;
 }
 
 // The single source of a body document's metrics — font, zero margin, HTML and
@@ -387,6 +368,37 @@ TranscriptDelegate::~TranscriptDelegate()
     }
 }
 
+// resolveBodyHtml — see the header. Notes highlight like messages (audit F48):
+// a note is where every error, rate-limit and compaction line lives, so a find
+// that reaches them but cannot show WHERE the hit is only half-works. Whether
+// the row matches comes from the model's cached flag, not a fresh scan of the
+// row's plain text per paint.
+QString TranscriptDelegate::resolveBodyHtml(const QModelIndex &idx) const
+{
+    const auto kind = TranscriptModel::Kind(idx.data(TranscriptModel::KindRole).toInt());
+    if (kind != TranscriptModel::Message && kind != TranscriptModel::Note) {
+        return idx.data(TranscriptModel::HtmlRole).toString();
+    }
+    const auto *m = qobject_cast<const TranscriptModel *>(idx.model());
+    if (!m || m->findNeedle().isEmpty() || !m->findMatch(idx.row())) {
+        return idx.data(TranscriptModel::HtmlRole).toString();
+    }
+    const bool current = idx.row() == m->findCurrentRow();
+    const quintptr id = idx.data(TranscriptModel::StableIdRole).value<quintptr>();
+    const auto it = m_highlightCache.constFind(id);
+    if (it != m_highlightCache.constEnd() && it->needle == m->findNeedle()
+        && it->current == current) {
+        return it->html;
+    }
+    if (m_highlightCache.size() >= kHighlightCacheCap) {
+        m_highlightCache.clear();
+    }
+    const QString html = highlightedHtml(idx.data(TranscriptModel::PlainRole).toString(),
+                                         m->findNeedle(), current);
+    m_highlightCache.insert(id, HighlightEntry{m->findNeedle(), current, html});
+    return html;
+}
+
 // bodyDoc hands back the row's laid-out body document from the cache, laying it
 // out only when the row's HTML or wrap width actually changed. sizeHint() and
 // paint() both go through here: they used to build a QTextDocument each, so one
@@ -475,6 +487,7 @@ QTextDocument *TranscriptDelegate::toolDoc(const QModelIndex &idx, ToolSlot slot
 void TranscriptDelegate::invalidateRow(quintptr stableId) const
 {
     m_heightCache.remove(stableId);
+    m_highlightCache.remove(stableId);
     for (QHash<quintptr, DocEntry> *cache : {&m_docCache, &m_detailCache, &m_resultCache}) {
         const auto it = cache->constFind(stableId);
         if (it != cache->constEnd()) {

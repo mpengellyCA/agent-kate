@@ -3,6 +3,8 @@
 
 #include "WorkflowMonitor.h"
 
+#include "SafeContent.h"
+
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -19,11 +21,25 @@ namespace {
 // Poll cadence while a workflow is still running — a backstop for the file
 // watcher, which coalesces and can miss rapid append bursts.
 constexpr int kPollMs = 1500;
+// After this long with no snapshot change, back the poll off to kIdlePollMs.
+// Never stop outright for a non-terminal run: the backed-off poll (plus the
+// watcher) is what lets the view recover when activity resumes.
+constexpr qint64 kIdleAfterMs = 10 * 60 * 1000;
+constexpr int kIdlePollMs = 30 * 1000;
 // Coalesce a flurry of watcher signals into one rescan.
 constexpr int kDebounceMs = 250;
 // How much of each sub-agent transcript to read from the end for "current
 // activity". Enough to hold the last few stream-json events.
 constexpr qint64 kTailBytes = 64 * 1024;
+// Most new journal bytes one poll will ingest. A faster writer is skipped
+// forward (readBoundedTail's gap), never read unboundedly.
+constexpr qint64 kJournalChunkBytes = 256 * 1024;
+// A journal entry is a one-line JSON record; a "line" still unterminated past
+// this is not one, so the carried partial is dropped rather than hoarded.
+constexpr qint64 kMaxJournalLineBytes = 64 * 1024;
+// The final <runId>.json is written into an agent-writable tree, so its size is
+// attacker-influenced: bound the read instead of readAll (audit F55 class).
+constexpr qint64 kMaxFinalJsonBytes = 4 * 1024 * 1024;
 
 // Pull the first capture of `pattern` out of `text`, trimmed, or empty.
 QString firstMatch(const QString &text, const QString &pattern)
@@ -182,6 +198,7 @@ void WorkflowMonitor::startWatching()
     m_poll = new QTimer(this);
     m_poll->setInterval(kPollMs);
     connect(m_poll, &QTimer::timeout, this, &WorkflowMonitor::refresh);
+    m_sinceChange.start();
     m_poll->start();
 }
 
@@ -193,22 +210,42 @@ void WorkflowMonitor::refresh()
     Snapshot s;
     // Re-attach the watcher to the transcript dir once it exists (it may not have
     // when the monitor was created milliseconds after launch).
-    if (m_watcher && QFileInfo::exists(m_transcriptDir)
-        && !m_watcher->directories().contains(m_transcriptDir)) {
-        m_watcher->addPath(m_transcriptDir);
+    const bool dirExists = QFileInfo::exists(m_transcriptDir);
+    if (dirExists) {
+        m_sawTranscriptDir = true;
+        if (m_watcher && !m_watcher->directories().contains(m_transcriptDir)) {
+            m_watcher->addPath(m_transcriptDir);
+        }
     }
 
-    QFile finalFile(m_finalJsonPath);
-    if (finalFile.exists() && finalFile.open(QIODevice::ReadOnly)) {
-        const QJsonObject root =
-            QJsonDocument::fromJson(finalFile.readAll()).object();
-        finalFile.close();
-        if (!root.isEmpty()) {
-            s = buildFromFinalJson(root);
+    // Regular files only, and never more than the cap: the final json lives in
+    // an agent-writable tree. An over-cap file parses as truncated JSON, fails,
+    // and falls through to the live view — refuse rather than readAll.
+    const QFileInfo finalInfo(m_finalJsonPath);
+    if (finalInfo.isFile() && finalInfo.size() <= kMaxFinalJsonBytes) {
+        QFile finalFile(m_finalJsonPath);
+        if (finalFile.open(QIODevice::ReadOnly)) {
+            const QJsonObject root =
+                QJsonDocument::fromJson(finalFile.read(kMaxFinalJsonBytes)).object();
+            finalFile.close();
+            if (!root.isEmpty()) {
+                s = buildFromFinalJson(root);
+            }
         }
     }
     if (s.state == State::Unknown) {
-        s = buildFromLive();
+        if (m_sawTranscriptDir && !dirExists) {
+            // The live tree existed and is gone, with no final snapshot: the
+            // run died (or was cleaned up) mid-flight. Terminal — stop polling
+            // rather than re-scanning a void forever.
+            s.state = State::Failed;
+            s.summary = QStringLiteral(
+                "Transcript directory disappeared before a final result was written.");
+            s.phases = m_snapshot.phases;
+            s.agentCount = m_snapshot.agentCount;
+        } else {
+            s = buildFromLive();
+        }
     }
 
     // Carry the launch anchors + plan through every snapshot.
@@ -224,10 +261,21 @@ void WorkflowMonitor::refresh()
 
     const QString fp = fingerprint(s);
     if (fp == m_fingerprint) {
+        // Long quiet spell: drop the poll to the idle cadence. The watcher and
+        // the idle poll both still call back here, and any change resets the
+        // cadence below — the view recovers, it just stops burning 1.5 s scans.
+        if (m_poll && m_poll->isActive() && m_sinceChange.isValid()
+            && m_sinceChange.elapsed() >= kIdleAfterMs) {
+            m_poll->setInterval(kIdlePollMs);
+        }
         return;
     }
     m_fingerprint = fp;
     m_snapshot = s;
+    m_sinceChange.restart();
+    if (m_poll && m_poll->interval() != kPollMs) {
+        m_poll->setInterval(kPollMs);
+    }
     emit changed();
 
     // Once terminal, stop polling — the final json won't change again.
@@ -308,58 +356,108 @@ WorkflowMonitor::buildFromFinalJson(const QJsonObject &root) const
     return s;
 }
 
-WorkflowMonitor::Snapshot WorkflowMonitor::buildFromLive() const
+bool WorkflowMonitor::pollJournal(JournalState &st, const QString &path)
 {
-    Snapshot s;
-    s.state = State::Running;
+    const agentkate::TailRead chunk =
+        agentkate::readBoundedTail(path, st.offset, kJournalChunkBytes);
+    applyJournalChunk(st, chunk);
+    return chunk.restarted;
+}
 
-    QFile journal(m_transcriptDir + QStringLiteral("/journal.jsonl"));
-    if (!journal.open(QIODevice::ReadOnly)) {
-        // Dir may not exist yet (launched moments ago) — still a valid running
-        // state, just nothing to show but the plan.
-        return s;
+void WorkflowMonitor::applyJournalChunk(JournalState &st,
+                                        const agentkate::TailRead &chunk)
+{
+    if (chunk.restarted) {
+        // Truncated or rewritten underneath us: everything derived from the old
+        // bytes no longer describes this file.
+        st.remainder.clear();
+        st.order.clear();
+        st.done.clear();
     }
-
-    // Ordered agent ids (first-seen) + which have produced a result.
-    QVector<QString> order;
-    QMap<QString, bool> done; // agentId -> result seen
-    while (!journal.atEnd()) {
-        const QByteArray line = journal.readLine();
+    QByteArray buf;
+    if (chunk.gap) {
+        // We jumped over bytes, so the carried partial no longer joins up and
+        // the window almost certainly begins mid-line: resync to the first
+        // newline. Entries in the skipped span are simply missed (best-effort).
+        st.remainder.clear();
+        const int nl = chunk.bytes.indexOf('\n');
+        if (nl < 0) {
+            return;
+        }
+        buf = chunk.bytes.mid(nl + 1);
+    } else {
+        buf = st.remainder + chunk.bytes;
+        st.remainder.clear();
+    }
+    int start = 0;
+    while (true) {
+        const int nl = buf.indexOf('\n', start);
+        if (nl < 0) {
+            break;
+        }
+        const QByteArray line = buf.mid(start, nl - start);
+        start = nl + 1;
         const QJsonObject o = QJsonDocument::fromJson(line).object();
         const QString agentId = o.value(QStringLiteral("agentId")).toString();
         if (agentId.isEmpty()) {
             continue;
         }
-        const QString type = o.value(QStringLiteral("type")).toString();
-        if (!done.contains(agentId)) {
-            order.append(agentId);
-            done.insert(agentId, false);
+        if (!st.done.contains(agentId)) {
+            st.order.append(agentId);
+            st.done.insert(agentId, false);
         }
-        if (type == QLatin1String("result")) {
-            done.insert(agentId, true);
+        if (o.value(QStringLiteral("type")).toString() == QLatin1String("result")) {
+            st.done.insert(agentId, true);
         }
     }
-    journal.close();
+    st.remainder = buf.mid(start);
+    if (st.remainder.size() > kMaxJournalLineBytes) {
+        st.remainder.clear();
+    }
+}
+
+WorkflowMonitor::Snapshot WorkflowMonitor::buildFromLive()
+{
+    Snapshot s;
+    s.state = State::Running;
+
+    // Fold in only the bytes appended since the last poll; the accumulated
+    // order/done state persists across refreshes. A shrunk journal resets it,
+    // and the per-agent tail cache with it. (A missing journal — dir not
+    // created yet — is still a valid running state: just the plan to show.)
+    if (pollJournal(m_journal, m_transcriptDir + QStringLiteral("/journal.jsonl"))) {
+        m_agentTails.clear();
+    }
 
     Phase running;
     running.title = QStringLiteral("Running");
     Phase finished;
     finished.title = QStringLiteral("Completed");
 
-    for (const QString &agentId : order) {
+    for (const QString &agentId : m_journal.order) {
         SubAgent a;
         a.agentId = agentId;
         a.label = QStringLiteral("agent ") + agentId.left(8);
         a.jsonlPath = m_transcriptDir + QStringLiteral("/agent-") + agentId
                       + QStringLiteral(".jsonl");
-        const bool isDone = done.value(agentId);
+        const bool isDone = m_journal.done.value(agentId);
         a.state = isDone ? QStringLiteral("done") : QStringLiteral("running");
-        QString preview;
-        a.lastActivity = tailActivity(a.jsonlPath, preview);
-        a.resultPreview = preview;
+        // Re-tail only when the transcript moved since the last poll — size and
+        // mtime together are the cheap "did anything change" signal.
+        AgentTail &tail = m_agentTails[agentId];
+        const QFileInfo fi(a.jsonlPath);
+        if (fi.exists() && (fi.size() != tail.size || fi.lastModified() != tail.mtime)) {
+            tail.size = fi.size();
+            tail.mtime = fi.lastModified();
+            QString preview;
+            tail.lastActivity = tailActivity(a.jsonlPath, preview);
+            tail.preview = preview;
+        }
+        a.lastActivity = tail.lastActivity;
+        a.resultPreview = tail.preview;
         (isDone ? finished : running).agents.append(a);
     }
-    s.agentCount = order.size();
+    s.agentCount = m_journal.order.size();
     if (!running.agents.isEmpty()) {
         s.phases.append(running);
     }

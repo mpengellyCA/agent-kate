@@ -3,8 +3,10 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func rawEvent(t *testing.T, v any) json.RawMessage {
@@ -229,5 +231,175 @@ func TestTurnWaitUnblocksOnThreadEnd(t *testing.T) {
 	tt.TurnFailed("t-failed")
 	if _, timedOut := tt.Wait(context.Background(), "t-failed", 50*time.Millisecond); timedOut {
 		t.Fatal("TurnFailed must leave the thread idle")
+	}
+}
+
+// --- F61: reap sweep + lastText bound ---------------------------------------
+
+func tracked(tt *TurnTracker, id string) bool {
+	tt.mu.Lock()
+	defer tt.mu.Unlock()
+	_, ok := tt.threads[id]
+	return ok
+}
+
+func waiterCount(tt *TurnTracker, id string) int {
+	tt.mu.Lock()
+	defer tt.mu.Unlock()
+	if st := tt.threads[id]; st != nil {
+		return st.waiters
+	}
+	return 0
+}
+
+// A terminal lifecycle with no waiter registered sweeps the entry — a plain
+// agent.stop must not leave the final assistant message in the map forever.
+func TestTurnTrackerSweepsReapedThreadWithoutWaiters(t *testing.T) {
+	tt := NewTurnTracker()
+	tt.TurnQueued("t-swept")
+	tt.Observe("t-swept", rawEvent(t, map[string]any{
+		"type": "assistant",
+		"message": map[string]any{"role": "assistant", "content": []map[string]any{
+			{"type": "text", "text": "final answer"},
+		}},
+	}))
+	tt.Observe("t-swept", rawEvent(t, map[string]any{
+		"type": "_lifecycle", "phase": "exited", "detail": "exited cleanly",
+	}))
+	if tracked(tt, "t-swept") {
+		t.Fatal("reaped thread with no waiters must be swept from the tracker")
+	}
+	if got := tt.LastText("t-swept"); got != "" {
+		t.Fatalf("swept thread still retains lastText %q", got)
+	}
+}
+
+// A waiter parked at reap time still receives lastText; the LAST waiter
+// leaving completes the sweep.
+func TestTurnTrackerSweepsAfterWaitersDrain(t *testing.T) {
+	tt := NewTurnTracker()
+	tt.TurnQueued("t-drain")
+	tt.Observe("t-drain", rawEvent(t, map[string]any{
+		"type": "assistant",
+		"message": map[string]any{"role": "assistant", "content": []map[string]any{
+			{"type": "text", "text": "the worker's answer"},
+		}},
+	}))
+	got := make(chan string, 1)
+	go func() {
+		text, _ := tt.Wait(context.Background(), "t-drain", 5*time.Second)
+		got <- text
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for waiterCount(tt, "t-drain") == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("waiter never registered")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// Entry survives the reap while the waiter is parked...
+	tt.ObserveLifecycle("t-drain", "exited")
+	select {
+	case text := <-got:
+		if text != "the worker's answer" {
+			t.Fatalf("parked waiter got %q, want the retained lastText", text)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waiter did not wake on the terminal lifecycle")
+	}
+	// ...and is gone once the waiter drained.
+	if tracked(tt, "t-drain") {
+		t.Fatal("entry must be swept once the last waiter drains")
+	}
+}
+
+// Wait on a never-seen id must not leak a permanent entry: any approved bridge
+// can wait on any id, and nothing would ever sweep the phantom.
+func TestTurnWaitUnknownIDLeavesNoEntry(t *testing.T) {
+	tt := NewTurnTracker()
+	text, timedOut := tt.Wait(context.Background(), "t-ghost", time.Second)
+	if text != "" || timedOut {
+		t.Fatalf("Wait on unknown id = %q/%v, want \"\"/false", text, timedOut)
+	}
+	if tracked(tt, "t-ghost") {
+		t.Fatal("Wait created a tracker entry for a never-seen id")
+	}
+}
+
+// The give-up paths (deadline, cancellation) unregister their waiter, so a
+// reap after an abandoned wait still sweeps.
+func TestTurnTrackerSweepsAfterAbandonedWaits(t *testing.T) {
+	tt := NewTurnTracker()
+
+	tt.TurnQueued("t-late")
+	if _, timedOut := tt.Wait(context.Background(), "t-late", 30*time.Millisecond); !timedOut {
+		t.Fatal("expected the deadline to fire")
+	}
+	if n := waiterCount(tt, "t-late"); n != 0 {
+		t.Fatalf("timed-out wait left %d waiters registered", n)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = tt.Wait(ctx, "t-late", time.Hour)
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for waiterCount(tt, "t-late") == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("waiter never registered")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	<-done
+	if n := waiterCount(tt, "t-late"); n != 0 {
+		t.Fatalf("cancelled wait left %d waiters registered", n)
+	}
+
+	tt.ObserveLifecycle("t-late", "exited")
+	if tracked(tt, "t-late") {
+		t.Fatal("abandoned waits must not pin a reaped entry")
+	}
+}
+
+// lastText is bounded: neither an assistant event nor a claude result may pin
+// an unbounded final message in memory.
+func TestTurnTrackerCapsLastText(t *testing.T) {
+	huge := strings.Repeat("x", maxLastTextBytes+4096)
+	limit := maxLastTextBytes + len("\n[truncated]")
+
+	tt := NewTurnTracker()
+	tt.TurnQueued("t-cap")
+	tt.Observe("t-cap", rawEvent(t, map[string]any{
+		"type": "assistant",
+		"message": map[string]any{"role": "assistant", "content": []map[string]any{
+			{"type": "text", "text": huge},
+		}},
+	}))
+	if got := tt.LastText("t-cap"); len(got) > limit {
+		t.Fatalf("assistant lastText retained %d bytes, cap is %d", len(got), limit)
+	} else if !strings.HasPrefix(got, "xxxx") {
+		t.Fatal("cap must keep the head of the message")
+	}
+
+	tt.Observe("t-cap", rawEvent(t, map[string]any{
+		"type": "result", "subtype": "success", "result": huge,
+	}))
+	if got := tt.LastText("t-cap"); len(got) > limit {
+		t.Fatalf("result lastText retained %d bytes, cap is %d", len(got), limit)
+	}
+}
+
+// The cap must not split a UTF-8 rune at the boundary.
+func TestCapLastTextRuneBoundary(t *testing.T) {
+	s := strings.Repeat("é", maxLastTextBytes) // 2 bytes per rune, crosses the cap mid-rune
+	capped := capLastText(s)
+	if len(capped) > maxLastTextBytes+len("\n[truncated]") {
+		t.Fatalf("capped to %d bytes, over the limit", len(capped))
+	}
+	if !utf8.ValidString(capped) {
+		t.Fatal("cap split a rune")
 	}
 }

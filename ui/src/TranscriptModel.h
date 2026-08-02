@@ -97,6 +97,17 @@ public:
         // Checklist items ({content, status} objects, status one of
         // pending / in_progress / completed). Empty for every other row.
         QJsonArray checklist;
+        // Lowercased searchText, built once and cached (audit F58): find runs
+        // per keystroke over every row, and a Tool row's searchText re-joined
+        // up to 128 KB of retained result on every call. Invalidated through
+        // touched() — the same seam that busts the delegate's height cache.
+        mutable QString searchLower;
+        mutable bool searchLowerValid = false;
+        // Whether this row matches the active find needle. Kept only for the
+        // kinds the delegate renders highlighted (Message/Note); maintained by
+        // setFind / touched / append so neither setFind nor the delegate has to
+        // re-scan the row's text to answer it.
+        bool findMatched = false;
         // Per-row identity, assigned once at append and STABLE for the life of
         // the row. A mutation does not mint a new one: it emits
         // heightInvalidated(stableId) instead, so the delegate drops exactly
@@ -184,6 +195,16 @@ public:
     // searching for the error text on screen answered "No matches".
     QString searchText(int row) const;
 
+    // searchText lowercased, cached on the row (audit F58). Find's per-keystroke
+    // scan goes through this so a keystroke costs one contains() per row over an
+    // already-built string, never a fresh join of a Tool row's retained result.
+    QString searchTextLower(int row) const;
+
+    // Whether the row's body is drawn highlighted for the active find needle —
+    // the cached flag setFind maintains, so the delegate does not re-scan the
+    // row's plain text on every paint. False for kinds find never highlights.
+    bool findMatch(int row) const;
+
 Q_SIGNALS:
     // A row's content changed in a way that can change its measured height or
     // its laid-out body: the delegate must drop whatever it cached for this
@@ -202,6 +223,11 @@ private:
     // re-measures it. The row's stable id does NOT change.
     void touched(int row);
 
+    // Recompute one row's cached find-match flag against the active needle.
+    // Returns true when the flag flipped (the row's rendered form — highlighted
+    // plain text vs its HTML — and therefore its height changed).
+    bool updateFindMatch(int row);
+
     // Translate a stable key (from append*) to the item's current position, or
     // -1 if the row has since been evicted.
     int rowForKey(int key) const;
@@ -215,5 +241,8 @@ private:
     // is m_base. key - m_base == current row index.
     int m_base = 0;
     QString m_findNeedle;
+    // m_findNeedle lowercased once per needle change, so the per-row match test
+    // is a case-sensitive contains over the cached lowercased search text.
+    QString m_findNeedleLower;
     int m_findRow = -1;
 };

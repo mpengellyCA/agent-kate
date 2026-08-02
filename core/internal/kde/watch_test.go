@@ -51,6 +51,36 @@ func TestRegisterNonceStaysOneShot(t *testing.T) {
 	}
 }
 
+// A watch dropped without Stop() used to park its pump on <-raw forever;
+// unregisterNonce now CLOSES the rendezvous so a parked receiver wakes and
+// exits (audit F65). This is the pump's exit seam, tested at the channel level
+// because the pump itself needs a live KWin to construct. Fails if the close
+// is removed: the receive never fires and the timeout trips.
+func TestUnregisterNonceReleasesParkedReceiver(t *testing.T) {
+	c := &Client{reports: map[string]chan string{}}
+	ch := c.registerNonceBuf("n3", 8)
+
+	woke := make(chan struct{})
+	go func() {
+		for range ch { // drains until the channel is CLOSED
+		}
+		close(woke)
+	}()
+
+	c.unregisterNonce("n3")
+	select {
+	case <-woke:
+	case <-time.After(time.Second):
+		t.Fatal("unregisterNonce did not close the rendezvous; a pump parked on it leaks")
+	}
+	// A late Report against the closed rendezvous must be a no-op, not a
+	// send-on-closed-channel panic; and a second unregister must be idempotent.
+	if err := (*reporter)(c).Report("n3", "late"); err != nil {
+		t.Fatalf("Report after unregister: %v", err)
+	}
+	c.unregisterNonce("n3")
+}
+
 // FAIL CLOSED: with no session bus there is no watch, and the caller must be told so
 // rather than handed a channel that never fires (which would read as "focus never
 // changed" and let a 30 s script run unsupervised).

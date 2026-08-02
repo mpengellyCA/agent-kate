@@ -526,7 +526,12 @@ func runCore() {
 		}
 	}
 
-	// Don't outlive the UI: when the last client disconnects, shut down.
+	// Don't outlive the UI: once a UI has connected at all, the last UI
+	// connection disconnecting shuts the core down — live agent bridges do
+	// not keep it alive (audit F66: nothing runs hidden from the user, and
+	// the UI's own shutdown path stops agents before it disconnects).
+	// Bridge-only churn BEFORE any UI has connected never fires this, so a
+	// startup phase that re-attaches agents ahead of the window is safe.
 	srv.OnAllClientsGone(func() {
 		log.Info("ui disconnected; akcore shutting down")
 		stop()

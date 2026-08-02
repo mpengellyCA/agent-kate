@@ -7,6 +7,8 @@
 #include <QStringList>
 #include <QTextDocumentFragment>
 
+#include <algorithm>
+
 namespace {
 // The in-RAM feed is capped at this many rows; once it grows past the cap the
 // oldest rows are evicted (the full conversation stays on disk and reloads on
@@ -71,6 +73,11 @@ int TranscriptModel::appendMessage(const QString &role, const QString &accentHex
     beginInsertRows({}, row, row);
     m_items.append(it);
     endInsertRows();
+    // A row appended while find is active (streaming under an open find bar)
+    // must highlight without waiting for the next keystroke.
+    if (!m_findNeedleLower.isEmpty()) {
+        updateFindMatch(row);
+    }
     enforceCap();
     return key;
 }
@@ -90,6 +97,9 @@ int TranscriptModel::appendNote(const QString &html, const QString &noteKind,
     beginInsertRows({}, row, row);
     m_items.append(it);
     endInsertRows();
+    if (!m_findNeedleLower.isEmpty()) {
+        updateFindMatch(row);
+    }
     enforceCap();
     return key;
 }
@@ -281,46 +291,104 @@ QString TranscriptModel::searchText(int row) const
     return {};
 }
 
+QString TranscriptModel::searchTextLower(int row) const
+{
+    if (row < 0 || row >= m_items.size()) {
+        return {};
+    }
+    const Item &it = m_items.at(row);
+    if (!it.searchLowerValid) {
+        it.searchLower = searchText(row).toLower();
+        it.searchLowerValid = true;
+    }
+    return it.searchLower;
+}
+
+bool TranscriptModel::findMatch(int row) const
+{
+    return row >= 0 && row < m_items.size() && m_items.at(row).findMatched;
+}
+
+bool TranscriptModel::updateFindMatch(int row)
+{
+    Item &it = m_items[row];
+    // Only the kinds the delegate renders highlighted carry the flag; a Tool
+    // row must not pay a toLower of its retained result here.
+    const bool now = (it.kind == Message || it.kind == Note)
+        && !m_findNeedleLower.isEmpty()
+        && searchTextLower(row).contains(m_findNeedleLower);
+    if (now == it.findMatched) {
+        return false;
+    }
+    it.findMatched = now;
+    return true;
+}
+
 void TranscriptModel::setFind(const QString &needle, int currentRow)
 {
     if (needle == m_findNeedle && currentRow == m_findRow) {
         return;
     }
-    const QString oldNeedle = m_findNeedle;
+    const bool needleChanged = needle != m_findNeedle;
+    const int oldRow = m_findRow;
     m_findNeedle = needle;
+    m_findNeedleLower = needle.toLower();
     m_findRow = currentRow;
     if (m_items.isEmpty()) {
         return;
     }
-    // A Message or Note row whose plain text matches the needle is rendered as
+    // A Message or Note row whose text matches the needle is rendered as
     // highlighted PLAIN text rather than its rendered HTML, and the two have
-    // different heights. So a row whose match state flips between the old and new
-    // needle must be re-measured: invalidate the delegate's height-cache entry
-    // for it. (Rows that match both needles, or other kinds, keep the same
-    // height — a pure highlight/currentRow change is paint-only.)
-    bool geometryChanged = false;
-    if (oldNeedle != needle) {
-        const auto matches = [](const QString &text, const QString &n) {
-            return !n.isEmpty() && text.contains(n, Qt::CaseInsensitive);
-        };
+    // different heights. Exactly three per-row states can change what is shown:
+    //   * the match state flipped — re-measure (heightInvalidated + role-less
+    //     dataChanged);
+    //   * the row matches both needles — same height, new highlight spans, so
+    //     repaint only;
+    //   * the current-match row moved — the old and new current rows swap
+    //     highlight strength, repaint only.
+    // Every other row is untouched. dataChanged is emitted for exactly these
+    // rows: the full-range emission this replaces repainted the whole feed and
+    // closed the panel's selection overlay on every find keystroke.
+    QList<int> remeasure;
+    QList<int> repaint;
+    if (needleChanged) {
         for (int i = 0; i < m_items.size(); ++i) {
-            if (m_items[i].kind != Message && m_items[i].kind != Note) {
+            Item &it = m_items[i];
+            if (it.kind != Message && it.kind != Note) {
                 continue;
             }
-            if (matches(m_items[i].plain, oldNeedle) != matches(m_items[i].plain, needle)) {
-                emit heightInvalidated(m_items.at(i).stableId);
-                geometryChanged = true;
+            const bool was = it.findMatched;
+            if (updateFindMatch(i)) {
+                emit heightInvalidated(it.stableId);
+                remeasure.append(i);
+            } else if (was) {
+                repaint.append(i);
             }
         }
-    }
-    // A role-less dataChanged makes the view re-query sizeHint (re-measuring the
-    // rows whose stable id we bumped); restrict to a repaint when only the
-    // highlight/current-match moved and no row changed height.
-    if (geometryChanged) {
-        emit dataChanged(index(0), index(m_items.size() - 1));
     } else {
-        emit dataChanged(index(0), index(m_items.size() - 1), {Qt::DisplayRole});
+        for (const int r : {oldRow, currentRow}) {
+            if (r >= 0 && r < m_items.size() && m_items.at(r).findMatched
+                && !repaint.contains(r)) {
+                repaint.append(r);
+            }
+        }
+        std::sort(repaint.begin(), repaint.end());
     }
+    // Coalesce consecutive rows into ranges so a needle matching a block of
+    // rows still costs one signal per run, not one per row.
+    const auto emitRuns = [this](const QList<int> &rows, const QList<int> &roles) {
+        int i = 0;
+        while (i < rows.size()) {
+            int j = i;
+            while (j + 1 < rows.size() && rows.at(j + 1) == rows.at(j) + 1) {
+                ++j;
+            }
+            emit dataChanged(index(rows.at(i)), index(rows.at(j)), roles);
+            i = j + 1;
+        }
+    };
+    emitRuns(remeasure, {});
+    emitRuns(repaint, {Qt::DisplayRole});
 }
 
 // touched invalidates one row's cached geometry. It deliberately does NOT mint a
@@ -330,7 +398,15 @@ void TranscriptModel::setFind(const QString &needle, int currentRow)
 // "this exact row changed" costs one signal and keeps the id a real identity.
 void TranscriptModel::touched(int row)
 {
-    emit heightInvalidated(m_items.at(row).stableId);
+    Item &it = m_items[row];
+    // Content changed, so the cached search text (audit F58) and the find-match
+    // flag change with it — the same seam that busts the delegate's caches.
+    it.searchLowerValid = false;
+    it.searchLower.clear();
+    if (!m_findNeedleLower.isEmpty()) {
+        updateFindMatch(row);
+    }
+    emit heightInvalidated(it.stableId);
     const QModelIndex idx = index(row);
     emit dataChanged(idx, idx);
 }

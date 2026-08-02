@@ -574,3 +574,99 @@ func TestServeRefusesWorldAccessibleSocketDir(t *testing.T) {
 		t.Fatal("Serve accepted a socket directory it could not stat")
 	}
 }
+
+// --- audit F66: "all clients gone" means "all UI clients gone" --------------
+
+// allGoneServer starts a server exposing role-claim handlers and returns it
+// with a fired-flag for onAllGone.
+func allGoneServer(t *testing.T) (srv *Server, sock string, gone *atomic.Int32) {
+	t.Helper()
+	sock = privateSocketDir(t) + "/ipc.sock"
+	srv = NewServer(sock, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	gone = &atomic.Int32{}
+	srv.OnAllClientsGone(func() { gone.Add(1) })
+	srv.Handle("ui", func(ctx context.Context, _ json.RawMessage) (any, error) {
+		if !srv.MarkUI(ctx) {
+			return nil, Errorf(CodeInvalidRequest, "UI role refused")
+		}
+		return map[string]any{"ok": true}, nil
+	})
+	srv.Handle("bridge", func(ctx context.Context, _ json.RawMessage) (any, error) {
+		if ok, reason := srv.IdentifyBridge(ctx, "t-1"); !ok {
+			return nil, Errorf(CodeInvalidRequest, reason)
+		}
+		return map[string]any{"ok": true}, nil
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = srv.Serve(ctx) }()
+	if !waitFor(t, 2*time.Second, func() bool {
+		c, err := net.Dial("unix", sock)
+		if err != nil {
+			return false
+		}
+		_ = c.Close()
+		return true
+	}) {
+		t.Fatal("server never came up")
+	}
+	return srv, sock, gone
+}
+
+// The UI leaving fires onAllGone even while an agent bridge is still
+// connected: the core must not outlive its window just because a resident
+// engine keeps its bridge open. Fails if the role filter is removed — the
+// live bridge then keeps len(s.conns) above zero and nothing fires.
+func TestAllGoneFiresOnLastUIDespiteLiveBridge(t *testing.T) {
+	_, sock, gone := allGoneServer(t)
+
+	bridge, err := Dial(sock)
+	if err != nil {
+		t.Fatalf("dial (bridge): %v", err)
+	}
+	t.Cleanup(func() { _ = bridge.Close() })
+	if err := bridge.Call("bridge", map[string]any{}, nil); err != nil {
+		t.Fatalf("identify bridge: %v", err)
+	}
+
+	ui, err := Dial(sock)
+	if err != nil {
+		t.Fatalf("dial (ui): %v", err)
+	}
+	if err := ui.Call("ui", map[string]any{}, nil); err != nil {
+		t.Fatalf("mark ui: %v", err)
+	}
+
+	_ = ui.Close()
+	if !waitFor(t, 2*time.Second, func() bool { return gone.Load() == 1 }) {
+		t.Fatal("the UI disconnected and onAllGone never fired — the live bridge kept the core alive")
+	}
+}
+
+// Bridge-only churn before any UI has ever connected must NOT fire onAllGone:
+// a startup phase that re-attaches agents ahead of the window would otherwise
+// shut the core down at birth. Fails if the uiSeen latch (or the role filter)
+// is removed — the last bridge disconnecting then counts as "all gone".
+func TestAllGoneIgnoresBridgeChurnBeforeAnyUI(t *testing.T) {
+	_, sock, gone := allGoneServer(t)
+
+	bridge, err := Dial(sock)
+	if err != nil {
+		t.Fatalf("dial (bridge): %v", err)
+	}
+	if err := bridge.Call("bridge", map[string]any{}, nil); err != nil {
+		t.Fatalf("identify bridge: %v", err)
+	}
+	_ = bridge.Close()
+
+	// Also a connection that never claimed any role at all.
+	anon, err := Dial(sock)
+	if err != nil {
+		t.Fatalf("dial (anon): %v", err)
+	}
+	_ = anon.Close()
+
+	if waitFor(t, 300*time.Millisecond, func() bool { return gone.Load() != 0 }) {
+		t.Fatal("onAllGone fired during a bridge-only startup phase, before any UI connected")
+	}
+}

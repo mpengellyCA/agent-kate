@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/godbus/dbus/v5"
+
+	"agentkate/internal/safe"
 )
 
 // ActiveWindowEvent is one KWin activation report: the window that just became
@@ -157,7 +159,10 @@ func (c *Client) WatchActiveWindow(timeout time.Duration) (*ActiveWindowWatch, e
 		close(done) // ends the pump; the pump closes out and unloads the script
 	}
 
-	go func() {
+	// safe.Go, not a bare goroutine: one panic in a pump must not take down the
+	// daemon and orphan every agent (the project rule this file was the last
+	// exception to — audit F65).
+	safe.Go("kde.actwatch", func() {
 		defer close(out)
 		defer unload()
 		// Replay the handshake event so the consumer sees the starting state without a
@@ -171,7 +176,12 @@ func (c *Client) WatchActiveWindow(timeout time.Duration) (*ActiveWindowWatch, e
 			select {
 			case <-done:
 				return
-			case payload := <-raw:
+			case payload, ok := <-raw:
+				if !ok {
+					// unregisterNonce closed the rendezvous: the watch was torn
+					// down without Stop(); exit rather than park forever.
+					return
+				}
 				var ev ActiveWindowEvent
 				if err := json.Unmarshal([]byte(payload), &ev); err != nil {
 					ev = ActiveWindowEvent{Error: "malformed activation report"}
@@ -183,6 +193,6 @@ func (c *Client) WatchActiveWindow(timeout time.Duration) (*ActiveWindowWatch, e
 				}
 			}
 		}
-	}()
+	})
 	return w, nil
 }

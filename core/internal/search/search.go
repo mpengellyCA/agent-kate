@@ -5,12 +5,21 @@ package search
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 )
+
+// runTimeout caps one ripgrep invocation (audit F64). Without it an unbounded
+// rg over a huge root pins the IPC handler goroutine (and one of the caller's
+// dispatch slots) for as long as rg cares to run, and a disconnected client
+// never kills the child. The handler's own ctx is honoured too, so a caller
+// going away ends the search before the cap does.
+const runTimeout = 30 * time.Second
 
 // Options control a single search.
 type Options struct {
@@ -52,8 +61,10 @@ type Result struct {
 	Total     int           `json:"total"`
 }
 
-// Run executes ripgrep and parses its JSON event stream.
-func Run(opts Options) (*Result, error) {
+// Run executes ripgrep and parses its JSON event stream. It stops — killing
+// the rg child — when ctx is cancelled or after runTimeout, whichever comes
+// first, returning whatever matched so far as a truncated result.
+func Run(ctx context.Context, opts Options) (*Result, error) {
 	if strings.TrimSpace(opts.Query) == "" {
 		return &Result{Files: []FileMatches{}}, nil
 	}
@@ -93,7 +104,9 @@ func Run(opts Options) (*Result, error) {
 	}
 	args = append(args, "--", opts.Query, opts.Root)
 
-	cmd := exec.Command("rg", args...)
+	ctx, cancel := context.WithTimeout(ctx, runTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "rg", args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
@@ -165,6 +178,11 @@ func Run(opts Options) (*Result, error) {
 	// rg exits non-zero on "no matches" (1) and on errors (2). Ignore both —
 	// we either got matches or we didn't.
 	_ = cmd.Wait()
+	// A search ended by the cap or by the caller going away did not finish;
+	// what it collected is a prefix, and the UI must not read it as exhaustive.
+	if ctx.Err() != nil {
+		truncated = true
+	}
 
 	files := make([]FileMatches, 0, len(order))
 	for _, p := range order {

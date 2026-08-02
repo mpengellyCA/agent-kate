@@ -89,6 +89,16 @@ public:
     QTextDocument *bodyDoc(const QModelIndex &idx, int contentWidth,
                            const QStyleOptionViewItem &opt) const;
 
+    // The body HTML a Message/Note row shows: the pre-rendered HtmlRole, with
+    // the find highlight substituted in for a matching row. One routine for the
+    // painted row and the selection overlay so both show identical content.
+    // The highlighted form is cached per row keyed on (needle, current-row):
+    // highlightedHtml escapes and scans the row's whole plain text, and it used
+    // to be rebuilt on every paint of every matching row for the life of the
+    // find bar. Same invalidation as the doc caches (invalidateRow), capped
+    // like them too. Public for the same reason as bodyDoc.
+    QString resolveBodyHtml(const QModelIndex &idx) const;
+
     // The two mono documents of an EXPANDED tool row: its input detail and its
     // result. They used to be heap-allocated, laid out and destroyed on every
     // single paint — two full layouts of up to the whole (unbounded, after
@@ -185,6 +195,16 @@ private:
     // context, so a theme switch needs a repaint, not a re-layout).
     mutable QHash<quintptr, DocEntry> m_detailCache;
     mutable QHash<quintptr, DocEntry> m_resultCache;
+
+    // One row's find-highlighted body HTML, keyed on what it was built for. A
+    // stale (needle, current) pair rebuilds in place, so the cache holds at
+    // most one entry per row; invalidateRow drops it with the row's documents.
+    struct HighlightEntry {
+        QString needle;
+        bool current = false;
+        QString html;
+    };
+    mutable QHash<quintptr, HighlightEntry> m_highlightCache;
 
     // Bumped whenever the application/widget palette changes (ThemeManager theme
     // switch, or a system colour-scheme change arriving as

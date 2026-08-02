@@ -87,6 +87,11 @@ type Server struct {
 	conns       map[*conn]struct{}
 	onAllGone   func()
 	primaryConn *conn // the first UI to handshake; runs portal sessions (Cowork keystone)
+	// uiSeen latches once any connection claims the UI role (MarkUI). It
+	// arms onAllGone: until a UI has actually connected, a bridge-only
+	// startup phase (e.g. rate-window auto-resume re-attaching agents before
+	// the window opens) must not read as "the UI left" (audit F66).
+	uiSeen bool
 	// onBridgeActivity is set once before Serve (registerMCPActivity) and read
 	// without locking thereafter, like handlers.
 	onBridgeActivity BridgeActivityFunc
@@ -138,9 +143,15 @@ func (s *Server) Methods() []string {
 // bridges are reported.
 func (s *Server) OnBridgeActivity(f BridgeActivityFunc) { s.onBridgeActivity = f }
 
-// OnAllClientsGone registers a callback fired whenever the last connected UI
-// client disconnects. The core uses this to shut itself down rather than be
-// orphaned when its UI exits. Call before Serve.
+// OnAllClientsGone registers a callback fired when the last connection holding
+// the UI role disconnects — not the last connection of any kind (audit F66).
+// Agent bridges are the core's own children: counting them meant a core whose
+// window had closed stayed up, headless, for as long as any resident agent kept
+// its bridge open, which is exactly the "nothing runs hidden from the user"
+// rule inverted. The callback never fires before a UI has connected at all
+// (see uiSeen), so a bridge-only startup phase cannot shut the core down at
+// birth. The core uses this to shut itself down rather than be orphaned when
+// its UI exits. Call before Serve.
 func (s *Server) OnAllClientsGone(f func()) {
 	s.onAllGone = f
 }
@@ -243,7 +254,7 @@ func (s *Server) serveConn(ctx context.Context, netConn net.Conn) {
 	s.conns[c] = struct{}{}
 	n := len(s.conns)
 	s.mu.Unlock()
-	s.log.Info("ui connected", "clients", n)
+	s.log.Info("client connected", "clients", n)
 
 	// One dedicated writer goroutine per connection drains the outbound queue
 	// and performs the blocking write+flush in isolation, so a slow client can
@@ -263,10 +274,23 @@ func (s *Server) serveConn(ctx context.Context, netConn net.Conn) {
 				s.primaryConn = nil // a Cowork portal request will now fail closed until a UI reconnects
 			}
 			remaining := len(s.conns)
+			// The all-gone decision counts only UI connections (audit F66):
+			// this teardown belongs to a UI, a UI has been seen at all, and
+			// no other connection still holds the role. Lock order is
+			// s.mu→idMu, the same as MarkUI/NotifyUI (getRole takes idMu).
+			uiGone := s.uiSeen && c.getRole() == "ui"
+			if uiGone {
+				for other := range s.conns {
+					if other.getRole() == "ui" {
+						uiGone = false
+						break
+					}
+				}
+			}
 			s.mu.Unlock()
 			netConn.Close()
-			s.log.Info("ui disconnected", "clients", remaining)
-			if remaining == 0 && s.onAllGone != nil {
+			s.log.Info("client disconnected", "clients", remaining)
+			if uiGone && s.onAllGone != nil {
 				s.onAllGone()
 			}
 		}()
@@ -916,6 +940,9 @@ func (s *Server) MarkUI(ctx context.Context) bool {
 		return false
 	}
 	c.role = "ui"
+	// Arms onAllGone (audit F66): from here on, the last UI leaving is a
+	// shutdown signal even while agent bridges stay connected.
+	s.uiSeen = true
 	// The first UI to hold the role runs portal sessions. Claimed only after
 	// the role is granted, so a refused claimant can never leave itself parked
 	// as the primary — the unwind the old two-phase version needed.

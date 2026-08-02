@@ -3,6 +3,10 @@
 
 #pragma once
 
+#include <QByteArray>
+#include <QDateTime>
+#include <QElapsedTimer>
+#include <QHash>
 #include <QObject>
 #include <QString>
 #include <QStringList>
@@ -11,6 +15,11 @@
 class QFileSystemWatcher;
 class QTimer;
 class QJsonObject;
+
+namespace agentkate
+{
+struct TailRead;
+}
 
 // WorkflowMonitor watches a background Workflow (a `Workflow` tool launched by an
 // agent) and reports its live status by reading the run's on-disk artifacts.
@@ -91,6 +100,24 @@ public:
     const Snapshot &snapshot() const { return m_snapshot; }
     QString runId() const { return m_runId; }
 
+    // Incremental journal follow state: a byte offset into journal.jsonl plus
+    // the parse state accumulated from it. Each poll reads ONLY the bytes
+    // appended since the previous one (bounded, via readBoundedTail), so the
+    // cost of a refresh scales with new activity, not with run history. A file
+    // that shrank (truncated/rotated) invalidates everything derived from it,
+    // so the whole state resets. Exposed for the regression test.
+    struct JournalState {
+        qint64 offset = 0;         // next byte to read
+        QByteArray remainder;      // trailing partial line, carried to the next poll
+        QVector<QString> order;    // agent ids, first-seen order
+        QHash<QString, bool> done; // agentId -> a "result" entry was seen
+    };
+
+    // One bounded step: read the bytes appended to `path` since `st.offset` and
+    // fold them into `st`. Returns true when the file shrank and `st` was
+    // rebuilt from the new content. Exposed for the regression test.
+    static bool pollJournal(JournalState &st, const QString &path);
+
     // Re-scan disk now and, if the snapshot changed, emit changed(). Also called
     // by the watcher/poll internally; safe to call directly (e.g. on first show).
     void refresh();
@@ -103,8 +130,10 @@ private:
     void parseScriptPhases(const QString &inputJson);
     void startWatching();
 
+    static void applyJournalChunk(JournalState &st, const agentkate::TailRead &chunk);
+
     Snapshot buildFromFinalJson(const QJsonObject &root) const;
-    Snapshot buildFromLive() const;
+    Snapshot buildFromLive();
 
     // Tail the last ~64 KB of a sub-agent transcript for its latest activity
     // (returns a one-line summary; fills `preview` with the latest assistant text).
@@ -121,6 +150,23 @@ private:
 
     Snapshot m_snapshot;
     QString m_fingerprint;
+
+    JournalState m_journal;
+
+    // Per-agent transcript tail cache: tailActivity re-reads an agent's file
+    // only when its size or mtime moved since the last poll.
+    struct AgentTail {
+        qint64 size = -1;
+        QDateTime mtime;
+        QString lastActivity;
+        QString preview;
+    };
+    QHash<QString, AgentTail> m_agentTails;
+
+    // The transcript dir existed at some point — its later disappearance (with
+    // no final json) means the run died, not that it hasn't started yet.
+    bool m_sawTranscriptDir = false;
+    QElapsedTimer m_sinceChange; // since the snapshot last changed (poll backoff)
 
     QFileSystemWatcher *m_watcher = nullptr;
     QTimer *m_poll = nullptr;

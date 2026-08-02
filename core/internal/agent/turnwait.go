@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // TurnTracker mirrors every thread's turn state at the orchestration layer,
@@ -34,8 +35,27 @@ type TurnTracker struct {
 
 type turnState struct {
 	inFlight int
+	waiters  int    // Waits currently parked on this thread
 	ended    bool   // terminal lifecycle seen; no result is coming
-	lastText string // last assistant text (or claude result text)
+	lastText string // last assistant text (or claude result text), capped
+}
+
+// maxLastTextBytes bounds the retained lastText. Its only consumers are
+// agent.wait / wait_agent, which hand a controller its worker's reply as tool
+// result text — the head of a runaway final message is enough for that, and an
+// uncapped copy of every thread's final message is a leak (F61).
+const maxLastTextBytes = 64 << 10
+
+// capLastText truncates on a rune boundary and marks the cut.
+func capLastText(s string) string {
+	if len(s) <= maxLastTextBytes {
+		return s
+	}
+	cut := maxLastTextBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "\n[truncated]"
 }
 
 // NewTurnTracker creates an empty tracker.
@@ -80,7 +100,10 @@ func (tt *TurnTracker) TurnQueued(threadID string) {
 func (tt *TurnTracker) TurnFailed(threadID string) {
 	tt.mu.Lock()
 	defer tt.mu.Unlock()
-	st := tt.state(threadID)
+	st := tt.threads[threadID]
+	if st == nil {
+		return
+	}
 	if st.inFlight > 0 {
 		st.inFlight--
 	}
@@ -123,7 +146,11 @@ func (tt *TurnTracker) Observe(threadID string, raw json.RawMessage) {
 		}
 		if text := strings.TrimSpace(sb.String()); text != "" {
 			tt.mu.Lock()
-			tt.state(threadID).lastText = text
+			// Not state(): a stray event for a swept thread (a tail frame
+			// racing the reap) must not recreate an entry nothing will prune.
+			if st := tt.threads[threadID]; st != nil {
+				st.lastText = capLastText(text)
+			}
 			tt.mu.Unlock()
 		}
 	case "result":
@@ -135,9 +162,13 @@ func (tt *TurnTracker) Observe(threadID string, raw json.RawMessage) {
 			_ = json.Unmarshal(head.Result, &resText)
 		}
 		tt.mu.Lock()
-		st := tt.state(threadID)
+		st := tt.threads[threadID]
+		if st == nil {
+			tt.mu.Unlock()
+			return
+		}
 		if strings.TrimSpace(resText) != "" {
-			st.lastText = resText
+			st.lastText = capLastText(resText)
 		}
 		if st.inFlight > 0 {
 			st.inFlight--
@@ -158,14 +189,25 @@ func (tt *TurnTracker) Observe(threadID string, raw json.RawMessage) {
 func (tt *TurnTracker) ObserveLifecycle(threadID, phase string) {
 	tt.mu.Lock()
 	defer tt.mu.Unlock()
-	st := tt.state(threadID)
 	switch phase {
 	case "exited", "interrupted", "error":
+		st := tt.threads[threadID]
+		if st == nil {
+			return // never tracked; nothing to end, nothing to sweep
+		}
 		st.inFlight = 0
 		st.ended = true
 		tt.broadcastLocked()
+		// Reap sweep (F61): the entry's only remaining consumer is a parked
+		// waiter reading lastText on wake. With none registered, drop it now
+		// instead of holding the final message until discard/stopClose; with
+		// waiters parked, the last one out completes the sweep
+		// (unregisterWaiterLocked).
+		if st.waiters == 0 {
+			delete(tt.threads, threadID)
+		}
 	case "started", "resumed":
-		st.ended = false
+		tt.state(threadID).ended = false
 	}
 }
 
@@ -184,25 +226,71 @@ func (tt *TurnTracker) LastText(threadID string) string {
 // must release its waiter, not park it until the deadline). It returns the
 // thread's last assistant text and whether the wait gave up before idle
 // (deadline or cancellation) — check ctx.Err() to tell the two apart.
+//
+// A never-seen id is idle with nothing to report. Wait deliberately does NOT
+// create an entry for it (F61): any approved bridge can wait on any id, and a
+// tracker entry with no thread behind it would never see the terminal
+// lifecycle that sweeps it.
 func (tt *TurnTracker) Wait(ctx context.Context, threadID string, timeout time.Duration) (lastText string, timedOut bool) {
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
+	registered := false
 	for {
 		tt.mu.Lock()
-		st := tt.state(threadID)
+		st := tt.threads[threadID]
+		if st == nil {
+			tt.mu.Unlock()
+			return "", false
+		}
 		if st.inFlight == 0 || st.ended {
 			text := st.lastText
+			if registered {
+				tt.unregisterWaiterLocked(threadID, st)
+			}
 			tt.mu.Unlock()
 			return text, false
+		}
+		if !registered {
+			st.waiters++
+			registered = true
 		}
 		ch := tt.changed
 		tt.mu.Unlock()
 		select {
 		case <-ch:
 		case <-ctx.Done():
-			return tt.LastText(threadID), true
+			return tt.detach(threadID, registered), true
 		case <-deadline.C:
-			return tt.LastText(threadID), true
+			return tt.detach(threadID, registered), true
 		}
+	}
+}
+
+// detach reads the thread's last text and, if this Wait had registered as a
+// waiter, unregisters it — the give-up paths must not leave a phantom waiter
+// holding an ended entry alive forever.
+func (tt *TurnTracker) detach(threadID string, registered bool) string {
+	tt.mu.Lock()
+	defer tt.mu.Unlock()
+	st := tt.threads[threadID]
+	if st == nil {
+		return ""
+	}
+	text := st.lastText
+	if registered {
+		tt.unregisterWaiterLocked(threadID, st)
+	}
+	return text
+}
+
+// unregisterWaiterLocked drops one waiter; the last waiter leaving an ended
+// thread completes the reap sweep ObserveLifecycle deferred to it. Caller
+// holds tt.mu.
+func (tt *TurnTracker) unregisterWaiterLocked(threadID string, st *turnState) {
+	if st.waiters > 0 {
+		st.waiters--
+	}
+	if st.ended && st.waiters == 0 {
+		delete(tt.threads, threadID)
 	}
 }

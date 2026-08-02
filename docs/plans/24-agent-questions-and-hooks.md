@@ -1,10 +1,80 @@
 # 24 — The interaction channel: agents asking the user, and hooks made visible
 
-**Status: PLANNED.** Covers IDEAS #8 (interactive agent questions) and #7
+**Status: §1–3 (questions) LANDED under a different design — see the
+reconciliation below. §4–7 (hooks, settings overlays, screened trust) still
+PLANNED.** Covers IDEAS #8 (interactive agent questions) and #7
 (hooks channel and hook manager). Program context:
 [20-approved-features-program.md](20-approved-features-program.md).
 
 **Size: L** — questions (§1–3) M–L, hooks (§4–6) M. Questions ship first.
+
+## §1–3 LANDED (different design) — reconciliation 2026-08-02
+
+A working questions feature shipped, but not through this plan's harness seam.
+There is no `harness.Question`, no `AnswerQuestion` method, no
+`Capabilities.InteractiveQuestions`, and no `_question` event. What landed
+instead:
+
+- **Kimi** (`core/internal/kimi/thread.go`): `isQuestionRequest` detects a
+  bridged question by the option-id namespace (`^q\d+_opt_\d+$`, regex at
+  ~:2142) — *before* the boolean permission path (`onAgentRequest` ~:1908) — and
+  `answerQuestion` (~:2176) re-shapes it as claude's `AskUserQuestion` input
+  (`{questions:[{question, options:[{label}]}]}`) and sends it down the
+  **existing permission channel** (`s.perm` → `askHumanPermission` →
+  `permission.requested`). The human's pick comes back as `updatedInput` and is
+  mapped to an option id **by label**; no match / dismissal / timeout answers
+  kimi's own `q<n>_skip` (or a `cancelled` outcome when no once-scoped refusal
+  exists). Always-scoped options are filtered out (audit F27).
+- **Claude**: the `AskUserQuestion` *tool* round-trips through the MCP
+  permission prompt (`core/cmd/akcore/mcp.go` `request_permission`, answers as
+  `updatedInput`) — so claude questions work end-to-end too, via a channel this
+  plan did not credit.
+- **UI** (`ui/src/AgentPanel.cpp`, anchors approximate — file under concurrent
+  edit): `permission.requested` with `toolName == "AskUserQuestion"` renders a
+  real question form (`m_questionBox`, `buildQuestionForm` ~:5255) instead of
+  the Approve/Deny bar; it shares `m_permQueue` and the one-prompt-at-a-time
+  gate (`showNextPermission` ~:5067), the 8-minute broker countdown, and the
+  `attentionChanged` → roster + `AgentNotifier` path.
+
+### Scorecard against this plan's §1–3 requirements
+
+| Requirement | Verdict | Notes |
+|---|---|---|
+| Mis-answer bug (Approve → `q0_opt_0`) dead, with regression test | **MET** | Label-mapped answers; `TestKimiQuestionAnswersTheChosenOption` pins `q0_opt_1` on the wire, `TestKimiQuestionUnansweredSkips` pins the skip; F27 tests pin scope-exactness |
+| Skip/dismissal first-class (`q0_skip` / cancelled, not hidden) | **MET, differently** | Kimi's own Skip option is kept in the offered list; dismissal/timeout/no-match answers `q0_skip`. Gap: no dedicated dismiss *button* — on claude questions the only decline is the countdown expiring |
+| Interrupt/stop cancels a pending question frame | **PARTIAL** | UI clears the queue and hides the form on `turn_aborted`/`exited` but never responds; the core broker ask parks until the 8-minute timeout, then answers skip/cancelled. Bounded, not immediate; no `TestInterruptCancelsPendingQuestion` |
+| Never auto-approved by any permission mode | **MET core-side** | Kimi questions always reach `askHumanPermission`; akcore has no rules/mode layer that could auto-answer, and an allow with unusable `updatedInput` falls to skip, never first-option. Unverified: whether claude's own `bypassPermissions` still routes `AskUserQuestion` through the prompt tool (CLI-internal — probe) |
+| One-prompt-at-a-time queueing | **MET, differently** | Shared `m_permQueue` rather than a separate `m_questionQueue`; the gate covers both widgets, so a question and a permission can't show at once. Fine — arguably better |
+| Notification/attention when the panel isn't visible | **MET, mostly** | Questions count in `attentionChanged` → roster attention + `agentNeedsAttention` KNotification. No distinct `agentAsksQuestion` event in `agentkate.notifyrc` |
+| Transcript replay renders answered questions as history | **UNMET** | The prompt is a live-only notification; the "asked/answered" notes are unpersisted `addNote` rows; transcript rendering deliberately *skips* `AskUserQuestion` tool_use blocks. Replay shows nothing |
+| Claude `request_user_dialog` / `side_question` subtypes | **STILL DROPPED** | Fall into the system-subtype deliberate-silence branch. Mitigated: the `AskUserQuestion` tool channel works, so claude *can* ask; the dialog subtypes remain a probe-then-decide item |
+| `Capabilities.InteractiveQuestions` gating | **ABSENT — implicit gating, acceptable** | Detection is namespace-based (kimi) / toolName-based (claude) and falls back to the plain permission path, so an engine that can't ask simply never triggers the form. OK while the feature is purely reactive; a flag becomes necessary only if a *proactive* surface (traits row, "ask the user" affordance) is added |
+| UI tests (`QuestionCardTest.cpp`) | **UNMET** | No question-form coverage in `ui/tests/` |
+
+Bonus beyond the plan: audit-F27 hardening (a question can never install a
+standing allow/reject; an all-standing question is not shown at all), and the
+8-minute countdown doubles as the auto-dismiss this plan's open question 1
+asked about (fixed, not configurable; dismissal is the protocol-legal skip).
+
+### Residual gaps (actionable)
+
+1. **Transcript replay**: persist an answered-question record core-side (or
+   stop skipping `AskUserQuestion` tool_use on replay) so history shows
+   "*asked:* … → **answer**". The biggest genuine gap.
+2. **Prompt cancellation on interrupt/stop**: resolve pending broker asks
+   immediately when the turn aborts or the thread exits instead of waiting out
+   the 8-minute timer; add `TestInterruptCancelsPendingQuestion`.
+3. **Explicit dismiss affordance** on the question card (today: kimi's Skip
+   radio, or the countdown; claude questions have no decline button).
+4. **Probe** claude `bypassPermissions` × `AskUserQuestion` (does it still hit
+   the permission prompt tool?) and record the answer in `docs/HARNESSES.md`.
+5. **`request_user_dialog` / `side_question`**: still silent — run this plan's
+   Phase 2 probe, then either render read-only or wire the reply channel.
+6. Distinct `agentAsksQuestion` notifyrc event (nice-to-have).
+7. Question-form UI test coverage (build/submit/queue-drain).
+
+The original plan text below is the historical record; §4–7 remain the live
+plan for hooks and screened trust.
 
 > **User note on #8:** *"This is a much needed feature for all agent types that
 > can support it."*

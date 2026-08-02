@@ -51,6 +51,10 @@ private Q_SLOTS:
     void runningToolShowsItsPartialOutput();
     void failedToolLooksDifferentFromASuccessfulOne();
     void findScansNotesToolsAndThinking();
+    void searchTextIsCachedUntilTheRowChanges();
+    void findKeystrokeTouchesOnlyRowsWhoseMatchChanged();
+    void findHighlightHtmlIsCachedPerRowAndNeedle();
+    void startReplyWithoutAThreadIdIsAFailure();
     void notesCarryPlainTextAndATimestamp();
     void disconnectedAdviceFollowsTheLadder();
     void emptyStateNamesTheRealIsolation();
@@ -316,6 +320,187 @@ void TranscriptModelTest::findScansNotesToolsAndThinking()
         sawNote = sawNote || args.at(0).value<quintptr>() == noteId;
     }
     QVERIFY2(sawNote, "a note that starts matching must be re-measured, not repainted stale");
+}
+
+// Audit F58. Find used to call searchText(row) for every row on every
+// keystroke, and a Tool row's searchText re-joined name + summary + detail +
+// the full retained result — up to 128 KB — into a fresh QString each call.
+// The lowercased search text is now cached on the row: repeated reads hand
+// back the same buffer, and the cache is busted through the same touched()
+// seam that invalidates the delegate's height cache.
+void TranscriptModelTest::searchTextIsCachedUntilTheRowChanges()
+{
+    TranscriptModel m;
+    const int key = m.appendTool(QStringLiteral("Bash"), QStringLiteral("make"),
+                                 QStringLiteral("{\"command\":\"make\"}"), true);
+    const QString big =
+        QString(100000, QLatin1Char('X')) + QStringLiteral(" ModuleNotFoundError");
+    m.setToolResult(key, QStringLiteral("clipped"), big, true);
+
+    const QString first = m.searchTextLower(key);
+    QVERIFY(first.contains(QStringLiteral("modulenotfounderror"))); // lowercased
+    QVERIFY(first.contains(QStringLiteral("bash")));
+    // The second read is the SAME buffer, not a fresh 128 KB join — QString is
+    // COW, so a rebuilt string could never share data with the first one.
+    QVERIFY2(m.searchTextLower(key).constData() == first.constData(),
+             "searchTextLower rebuilt the row's text on a repeated read — the "
+             "per-keystroke find scan is re-joining every row again");
+
+    // A content mutation (through the touched() seam) busts the cache: the next
+    // read reflects the new text.
+    m.setToolResult(key, QStringLiteral("clipped"), big + QStringLiteral(" And More"),
+                    true);
+    const QString again = m.searchTextLower(key);
+    QVERIFY2(again.contains(QStringLiteral("and more")),
+             "a mutated row served its stale cached search text");
+    // And the fresh value is itself cached again.
+    QVERIFY(m.searchTextLower(key).constData() == again.constData());
+}
+
+// Carried finding C3 (rides audit F58's cache). setFind used to end in a
+// FULL-RANGE dataChanged on every needle/current-row change, which repainted
+// every row and closed the panel's selection overlay on every find keystroke.
+// With the match flags cached, the emission narrows to exactly the rows whose
+// rendered form changed — a row whose match state did not move is in no span.
+void TranscriptModelTest::findKeystrokeTouchesOnlyRowsWhoseMatchChanged()
+{
+    TranscriptModel m;
+    const auto msg = [&m](const QString &text) {
+        return m.appendMessage(QStringLiteral("Agent Kate"), QStringLiteral("#1a7f6b"),
+                               text, text, false, QString());
+    };
+    const int hitA = msg(QStringLiteral("the needle is here"));
+    const int miss = msg(QStringLiteral("nothing to see"));
+    const int hitB = msg(QStringLiteral("another needle row"));
+
+    QSignalSpy spy(&m, &QAbstractItemModel::dataChanged);
+    const auto covered = [&spy](int row) {
+        for (const auto &args : spy) {
+            if (row >= args.at(0).toModelIndex().row()
+                && row <= args.at(1).toModelIndex().row()) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // First keystroke: the two matching rows flip and re-measure; the
+    // non-matching row between them is untouched.
+    m.setFind(QStringLiteral("needle"), hitA);
+    QVERIFY(covered(hitA));
+    QVERIFY(covered(hitB));
+    QVERIFY2(!covered(miss),
+             "an unchanged-match row was repainted — the full-range dataChanged "
+             "that closes the selection overlay on every keystroke is back");
+
+    // Cycling to the next hit (same needle): only the two current-row swaps
+    // repaint, and nothing needs a re-measure.
+    spy.clear();
+    QSignalSpy invalidated(&m, &TranscriptModel::heightInvalidated);
+    m.setFind(QStringLiteral("needle"), hitB);
+    QVERIFY(covered(hitA));
+    QVERIFY(covered(hitB));
+    QVERIFY(!covered(miss));
+    QCOMPARE(invalidated.count(), 0); // paint-only — no height changed
+
+    // Extending the needle so both rows still match: the highlight spans moved,
+    // so both repaint (same height); the miss row is still untouched.
+    spy.clear();
+    m.setFind(QStringLiteral("needle "), hitB);
+    QVERIFY(covered(hitA));
+    QVERIFY(covered(hitB));
+    QVERIFY(!covered(miss));
+
+    // Clearing the find flips the matches back and never touches the miss row.
+    spy.clear();
+    m.setFind(QString(), -1);
+    QVERIFY(covered(hitA));
+    QVERIFY(covered(hitB));
+    QVERIFY(!covered(miss));
+}
+
+// Carried finding C2 (rides audit F58). The find-highlighted body HTML —
+// toHtmlEscaped over the row's whole plain text plus a scan per hit — used to
+// be rebuilt on EVERY paint of every matching row for the life of the find
+// bar. It is now cached per row keyed on (needle, current-row), with the same
+// invalidation discipline as the delegate's document caches.
+void TranscriptModelTest::findHighlightHtmlIsCachedPerRowAndNeedle()
+{
+    TranscriptModel m;
+    const int row = m.appendMessage(QStringLiteral("Agent Kate"),
+                                    QStringLiteral("#1a7f6b"),
+                                    QStringLiteral("alpha <b>needle</b> beta"),
+                                    QStringLiteral("alpha needle beta"), false,
+                                    QString());
+    TranscriptDelegate d;
+
+    // No needle: the pre-rendered HTML, untouched.
+    QCOMPARE(d.resolveBodyHtml(m.index(row)),
+             QStringLiteral("alpha <b>needle</b> beta"));
+
+    m.setFind(QStringLiteral("needle"), row);
+    const QString strong = d.resolveBodyHtml(m.index(row));
+    QVERIFY(strong.contains(QStringLiteral("<span")));
+    // A repaint of the unchanged row is a cache hit — the same COW buffer, not
+    // a fresh escape-and-scan of the whole body.
+    QVERIFY2(d.resolveBodyHtml(m.index(row)).constData() == strong.constData(),
+             "the highlighted HTML was rebuilt on a repeated paint of an "
+             "unchanged row");
+
+    // The current match moving off this row swaps the highlight strength: a
+    // different string, cached in its own right.
+    m.setFind(QStringLiteral("needle"), -1);
+    const QString muted = d.resolveBodyHtml(m.index(row));
+    QVERIFY(muted != strong);
+    QVERIFY(d.resolveBodyHtml(m.index(row)).constData() == muted.constData());
+
+    // invalidateRow drops the entry like it drops the row's documents: the next
+    // paint rebuilds (same content, necessarily a new buffer).
+    const quintptr id =
+        m.data(m.index(row), TranscriptModel::StableIdRole).value<quintptr>();
+    d.invalidateRow(id);
+    const QString rebuilt = d.resolveBodyHtml(m.index(row));
+    QCOMPARE(rebuilt, muted);
+    QVERIFY2(rebuilt.constData() != muted.constData(),
+             "invalidateRow left the stale highlight entry behind");
+}
+
+// Audit F67. agent.start's SUCCESS reply was trusted to carry a threadId. An
+// empty id left the user's message committed to the feed and the panel latched
+// on "opening…" forever (every notification is dropped while the id is empty,
+// and no _lifecycle/started can arrive for an empty id), and the F37
+// give-the-prompt-back path never ran because it fired only on `error`. The
+// panel now routes the reply through startFailureReason, which fails closed.
+void TranscriptModelTest::startReplyWithoutAThreadIdIsAFailure()
+{
+    using agentkate::startFailureReason;
+
+    // A real start: no failure.
+    QVERIFY(startFailureReason(
+                QJsonObject{{QStringLiteral("threadId"), QStringLiteral("t-1")}},
+                QJsonObject{})
+                .isEmpty());
+
+    // An error reply keeps its own message.
+    QCOMPARE(startFailureReason(
+                 QJsonObject{},
+                 QJsonObject{{QStringLiteral("message"), QStringLiteral("boom")}}),
+             QStringLiteral("boom"));
+    // An error wins even when a threadId rides along, and a message-less error
+    // must not read as success.
+    QVERIFY(!startFailureReason(
+                 QJsonObject{{QStringLiteral("threadId"), QStringLiteral("t-1")}},
+                 QJsonObject{{QStringLiteral("code"), -32000}})
+                 .isEmpty());
+
+    // THE finding: a success reply with a missing or empty threadId is a
+    // failure, so the panel takes the same error path (note + prompt restored).
+    QVERIFY2(!startFailureReason(QJsonObject{}, QJsonObject{}).isEmpty(),
+             "a success reply with no threadId was treated as a start — the "
+             "panel will latch m_pendingOpening forever");
+    QVERIFY(!startFailureReason(
+                 QJsonObject{{QStringLiteral("threadId"), QString()}}, QJsonObject{})
+                 .isEmpty());
 }
 
 // Notes carry their own plain text (so find and "Copy text" can reach them) and

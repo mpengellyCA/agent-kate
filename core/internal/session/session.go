@@ -136,6 +136,16 @@ type Store struct {
 	path string
 	mu   sync.Mutex
 	recs map[string]Record // threadID -> Record
+
+	// archMu serializes all access to threads-archive.json and guards
+	// archCache. It exists so Archive/Restore/ListArchived can do their
+	// whole-file archive I/O WITHOUT holding s.mu (F62) — s.mu is on every
+	// hot path (the relay's throttled sessions.Update lands on each turn
+	// result) and must never wait on a 4 MB read-modify-write. Lock order:
+	// archMu may be taken first and held while s.mu is acquired, never the
+	// reverse.
+	archMu    sync.Mutex
+	archCache []ArchiveRecord // resolved-Env mirror of the archive file; nil = not loaded
 }
 
 // DefaultPath is where the thread store lives unless overridden.
@@ -431,13 +441,26 @@ func (s *Store) archivePath() string {
 	return filepath.Join(dir, "threads-archive.json")
 }
 
-// loadArchive reads the archive file. A missing file is an empty archive, not
-// an error. The caller need not hold s.mu — the archive file is independent of
-// the in-memory live map.
+// loadArchive returns the archive list, taking archMu itself. Convenience for
+// callers outside the Archive/Restore critical sections (and tests).
 func (s *Store) loadArchive() ([]ArchiveRecord, error) {
+	s.archMu.Lock()
+	defer s.archMu.Unlock()
+	return s.loadArchiveLocked()
+}
+
+// loadArchiveLocked serves the archive list from archCache, reading the file
+// only on the first call. A missing file is an empty archive, not an error.
+// Caller holds s.archMu — never s.mu — and must treat the returned slice as
+// read-only (build a new slice to change the archive).
+func (s *Store) loadArchiveLocked() ([]ArchiveRecord, error) {
+	if s.archCache != nil {
+		return s.archCache, nil
+	}
 	b, err := os.ReadFile(s.archivePath())
 	if err != nil {
 		if os.IsNotExist(err) {
+			s.archCache = []ArchiveRecord{}
 			return nil, nil
 		}
 		return nil, err
@@ -454,6 +477,10 @@ func (s *Store) loadArchive() ([]ArchiveRecord, error) {
 		// archive kept in cleartext.
 		file.Threads[i].Env = resolveEnvFromProcess(file.Threads[i].Env)
 	}
+	if file.Threads == nil {
+		file.Threads = []ArchiveRecord{}
+	}
+	s.archCache = file.Threads
 	return file.Threads, nil
 }
 
@@ -470,9 +497,20 @@ const (
 	maxArchiveBytes   = 4 << 20
 )
 
-// writeArchive atomically writes the archive list to disk, newest-first and
-// bounded by the retention caps above.
+// writeArchive atomically writes the archive list, taking archMu itself.
+// Convenience for callers outside the Archive/Restore critical sections (and
+// tests).
 func (s *Store) writeArchive(list []ArchiveRecord) error {
+	s.archMu.Lock()
+	defer s.archMu.Unlock()
+	return s.writeArchiveLocked(list)
+}
+
+// writeArchiveLocked atomically writes the archive list to disk, newest-first
+// and bounded by the retention caps above, and mirrors exactly what survived
+// into archCache (with RESOLVED Env — the cache is the in-memory view, the
+// redaction below is for the file only). Caller holds s.archMu, never s.mu.
+func (s *Store) writeArchiveLocked(list []ArchiveRecord) error {
 	sort.Slice(list, func(i, j int) bool { return list[i].ArchivedAt.After(list[j].ArchivedAt) })
 	if len(list) > maxArchiveRecords {
 		list = list[:maxArchiveRecords]
@@ -485,7 +523,7 @@ func (s *Store) writeArchive(list []ArchiveRecord) error {
 		ar.Env = redactEnvForPersist(ar.Env)
 		out = append(out, ar)
 	}
-	b, err := marshalArchiveWithin(out, maxArchiveBytes)
+	b, kept, err := marshalArchiveWithin(out, maxArchiveBytes)
 	if err != nil {
 		return err
 	}
@@ -493,15 +531,29 @@ func (s *Store) writeArchive(list []ArchiveRecord) error {
 	if err := fsperm.MkdirAll(filepath.Dir(path)); err != nil {
 		return err
 	}
+	if archiveIOTestHook != nil {
+		archiveIOTestHook()
+	}
 	tmp := path + ".tmp"
 	if err := fsperm.WriteFile(tmp, b); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	s.archCache = list[:kept]
+	return nil
 }
+
+// archiveIOTestHook, when non-nil, runs inside the archive-file critical
+// section — s.archMu held, s.mu NOT held. Test seam for F62: a test parks the
+// archive write here and proves the store stays responsive meanwhile.
+var archiveIOTestHook func()
 
 // marshalArchiveWithin encodes the archive, dropping the OLDEST entries (the
 // tail — the list arrives newest-first) until the encoding fits the byte cap.
+// It reports how many entries survived so the caller's cache can mirror the
+// file exactly.
 //
 // Iterative rather than estimated: records vary by orders of magnitude in size
 // (a bare thread vs one carrying a long system prompt), so a per-record average
@@ -509,16 +561,16 @@ func (s *Store) writeArchive(list []ArchiveRecord) error {
 // in a handful of passes over a list already capped at maxArchiveRecords. The
 // newest entry is never dropped: an archive that cannot hold even one record
 // would make Archive lose the very thread it was asked to preserve.
-func marshalArchiveWithin(list []ArchiveRecord, maxBytes int) ([]byte, error) {
+func marshalArchiveWithin(list []ArchiveRecord, maxBytes int) (b []byte, kept int, err error) {
 	for {
 		b, err := json.MarshalIndent(struct {
 			Threads []ArchiveRecord `json:"threads"`
 		}{list}, "", "  ")
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		if len(b) <= maxBytes || len(list) <= 1 {
-			return b, nil
+			return b, len(list), nil
 		}
 		drop := len(list) / 10
 		if drop < 1 {
@@ -536,15 +588,24 @@ func marshalArchiveWithin(list []ArchiveRecord, maxBytes int) ([]byte, error) {
 // SAFETY: the archive file is written FIRST and only then is the live record
 // dropped. If the archive write fails, the live record is left intact so the
 // caller (the cleanup handler) never loses the record before git removal.
+//
+// LOCKING (F62): s.mu is held only for the record snapshot and the final
+// delete+flush — the whole-file archive read-modify-write happens under
+// archMu alone, so hot-path store callers (the relay's per-turn
+// sessions.Update) never stall behind it. archMu spans through the delete so
+// a concurrent Restore of the same thread cannot interleave between the
+// archive write and the live removal.
 func (s *Store) Archive(threadID, reason string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	rec, ok := s.recs[threadID]
+	s.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("unknown thread %s", threadID)
 	}
 
-	existing, err := s.loadArchive()
+	s.archMu.Lock()
+	defer s.archMu.Unlock()
+	existing, err := s.loadArchiveLocked()
 	if err != nil {
 		return err
 	}
@@ -564,9 +625,11 @@ func (s *Store) Archive(threadID, reason string) error {
 		Reason:     reason,
 	})
 	// Archive file written BEFORE the live record is removed.
-	if err := s.writeArchive(out); err != nil {
+	if err := s.writeArchiveLocked(out); err != nil {
 		return err
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	delete(s.recs, threadID)
 	return s.flush()
 }
@@ -580,30 +643,34 @@ func (s *Store) Archive(threadID, reason string) error {
 // peer the daemon's credentials, values that were never even on disk. Restore
 // and Archive use loadArchive directly and keep the resolved values.
 func (s *Store) ListArchived() []ArchiveRecord {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	list, err := s.loadArchive()
+	s.archMu.Lock()
+	list, err := s.loadArchiveLocked()
+	s.archMu.Unlock()
 	if err != nil {
 		return nil
 	}
-	for i := range list {
-		list[i].Env = RedactEnvForWire(list[i].Env)
+	// Copy before redacting: list may be the cache itself, and the cache keeps
+	// the resolved values Restore needs.
+	out := make([]ArchiveRecord, len(list))
+	copy(out, list)
+	for i := range out {
+		out[i].Env = RedactEnvForWire(out[i].Env)
 	}
-	sort.Slice(list, func(i, j int) bool { return list[i].ArchivedAt.After(list[j].ArchivedAt) })
-	if list == nil {
-		return []ArchiveRecord{}
-	}
-	return list
+	sort.Slice(out, func(i, j int) bool { return out[i].ArchivedAt.After(out[j].ArchivedAt) })
+	return out
 }
 
 // Restore best-effort moves an archived record back into the live store as a
 // dormant, non-isolated thread (its worktree is gone after cleanup, so it can
 // only be resumed in the workspace). The archive entry is removed once the live
 // record is written.
+// LOCKING (F62): like Archive, the archive-file work runs under archMu alone;
+// s.mu is taken only around the live-map insert+flush (archMu → s.mu is the
+// one permitted nesting).
 func (s *Store) Restore(threadID string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	list, err := s.loadArchive()
+	s.archMu.Lock()
+	defer s.archMu.Unlock()
+	list, err := s.loadArchiveLocked()
 	if err != nil {
 		return err
 	}
@@ -628,11 +695,15 @@ func (s *Store) Restore(threadID string) error {
 	rec.Worktree.Path = rec.Project
 	rec.Worktree.Branch = ""
 	rec.Updated = time.Now()
-	s.recs[rec.ThreadID] = rec
-	if err := s.flush(); err != nil {
+	if err := func() error {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.recs[rec.ThreadID] = rec
+		return s.flush()
+	}(); err != nil {
 		return err
 	}
-	return s.writeArchive(remaining)
+	return s.writeArchiveLocked(remaining)
 }
 
 // NewID returns a fresh random UUID (v4) — a valid `claude --session-id`.

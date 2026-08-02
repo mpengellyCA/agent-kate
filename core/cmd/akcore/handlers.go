@@ -1794,15 +1794,16 @@ func registerHandlers(d handlerDeps) {
 	})
 
 	// --- cooperation state (shared with the Cooperation MCP) ---------------
-	d.srv.Handle("coop.setOpenFiles", func(_ context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("coop.setOpenFiles", func(ctx context.Context, raw json.RawMessage) (any, error) {
 		var p coopSetOpenFilesParams
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
-		if p.Owner == "" {
-			p.Owner = "human"
+		owner, err := coopCallerIdentity(ctx, p.Owner)
+		if err != nil {
+			return nil, err
 		}
-		d.coop.SetOpenFiles(p.Owner, p.Files)
+		d.coop.SetOpenFiles(owner, p.Files)
 		d.srv.NotifyPrimaryUI("coop.changed", map[string]any{})
 		return map[string]any{"ok": true}, nil
 	})
@@ -1811,15 +1812,16 @@ func registerHandlers(d handlerDeps) {
 		return map[string]any{"files": d.coop.ListOpenFiles()}, nil
 	})
 
-	d.srv.Handle("coop.postNote", func(_ context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("coop.postNote", func(ctx context.Context, raw json.RawMessage) (any, error) {
 		var p coopPostNoteParams
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
-		if p.Author == "" {
-			p.Author = "human"
+		author, err := coopCallerIdentity(ctx, p.Author)
+		if err != nil {
+			return nil, err
 		}
-		note := d.coop.PostNote(p.Author, p.Text)
+		note := d.coop.PostNote(author, p.Text)
 		d.srv.NotifyPrimaryUI("coop.changed", map[string]any{})
 		return note, nil
 	})
@@ -1828,7 +1830,7 @@ func registerHandlers(d handlerDeps) {
 		return map[string]any{"notes": d.coop.ReadNotes()}, nil
 	})
 
-	d.srv.Handle("coop.setPresence", func(_ context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("coop.setPresence", func(ctx context.Context, raw json.RawMessage) (any, error) {
 		var p struct {
 			Owner       string `json:"owner"`
 			FocusedFile string `json:"focusedFile"`
@@ -1836,10 +1838,11 @@ func registerHandlers(d handlerDeps) {
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
-		if p.Owner == "" {
-			p.Owner = "human"
+		owner, err := coopCallerIdentity(ctx, p.Owner)
+		if err != nil {
+			return nil, err
 		}
-		d.coop.SetPresence(p.Owner, p.FocusedFile)
+		d.coop.SetPresence(owner, p.FocusedFile)
 		d.srv.NotifyPrimaryUI("coop.changed", map[string]any{})
 		return map[string]any{"ok": true}, nil
 	})
@@ -1852,7 +1855,7 @@ func registerHandlers(d handlerDeps) {
 		}, nil
 	})
 
-	d.srv.Handle("coop.claimFile", func(_ context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("coop.claimFile", func(ctx context.Context, raw json.RawMessage) (any, error) {
 		var p struct {
 			Path  string `json:"path"`
 			Owner string `json:"owner"`
@@ -1860,15 +1863,16 @@ func registerHandlers(d handlerDeps) {
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
-		if p.Owner == "" {
-			p.Owner = "human"
+		owner, err := coopCallerIdentity(ctx, p.Owner)
+		if err != nil {
+			return nil, err
 		}
-		ok, holder := d.coop.ClaimFile(p.Path, p.Owner)
+		ok, holder := d.coop.ClaimFile(p.Path, owner)
 		d.srv.NotifyPrimaryUI("coop.changed", map[string]any{})
 		return map[string]any{"ok": ok, "holder": holder}, nil
 	})
 
-	d.srv.Handle("coop.releaseFile", func(_ context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("coop.releaseFile", func(ctx context.Context, raw json.RawMessage) (any, error) {
 		var p struct {
 			Path  string `json:"path"`
 			Owner string `json:"owner"`
@@ -1876,15 +1880,16 @@ func registerHandlers(d handlerDeps) {
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
-		if p.Owner == "" {
-			p.Owner = "human"
+		owner, err := coopCallerIdentity(ctx, p.Owner)
+		if err != nil {
+			return nil, err
 		}
-		d.coop.ReleaseFile(p.Path, p.Owner)
+		d.coop.ReleaseFile(p.Path, owner)
 		d.srv.NotifyPrimaryUI("coop.changed", map[string]any{})
 		return map[string]any{"ok": true}, nil
 	})
 
-	d.srv.Handle("coop.requestReview", func(_ context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("coop.requestReview", func(ctx context.Context, raw json.RawMessage) (any, error) {
 		var p struct {
 			Thread  string `json:"thread"`
 			Summary string `json:"summary"`
@@ -1892,9 +1897,15 @@ func registerHandlers(d handlerDeps) {
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
-		rev := d.coop.AddReview(p.Thread, p.Summary)
+		// The reviewed thread is the CALLER's for a bridge — a review filed
+		// under somebody else's name would point the human at the wrong diff.
+		thread, err := coopCallerIdentity(ctx, p.Thread)
+		if err != nil {
+			return nil, err
+		}
+		rev := d.coop.AddReview(thread, p.Summary)
 		d.srv.Notify("agent.reviewRequested", map[string]any{
-			"threadId": p.Thread,
+			"threadId": thread,
 			"summary":  p.Summary,
 			"id":       rev.ID,
 		})
@@ -3239,7 +3250,7 @@ func registerHandlers(d handlerDeps) {
 		if p.Root == "" {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "root required")
 		}
-		res, err := search.Run(search.Options{
+		res, err := search.Run(ctx, search.Options{
 			Query:         p.Query,
 			Root:          p.Root,
 			Regex:         p.Regex,
@@ -3254,6 +3265,39 @@ func registerHandlers(d handlerDeps) {
 		}
 		return res, nil
 	})
+}
+
+// coopCallerIdentity resolves the identity a coop.* write is attributed to
+// (audit F63). The cooperation board stays open — any agent may write to it,
+// which is the shared-board basis handlers_inventory_test.go checks — but WHO
+// wrote is not the payload's to choose: a bridge connection is attributed as
+// its bound thread, whatever owner/author/thread it supplied, so a
+// prompt-injected agent can neither plant notes authored "human" nor release
+// the human's file claims. "human" stays reserved for the UI role, the only
+// connection that speaks for the human (F13's binding, applied to
+// attribution). A connection that is neither is refused — the same fail-closed
+// direction as requireCallerThread.
+func coopCallerIdentity(ctx context.Context, supplied string) (string, error) {
+	ref := ipc.ConnFromContext(ctx)
+	if ref == nil {
+		return "", ipc.Errorf(ipc.CodeInvalidParams,
+			"coop: caller has no connection identity")
+	}
+	switch ref.Role() {
+	case "ui":
+		if supplied == "" {
+			return "human", nil
+		}
+		return supplied, nil
+	case "bridge":
+		if tid := ref.ThreadID(); tid != "" {
+			return tid, nil
+		}
+		return "", ipc.Errorf(ipc.CodeInvalidParams,
+			"coop: bridge connection has no bound thread")
+	}
+	return "", ipc.Errorf(ipc.CodeInvalidParams,
+		"coop: connection has not identified (handshake or bridge.identify first)")
 }
 
 // resolveLogSource maps the (threadId, repoRoot) pair the log-viewer RPCs

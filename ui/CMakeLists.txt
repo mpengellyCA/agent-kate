@@ -328,6 +328,18 @@ if(Qt6Test_FOUND)
     set_tests_properties(SubAgentTranscriptDialogTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
+    # Audit F59: the workflow journal is followed incrementally (byte offset +
+    # carried parse state), not re-read whole every 1.5 s poll. Pins the
+    # appended-bytes-only and shrink-reset properties of that follow.
+    add_executable(WorkflowMonitorTest tests/WorkflowMonitorTest.cpp
+        src/WorkflowMonitor.cpp src/SafeContent.cpp)
+    target_include_directories(WorkflowMonitorTest PRIVATE src)
+    target_link_libraries(WorkflowMonitorTest PRIVATE Qt6::Widgets Qt6::Test
+        KF6::I18n KF6::WidgetsAddons)
+    add_test(NAME WorkflowMonitorTest COMMAND WorkflowMonitorTest)
+    set_tests_properties(WorkflowMonitorTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
     # Plan 16 P5: the roster is no longer a two-level tree — workers nest under
     # their controller. Guards the traversals and the two ways a nested agent
     # could be lost (a closed controller, a filter match under a hidden parent).
@@ -463,6 +475,22 @@ if(Qt6Test_FOUND)
         KF6::WidgetsAddons)
     add_test(NAME AgentPanelTest COMMAND AgentPanelTest)
     set_tests_properties(AgentPanelTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    # Audit F60 (the F19b sibling): the Agent Activity inspector must read a
+    # result event's usage through HarnessTraits::usageReporting — a cumulative
+    # readout (kimi) lands as the latest snapshot, never as a sum — and its
+    # per-thread state is bounded: resolved tool-call lookups are consumed, the
+    # timeline is a ring. Driven on the real widget through the notification
+    # wire, because the missing gate was a wiring bug.
+    add_executable(AiInspectorPanelTest tests/AiInspectorPanelTest.cpp
+        src/AiInspectorPanel.cpp src/AgentChatHelpers.cpp src/MarkdownUtil.cpp
+        src/state/HarnessTraits.cpp src/ProviderConfig.cpp src/ipc/CoreClient.cpp)
+    target_include_directories(AiInspectorPanelTest PRIVATE src)
+    target_link_libraries(AiInspectorPanelTest PRIVATE Qt6::Widgets Qt6::Test
+        Qt6::Network KF6::ConfigCore KF6::I18n KF6::WidgetsAddons)
+    add_test(NAME AiInspectorPanelTest COMMAND AiInspectorPanelTest)
+    set_tests_properties(AiInspectorPanelTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
     # Desktop alerts: which agent transitions are worth interrupting the user

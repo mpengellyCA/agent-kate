@@ -36,6 +36,14 @@ public:
     // Point the inspector at a thread; clears the view when the thread changes.
     void setActiveThread(const QString &threadId);
 
+    // Declare the engine behind the active thread. It decides how result-event
+    // usage is read: per-turn spend (summed) or a cumulative context readout
+    // (latest snapshot — kimi's /usage repeats most of itself every turn, and
+    // summing it grew quadratically; audit F19b/F60). setActiveThread resolves
+    // it from the core's session.listThreads; this is the seam that lands the
+    // answer, public for callers (and tests) that already know the engine.
+    void setThreadBackend(const QString &backend);
+
     // Human titles per thread id (the roster's), so the all-threads timeline
     // can name the agent behind each row instead of showing a bare id.
     void setAgentTitles(const QHash<QString, QString> &titlesByThread);
@@ -44,6 +52,9 @@ private:
     void handleEvents(const QJsonArray &events);
     void handleEvent(const QJsonObject &ev);
     void updateTotals();
+    // Ask the core which engine runs threadId; stale replies (the panel moved
+    // on) are ignored.
+    void resolveThreadBackend(const QString &threadId);
     // Append one mcp.activity notification to the all-threads timeline.
     void appendActivity(const QJsonObject &params);
     // Short, human label for a thread in the all-threads view.
@@ -68,6 +79,12 @@ private:
     };
     QHash<QString, ToolTotals> m_perTool;
 
+    // Whether result-event usage is a TURN's spend (summed into the totals) or
+    // a cumulative readout (latest snapshot wins). Same gate as AgentPanel's
+    // `billed`: the registry answers an unknown engine with claude-shaped
+    // defaults, so only a harness that positively declares no usage reporting
+    // is excluded (audit F19b/F60).
+    bool m_billed = true;
     // Accumulated usage for the active thread (reset on thread switch).
     qlonglong m_inTok = 0;
     qlonglong m_outTok = 0;

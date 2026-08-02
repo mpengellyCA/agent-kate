@@ -107,6 +107,18 @@ enum class LinkState {
 QString disconnectedSendNote(LinkState state);
 QString disconnectedSendStatus(LinkState state);
 
+// startFailureReason classifies an agent.start reply: empty means the reply is
+// a genuine start (it carries a usable threadId), anything else is the
+// human-readable reason to treat it as a failure.
+//
+// A SUCCESS reply with an empty threadId is a failure (audit F67), not a start:
+// every notification for the thread is dropped while the panel's id is empty
+// and no `_lifecycle/started` can ever arrive for an empty id — so trusting it
+// left the user's message committed to the feed and the panel latched on
+// "opening…" forever, with the give-the-prompt-back path (audit F37) never
+// running because it fired only on `error`. Plain text (the caller escapes).
+QString startFailureReason(const QJsonObject &result, const QJsonObject &error);
+
 // The empty-feed hint (audit F44), as an HTML fragment. `isolation` is the
 // isolation token the agent is on ("auto" / "isolated" / "workspace") and
 // `sendKey` the composer's current send key.

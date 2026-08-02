@@ -487,6 +487,21 @@ QString disconnectedSendStatus(LinkState state)
     return i18n("Core is not connected yet");
 }
 
+QString startFailureReason(const QJsonObject &result, const QJsonObject &error)
+{
+    if (!error.isEmpty()) {
+        const QString msg = error.value(QStringLiteral("message")).toString();
+        // A message-less error must not read as success.
+        return msg.isEmpty() ? i18n("the core returned an unnamed error") : msg;
+    }
+    if (result.value(QStringLiteral("threadId")).toString().isEmpty()) {
+        // Fail closed: a "success" the panel cannot address is not a start
+        // (audit F67).
+        return i18n("the core reported success but returned no thread id");
+    }
+    return QString();
+}
+
 QString feedEmptyStateHtml(const QString &isolation, const QString &sendKey)
 {
     QString what;

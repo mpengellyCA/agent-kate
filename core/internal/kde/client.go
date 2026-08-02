@@ -85,6 +85,15 @@ func (c *Client) Close() error {
 		c.atspiConn = nil
 	}
 	c.atspiMu.Unlock()
+	// Release every parked rendezvous consumer: with the bus gone no Report
+	// can ever arrive, so a resident pump (WatchActiveWindow) waiting on its
+	// channel would otherwise wait forever (audit F65).
+	c.mu.Lock()
+	for n, ch := range c.reports {
+		delete(c.reports, n)
+		close(ch)
+	}
+	c.mu.Unlock()
 	_, _ = c.conn.ReleaseName(c.busName)
 	err := c.conn.Close()
 	c.conn = nil
@@ -97,17 +106,18 @@ func (c *Client) Close() error {
 type reporter Client
 
 // Report receives one window-list JSON payload keyed by the per-call nonce.
+// The send happens UNDER c.mu (it never blocks — the select drops instead), so
+// unregisterNonce can close the channel without racing a send-on-closed panic.
 func (r *reporter) Report(nonce string, payload string) *dbus.Error {
 	c := (*Client)(r)
 	c.mu.Lock()
-	ch := c.reports[nonce]
-	c.mu.Unlock()
-	if ch != nil {
+	if ch, ok := c.reports[nonce]; ok {
 		select {
 		case ch <- payload:
-		default: // already delivered; ignore duplicates
+		default: // already delivered / consumer behind; drop rather than block
 		}
 	}
+	c.mu.Unlock()
 	return nil
 }
 
@@ -129,8 +139,16 @@ func (c *Client) registerNonceBuf(nonce string, n int) chan string {
 	return ch
 }
 
+// unregisterNonce removes the rendezvous and CLOSES its channel, so a resident
+// consumer (WatchActiveWindow's pump) parked on a receive wakes up and exits
+// rather than leaking when the watch is torn down (audit F65). Safe against a
+// concurrent Report: both the close and the send hold c.mu, and Report checks
+// map membership first. Idempotent for repeated unregisters.
 func (c *Client) unregisterNonce(nonce string) {
 	c.mu.Lock()
-	delete(c.reports, nonce)
+	if ch, ok := c.reports[nonce]; ok {
+		delete(c.reports, nonce)
+		close(ch)
+	}
 	c.mu.Unlock()
 }
