@@ -41,6 +41,16 @@ QString targetText(const QJsonObject &t)
     if (kind == QLatin1String("screen")) {
         return i18n("a whole screen");
     }
+    if (kind == QLatin1String("region")) {
+        // The core describes the rectangle it is really about to capture (it never passes
+        // the agent's own label through for a region — see resolveCaptureTarget), so the
+        // numbers the human reads are the numbers KWin's CaptureArea is given. Escaped all
+        // the same: this fragment lands in a RichText label.
+        if (!label.isEmpty()) {
+            return label;
+        }
+        return i18n("a rectangular area of your screen");
+    }
     if (kind == QLatin1String("vdesktop") || kind == QLatin1String("sandbox")) {
         // Honesty (audit F32): a separate virtual desktop is an ORGANIZATIONAL
         // boundary, not containment — never call it a sandbox in the UI.
@@ -82,6 +92,26 @@ ConsentDialog::ConsentDialog(const QJsonObject &request, QWidget *parent)
                          "Anything visible may be read by the AI.",
                          thread.toHtmlEscaped(), CoworkCaps::verb(cap), targetText(target)));
     layout->addWidget(detail);
+
+    // SECURITY (audit F35, round 4): a whole-frame capture cannot be refused by name — our
+    // own windows are simply in those pixels — and the blackout the core computes rectangles
+    // for is not implemented in the capture pipeline. The core says so in the target
+    // (includesAgentKate); before this, targetText discarded the Label for screen targets, so
+    // the sentence the core had written never reached anyone and the human approved a grab of
+    // the consent dialog, the policy switches and the kill switch without being told. An
+    // honest gap beats a refusal that is not enforced anywhere.
+    if (target.value(QStringLiteral("includesAgentKate")).toBool()) {
+        auto *selfWarning = new KMessageWidget(this);
+        selfWarning->setMessageType(KMessageWidget::Warning);
+        selfWarning->setCloseButtonVisible(false);
+        selfWarning->setWordWrap(true);
+        selfWarning->setIcon(QIcon::fromTheme(QStringLiteral("security-low")));
+        selfWarning->setText(i18n("This image will include the Agent Kate window itself — its "
+                                  "consent prompts, permission switches and emergency stop are "
+                                  "not hidden from the agent. Capture a single application "
+                                  "window instead if you do not want that."));
+        layout->addWidget(selfWarning);
+    }
 
     auto *form = new QFormLayout;
     m_scope = new QComboBox(this);

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "AgentActions.h"
+
 #include <QHash>
 #include <QSet>
 #include <QString>
@@ -9,10 +11,31 @@
 class QAction;
 class QLabel;
 class QLineEdit;
+class QMenu;
 class QTimer;
 class QToolButton;
 class QTreeWidget;
 class QTreeWidgetItem;
+
+// AgentRowMenu is the roster's per-agent context menu, BUILT BUT NOT SHOWN.
+//
+// It is a separate, public step for one reason: this menu is the primary way
+// users reach every git and destructive action, so its enable-state is a gate —
+// and a gate that only ever exists inside a `menu.exec()` lambda is a gate no
+// test can see. That is precisely how the previous round's isolation guard came
+// to be wired to the menu bar and not to this menu.
+struct AgentRowMenu {
+    QMenu *menu = nullptr; // owned by whoever passed the parent widget
+    // Stable keys: "resume", "rename", "fork", "terminal", "commit", "pr",
+    // "merge", "discard", "tags", "close". A key that is absent was not offered
+    // at all (only "resume" is conditional today).
+    QHash<QString, QAction *> byKey;
+    // The Tags submenu's per-tag toggles, and its "Edit tags…" entry.
+    QHash<QAction *, QString> tagActions;
+    QAction *editTags = nullptr;
+
+    QAction *action(const QString &key) const { return byKey.value(key); }
+};
 
 // One entry in the "+ New Agent" quick menu: either an engine section header,
 // or a concrete {engine, model} launch choice listed under it.
@@ -81,6 +104,13 @@ public:
     void setAgentTags(int agentId, const QStringList &tags);
     QStringList agentTags(int agentId) const;
     void setAgentDormant(int agentId, bool dormant);
+    // The two facts the row's own action menu gates on (AgentActions::compute):
+    // whether the agent has a PRIVATE branch, and whether any working directory
+    // is known for it. Pushed by AgentDock from the same sources the window's
+    // &Agent menu reads, so the two menus cannot disagree about what may be
+    // offered. Not painted — the delegate never reads them.
+    void setAgentIsolated(int agentId, bool isolated);
+    void setAgentHasWorktreePath(int agentId, bool hasPath);
     // Orchestration linkage (plan 16 P5). setAgentParent nests a worker's row
     // under the controller that launched it; a parentAgentId of -1 (or one that
     // is not in the roster — a controller the human discarded or archived)
@@ -105,6 +135,12 @@ public:
     // The engines + models offered by the "+ New Agent" dropdown, grouped by
     // engine (header rows) with concrete launch choices beneath each.
     void setEngineChoices(const QList<EngineChoice> &choices);
+
+    // Build (do not show) the context menu for one agent row, with every entry
+    // already enabled/disabled and named for what it will actually do. The
+    // right-click handler exec()s the result; a test asserts on it. Returns an
+    // AgentRowMenu whose `menu` is null when there is no such agent row.
+    AgentRowMenu buildAgentRowMenu(int agentId, QWidget *parent) const;
 
     // Programmatic equivalents of the context-menu git actions, so the window's
     // Agent menu can act on the active agent through the same wiring (these emit
@@ -183,6 +219,10 @@ private:
     void updateWorkingAnimation();
     void repaintWorkingRows();
     void updateEmptyState();
+    // Repaint the fleet-level usage-limit strip from the shared RateLimitState
+    // (audit F43). A rate limit is account-wide, so it is one line under the
+    // tree, not a badge on every card.
+    void updateRateLimitStrip();
     void openFileManager(const QString &path) const;
     QTreeWidgetItem *projectItem(const QString &path) const;
     QTreeWidgetItem *agentItem(int agentId) const;
@@ -201,6 +241,9 @@ private:
     QToolButton *m_tagFilterButton = nullptr;
     QTreeWidget *m_tree = nullptr;
     QLabel *m_emptyHint = nullptr;
+    // "N agents paused by a usage limit — resets at 15:04". Hidden while the
+    // fleet is under its quota.
+    QLabel *m_rateLimitStrip = nullptr;
     QString m_filter;
     QSet<QString> m_tagFilter; // lowercased tags the user is filtering by
     // Restored filter tags that no agent carries YET. The roster is empty at

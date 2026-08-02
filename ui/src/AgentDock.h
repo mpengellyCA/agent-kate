@@ -72,6 +72,12 @@ public:
     bool activeAgentRunning() const;     // live process — Stop is meaningful
     bool activeAgentDormant() const;     // resumable — Resume is meaningful
     bool activeAgentHasWorktree() const; // git lifecycle ops are meaningful
+    // Isolated == the agent has a PRIVATE branch of its own. Deliberately not
+    // the same question as activeAgentHasWorktree(): git.snapshot reports a
+    // path for every thread, workspace-mode threads included, so "has a path"
+    // enabled Merge for agents with nothing to merge from — the same
+    // isolated-vs-workspace asymmetry that made Discard a data-loss bug (F29).
+    bool activeAgentIsolated() const;
 
     void newAgentInActiveProject();
     // The guided New Agent dialog for one named project. Every visible "new
@@ -220,6 +226,13 @@ private:
     // otherwise not reach the title consumers until git next moved, leaving the
     // Jobs panel naming agents by raw thread uuid.
     void pushAgentTitles();
+    // Push each agent's isolation + "has a working directory" onto its roster
+    // row, so the roster's right-click menu gates its actions from exactly the
+    // facts the window's &Agent menu reads. Cheap and synchronous (no RPC) for
+    // the same reason pushAgentTitles is: a thread binding or a promote must
+    // reach the menu before the next git.snapshot, or the primary path spends
+    // minutes offering actions the core will refuse.
+    void pushAgentActionFacts();
     bool hasThread(const QString &threadId) const;
     // Add or remove one tag on an agent, optimistic with rollback on error.
     void mutateTag(int agentId, const QString &tag, bool add);
@@ -229,8 +242,20 @@ private:
     void autoOrganize(const QString &projectPath);
     void showOrganizeProposals(const QString &projectPath,
                                const QJsonArray &proposals);
-    void removeAgentEntry(int agentId);
-    void closeAgent(int agentId);
+    // What to do with the agent's persisted composer draft when its entry goes.
+    //
+    // Keep is the default and it is the default for a REASON: Close is not
+    // destruction. A closed agent is re-openable (its session is archived, its
+    // worktree is still there) and must find the text it had waiting. Clearing
+    // on every teardown fixed a stale `draft-…` config key by destroying the
+    // user's unsent words — a strictly worse trade.
+    enum class DraftDisposition {
+        Keep,  // the agent can come back; its draft must come back with it
+        Forget // the thread is GONE (discarded / cleaned up / archived away)
+    };
+    void removeAgentEntry(int agentId,
+                          DraftDisposition drafts = DraftDisposition::Keep);
+    void closeAgent(int agentId, DraftDisposition drafts = DraftDisposition::Keep);
     void closeProject(const QString &path);
     Entry *entryById(int agentId);
     Entry *entryByPanel(const AgentPanel *panel);

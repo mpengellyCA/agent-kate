@@ -46,10 +46,13 @@ find_package(KF6 6.0 QUIET COMPONENTS Wallet)
 add_executable(agentkate
     src/main.cpp
     src/state/HarnessTraits.cpp
+    src/state/DraftStore.cpp
     src/state/EngineAvailability.cpp
     src/state/EnsembleCatalog.cpp
+    src/state/RateLimitState.cpp
     src/state/Reactive.cpp
     src/state/SessionProjects.cpp
+    src/state/WindowTitle.cpp
     src/theme/ThemeManager.cpp
     src/AppearanceDialog.cpp
     src/CommandPalette.cpp
@@ -328,15 +331,39 @@ if(Qt6Test_FOUND)
     # Plan 16 P5: the roster is no longer a two-level tree — workers nest under
     # their controller. Guards the traversals and the two ways a nested agent
     # could be lost (a closed controller, a filter match under a hidden parent).
+    # RateLimitState comes along because the roster renders the fleet-level
+    # usage-limit strip from it (audit F43) — hence KF6::Notifications, which the
+    # coalesced popup needs. Tests switch desktop alerts off, so nothing here
+    # ever reaches a notification server.
     add_executable(AgentRosterTest tests/AgentRosterTest.cpp
         src/AgentRoster.cpp src/AgentCardDelegate.cpp src/shell/ChipPainter.cpp
-        src/shell/FlowLayout.cpp src/theme/ThemeManager.cpp)
+        src/shell/FlowLayout.cpp src/theme/ThemeManager.cpp
+        src/state/RateLimitState.cpp)
     target_include_directories(AgentRosterTest PRIVATE src)
     target_link_libraries(AgentRosterTest PRIVATE Qt6::Widgets Qt6::Test
         KF6::ColorScheme KF6::ConfigCore KF6::I18n KF6::CoreAddons
-        KF6::SyntaxHighlighting)
+        KF6::Notifications KF6::SyntaxHighlighting)
     add_test(NAME AgentRosterTest COMMAND AgentRosterTest)
     set_tests_properties(AgentRosterTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    # The per-agent action gates and the labels describing what those actions
+    # destroy or open. MainWindow.cpp / AgentDock.cpp / AgentRoster.cpp are
+    # compiled by the application target alone, so a guard living in them is
+    # invisible to the suite — a verifier deleted every one of them and ctest
+    # stayed green. The decision is now a pure function (AgentActions.h) and the
+    # roster's context menu is built by a callable that needs no exec(), so this
+    # covers the primary path as well as the predicate.
+    add_executable(AgentActionsTest tests/AgentActionsTest.cpp
+        src/AgentRoster.cpp src/AgentCardDelegate.cpp src/shell/ChipPainter.cpp
+        src/shell/FlowLayout.cpp src/theme/ThemeManager.cpp
+        src/state/RateLimitState.cpp)
+    target_include_directories(AgentActionsTest PRIVATE src)
+    target_link_libraries(AgentActionsTest PRIVATE Qt6::Widgets Qt6::Test
+        KF6::ColorScheme KF6::ConfigCore KF6::I18n KF6::CoreAddons
+        KF6::Notifications KF6::SyntaxHighlighting)
+    add_test(NAME AgentActionsTest COMMAND AgentActionsTest)
+    set_tests_properties(AgentActionsTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
     # Plan 19: attaching a screenshot is attaching a temp file that gets reaped.
@@ -368,6 +395,33 @@ if(Qt6Test_FOUND)
     set_tests_properties(JobsPanelTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
+    # Audit F44/F30/F43 on the panel ITSELF, not on the helpers behind it. The
+    # bugs this catches are wiring bugs — an empty-state hint that never hears
+    # the isolation picker change, a usage-limit claim never withdrawn — and a
+    # test on the free functions cannot see either. It links most of the chat
+    # stack because the panel is the chat stack; that is the cost of testing the
+    # real widget rather than a stand-in.
+    add_executable(AgentPanelTest tests/AgentPanelTest.cpp
+        src/AgentPanel.cpp src/AgentCardDelegate.cpp src/AgentChatHelpers.cpp
+        src/AttachmentBuilder.cpp src/SafeContent.cpp src/ImageView.cpp
+        src/MarkdownUtil.cpp src/ProviderConfig.cpp
+        src/SubAgentTranscriptDialog.cpp src/ToolInspectorDialog.cpp
+        src/TranscriptDelegate.cpp src/TranscriptModel.cpp
+        src/WorkflowMonitor.cpp src/WorkflowMonitorDialog.cpp
+        src/WorkflowMonitorView.cpp src/DiffView.cpp src/ipc/CoreClient.cpp
+        src/shell/ChipPainter.cpp src/shell/ElidingLabel.cpp
+        src/shell/FlowLayout.cpp src/state/DraftStore.cpp
+        src/state/EngineAvailability.cpp src/state/HarnessTraits.cpp
+        src/state/RateLimitState.cpp src/theme/ThemeManager.cpp)
+    target_include_directories(AgentPanelTest PRIVATE src)
+    target_link_libraries(AgentPanelTest PRIVATE Qt6::Widgets Qt6::Test
+        Qt6::Network KF6::ColorScheme KF6::ConfigCore KF6::ConfigGui
+        KF6::CoreAddons KF6::I18n KF6::Notifications KF6::SyntaxHighlighting
+        KF6::WidgetsAddons)
+    add_test(NAME AgentPanelTest COMMAND AgentPanelTest)
+    set_tests_properties(AgentPanelTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
     # Desktop alerts: which agent transitions are worth interrupting the user
     # for. Covers the finish/fail rules, the status+attention dedup (one popup
     # per prompt, arriving in either order), the on-screen suppression rule and
@@ -385,7 +439,8 @@ if(Qt6Test_FOUND)
     # places the editor could silently write an ensemble that is wrong.
     add_executable(EnsembleDialogTest tests/EnsembleDialogTest.cpp
         src/EnsembleDialog.cpp src/state/EnsembleCatalog.cpp
-        src/state/HarnessTraits.cpp src/ProviderConfig.cpp src/ipc/CoreClient.cpp)
+        src/state/HarnessTraits.cpp src/state/EngineAvailability.cpp
+        src/ProviderConfig.cpp src/ipc/CoreClient.cpp)
     target_include_directories(EnsembleDialogTest PRIVATE src)
     target_link_libraries(EnsembleDialogTest PRIVATE Qt6::Widgets Qt6::Test
         Qt6::Network KF6::ConfigCore KF6::I18n KF6::WidgetsAddons)
@@ -440,6 +495,7 @@ if(Qt6Test_FOUND)
     # worktree a sandbox.
     add_executable(NewAgentDialogTest tests/NewAgentDialogTest.cpp
         src/NewAgentDialog.cpp src/ProviderConfig.cpp src/state/EnsembleCatalog.cpp
+        src/state/EngineAvailability.cpp
         src/state/HarnessTraits.cpp src/ipc/CoreClient.cpp)
     target_include_directories(NewAgentDialogTest PRIVATE src)
     target_link_libraries(NewAgentDialogTest PRIVATE Qt6::Widgets Qt6::Test
@@ -459,6 +515,18 @@ if(Qt6Test_FOUND)
         Qt6::Network KF6::ConfigCore KF6::I18n)
     add_test(NAME EngineAvailabilityTest COMMAND EngineAvailabilityTest)
     set_tests_properties(EngineAvailabilityTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    # Audit F43: the account-level usage-limit state a rate-limited agent is
+    # finally visible through — and plan 28 §Phase 2's input, which is why its
+    # resetsAt has to survive as a QDateTime rather than a formatted string.
+    add_executable(RateLimitStateTest tests/RateLimitStateTest.cpp
+        src/state/RateLimitState.cpp)
+    target_include_directories(RateLimitStateTest PRIVATE src)
+    target_link_libraries(RateLimitStateTest PRIVATE Qt6::Widgets Qt6::Test
+        KF6::I18n KF6::Notifications)
+    add_test(NAME RateLimitStateTest COMMAND RateLimitStateTest)
+    set_tests_properties(RateLimitStateTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
     # Audit F47: the open-project SET, which relaunch used to throw away.
@@ -482,6 +550,26 @@ if(Qt6Test_FOUND)
         KF6::ConfigCore KF6::I18n)
     add_test(NAME ProviderConfigTest COMMAND ProviderConfigTest)
     set_tests_properties(ProviderConfigTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    # The window title has two independent inputs (active project, agents
+    # waiting) and used to have two writers, so one erased the other.
+    add_executable(WindowTitleTest tests/WindowTitleTest.cpp
+        src/state/WindowTitle.cpp)
+    target_include_directories(WindowTitleTest PRIVATE src)
+    target_link_libraries(WindowTitleTest PRIVATE Qt6::Core Qt6::Test KF6::I18n)
+    add_test(NAME WindowTitleTest COMMAND WindowTitleTest)
+    set_tests_properties(WindowTitleTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    # Audit F50: a closed-with-draft agent used to leak a config entry forever.
+    add_executable(DraftStoreTest tests/DraftStoreTest.cpp
+        src/state/DraftStore.cpp)
+    target_include_directories(DraftStoreTest PRIVATE src)
+    target_link_libraries(DraftStoreTest PRIVATE Qt6::Core Qt6::Test
+        KF6::ConfigCore)
+    add_test(NAME DraftStoreTest COMMAND DraftStoreTest)
+    set_tests_properties(DraftStoreTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
     # Audit F47/F50: the welcome screen offers the whole previous session, and

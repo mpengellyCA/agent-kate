@@ -13,12 +13,15 @@
 
 #include "AgentCardDelegate.h"
 #include "AgentRoster.h"
+#include "state/RateLimitState.h"
 
 #include <KConfigGroup>
 #include <KSharedConfig>
 
 #include <QAction>
+#include <QLabel>
 #include <QLineEdit>
+#include <QLocale>
 #include <QMenu>
 #include <QSignalSpy>
 #include <QStandardPaths>
@@ -48,6 +51,10 @@ private Q_SLOTS:
     void publishesHowManyAgentsAreWaiting();
     void aCollapsedProjectStaysCollapsedNextSession();
     void aTagFilterSurvivesAndAppliesOnceItsTagAppears();
+
+    // Audit F43: a rate-limited agent has to be visible from OUTSIDE its own
+    // panel, and stop being visible once the fleet is back under its quota.
+    void showsWhenTheFleetIsPausedByAUsageLimit();
 
 private:
     QTreeWidgetItem *projectRow() const { return m_tree->topLevelItem(0); }
@@ -336,6 +343,53 @@ void AgentRosterTest::aTagFilterSurvivesAndAppliesOnceItsTagAppears()
     KSharedConfig::openConfig()
         ->group(QStringLiteral("View"))
         .writeEntry("rosterTagFilter", QStringList());
+}
+
+// Audit F43. The whole complaint was that a parked agent was invisible unless
+// you opened it, so this asserts the roster — the thing on screen while five
+// agents run — actually says so, and stops saying so when it stops being true.
+void AgentRosterTest::showsWhenTheFleetIsPausedByAUsageLimit()
+{
+    agentkate::RateLimitState::setDesktopAlertsEnabled(false);
+    agentkate::RateLimitState *state = agentkate::RateLimitState::self();
+    state->forget(QStringLiteral("thread-a"));
+
+    // Find the strip by its content, not by an object name the roster could
+    // rename: it is the only label that is hidden while nothing is limited.
+    const auto strip = [this]() -> QLabel * {
+        const QList<QLabel *> labels = m_roster->findChildren<QLabel *>();
+        for (QLabel *l : labels) {
+            if (l->text().contains(QStringLiteral("usage limit"))) {
+                return l;
+            }
+        }
+        return nullptr;
+    };
+
+    QVERIFY2(!strip(), "the roster claimed a usage limit before any was reported");
+
+    const QDateTime resets = QDateTime::currentDateTimeUtc().addSecs(900);
+    state->report(QStringLiteral("thread-a"),
+                  agentkate::RateLimitReport{QStringLiteral("rejected"),
+                                             QStringLiteral("five_hour"), resets,
+                                             false});
+    QLabel *shown = strip();
+    QVERIFY2(shown, "a rate-limited agent left no trace anywhere in the roster");
+    QVERIFY(shown->isVisibleTo(m_roster));
+    // The reset time is the actionable half — "paused" without "until when" is
+    // the same dead end the panel-only chip already was.
+    QVERIFY(shown->text().contains(
+        QLocale().toString(resets.toLocalTime().time(), QLocale::ShortFormat)));
+
+    // Back under the limit: the strip goes away rather than lingering as a
+    // permanent scare.
+    state->report(QStringLiteral("thread-a"),
+                  agentkate::RateLimitReport{QStringLiteral("allowed"),
+                                             QStringLiteral("five_hour"), resets,
+                                             false});
+    QVERIFY2(!strip() || !shown->isVisibleTo(m_roster),
+             "the usage-limit strip outlived the usage limit");
+    state->forget(QStringLiteral("thread-a"));
 }
 
 QTEST_MAIN(AgentRosterTest)

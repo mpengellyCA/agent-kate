@@ -62,4 +62,11 @@ QString installUrl(const QList<Engine> &engines);
 // missing so a dead choice is visibly dead.
 QString pickerLabel(const Engine &engine);
 
+// The same label for callers that iterate HarnessRegistry rather than scan()
+// — the New Agent dialog, the panel's engine combo and the ensemble editor all
+// have a harness id and a display name in hand, and before this overload each
+// spelled "not installed" itself. One suffix, one place: four pickers that
+// disagree about whether an engine is dead are four chances to be believed.
+QString pickerLabel(const QString &harnessId, const QString &displayName);
+
 } // namespace EngineAvailability

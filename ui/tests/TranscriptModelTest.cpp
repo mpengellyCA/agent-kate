@@ -52,7 +52,85 @@ private Q_SLOTS:
     void failedToolLooksDifferentFromASuccessfulOne();
     void findScansNotesToolsAndThinking();
     void notesCarryPlainTextAndATimestamp();
+    void disconnectedAdviceFollowsTheLadder();
+    void emptyStateNamesTheRealIsolation();
 };
+
+// Audit F50, round 3. The advice printed when a send is refused has now been
+// wrong in BOTH directions: round 1 said "restart to recover" while the
+// reconnect ladder was still climbing, round 2 said "reconnecting" while the
+// banner said the ladder had given up. The three states must not share a
+// sentence, and each must not carry the other's instruction.
+void TranscriptModelTest::disconnectedAdviceFollowsTheLadder()
+{
+    using agentkate::disconnectedSendNote;
+    using agentkate::disconnectedSendStatus;
+    using agentkate::LinkState;
+
+    const QString climbing = disconnectedSendNote(LinkState::Reconnecting);
+    const QString gaveUp = disconnectedSendNote(LinkState::GaveUp);
+    const QString never = disconnectedSendNote(LinkState::NeverConnected);
+
+    // Three states, three sentences: a shared one is how both regressions
+    // happened.
+    QVERIFY(climbing != gaveUp);
+    QVERIFY(climbing != never);
+    QVERIFY(gaveUp != never);
+
+    // Climbing: wait. It must NOT tell the user to restart — that throws away a
+    // session that is usually seconds from coming back.
+    QVERIFY(climbing.contains(QStringLiteral("reconnecting"), Qt::CaseInsensitive));
+    QVERIFY(!climbing.contains(QStringLiteral("restart"), Qt::CaseInsensitive));
+
+    // Given up: restart. It must NOT promise a reconnection nothing is
+    // performing.
+    QVERIFY(gaveUp.contains(QStringLiteral("restart"), Qt::CaseInsensitive));
+    QVERIFY(!gaveUp.contains(QStringLiteral("is reconnecting"), Qt::CaseInsensitive));
+
+    // Never connected: no ladder is running, so neither instruction applies.
+    QVERIFY(!never.contains(QStringLiteral("restart"), Qt::CaseInsensitive));
+    QVERIFY(!never.contains(QStringLiteral("is reconnecting"), Qt::CaseInsensitive));
+
+    // Every state keeps the promise the composer actually makes: the text is
+    // still there.
+    for (const QString &s : {climbing, gaveUp, never}) {
+        QVERIFY(s.contains(QStringLiteral("composer")));
+    }
+    // The status line tracks the same split.
+    QVERIFY(disconnectedSendStatus(LinkState::Reconnecting)
+            != disconnectedSendStatus(LinkState::GaveUp));
+}
+
+// Audit F44 (and F30's rule). The empty state is the first sentence a new user
+// reads, and it makes a claim about what happens to their files — so it has to
+// track the isolation actually selected, and it must not smuggle back the
+// containment promise that was removed from the word "sandbox".
+void TranscriptModelTest::emptyStateNamesTheRealIsolation()
+{
+    using agentkate::feedEmptyStateHtml;
+    const QString key = QStringLiteral("Enter");
+    const QString isolated = feedEmptyStateHtml(QStringLiteral("isolated"), key);
+    const QString workspace = feedEmptyStateHtml(QStringLiteral("workspace"), key);
+    const QString automatic = feedEmptyStateHtml(QStringLiteral("auto"), key);
+
+    // The word this copy may never use, in any variant.
+    for (const QString &s : {isolated, workspace, automatic}) {
+        QVERIFY2(!s.contains(QStringLiteral("sandbox"), Qt::CaseInsensitive),
+                 "the empty state reintroduced the containment claim");
+        // It has to say what to DO, and advertise the palette that is
+        // advertised nowhere else.
+        QVERIFY(s.contains(key));
+        QVERIFY(s.contains(QStringLiteral("Ctrl+Shift+P")));
+    }
+
+    // A private copy is promised only where there will be one.
+    QVERIFY(isolated.contains(QStringLiteral("private copy")));
+    QVERIFY2(!workspace.contains(QStringLiteral("private copy")),
+             "promised a private copy to an agent editing the user's own files");
+    QVERIFY(workspace.contains(QStringLiteral("directly")));
+    // "auto" is conditional, so it must not promise one unconditionally either.
+    QVERIFY(automatic.contains(QStringLiteral("where it can")));
+}
 
 // Audit F28. The permission bar is the highest-frequency prompt in the product
 // and it clips its one-line summary. Clipping a Bash command at the TAIL shows

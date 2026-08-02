@@ -11,7 +11,13 @@
 // These tests pin the properties that make the sentence true, each of which
 // fails if the isolation branch is inverted or dropped.
 
+// The same file also pins the review/land copy shared by the dashboard and its
+// diff reader (WorktreeReviewCopy): what the diff view may claim to have shown
+// (F41), what "land" merges into (F50), and which threads may be landed at all
+// (the F29 asymmetry, in its merge form).
+
 #include "WorktreeDashboard.h"
+#include "git/WorktreeReviewCopy.h"
 
 #include <QtTest>
 
@@ -27,6 +33,10 @@ private Q_SLOTS:
     void confirmLabelsAreNamedActionsAndDiffer();
     void pluralFormsAgreeWithTheCount();
     void notIsolatedMarkersAreNonEmptyAndDistinct();
+    void landCopyNamesTheWorkspaceNotMain();
+    void landIsRefusedForWorkspaceModeThreads();
+    void diffHeaderDoesNotCallTheUsersCheckoutAWorktree();
+    void diffViewDisclosesWhatItCannotShow();
 };
 
 // The isolated row keeps the agent-scoped framing, because there it is true.
@@ -123,6 +133,78 @@ void WorktreeCopyTest::notIsolatedMarkersAreNonEmptyAndDistinct()
     QVERIFY(!WorktreeCopy::notIsolatedTooltip().isEmpty());
     QVERIFY(WorktreeCopy::notIsolatedTooltip().contains(
         QStringLiteral("your own files")));
+}
+
+// Audit F50: agent.land and git.land both merge into the workspace's CURRENT
+// branch (`git branch --show-current`), which is very often not main. The
+// action's own name must not claim otherwise, and the tooltip has to say what
+// "the workspace" resolves to — the one place the honest answer fits.
+void WorktreeCopyTest::landCopyNamesTheWorkspaceNotMain()
+{
+    const QString label = WorktreeReviewCopy::landLabel();
+    QVERIFY(!label.isEmpty());
+    QVERIFY(!label.contains(QStringLiteral("main"), Qt::CaseInsensitive));
+    QVERIFY(label.contains(QStringLiteral("workspace")));
+    const QString tip = WorktreeReviewCopy::landTooltip();
+    // The only permitted mention of main is the one that denies it.
+    QVERIFY(!tip.contains(QStringLiteral("into main")));
+    QVERIFY(tip.contains(QStringLiteral("not necessarily main")));
+    QVERIFY(tip.contains(QStringLiteral("right now")));
+}
+
+// The merge half of the F29 asymmetry: git.snapshot reports a path (and often a
+// branch — the workspace's own) for EVERY thread, so "has a worktree" is true
+// for threads that have none. Only an isolated thread with commits of its own
+// can be landed, and the predicate the button and the handlers share must say
+// so on its own, without help from the caller.
+void WorktreeCopyTest::landIsRefusedForWorkspaceModeThreads()
+{
+    QVERIFY(!WorktreeReviewCopy::canLand(/*isolated*/ false, /*ahead*/ 5));
+    QVERIFY(!WorktreeReviewCopy::canLand(false, 0));
+    QVERIFY(!WorktreeReviewCopy::canLand(/*isolated*/ true, /*ahead*/ 0));
+    QVERIFY(WorktreeReviewCopy::canLand(true, 1));
+}
+
+// Audit F41's converse: for a workspace-mode thread the "worktree" IS the
+// user's checkout, and the changes listed are theirs as much as the agent's.
+void WorktreeCopyTest::diffHeaderDoesNotCallTheUsersCheckoutAWorktree()
+{
+    const QString iso = WorktreeReviewCopy::diffHeader(
+        true, QStringLiteral("#3 agentkate/t-1"),
+        QStringLiteral("/home/u/proj/.agentkate/worktrees/t-1"));
+    QVERIFY(iso.contains(QStringLiteral("worktree")));
+    QVERIFY(iso.contains(QStringLiteral("#3")));
+
+    const QString ws = WorktreeReviewCopy::diffHeader(
+        false, QStringLiteral("#3 main"), QStringLiteral("/home/u/proj"));
+    QVERIFY(!ws.contains(QStringLiteral("worktree")));
+    QVERIFY(ws.contains(QStringLiteral("directly in your own files")));
+    QVERIFY(ws.contains(QStringLiteral("/home/u/proj")));
+    QVERIFY(ws.contains(QStringLiteral("cannot tell your edits")));
+
+    // Shown as rich text, so a path cannot rewrite the sentence around it.
+    const QString evil = WorktreeReviewCopy::diffHeader(
+        false, QString(), QStringLiteral("/home/u/<b>proj</b>"));
+    QVERIFY(!evil.contains(QStringLiteral("<b>proj</b>")));
+    QVERIFY(evil.contains(QStringLiteral("&lt;b&gt;proj&lt;/b&gt;")));
+}
+
+// Audit F41, the residue no diff can cover: ignored paths and absolute-path
+// writes outside the folder. The view may not imply it has shown everything —
+// especially in its EMPTY state, which is where "has not changed anything yet"
+// came from.
+void WorktreeCopyTest::diffViewDisclosesWhatItCannotShow()
+{
+    for (bool isolated : {true, false}) {
+        const QString limits = WorktreeReviewCopy::diffLimits(isolated);
+        QVERIFY(limits.contains(QStringLiteral("ignore")));
+        QVERIFY(limits.contains(QStringLiteral("outside")));
+
+        const QString empty = WorktreeReviewCopy::diffEmptyMessage(isolated);
+        QVERIFY(empty.contains(QStringLiteral("outside")));
+        // "No uncommitted changes." full stop is the claim under test.
+        QVERIFY(!empty.trimmed().endsWith(QStringLiteral("changes.")));
+    }
 }
 
 QTEST_MAIN(WorktreeCopyTest)

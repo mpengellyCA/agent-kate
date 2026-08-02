@@ -3,6 +3,7 @@
 
 #include "WorktreeDiffDialog.h"
 #include "DiffView.h"
+#include "WorktreeReviewCopy.h"
 #include "ipc/CoreClient.h"
 #include "theme/ThemeManager.h"
 
@@ -18,6 +19,7 @@
 #include <QLabel>
 #include <QListWidget>
 #include <QListWidgetItem>
+#include <QPalette>
 #include <QPointer>
 #include <QPushButton>
 #include <QSplitter>
@@ -49,12 +51,14 @@ QColor statusColor(const QString &status)
 } // namespace
 
 WorktreeDiffDialog::WorktreeDiffDialog(CoreClient *core, const QString &threadId,
-                                       const QString &branch, int number,
-                                       bool canMerge, QWidget *parent)
+                                       const QString &branch, const QString &path,
+                                       int number, bool isolated, int ahead,
+                                       QWidget *parent)
     : QDialog(parent)
     , m_core(core)
     , m_threadId(threadId)
     , m_branch(branch)
+    , m_isolated(isolated)
 {
     setWindowTitle(branch.isEmpty()
                        ? i18nc("@title:window", "Worktree changes")
@@ -74,8 +78,24 @@ WorktreeDiffDialog::WorktreeDiffDialog(CoreClient *core, const QString &threadId
                                       : branch)
                        : (branch.isEmpty() ? i18nc("git branch state", "(detached)")
                                            : branch);
-        m_header->setText(i18n("Uncommitted changes in worktree <b>%1</b>.",
-                               label.toHtmlEscaped()));
+        // A workspace-mode thread has no worktree of its own: what is listed
+        // below is everything uncommitted in the user's real checkout, theirs
+        // included (audit F41's converse). Say which of the two this is.
+        m_header->setText(
+            WorktreeReviewCopy::diffHeader(isolated, label, path));
+    }
+
+    // What no diff of one folder can show: ignored paths, and absolute-path
+    // writes outside it (audit F41's honest residue). Stated where the user is
+    // forming the belief "this is what the agent did", not in a tooltip.
+    auto *limits = new QLabel(WorktreeReviewCopy::diffLimits(isolated), this);
+    limits->setWordWrap(true);
+    limits->setTextFormat(Qt::PlainText);
+    {
+        QPalette pal = limits->palette();
+        pal.setColor(QPalette::WindowText,
+                     pal.color(QPalette::Disabled, QPalette::WindowText));
+        limits->setPalette(pal);
     }
 
     m_files = new QListWidget(this);
@@ -102,13 +122,18 @@ WorktreeDiffDialog::WorktreeDiffDialog(CoreClient *core, const QString &threadId
                            QDialogButtonBox::ActionRole);
     // "Land into workspace…", not "into main" (audit F50): this button emits
     // landRequested, the dashboard answers it with git.land, and git.land merges
-    // into the workspace's CURRENT branch — whatever it happens to be. Matches
-    // WorktreeDashboard's own button, which raises the same operation.
-    auto *landBtn = buttons->addButton(i18nc("@action:button", "Land into workspace…"),
+    // into the workspace's CURRENT branch — whatever it happens to be. Label and
+    // tooltip come from the shared copy so this and the dashboard's own button
+    // cannot drift into two different claims about the same operation.
+    auto *landBtn = buttons->addButton(WorktreeReviewCopy::landLabel(),
                                        QDialogButtonBox::ActionRole);
+    landBtn->setToolTip(WorktreeReviewCopy::landTooltip());
     auto *prBtn =
         buttons->addButton(i18nc("@action:button", "Open PR…"),
                            QDialogButtonBox::ActionRole);
+    // Same predicate as the dashboard's enablement: a workspace-mode thread has
+    // no branch of its own, so neither landing nor a PR means anything for it.
+    const bool canMerge = WorktreeReviewCopy::canLand(isolated, ahead);
     landBtn->setEnabled(canMerge);
     prBtn->setEnabled(canMerge);
     auto *closeBtn = buttons->addButton(QDialogButtonBox::Close);
@@ -131,6 +156,7 @@ WorktreeDiffDialog::WorktreeDiffDialog(CoreClient *core, const QString &threadId
     root->setSpacing(10);
     root->addWidget(m_header);
     root->addWidget(splitter, 1);
+    root->addWidget(limits);
     root->addWidget(buttons);
 
     // Seed the diff pane so it is never empty before the RPC returns.
@@ -249,7 +275,10 @@ void WorktreeDiffDialog::replaceDiff(const QString &patch)
     }
     m_diff = new DiffView(patch, this);
     if (patch.isEmpty()) {
-        m_diff->setEmptyMessage(i18n("No uncommitted changes."));
+        // Not "No uncommitted changes." — that answers a question about the
+        // agent with a fact about one directory, which is the sentence F41 was
+        // reported against ("where did my code go").
+        m_diff->setEmptyMessage(WorktreeReviewCopy::diffEmptyMessage(m_isolated));
     }
     m_diffSlot->addWidget(m_diff);
 }

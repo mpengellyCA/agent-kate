@@ -8,6 +8,7 @@
 #include "git/ConflictDialog.h"
 #include "git/PRDialog.h"
 #include "git/WorktreeDiffDialog.h"
+#include "git/WorktreeReviewCopy.h"
 #include "ipc/CoreClient.h"
 #include "shell/FlowLayout.h"
 
@@ -187,7 +188,10 @@ WorktreeDashboard::WorktreeDashboard(CoreClient *core, QWidget *parent)
     // "Land into workspace…", not "into main": git.land merges into whatever
     // branch the workspace is currently on (worktree.LandWithOptions reads
     // `git branch --show-current`), which is very often not main (audit F50).
-    m_landBtn = new QPushButton(i18nc("@action:button", "Land into workspace…"), this);
+    // Label and tooltip are shared with the diff dialog's button so the same
+    // operation cannot be described two ways.
+    m_landBtn = new QPushButton(WorktreeReviewCopy::landLabel(), this);
+    m_landBtn->setToolTip(WorktreeReviewCopy::landTooltip());
     m_landBtn->setEnabled(false);
     m_prBtn = new QPushButton(i18nc("@action:button", "Open PR…"), this);
     m_prBtn->setEnabled(false);
@@ -287,8 +291,10 @@ void WorktreeDashboard::updateActionEnablement()
     const WorktreeRow *r = selectedRow();
     m_commitBtn->setEnabled(r != nullptr);
     // Land and Open PR only make sense for an isolated worktree on its own
-    // branch with commits actually to merge / push.
-    const bool merging = r != nullptr && r->isolated && r->ahead > 0;
+    // branch with commits actually to merge / push. One shared predicate, so
+    // the button state and the handlers' own refusal below cannot drift.
+    const bool merging =
+        r != nullptr && WorktreeReviewCopy::canLand(r->isolated, r->ahead);
     m_landBtn->setEnabled(merging);
     m_prBtn->setEnabled(merging);
     // Discard is only meaningful when there are uncommitted changes.
@@ -301,9 +307,8 @@ void WorktreeDashboard::openDiffDialog()
     if (!r || r->threadId.isEmpty()) {
         return;
     }
-    const bool canMerge = r->isolated && r->ahead > 0;
-    auto *dlg = new WorktreeDiffDialog(m_core, r->threadId, r->branch, r->number,
-                                       canMerge, this);
+    auto *dlg = new WorktreeDiffDialog(m_core, r->threadId, r->branch, r->path,
+                                       r->number, r->isolated, r->ahead, this);
     // The dashboard owns the action dialogs, so the diff modal hands off to us.
     connect(dlg, &WorktreeDiffDialog::commitRequested, this,
             [this](const QString &) { openCommitDialog(); });
@@ -326,7 +331,12 @@ const WorktreeRow *WorktreeDashboard::selectedRow() const
 void WorktreeDashboard::openPRDialog()
 {
     const WorktreeRow *r = selectedRow();
-    if (!r || r->branch.isEmpty()) {
+    // Refuse a workspace-mode thread here as well as in the button state: a
+    // non-isolated row can carry a branch name (the workspace's own — "main",
+    // say), so "has a branch" is not the same question as "has a branch of its
+    // own", and the core refuses this too (worktree.OpenPRWithOptions).
+    if (!r || r->branch.isEmpty()
+        || !WorktreeReviewCopy::canLand(r->isolated, r->ahead)) {
         return;
     }
     auto *dlg = new PRDialog(m_core, r->threadId, r->branch, this);
@@ -343,7 +353,14 @@ void WorktreeDashboard::openPRDialog()
 void WorktreeDashboard::landSelected()
 {
     const WorktreeRow *r = selectedRow();
-    if (!r || r->branch.isEmpty()) {
+    // As in openPRDialog: the branch name alone does not say the thread has a
+    // branch of ITS OWN. Landing a workspace-mode thread would ask git to merge
+    // the workspace's current branch into itself; the core refuses it
+    // (worktree.LandWithOptions, "not running on its own branch") and so does
+    // this, because a disabled button is not a guard — the diff dialog raises
+    // the same action, and this is the entry point both of them reach.
+    if (!r || r->branch.isEmpty()
+        || !WorktreeReviewCopy::canLand(r->isolated, r->ahead)) {
         return;
     }
     const QString threadId = r->threadId;

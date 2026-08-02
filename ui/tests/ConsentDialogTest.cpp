@@ -197,6 +197,55 @@ private Q_SLOTS:
         QVERIFY(!CoworkCaps::title(bogus).isEmpty());
         QVERIFY(!CoworkCaps::description(bogus).isEmpty());
     }
+
+    // SECURITY (audit F35, round 4): a whole-screen capture cannot be refused by name and
+    // the blackout the core computes rectangles for is not implemented, so the core marks
+    // the target `includesAgentKate` and the human must be TOLD. Before this the dialog
+    // rendered "a whole screen" and threw the Label — the only channel the warning had —
+    // away, so nobody ever saw it. An honest gap beats an unenforced refusal; a silent gap
+    // beats neither.
+    void wholeScreenCaptureSaysItIncludesAgentKateItself()
+    {
+        ConsentDialog warned(request(
+            QStringLiteral("screenshot"),
+            QJsonObject{{QStringLiteral("kind"), QStringLiteral("screen")},
+                        {QStringLiteral("label"), QStringLiteral("the whole screen — includes the Agent Kate window")},
+                        {QStringLiteral("includesAgentKate"), true}}));
+        const QString text = allText(warned);
+        QVERIFY2(text.contains(QLatin1String("Agent Kate window")), qPrintable(text));
+        // …and specifically what is in it, since "our window" means nothing to a user.
+        QVERIFY2(text.contains(QLatin1String("emergency stop"), Qt::CaseInsensitive)
+                     || text.contains(QLatin1String("kill"), Qt::CaseInsensitive),
+                 qPrintable(text));
+
+        // A clean frame must NOT carry the warning: a caution shown every time is one the
+        // user learns to click past, and the whole value of this sentence is that it is true.
+        ConsentDialog clean(request(
+            QStringLiteral("screenshot"),
+            QJsonObject{{QStringLiteral("kind"), QStringLiteral("screen")},
+                        {QStringLiteral("label"), QStringLiteral("the whole screen")}}));
+        QVERIFY(!allText(clean).contains(QLatin1String("Agent Kate window")));
+    }
+
+    // A region capture is described by the rectangle the core resolved (it never passes the
+    // agent's own label through for a region), and the fragment is still escaped.
+    void regionTargetIsDescribedRatherThanCalledYourDesktop()
+    {
+        ConsentDialog dlg(request(
+            QStringLiteral("screenshot"),
+            QJsonObject{{QStringLiteral("kind"), QStringLiteral("region")},
+                        {QStringLiteral("label"), QStringLiteral("a 60×30 <b>region</b> of the screen at (200,150)")}}));
+        const QString text = allText(dlg);
+        QVERIFY2(text.contains(QStringLiteral("60×30")), qPrintable(text));
+        QVERIFY2(text.contains(QLatin1String("&lt;b&gt;region&lt;/b&gt;")), qPrintable(text));
+        QVERIFY(!text.contains(QLatin1String("<b>region</b>")));
+
+        // With no description at all it must still not be called "your desktop" — that is
+        // the catch-all for an unrecognised kind and it understates a targeted grab.
+        ConsentDialog bare(request(QStringLiteral("screenshot"),
+                                   QJsonObject{{QStringLiteral("kind"), QStringLiteral("region")}}));
+        QVERIFY2(allText(bare).contains(QLatin1String("area of your screen")), qPrintable(allText(bare)));
+    }
 };
 
 QTEST_MAIN(ConsentDialogTest)

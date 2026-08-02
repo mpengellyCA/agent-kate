@@ -82,4 +82,39 @@ bool modelAvailable(const QString &harnessId, const QString &providerId,
 // if the user cancelled. oldModel is shown for context.
 QString askReplacementModel(QWidget *parent, const QString &harnessId,
                             const QString &providerId, const QString &oldModel);
+
+// --- copy that has to track a state, and must therefore be assertable -------
+// These two exist as free functions for the same reason WorktreeCopyTest's
+// strings do: a sentence that tells the user what to DO is wrong the moment it
+// stops matching the state it describes, and the only way to keep it honest is
+// to be able to test it without exec()ing a panel.
+
+// Which of the link's three states a refused send happened in. CoreClient's
+// recovery ladder is a real state machine: it climbs for a bounded number of
+// rounds and then STOPS, staying dead until the app restarts. Round 1 printed
+// "restart to recover" while the ladder was still climbing (telling the user to
+// throw away a session that was about to come back); round 2 replaced it with
+// an unconditional "reconnecting", which is the same falsehood mirrored — said
+// while the banner announced the ladder had given up (audit F50).
+enum class LinkState {
+    NeverConnected, // no drop has happened; the first connection is not up yet
+    Reconnecting,   // the ladder is climbing — waiting is the right advice
+    GaveUp,         // the ladder is spent — only a restart recovers
+};
+
+// The feed note for a send refused in that state, and the status-bar line that
+// accompanies it. Plain text (the caller escapes for the feed).
+QString disconnectedSendNote(LinkState state);
+QString disconnectedSendStatus(LinkState state);
+
+// The empty-feed hint (audit F44), as an HTML fragment. `isolation` is the
+// isolation token the agent is on ("auto" / "isolated" / "workspace") and
+// `sendKey` the composer's current send key.
+//
+// The isolation argument is not decoration: the sentence describes what will
+// happen to the user's files, and saying "private copy" to an agent set to
+// "Directly in my files" would be exactly the falsehood F30 removed from the
+// word "sandbox". It claims no containment either — a worktree separates the
+// agent's CHANGES from yours, it does not confine the process.
+QString feedEmptyStateHtml(const QString &isolation, const QString &sendKey);
 } // namespace agentkate

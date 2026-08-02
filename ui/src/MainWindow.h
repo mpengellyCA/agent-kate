@@ -76,6 +76,12 @@ private:
     // palette — the keyboard-first way to reach any feature.
     void showCommandPalette();
 
+    // The ONLY writer of the window title. It has two independent inputs — the
+    // active project and how many agents are waiting on the human — and when
+    // each wrote the whole title directly, selecting an agent erased a live
+    // attention count that nothing would ever restore. See state/WindowTitle.h.
+    void refreshWindowTitle();
+
     // The &Agent menu surfaces the agent lifecycle (new / rename / resume /
     // attach / changes / stop / commit / PR / merge / terminal / tags / close)
     // for the active agent — until now reachable only via roster right-click.
@@ -115,6 +121,10 @@ private:
     int panelId(const QString &key) const;
     SideBar *panelBar(const QString &key) const;
     void raisePanelByKey(const QString &key); // raise it (and re-attach if floating)
+    // Rebuild every rail tab's hover text (what the panel is for + its Alt+N
+    // accelerator). Must run again after any move/detach: the accelerator is a
+    // POSITION in the strip, so moving one panel renumbers the rest.
+    void refreshPanelTooltips();
     void updateCursorStatus();
     void updateBreadcrumb(const QString &path);
     void updateAgentBadge();
@@ -199,6 +209,7 @@ private:
         int barId = -1;                // id within bar (>=0) or -1
         QWidget *floatingHost = nullptr; // window when detached
         QString lastStrip;             // remembered strip for re-attach
+        QString help;                  // plain-language "what this panel is for"
     };
     QHash<QString, PanelInfo> m_panels;       // by stable key
     QHash<QWidget *, QString> m_keyByWidget;  // for reverse lookup
@@ -274,6 +285,11 @@ private:
     QHash<KTextEditor::Document *, BlameController *> m_blames;
     QAction *m_blameToggle = nullptr;
     QString m_activeFilePath;
+
+    // Window-title inputs (see refreshWindowTitle). Kept as state rather than
+    // read back off the title, so neither part can be lost to the other.
+    QString m_titleProject;   // active project's directory name, "" before one
+    int m_attentionCount = 0; // agents currently waiting on the human
 
     QString m_activeProject;
     // Thread id → owning project path, filled as agents are activated / bound.

@@ -5,6 +5,8 @@
 #include "MarkdownUtil.h"
 #include "state/HarnessTraits.h"
 
+#include <KLocalizedString>
+
 #include <QComboBox>
 #include <QDialog>
 #include <QDialogButtonBox>
@@ -443,5 +445,69 @@ QString askReplacementModel(QWidget *parent, const QString &harnessId,
         return combo->currentData().toString();
     }
     return QString();
+}
+
+QString disconnectedSendNote(LinkState state)
+{
+    switch (state) {
+    case LinkState::GaveUp:
+        // The ladder is spent. Waiting is now the wrong advice, and saying
+        // "reconnecting" here contradicts the banner that already said it gave
+        // up (audit F50).
+        return i18n("Core process is not connected — the message was not sent. "
+                    "Agent Kate tried to reconnect and gave up, so restart Agent "
+                    "Kate to recover. Your text is still in the composer; copy it "
+                    "out before you do.");
+    case LinkState::Reconnecting:
+        // The ladder usually succeeds within seconds. Telling the user to
+        // restart here throws away a session that was about to come back.
+        return i18n("Core process is not connected — the message was not sent. "
+                    "Agent Kate is reconnecting; your text is still in the "
+                    "composer, so send it again in a moment.");
+    case LinkState::NeverConnected:
+        break;
+    }
+    // No drop has happened, so no ladder is running: promising a reconnection
+    // that nothing is performing would be a third falsehood.
+    return i18n("Core process is not connected yet — the message was not sent. "
+                "Your text is still in the composer, so send it again once the "
+                "core is up.");
+}
+
+QString disconnectedSendStatus(LinkState state)
+{
+    switch (state) {
+    case LinkState::GaveUp:
+        return i18n("Core is not connected — reconnection gave up");
+    case LinkState::Reconnecting:
+        return i18n("Core is not connected — reconnecting");
+    case LinkState::NeverConnected:
+        break;
+    }
+    return i18n("Core is not connected yet");
+}
+
+QString feedEmptyStateHtml(const QString &isolation, const QString &sendKey)
+{
+    QString what;
+    if (isolation == QLatin1String("workspace")) {
+        what = i18n("This agent edits the files in your project directly.");
+    } else if (isolation == QLatin1String("isolated")) {
+        what = i18n("The agent works in its own private copy of the project "
+                    "(a git worktree); you merge its work back when you are happy "
+                    "with it.");
+    } else {
+        // "auto" — a private copy only where the project can give it one, so the
+        // sentence must not promise one unconditionally.
+        what = i18n("The agent works in its own private copy of the project where "
+                    "it can (a git worktree); you merge its work back when you are "
+                    "happy with it.");
+    }
+    return QStringLiteral("<div style='line-height:150%'>%1<br>%2<br><br>%3</div>")
+        .arg(i18n("Describe a task below and press %1.", sendKey).toHtmlEscaped(),
+             what.toHtmlEscaped(),
+             // The command palette is advertised nowhere else in the product
+             // (audit F44/F50).
+             i18n("Press Ctrl+Shift+P for the command palette.").toHtmlEscaped());
 }
 } // namespace agentkate

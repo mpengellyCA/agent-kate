@@ -141,13 +141,27 @@ QString installUrl(const QList<Engine> &engines)
     return QString();
 }
 
+// The one "this engine is dead" suffix in the product. Both pickerLabel
+// overloads go through it so a picker cannot invent a second spelling; the
+// parenthetical form composes with the provider annotation the routed entries
+// carry ("Claude Code (not installed) via Fireworks (no API key set)").
+static QString missingSuffix(const QString &displayName)
+{
+    return i18nc("engine whose command-line program is not installed",
+                 "%1 (not installed)", displayName);
+}
+
 QString pickerLabel(const Engine &engine)
 {
-    if (engine.present) {
-        return engine.displayName;
-    }
-    return i18nc("engine whose command-line program is not installed",
-                 "%1 — not installed", engine.displayName);
+    return engine.present ? engine.displayName : missingSuffix(engine.displayName);
+}
+
+QString pickerLabel(const QString &harnessId, const QString &displayName)
+{
+    const QString name = displayName.isEmpty() ? harnessId : displayName;
+    // isPresent() answers permissively for a harness this build does not know
+    // (see the header), so an engine a newer core added is never labelled dead.
+    return isPresent(harnessId) ? name : missingSuffix(name);
 }
 
 } // namespace EngineAvailability

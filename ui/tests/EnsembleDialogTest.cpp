@@ -11,11 +11,25 @@
 // Both are silent failures — the save succeeds, the ensemble is just wrong the
 // next time it runs — which is exactly the kind a test has to catch.
 
+// Audit F30/F49, the convergence round: this editor was one of the two pickers
+// still calling "auto" a "Private copy (recommended)" after the guided dialog
+// had stopped promising a copy it may not get. Its isolation labels must be the
+// shared ones, and its engine list must carry the shared availability
+// annotation (audit F37) — a recipe naming an engine this machine does not have
+// is worth SAYING, even though an editor is right not to refuse the edit.
+
 #include "EnsembleDialog.h"
+#include "NewAgentDialog.h" // IsolationCopy — the shared isolation wording
+#include "state/EngineAvailability.h"
 #include "state/EnsembleCatalog.h"
+#include "state/HarnessTraits.h"
 
 #include <QComboBox>
+#include <QDir>
+#include <QFile>
 #include <QJsonObject>
+#include <QStandardPaths>
+#include <QTemporaryDir>
 #include <QtTest>
 
 namespace {
@@ -38,7 +52,86 @@ private Q_SLOTS:
     void modelIdFromEngineDefault();
     void modelIdFromUnknownIdKeptAsTyped();
     void modelIdFromTypedText();
+    void isolationLabelsComeFromTheSharedCopy();
+    void engineListSaysWhichEnginesAreMissing();
+
+private Q_SLOTS:
+    void initTestCase();
+    void cleanup();
+
+private:
+    QByteArray m_originalPath;
 };
+
+void EnsembleDialogTest::initTestCase()
+{
+    QStandardPaths::setTestModeEnabled(true);
+    m_originalPath = qgetenv("PATH");
+}
+
+void EnsembleDialogTest::cleanup()
+{
+    qputenv("PATH", m_originalPath);
+    EngineAvailability::invalidate();
+}
+
+// The convergence itself. The editor's isolation combos must render
+// IsolationCopy's words — not a local set that can drift back into promising a
+// private copy "auto" may decline to give.
+void EnsembleDialogTest::isolationLabelsComeFromTheSharedCopy()
+{
+    EnsembleDialog dlg(nullptr);
+    QComboBox *isolation = nullptr;
+    const auto combos = dlg.findChildren<QComboBox *>();
+    for (QComboBox *c : combos) {
+        if (c->findData(QStringLiteral("auto")) >= 0
+            && c->findData(QStringLiteral("workspace")) >= 0) {
+            isolation = c;
+            break;
+        }
+    }
+    QVERIFY2(isolation != nullptr, "the controller's isolation picker");
+    for (const char *mode : {"auto", "isolated", "workspace"}) {
+        const QString id = QString::fromLatin1(mode);
+        const int idx = isolation->findData(id);
+        QVERIFY(idx >= 0);
+        QCOMPARE(isolation->itemText(idx), IsolationCopy::modeLabel(id));
+    }
+    // "auto" in particular: no unconditional promise anywhere in the editor.
+    QCOMPARE(isolation->itemText(isolation->findData(QStringLiteral("auto"))),
+             IsolationCopy::modeLabel(QStringLiteral("auto")));
+    QVERIFY(!isolation->toolTip().isEmpty());
+}
+
+// Audit F37 in the editor: annotated, not disabled — an ensemble is a recipe
+// saved now and run later, possibly after installing the engine.
+void EnsembleDialogTest::engineListSaysWhichEnginesAreMissing()
+{
+    QTemporaryDir bin;
+    QVERIFY(bin.isValid());
+    qputenv("PATH", bin.path().toLocal8Bit()); // no engine CLI anywhere
+    EngineAvailability::invalidate();
+
+    EnsembleDialog dlg(nullptr);
+    QComboBox *engines = nullptr;
+    const auto combos = dlg.findChildren<QComboBox *>();
+    for (QComboBox *c : combos) {
+        if (c->findData(QStringLiteral("claude")) >= 0) {
+            engines = c;
+            break;
+        }
+    }
+    qputenv("PATH", m_originalPath);
+    EngineAvailability::invalidate();
+
+    QVERIFY2(engines != nullptr, "the controller's engine picker");
+    const int idx = engines->findData(QStringLiteral("claude"));
+    QVERIFY(idx >= 0);
+    QVERIFY2(engines->itemText(idx).contains(QStringLiteral("not installed")),
+             "a recipe naming an engine this machine lacks must say so");
+    QVERIFY2(engines->isEnabled(),
+             "but the editor must still let the recipe be authored");
+}
 
 void EnsembleDialogTest::jsonRoundTripKeepsEveryField()
 {

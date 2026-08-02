@@ -49,6 +49,16 @@ public:
 
     bool isConnected() const;
 
+    // Where the recovery ladder stands, for callers whose *message* depends on
+    // it. A send refused while the ladder is still climbing is worth retrying in
+    // a moment; one refused after the ladder gave up is not, and telling the
+    // user to wait would be as false as the "restart to recover" advice that
+    // used to be printed while the ladder was still climbing (audit F50, round
+    // 3). isReconnecting() and reconnectGaveUp() are mutually exclusive, and
+    // both are false on a connection that has never dropped.
+    bool isReconnecting() const { return m_reconnecting; }
+    bool reconnectGaveUp() const { return m_reconnectGaveUp; }
+
     // Deliver an agent event to the notification consumers as if the core had
     // sent it. Strictly for facts the UI holds and the core cannot state: after
     // a respawn the fresh core has never heard of the previous one's threads, so
@@ -132,6 +142,10 @@ private:
     // True from the drop until reconnected()/reconnectFailed(). The armed timer,
     // not this flag, is what keeps a second drop from starting a rival ladder.
     bool m_reconnecting = false;
+    // True once a ladder has run out of rounds (or resolved to the dead state):
+    // the client stays dead until the app is restarted. Cleared when a new
+    // ladder begins, because a fresh drop is a fresh chance to recover.
+    bool m_reconnectGaveUp = false;
     int m_reconnectAttempts = 0;
     // True once THIS recovery has had to launch a fresh core, carried until the
     // reconnected() that closes the ladder can report it. Reset per ladder, not

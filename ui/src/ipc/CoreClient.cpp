@@ -263,6 +263,7 @@ void CoreClient::onSocketConnected()
                      m_reconnecting = false;
                      m_reconnectAttempts = 0;
                      m_coreRespawned = false;
+                     m_reconnectGaveUp = true;
                      emit reconnectFailed();
                  }
                  return;
@@ -271,6 +272,7 @@ void CoreClient::onSocketConnected()
              if (m_reconnecting) {
                  m_reconnecting = false;
                  m_reconnectAttempts = 0;
+                 m_reconnectGaveUp = false;
                  const bool respawned = m_coreRespawned;
                  m_coreRespawned = false;
                  emit reconnected(respawned);
@@ -394,6 +396,7 @@ void CoreClient::beginReconnect()
         m_reconnecting = true;
         m_reconnectAttempts = 0;
         m_coreRespawned = false; // a fresh ladder has respawned nothing yet
+        m_reconnectGaveUp = false; // a fresh drop is a fresh chance to recover
         emit reconnecting();
     }
     // The armed timer — not m_reconnecting — is the re-entrancy guard, so a drop
@@ -414,6 +417,7 @@ void CoreClient::scheduleReconnect()
         // Out of rounds: fall back into the plain dead state, where every call
         // fails locally, rather than retrying forever behind the user's back.
         m_reconnecting = false;
+        m_reconnectGaveUp = true;
         emit reconnectFailed();
         return;
     }

@@ -3,6 +3,7 @@
 #include "state/AgentJob.h"
 #include "state/HarnessTraits.h"
 
+#include <QDateTime>
 #include <QHash>
 #include <QJsonArray>
 #include <QJsonObject>
@@ -195,6 +196,20 @@ public:
     // consumer has seen nothing at all.
     void republishJobs();
 
+    // Draft persistence at teardown. The composer draft is written by a 400 ms
+    // debounce timer (m_draftTimer), so a user who types and closes the agent
+    // inside that window loses the text: the timer is a child of this panel and
+    // dies with it, unfired. AgentDock calls flushDraft() on the KEEP teardown
+    // path (plain Close, project close) to settle the debounce deterministically
+    // before the panel goes, and dropPendingDraftWrite() on the FORGET path so a
+    // still-pending timer cannot re-create the draft the dock has just cleared.
+    //
+    // Deliberately NOT done in ~AgentPanel: the destructor runs from
+    // deleteLater, i.e. AFTER removeAgentEntry's DraftStore::clear, so saving
+    // there would resurrect the draft of a genuinely destroyed thread.
+    void flushDraft();
+    void dropPendingDraftWrite();
+
 Q_SIGNALS:
     void statusMessage(const QString &text);
     void titleChanged(const QString &title);
@@ -350,6 +365,16 @@ private:
     // Fold one rate_limit_event into the header chip, noting only TRANSITIONS
     // in the feed — the CLI emits one of these every turn.
     void applyRateLimit(const QJsonObject &info);
+    // Withdraw this agent's usage-limit claim — both the account-level one the
+    // roster strip aggregates and this panel's own header chip (audit F43).
+    //
+    // A rate_limit_event is a fact about a RUNNING turn, and it was only ever
+    // withdrawn in the destructor: an agent that was stopped, interrupted, went
+    // dormant or died mid-turn went on being counted as "paused by a usage
+    // limit" for as long as its panel stayed open, which is a status that
+    // outlives its condition — the same class of falsehood as a limit that
+    // survives its own reset time.
+    void clearRateLimitClaim();
     // Drive the mode/model/thinking pickers to the values a kimi `_options`
     // event reports, for each id it lists as changed.
     void adoptDiscoveredOptions(const QJsonArray &configOptions,
@@ -510,6 +535,11 @@ private:
     void positionJumpButton();
     void updateJumpButton();
 
+    // Show/hide (and re-word) the empty-feed hint (audit F44). Public-ish only
+    // to the panel: driven by the model's row signals, the viewport resize and
+    // a chat-settings change, because all three can change what it should say.
+    void updateFeedEmptyState();
+
     // Draft persistence (KConfig "Agent" group, draft-<id>): save on edit,
     // restore when (re)bound to a workspace/thread, clear on send.
     QString draftKey() const;
@@ -574,6 +604,10 @@ private:
     QListView *m_view = nullptr;
     TranscriptModel *m_model = nullptr;
     TranscriptDelegate *m_delegate = nullptr;
+    // The "nothing here yet" hint over an empty feed (audit F44). A child of the
+    // view's viewport, like the roster's — never a transcript row, so a replayed
+    // conversation cannot inherit it.
+    QLabel *m_feedEmptyHint = nullptr;
     bool m_stickBottom = true; // auto-scroll until the user scrolls upward
     // Floating "jump to latest" button over the feed viewport, shown when the
     // feed is scrolled up away from the bottom.
@@ -621,6 +655,11 @@ private:
     QString m_rateLimitStatus;   // "allowed" / "allowed_warning" / "rejected" / …
     QString m_rateLimitType;     // e.g. "five_hour"
     QString m_rateLimitResets;   // pre-formatted local time, empty when unknown
+    // The same reset as DATA. The formatted copy above is for this panel's own
+    // chip; the timestamp is what leaves the widget — plan 28 §Phase 2 arms a
+    // wake timer on it, and a scheduler cannot parse "3:07 PM" back into one
+    // (audit F43).
+    QDateTime m_rateLimitResetsAt;
     bool m_rateLimitOverage = false;
     // Stable key of the plan checklist card (-1 = none yet). Each TodoWrite /
     // ACP plan update rewrites this one card in place, so the feed carries the

@@ -36,3 +36,9 @@ Name=Agent failed
 Comment=An agent's start or turn ended with an error
 Action=Popup
 Urgency=Normal
+
+[Event/agentRateLimited]
+Name=Agents paused by a usage limit
+Comment=One or more agents cannot continue until the account's usage window resets
+Action=Popup
+Urgency=Normal

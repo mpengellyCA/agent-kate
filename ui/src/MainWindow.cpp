@@ -1,4 +1,5 @@
 #include "MainWindow.h"
+#include "AgentActions.h"
 #include "AgentDock.h"
 #include "AgentPanel.h"
 #include "AppearanceDialog.h"
@@ -32,6 +33,7 @@
 #include "ipc/CoreClient.h"
 #include "state/EngineAvailability.h"
 #include "state/EnsembleCatalog.h"
+#include "state/WindowTitle.h"
 
 #include <KTextEditor/Cursor>
 #include <KTextEditor/Document>
@@ -95,7 +97,7 @@
 MainWindow::MainWindow(const QString &openPath, QWidget *parent)
     : KMainWindow(parent)
 {
-    setWindowTitle(i18n("Agent Kate"));
+    refreshWindowTitle();
     m_tabsByAgent =
         KSharedConfig::openConfig()->group(QStringLiteral("Editor"))
             .readEntry("tabsByAgent", false);
@@ -336,8 +338,15 @@ void MainWindow::setupUi()
         {m_keyFiles, i18n("Browse the files in the active project.")},
         {m_keyOutline, i18n("Jump to the functions, classes and symbols in the open file.")},
         {m_keySearch, i18n("Search across the whole project — plain text or regular expressions.")},
-        {m_keyWorktrees, i18n("Each agent works in its own isolated copy of the project "
-                              "(a git worktree). Review and manage them here.")},
+        // NOT "each agent works in its own isolated copy": an agent launched
+        // with isolation "workspace", or with "auto" on a project git cannot
+        // branch from, works directly in the user's own files — and this very
+        // panel paints a "not isolated" pill for those rows
+        // (WorktreeCopy::notIsolatedPill). The help text must not contradict
+        // the panel it describes.
+        {m_keyWorktrees, i18n("Where each agent does its work: its own private copy of "
+                              "the project (a git worktree) where it has one, or your "
+                              "own files where it has not. Review and manage them here.")},
         {m_keyGitLog, i18n("The commit history for the active project.")},
         {m_keyCoop, i18n("See who — human or agent — is editing what, in real time.")},
         {m_keyCowork, i18n("Let an agent see and control your desktop, only with your permission.")},
@@ -349,54 +358,16 @@ void MainWindow::setupUi()
         {m_keyTasks, i18n("Everything running in the background — detached shells, "
                           "sub-agents and Workflow runs — across every agent.")},
     };
-    // The rail's raise-by-ordinal accelerators (setupShellShortcuts) are raw
-    // QShortcuts: they appear in no menu, so the command palette — which walks
-    // the menu bar — cannot surface them either, and nothing on screen says
-    // they exist (audit F50). Naming the binding in the tooltip that is already
-    // there is the interim answer; plan 27 §1's KActionCollection refactor is
-    // the real one, and this line goes away with it.
-    const auto railShortcut = [this](SideBar *bar, int id) -> QString {
-        if (bar != m_leftBar && bar != m_rightBar) {
-            return QString(); // the bottom strip has no ordinal binding
-        }
-        int index = -1;
-        for (int i = 0; i < bar->panelCount(); ++i) {
-            if (bar->panelIdAt(i) == id) {
-                index = i;
-                break;
-            }
-        }
-        if (index < 0 || index > 8) {
-            return QString(); // bindRaise only binds 1…9
-        }
-        const Qt::KeyboardModifiers mods = (bar == m_leftBar)
-            ? Qt::KeyboardModifiers(Qt::AltModifier)
-            : Qt::KeyboardModifiers(Qt::ControlModifier | Qt::AltModifier);
-        return QKeySequence(QKeyCombination(mods,
-                                            static_cast<Qt::Key>(Qt::Key_1 + index)))
-            .toString(QKeySequence::NativeText);
-    };
+    // Held on the panel record rather than used once here: the ordinal a tab's
+    // shortcut hint names changes whenever a panel is moved between strips or
+    // detached, so the tooltips have to be rebuildable (refreshPanelTooltips).
     for (auto it = panelHelp.constBegin(); it != panelHelp.constEnd(); ++it) {
-        SideBar *bar = panelBar(it.key());
-        const int id = panelId(it.key());
-        if (!bar || id < 0) {
-            continue;
-        }
-        if (auto *tab = bar->tabBar()->tab(id)) {
-            QString title = bar->panelLabel(id);
-            title.replace(QLatin1String("&&"), QLatin1String("&"));
-            QString tip = QStringLiteral("<b>%1</b><p>%2</p>")
-                              .arg(title.toHtmlEscaped(), it.value().toHtmlEscaped());
-            const QString seq = railShortcut(bar, id);
-            if (!seq.isEmpty()) {
-                tip += QStringLiteral("<p>%1</p>")
-                           .arg(i18nc("keyboard shortcut hint in a panel tooltip",
-                                      "Shortcut: %1", seq)
-                                    .toHtmlEscaped());
-            }
-            tab->setToolTip(tip);
+        auto info = m_panels.find(it.key());
+        if (info != m_panels.end()) {
+            info->help = it.value();
         }
     }
+    refreshPanelTooltips();
     // Wire the Output panel to drain m_core's coreLog. m_core does not exist
     // yet (setupCore runs after setupUi); defer the connect via a queued
     // single-shot, by which time m_core is constructed.
@@ -616,9 +587,12 @@ void MainWindow::setupUi()
     // per transition into "someone is waiting", and only while we are not the
     // active window — the roster already says it plainly when we are.
     connect(m_agent, &AgentDock::attentionCountChanged, this, [this](int count) {
-        setWindowTitle(count > 0
-                           ? i18np("(%1) Agent Kate", "(%1) Agent Kate", count)
-                           : i18n("Agent Kate"));
+        // Recorded, never written straight to the window: the project switch is
+        // the other writer of this title, and when the two raced it erased the
+        // count while agents were still blocked. attentionCountChanged is
+        // change-gated, so nothing would ever have put it back.
+        m_attentionCount = count;
+        refreshWindowTitle();
         // QApplication::alert is the portable "demand attention" request (it
         // no-ops when the window IS active), unlike KWindowSystem, which in KF6
         // exposes activation but no state setter.
@@ -1087,13 +1061,15 @@ void MainWindow::setupActions()
         }
     });
 
+    // Text + tooltip track the active agent's isolation (onAgentActivated): the
+    // folder this opens is only a "worktree" when the agent has a private copy.
     m_openWorktreeTerminalAct = viewMenu->addAction(
         QIcon::fromTheme(QStringLiteral("utilities-terminal")),
-        i18n("Open Terminal in &Worktree"));
+        AgentActions::terminalActionLabel(/*isolated=*/false));
     // Ctrl+Shift+T is "New Terminal" here; Ctrl+Alt+T is free.
     m_openWorktreeTerminalAct->setShortcut(Qt::CTRL | Qt::ALT | Qt::Key_T);
     m_openWorktreeTerminalAct->setToolTip(
-        i18n("Open a terminal rooted in the active agent's worktree."));
+        AgentActions::terminalActionTooltip(/*isolated=*/false));
     m_openWorktreeTerminalAct->setEnabled(false);
     connect(m_openWorktreeTerminalAct, &QAction::triggered, this, [this] {
         const QString dir =
@@ -1284,6 +1260,11 @@ void MainWindow::updateEngineAvailabilityBanner()
     const auto actions = m_engineBanner->actions();
     for (QAction *a : actions) {
         m_engineBanner->removeAction(a);
+        // removeAction only DETACHES: the action stays parented to the banner
+        // and every refresh added another "How to Install…" that nothing would
+        // ever free. deleteLater rather than delete because this can run from
+        // inside the banner's own action handling (audit F50, leak hygiene).
+        a->deleteLater();
     }
     m_engineBanner->setMessageType(KMessageWidget::Warning);
     m_engineBanner->setIcon(QIcon::fromTheme(QStringLiteral("dialog-warning")));
@@ -1300,6 +1281,11 @@ void MainWindow::updateEngineAvailabilityBanner()
         m_engineBanner->addAction(install);
     }
     m_engineBanner->animatedShow();
+}
+
+void MainWindow::refreshWindowTitle()
+{
+    setWindowTitle(WindowTitle::compose(m_titleProject, m_attentionCount));
 }
 
 void MainWindow::showCommandPalette()
@@ -1413,9 +1399,11 @@ void MainWindow::setupAgentMenu()
     m_agentPrAct = m_agentMenu->addAction(i18n("Create &Pull Request…"));
     connect(m_agentPrAct, &QAction::triggered, this,
             [this] { m_agent->createPullRequestForActiveAgent(); });
+    // Text + tooltip are re-derived per agent in updateAgentActions (the folder
+    // is only a "worktree" when the agent is isolated).
     m_agentTerminalAct = m_agentMenu->addAction(
         QIcon::fromTheme(QStringLiteral("utilities-terminal")),
-        i18n("Open &Terminal in Worktree"));
+        AgentActions::terminalActionLabel(/*isolated=*/false));
     connect(m_agentTerminalAct, &QAction::triggered, this,
             [this] { m_agent->openActiveAgentTerminal(); });
 
@@ -1426,8 +1414,10 @@ void MainWindow::setupAgentMenu()
     connect(m_agentTagsAct, &QAction::triggered, this,
             [this] { m_agent->editActiveAgentTags(); });
 
-    m_agentDiscardAct = m_agentMenu->addAction(i18n("&Discard Worktree"));
-    m_agentDiscardAct->setToolTip(i18n("Throw away the agent's working copy and its changes."));
+    m_agentDiscardAct =
+        m_agentMenu->addAction(AgentActions::discardActionLabel(/*isolated=*/false));
+    m_agentDiscardAct->setToolTip(
+        AgentActions::discardActionTooltip(/*isolated=*/false));
     connect(m_agentDiscardAct, &QAction::triggered, this,
             [this] { m_agent->discardActiveAgentWorktree(); });
 
@@ -1450,18 +1440,49 @@ void MainWindow::updateAgentActions()
     const bool running = m_agent && m_agent->activeAgentRunning();
     const bool dormant = m_agent && m_agent->activeAgentDormant();
     const bool worktree = m_agent && m_agent->activeAgentHasWorktree();
-    m_agentRenameAct->setEnabled(has);
-    m_agentResumeAct->setEnabled(dormant);
-    m_agentAttachAct->setEnabled(has && !dormant);
-    m_agentChangesAct->setEnabled(has);
-    m_agentStopAct->setEnabled(running);
-    m_agentCommitAct->setEnabled(worktree);
-    m_agentPrAct->setEnabled(worktree);
-    m_agentMergeAct->setEnabled(worktree);
-    m_agentTerminalAct->setEnabled(worktree);
-    m_agentTagsAct->setEnabled(has);
-    m_agentDiscardAct->setEnabled(worktree);
-    m_agentCloseAct->setEnabled(has);
+    // Merge needs a private BRANCH, not merely a path. git.snapshot hands back a
+    // path for workspace-mode threads too, so `worktree` was true for an agent
+    // running in the user's own checkout and "Merge Agent's Changes" offered to
+    // merge a branch that does not exist. AgentDock::landRequested already
+    // refuses that case; this stops the product from offering it in the first
+    // place, rather than explaining afterwards.
+    const bool isolated = m_agent && m_agent->activeAgentIsolated();
+    // One decision, shared with the roster's right-click menu (which is how
+    // most users reach these) so the two surfaces cannot disagree — and, unlike
+    // this file, testable: see AgentActions.h / AgentRosterTest.
+    const AgentActions::AgentActionEnablement en =
+        AgentActions::compute(has, running, dormant, isolated, worktree);
+    m_agentRenameAct->setEnabled(en.rename);
+    m_agentResumeAct->setEnabled(en.resume);
+    m_agentAttachAct->setEnabled(en.attach);
+    m_agentChangesAct->setEnabled(en.changes);
+    m_agentStopAct->setEnabled(en.stop);
+    m_agentCommitAct->setEnabled(en.commit);
+    // A pull request needs the same private BRANCH merging does: the core
+    // refuses OpenPRWithOptions outright when the thread is not isolated
+    // (worktree.go, "!wt.Isolated"), so enabling this on a workspace-mode agent
+    // offers an action that cannot succeed.
+    m_agentPrAct->setEnabled(en.pullRequest);
+    m_agentMergeAct->setEnabled(en.merge);
+    // A greyed-out item with no reason is its own small dead end. The one
+    // state worth naming is the one a user will not guess: the agent IS
+    // started and does have changes, it simply has no branch of its own.
+    m_agentMergeAct->setToolTip(
+        worktree && !isolated
+            ? i18n("This agent works directly in your project, so it has no "
+                   "separate branch to merge.")
+            : i18n("Bring this agent's work out of its private copy and into "
+                   "your project's current branch."));
+    m_agentTerminalAct->setEnabled(en.terminal);
+    // "Open Terminal in Worktree" opens the user's OWN checkout when the agent
+    // has no private copy — the action is right, the name was not.
+    m_agentTerminalAct->setText(AgentActions::terminalActionLabel(isolated));
+    m_agentTerminalAct->setToolTip(AgentActions::terminalActionTooltip(isolated));
+    m_agentTagsAct->setEnabled(en.tags);
+    m_agentDiscardAct->setEnabled(en.discard);
+    m_agentDiscardAct->setText(AgentActions::discardActionLabel(isolated));
+    m_agentDiscardAct->setToolTip(AgentActions::discardActionTooltip(isolated));
+    m_agentCloseAct->setEnabled(en.close);
 }
 
 // setupExperience installs the status-bar Simple/Advanced toggle and applies the
@@ -1786,6 +1807,65 @@ int MainWindow::registerPanel(const QString &key, const QIcon &icon,
     return info.barId;
 }
 
+// refreshPanelTooltips rebuilds every rail tab's hover text: what the panel is
+// for, plus the raise-by-ordinal accelerator that reaches it.
+//
+// The accelerators (setupShellShortcuts) are raw QShortcuts — they appear in no
+// menu, so the command palette, which walks the menu bar, cannot surface them
+// either, and nothing else on screen says they exist (audit F50). The tooltip
+// is the interim answer; plan 27 §1's KActionCollection refactor is the real
+// one and takes this whole method with it.
+//
+// It has to be a method rather than a one-shot at construction because the
+// ordinal is a POSITION in the strip: moving or detaching one panel renumbers
+// every panel after it, and a tooltip that then names the old key would be
+// worse than naming none.
+void MainWindow::refreshPanelTooltips()
+{
+    const auto railShortcut = [this](SideBar *bar, int id) -> QString {
+        if (bar != m_leftBar && bar != m_rightBar) {
+            return QString(); // the bottom strip has no ordinal binding
+        }
+        int index = -1;
+        for (int i = 0; i < bar->panelCount(); ++i) {
+            if (bar->panelIdAt(i) == id) {
+                index = i;
+                break;
+            }
+        }
+        if (index < 0 || index > 8) {
+            return QString(); // bindRaise only binds 1…9
+        }
+        const Qt::KeyboardModifiers mods = (bar == m_leftBar)
+            ? Qt::KeyboardModifiers(Qt::AltModifier)
+            : Qt::KeyboardModifiers(Qt::ControlModifier | Qt::AltModifier);
+        return QKeySequence(QKeyCombination(mods,
+                                            static_cast<Qt::Key>(Qt::Key_1 + index)))
+            .toString(QKeySequence::NativeText);
+    };
+    for (auto it = m_panels.constBegin(); it != m_panels.constEnd(); ++it) {
+        if (it->help.isEmpty() || !it->bar || it->barId < 0) {
+            continue; // no description, or currently floating
+        }
+        auto *tab = it->bar->tabBar()->tab(it->barId);
+        if (!tab) {
+            continue;
+        }
+        QString title = it->bar->panelLabel(it->barId);
+        title.replace(QLatin1String("&&"), QLatin1String("&"));
+        QString tip = QStringLiteral("<b>%1</b><p>%2</p>")
+                          .arg(title.toHtmlEscaped(), it->help.toHtmlEscaped());
+        const QString seq = railShortcut(it->bar, it->barId);
+        if (!seq.isEmpty()) {
+            tip += QStringLiteral("<p>%1</p>")
+                       .arg(i18nc("keyboard shortcut hint in a panel tooltip",
+                                  "Shortcut: %1", seq)
+                                .toHtmlEscaped());
+        }
+        tab->setToolTip(tip);
+    }
+}
+
 void MainWindow::movePanelToStrip(const QString &key, const QString &targetStrip)
 {
     auto it = m_panels.find(key);
@@ -1824,6 +1904,7 @@ void MainWindow::movePanelToStrip(const QString &key, const QString &targetStrip
     target->setRaisedId(it->barId);
     KSharedConfig::openConfig()->group(QString())
         .writeEntry(QStringLiteral("View/panels/%1/strip").arg(key), targetStrip);
+    refreshPanelTooltips(); // both strips renumbered — see the method's comment
 }
 
 void MainWindow::detachPanel(const QString &key)
@@ -1866,6 +1947,7 @@ void MainWindow::detachPanel(const QString &key)
     KSharedConfig::openConfig()->group(QString())
         .writeEntry(QStringLiteral("View/panels/%1/strip").arg(key),
                     QStringLiteral("floating"));
+    refreshPanelTooltips();
 }
 
 void MainWindow::reattachPanel(const QString &key)
@@ -1889,6 +1971,7 @@ void MainWindow::reattachPanel(const QString &key)
     }
     KSharedConfig::openConfig()->group(QString())
         .writeEntry(QStringLiteral("View/panels/%1/strip").arg(key), strip);
+    refreshPanelTooltips();
 }
 
 // showPanelContextMenu pops a context menu next to a right-clicked tab,
@@ -2206,10 +2289,20 @@ void MainWindow::onAgentActivated(int agentId, const QString &projectPath,
         m_inspectorPanel->setActiveThread(m_agent->currentThreadId());
     }
     if (m_openWorktreeTerminalAct) {
+        const bool isolated = m_agent && m_agent->activeAgentIsolated();
         m_openWorktreeTerminalAct->setEnabled(
-            m_agent && !m_agent->worktreePathForAgent(agentId).isEmpty());
+            AgentActions::compute(
+                m_agent != nullptr, /*running=*/false, /*dormant=*/false, isolated,
+                /*hasPath=*/m_agent
+                    && !m_agent->worktreePathForAgent(agentId).isEmpty())
+                .terminal);
+        m_openWorktreeTerminalAct->setText(
+            AgentActions::terminalActionLabel(isolated));
+        m_openWorktreeTerminalAct->setToolTip(
+            AgentActions::terminalActionTooltip(isolated));
     }
-    setWindowTitle(i18n("Agent Kate — %1", QDir(projectPath).dirName()));
+    m_titleProject = QDir(projectPath).dirName();
+    refreshWindowTitle();
     // An agent whose session started while a different agent was shown never
     // got the activeThreadChanged re-key; catch it here, before its group key
     // is resolved, so its tabs come back with it.

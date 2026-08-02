@@ -3,6 +3,7 @@
 
 #include "NewAgentDialog.h"
 #include "ProviderConfig.h"
+#include "state/EngineAvailability.h"
 #include "state/EnsembleCatalog.h"
 #include "state/HarnessTraits.h"
 
@@ -17,13 +18,140 @@
 #include <QFormLayout>
 #include <QLabel>
 #include <QLineEdit>
+#include <QPalette>
 #include <QPlainTextEdit>
+#include <QPointer>
+#include <QProcess>
 #include <QPushButton>
 #include <QSignalBlocker>
+#include <QStandardItemModel>
+#include <QTimer>
 #include <QVBoxLayout>
 
+namespace IsolationCopy {
+
+namespace {
+// How long a `git rev-parse` may take before we stop waiting for it. Nothing
+// user-visible hangs on this — the caller is already showing the Unknown
+// wording — it only bounds the stray process on a wedged mount.
+constexpr int kProbeTimeoutMs = 5000;
+} // namespace
+
+void probeIsolationAsync(const QString &projectPath, QObject *context,
+                         const std::function<void(Availability)> &done)
+{
+    if (!done) {
+        return;
+    }
+    // No path: nothing to ask about. Answering from the CALLER's working
+    // directory is the mistake worktree.EffectiveIsolation calls out — it would
+    // report on whatever repo happens to be there, which is a confident answer
+    // about the wrong project.
+    if (projectPath.trimmed().isEmpty()) {
+        done(Availability::Unknown);
+        return;
+    }
+    if (!context) {
+        return; // nothing to report to; see the header
+    }
+    // Unparented on purpose. As a child of the dialog it would be destroyed
+    // with it, and ~QProcess kills and then BLOCKS until the process is gone —
+    // which would move the very freeze this is removing from open to close. It
+    // deletes itself when git answers instead.
+    auto *git = new QProcess;
+    git->setWorkingDirectory(projectPath);
+    git->setProcessChannelMode(QProcess::MergedChannels);
+    const QPointer<QObject> guard(context);
+    // settle runs exactly once: finished() and errorOccurred() can both fire
+    // for one run (a crash emits each), so the first one through disconnects
+    // the other. Disconnecting and deleteLater()ing from inside the signal are
+    // both safe; the callback is invoked last, after this object has stopped
+    // being able to call back into a dialog that may not be there.
+    const auto settle = [git, guard, done](Availability a) {
+        git->disconnect();
+        git->deleteLater();
+        if (!guard) {
+            return; // the dialog closed while git was still running
+        }
+        done(a);
+    };
+    QObject::connect(git, &QProcess::errorOccurred, git,
+                     [settle](QProcess::ProcessError) {
+                         // No git on PATH, or it never started: we cannot know,
+                         // and "cannot know" must not become "no copy".
+                         settle(Availability::Unknown);
+                     });
+    QObject::connect(git, &QProcess::finished, git,
+                     [settle](int exitCode, QProcess::ExitStatus status) {
+                         if (status != QProcess::NormalExit) {
+                             settle(Availability::Unknown);
+                             return;
+                         }
+                         // git answered. Exit 0 = a HEAD commit exists, so
+                         // `git worktree add` has something to branch from.
+                         // Anything else (fresh repo, not a repo) means
+                         // Create() will run the agent in the workspace.
+                         settle(exitCode == 0 ? Availability::Available
+                                              : Availability::Unavailable);
+                     });
+    QTimer::singleShot(kProbeTimeoutMs, git, [git] {
+        if (git->state() != QProcess::NotRunning) {
+            git->kill(); // -> finished(CrashExit) -> Unknown
+        }
+    });
+    git->start(QStringLiteral("git"), {QStringLiteral("rev-parse"),
+                                       QStringLiteral("--verify"),
+                                       QStringLiteral("HEAD")});
+}
+
+} // namespace IsolationCopy
+
+namespace {
+
+// Grey out one row of a combo. QComboBox has no per-entry enabled flag; its
+// default model is a QStandardItemModel, so the item carries it — the same
+// idiom AgentPanel::applyModelEffortSupport uses for efforts a model cannot run.
+void setComboEntryEnabled(QComboBox *combo, int index, bool on,
+                          const QString &whyNot = QString())
+{
+    auto *model = qobject_cast<QStandardItemModel *>(combo->model());
+    QStandardItem *item = model ? model->item(index) : nullptr;
+    if (!item) {
+        return; // a custom model: annotated but selectable, which is still honest
+    }
+    item->setEnabled(on);
+    if (!on && !whyNot.isEmpty()) {
+        item->setToolTip(whyNot);
+    }
+}
+
+// Move off a refused entry. A combo whose current row is disabled still SHOWS
+// it and still reports its data, so leaving the selection there would hand the
+// launch exactly the choice the row was disabled to prevent.
+void selectFirstEnabled(QComboBox *combo)
+{
+    auto *model = qobject_cast<QStandardItemModel *>(combo->model());
+    if (!model) {
+        return;
+    }
+    const int cur = combo->currentIndex();
+    if (cur >= 0 && model->item(cur) && model->item(cur)->isEnabled()) {
+        return;
+    }
+    for (int i = 0; i < combo->count(); ++i) {
+        if (model->item(i) && model->item(i)->isEnabled()) {
+            combo->setCurrentIndex(i);
+            return;
+        }
+    }
+    // Nothing is startable at all. Leave the selection alone: the choice is
+    // moot, and EngineAvailability's banner is the surface that says why.
+}
+
+} // namespace
+
 NewAgentDialog::NewAgentDialog(const QString &projectName, CoreClient *core,
-                               QWidget *parent)
+                               QWidget *parent, const QString &projectPath)
     : QDialog(parent)
     , m_core(core)
 {
@@ -74,20 +202,47 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, CoreClient *core,
     m_engine->setToolTip(i18n(
         "Which agent engine runs this task: the agent program, optionally "
         "routed through a third-party API provider."));
+    // Every entry is LISTED — hiding an engine would make the product look like
+    // it supports one — but an entry that cannot start today says so and cannot
+    // be chosen. This is the guided front door: it creates the agent the moment
+    // it is accepted, so offering a route that ends in "executable file not
+    // found in $PATH" (audit F37) or "no API credential supplied" (audit F46)
+    // spends the user's task description to tell them something we already
+    // knew. Both annotations come from the shared helpers, so this picker, the
+    // panel's combo and the roster's quick menu cannot drift apart.
     for (const HarnessTraits &t : HarnessRegistry::self()->all()) {
-        m_engine->addItem(t.displayName, t.id);
+        const bool present = EngineAvailability::isPresent(t.id);
+        const QString engineLabel =
+            EngineAvailability::pickerLabel(t.id, t.displayName);
+        m_engine->addItem(engineLabel, t.id);
+        setComboEntryEnabled(
+            m_engine, m_engine->count() - 1, present,
+            i18n("Agent Kate drives an agent command-line program, and this "
+                 "engine's is not installed on this machine."));
         if (!t.providerRouting) {
             continue;
         }
         const QList<ProviderProfile> profiles = ProviderStore::load();
         for (const ProviderProfile &p : profiles) {
-            if (p.routed()) {
-                m_engine->addItem(i18nc("engine entry: harness via provider",
-                                        "%1 via %2", t.displayName, p.name),
-                                  t.id + QLatin1Char('|') + p.id);
+            if (!p.routed()) {
+                continue; // the direct entry IS the base harness row
             }
+            m_engine->addItem(i18nc("engine entry: harness via provider",
+                                    "%1 via %2", engineLabel,
+                                    ProviderStore::pickerLabel(p)),
+                              t.id + QLatin1Char('|') + p.id);
+            setComboEntryEnabled(
+                m_engine, m_engine->count() - 1,
+                present && ProviderStore::keyResolvable(p),
+                present ? i18n("No API key is stored for %1 — add one under "
+                               "Options ▸ Configure API Providers….", p.name)
+                        : i18n("Agent Kate drives an agent command-line "
+                               "program, and this engine's is not installed on "
+                               "this machine."));
         }
     }
+    // Never leave the picker resting on an entry it has just refused.
+    selectFirstEnabled(m_engine);
     form->addRow(i18n("Which agent?"), m_engine);
     m_model = new QComboBox(this);
     m_model->setToolTip(i18n("Which model powers this agent. Smarter is more capable; faster is cheaper."));
@@ -220,29 +375,37 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, CoreClient *core,
     connect(HarnessRegistry::self(), &HarnessRegistry::changed, this,
             rebuildBackendChoices);
 
-    m_sandbox = new QCheckBox(
-        i18n("Work in a private copy, so changes don't touch my files until I approve"), this);
+    // HONEST LABELLING (audit F30/F49). Every word of this control, and the
+    // reasoning behind splitting the promise off the label and into a note that
+    // depends on a probe, lives in IsolationCopy (NewAgentDialog.h).
+    m_sandbox = new QCheckBox(IsolationCopy::checkboxLabel(), this);
     m_sandbox->setChecked(true);
-    // HONEST LABELLING (audit F30): this is not a sandbox and must not be called
-    // one — docs/security-model.md says so in bold. A git worktree isolates
-    // CHECKOUT STATE, not the process: the agent still runs as you, with your
-    // network and your credentials, and a tool writing an absolute path outside
-    // the copy is invisible to every diff and dirty count we show. The checkbox
-    // label above is the canonical wording ("private copy"); the tooltip says
-    // what the mechanism is and, in the same breath, what it is not.
-    //
-    // The last sentence is the honest half of audit F49: the isolation request
-    // is "auto" (see choices()), so a project with no commits yet — nothing for
-    // git to branch from — starts the agent in the workspace instead of failing.
-    m_sandbox->setToolTip(
-        i18n("Recommended. The agent works in its own private copy of the "
-             "project (a git worktree); you merge its changes back when you're "
-             "happy with them. It keeps your working files untouched — it is "
-             "not a security sandbox, and the agent still runs with your own "
-             "permissions. A project with no commits yet has nothing to copy, "
-             "so the agent works directly in your files and says so when it "
-             "starts."));
+    m_sandbox->setToolTip(IsolationCopy::checkboxTooltip());
     root->addWidget(m_sandbox);
+    m_isolationNote = new QLabel(this);
+    m_isolationNote->setWordWrap(true);
+    m_isolationNote->setTextFormat(Qt::PlainText);
+    DisclosureStyle::apply(m_isolationNote);
+    root->addWidget(m_isolationNote);
+    // Resolve the degradation BEFORE the dialog can be accepted rather than
+    // promising a private copy and apologising once the agent has started.
+    //
+    // The probe does NOT block the constructor (audit F12's class): it starts
+    // in Availability::Unknown, whose wording covers both outcomes and promises
+    // neither, and repaints if git answers while the dialog is still open. A
+    // user who accepts before then sends "auto" — the same request the
+    // conditional sentence describes.
+    connect(m_sandbox, &QCheckBox::toggled, this,
+            [this] { updateIsolationState(); });
+    updateIsolationState();
+    IsolationCopy::probeIsolationAsync(
+        projectPath, this, [this](IsolationCopy::Availability a) {
+            if (a == m_isolationAvailability) {
+                return;
+            }
+            m_isolationAvailability = a;
+            updateIsolationState();
+        });
 
     // Power options, hidden until asked for.
     auto *advToggle = new QCheckBox(i18n("Show advanced options"), this);
@@ -328,7 +491,9 @@ void NewAgentDialog::applyEnsembleMode()
     const bool crew = !name.isEmpty();
     m_engine->setEnabled(!crew);
     m_model->setEnabled(!crew);
-    m_sandbox->setEnabled(!crew);
+    // The isolation checkbox has two independent owners — the ensemble picker
+    // and the project probe — so it is enabled in one place that consults both.
+    updateIsolationState();
     m_advanced->setEnabled(!crew);
     m_ensembleHint->setVisible(crew);
     if (!crew) {
@@ -352,6 +517,30 @@ void NewAgentDialog::applyEnsembleMode()
                        "list separator", ", "))));
 }
 
+// updateIsolationState keeps the checkbox and the sentence under it telling the
+// same story (audit F30, second pass). The failure it exists to prevent: a
+// ticked box promising a private copy on a project where "auto" will silently
+// hand the agent the user's own files instead.
+void NewAgentDialog::updateIsolationState()
+{
+    const bool crew = !m_ensemble->currentData().toString().isEmpty();
+    const bool possible =
+        m_isolationAvailability != IsolationCopy::Availability::Unavailable;
+    if (!possible && m_sandbox->isChecked()) {
+        // Untick rather than leave a ticked box above a note that says it will
+        // not happen. choices() then reports "workspace" — precisely what the
+        // launch would have degraded to anyway, so the fresh never-committed
+        // project still starts (audit F49) with the promise withdrawn instead
+        // of broken. Blocked so this does not recurse through the toggle.
+        QSignalBlocker block(m_sandbox);
+        m_sandbox->setChecked(false);
+    }
+    m_sandbox->setEnabled(!crew && possible);
+    m_isolationNote->setText(
+        IsolationCopy::isolationNote(m_isolationAvailability,
+                                     m_sandbox->isChecked()));
+}
+
 NewAgentChoices NewAgentDialog::choices() const
 {
     NewAgentChoices c;
@@ -365,9 +554,15 @@ NewAgentChoices NewAgentDialog::choices() const
     // ModeIsolated on a repo with no commit to branch from ("isolation needs at
     // least one commit"), so the RECOMMENDED default used to fail a brand-new
     // project with raw git-speak in the conversation. ModeAuto isolates wherever
-    // isolation is possible and falls back to the workspace where it is not —
-    // and the fallback is not silent: the core reports the effective isolation
-    // and the panel says "Working directly in your files" once the agent starts.
+    // isolation is possible and falls back to the workspace where it is not.
+    //
+    // The fallback is no longer something the user only learns about afterwards
+    // (audit F30, second pass): where the probe knows a copy is impossible,
+    // updateIsolationState() has already unticked the box and said why, so this
+    // returns "workspace" — the same launch that succeeds, without the dialog
+    // having promised the opposite. Where the probe could not answer, "auto" is
+    // still the request and the note under the checkbox is conditional to match;
+    // the panel's "Working directly in your files" then confirms which it was.
     c.isolation = m_sandbox->isChecked() ? QStringLiteral("auto")
                                          : QStringLiteral("workspace");
     c.permissionMode = m_permission->currentData().toString();

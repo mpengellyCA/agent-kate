@@ -1,4 +1,5 @@
 #include "AgentDock.h"
+#include "AgentActions.h"
 #include "RecentProjects.h"
 #include "AgentPanel.h"
 #include "AgentRoster.h"
@@ -10,6 +11,7 @@
 #include "TagEditorDialog.h"
 #include "ipc/CoreClient.h"
 #include "ProviderConfig.h"
+#include "state/DraftStore.h"
 #include "state/EngineAvailability.h"
 #include "state/EnsembleCatalog.h"
 #include "state/HarnessTraits.h"
@@ -26,6 +28,7 @@
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QPointer>
+#include <QPushButton>
 #include <QSet>
 #include <QStackedWidget>
 #include <QTimer>
@@ -129,7 +132,11 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
             emit agentActivated(e->id, e->project, m_lastEmittedWorktree);
         }
     });
-    connect(m_roster, &AgentRoster::closeRequested, this, &AgentDock::closeAgent);
+    // Closing keeps the composer draft (DraftDisposition::Keep, the default) —
+    // a closed agent is re-openable and must find its unsent text waiting. The
+    // lambda is required: a default argument is invisible to a PMF connect.
+    connect(m_roster, &AgentRoster::closeRequested, this,
+            [this](int id) { closeAgent(id); });
     connect(m_roster, &AgentRoster::openWorktreeTerminalRequested, this, [this](int id) {
         const QString p = worktreePathForAgent(id);
         if (!p.isEmpty()) {
@@ -191,8 +198,17 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
                             // core notification handler — the panel may be the
                             // very object the core is mid-emit on. Defer the
                             // teardown to the next event-loop turn.
+                            //
+                            // This is the ONE place a thread is actually
+                            // destroyed — agent.discard, git.removeWorktree and
+                            // cleanup.archiveAndRemove all end here — so it is
+                            // the one place the composer draft may be dropped.
+                            // Everything else (Close, closing a project) is
+                            // re-openable and keeps it.
                             const int id = e.id;
-                            QTimer::singleShot(0, this, [this, id] { closeAgent(id); });
+                            QTimer::singleShot(0, this, [this, id] {
+                                closeAgent(id, DraftDisposition::Forget);
+                            });
                             break;
                         }
                     }
@@ -262,6 +278,15 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
         Entry *e = entryById(id);
         if (!e || e->panel->threadId().isEmpty()) {
             emit statusMessage(i18n("Start the agent before opening a PR"));
+            return;
+        }
+        // Same gate landRequested has: the core refuses OpenPRWithOptions
+        // outright for a non-isolated thread, so without this the user is asked
+        // for a PR title and only then told it was never possible.
+        if (!e->panel->isIsolated()) {
+            emit statusMessage(i18n(
+                "This agent runs in the workspace — it has no branch to open a "
+                "pull request from"));
             return;
         }
         bool ok = false;
@@ -340,20 +365,38 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
             closeAgent(id);
             return;
         }
-        if (QMessageBox::question(m_dialogParent, i18n("Discard worktree"),
-                i18n("Discard this agent's worktree and all of its uncommitted "
-                     "changes? This cannot be undone."))
-            != QMessageBox::Yes) {
+        // The prompt has to name what agent.discard really destroys, and that
+        // differs by isolation — so it is built by the same kind of pure,
+        // isolation-aware function the Worktree Dashboard's discard already
+        // uses (audit F29), wearing that module's struct. "Discard this agent's
+        // worktree and all of its uncommitted changes" named one of six things
+        // for an isolated agent, and for a workspace agent named the one thing
+        // the operation provably does NOT touch (worktree.Remove returns early
+        // when !Isolated), scaring the user off a safe action.
+        const bool isolated = e->panel->isIsolated();
+        const WorktreeCopy::DiscardPrompt prompt = AgentActions::agentDiscardPrompt(
+            isolated, m_roster->agentTitle(id), worktreePathForAgent(id));
+        QMessageBox box(QMessageBox::Warning, prompt.title, prompt.body,
+                        QMessageBox::NoButton, m_dialogParent);
+        box.setTextFormat(Qt::RichText);
+        QPushButton *go = box.addButton(prompt.confirmLabel, QMessageBox::DestructiveRole);
+        box.addButton(QMessageBox::Cancel);
+        box.setDefaultButton(QMessageBox::Cancel);
+        box.exec();
+        if (box.clickedButton() != go) {
             return;
         }
         m_core->call(QStringLiteral("agent.discard"),
                      QJsonObject{{QStringLiteral("threadId"), e->panel->threadId()}},
-                     [this](const QJsonObject &, const QJsonObject &error) {
+                     [this, isolated](const QJsonObject &, const QJsonObject &error) {
                          if (!error.isEmpty()) {
                              emit statusMessage(i18n("Discard failed: %1",
                                  error.value(QStringLiteral("message")).toString()));
                          } else {
-                             emit statusMessage(i18n("Discarded the agent's worktree"));
+                             emit statusMessage(
+                                 isolated
+                                     ? i18n("Deleted the agent and its private copy")
+                                     : i18n("Deleted the agent"));
                          }
                      },
                      this);
@@ -440,6 +483,15 @@ bool AgentDock::activeAgentHasWorktree() const
     return id >= 0 && !worktreePathForAgent(id).isEmpty();
 }
 
+bool AgentDock::activeAgentIsolated() const
+{
+    const AgentPanel *p = activeAgentPanel();
+    // A thread id as well as the flag: before agent.start there is no branch
+    // anywhere, only a pre-selected isolation mode, and every git lifecycle
+    // action refuses with "start the agent first" anyway.
+    return p && p->isIsolated() && !p->threadId().isEmpty();
+}
+
 void AgentDock::newAgentInActiveProject()
 {
     const QString project = activeProjectPath();
@@ -458,7 +510,11 @@ void AgentDock::newAgentGuided(const QString &project)
     if (project.isEmpty()) {
         return;
     }
-    NewAgentDialog dlg(QDir(project).dirName(), m_core, m_dialogParent);
+    // The project PATH (not just its display name) is what lets the dialog ask
+    // git whether a private copy is actually possible here, and withdraw the
+    // offer before accept rather than after the agent has started. Without it
+    // the probe runs in Availability::Unknown and the checkbox is a guess.
+    NewAgentDialog dlg(QDir(project).dirName(), m_core, m_dialogParent, project);
     if (dlg.exec() != QDialog::Accepted) {
         return;
     }
@@ -865,7 +921,13 @@ void AgentDock::seedEngineChoices()
     // the feature is discoverable before any ensemble exists.
     choices.append({QString(), QString(), i18n("Ensembles"), true});
     for (const Ensemble &e : EnsembleCatalog::self()->list()) {
-        choices.append({QString(), QString(), e.name, false, e.name});
+        // An ensemble is only as startable as the engine its CONTROLLER runs
+        // on: without that CLI the whole crew dies at agent.start, after the
+        // user has picked a recipe and written a task (audit F37, moved). An
+        // empty controller backend means "the core's default engine", which
+        // isPresent() answers permissively — see EngineAvailability.h.
+        const bool available = EngineAvailability::isPresent(e.controller.backend);
+        choices.append({QString(), QString(), e.name, false, e.name, false, available});
     }
     choices.append(
         {QString(), QString(), i18n("Manage ensembles…"), false, QString(), true});
@@ -1065,6 +1127,9 @@ void AgentDock::wireAgentPanel(int agentId, AgentPanel *panel)
         // The agent only becomes nameable to thread-keyed consumers here — its
         // title existed all along, but there was no id to hang it on.
         pushAgentTitles();
+        // …and its isolation only becomes real here too (see
+        // pushAgentActionFacts), which is what the roster menu gates on.
+        pushAgentActionFacts();
     });
     // A live start/resume/promote reveals (or moves) this agent's worktree — if
     // it is the shown agent, re-root the file browser's Worktree tab.
@@ -1073,6 +1138,10 @@ void AgentDock::wireAgentPanel(int agentId, AgentPanel *panel)
                 if (m_stack->currentWidget() == panel) {
                     pushActiveWorktree(worktreePath);
                 }
+                // A live promote turns a workspace agent into an isolated one,
+                // which changes what its roster menu may offer and what the
+                // terminal / discard entries are truthfully called.
+                pushAgentActionFacts();
             });
     // "Stop & close" already archived the thread on the core; here we just drop
     // the panel and its roster entry. Deferred so we never delete the panel from
@@ -1093,6 +1162,8 @@ void AgentDock::wireAgentPanel(int agentId, AgentPanel *panel)
     // thread and a title, and the rows it just published would read as raw
     // uuids until git next moved.
     pushAgentTitles();
+    // …and with an isolation flag, which its roster row's menu gates on.
+    pushAgentActionFacts();
 }
 
 // forgetFinishedJobsEverywhere backs the Jobs panel's "Clear finished": each
@@ -1325,12 +1396,28 @@ void AgentDock::refreshAgentNumbers()
                      // Feed the WorktreeDashboard and the Jobs panel so their
                      // rows name the agent, not just its branch / thread id.
                      pushAgentTitles();
+                     // The paths just changed, so the roster's action gates did.
+                     pushAgentActionFacts();
                      // A dormant agent's worktree path may only have become known
                      // in this snapshot — refresh the shown agent's file-browser
                      // scope so its Worktree tab enables without re-selecting it.
                      emitActiveWorktree();
                  },
                  this);
+}
+
+// pushAgentActionFacts mirrors the two facts AgentActions::compute gates on
+// onto every roster row. isIsolated() is qualified by a bound thread for the
+// same reason activeAgentIsolated() is: before agent.start there is no branch
+// anywhere, only a pre-selected isolation mode.
+void AgentDock::pushAgentActionFacts()
+{
+    for (const Entry &e : std::as_const(m_agents)) {
+        const bool started = !e.panel->threadId().isEmpty();
+        m_roster->setAgentIsolated(e.id, started && e.panel->isIsolated());
+        m_roster->setAgentHasWorktreePath(e.id,
+                                          !worktreePathForAgent(e.id).isEmpty());
+    }
 }
 
 // pushAgentTitles publishes thread id → human title for every bound agent.
@@ -1353,7 +1440,7 @@ void AgentDock::pushAgentTitles()
     Q_EMIT agentTitlesChanged(titlesByThread);
 }
 
-void AgentDock::removeAgentEntry(int agentId)
+void AgentDock::removeAgentEntry(int agentId, DraftDisposition drafts)
 {
     for (int i = 0; i < m_agents.size(); ++i) {
         if (m_agents.at(i).id == agentId) {
@@ -1373,7 +1460,50 @@ void AgentDock::removeAgentEntry(int agentId)
                 Q_EMIT jobsChanged(goneThread, {});
             }
             m_notifier->forgetAgent(agentId);
+            const QString goneProject = m_agents.at(i).project;
             m_agents.removeAt(i);
+            // Forget this agent's persisted composer draft — but ONLY when the
+            // thread is genuinely gone (discarded, cleaned up). Nothing used to
+            // clear these, so a closed-with-draft agent left a `draft-…` entry
+            // in the config for the life of the profile (audit F50); clearing
+            // them on every teardown then traded that stale key for the user's
+            // unsent text, because plain Close routes through here too and a
+            // closed agent is re-openable. A leaked config line is cheap; the
+            // words someone typed are not.
+            //
+            // The thread-scoped key is this agent's alone; the workspace-scoped
+            // one (a never-started agent) is SHARED with every other
+            // not-yet-started agent in the same project, so it only goes once
+            // the last of them has.
+            // Both ids: goneThread prefers the PUBLISHED one (the close path
+            // clears threadId() first), but the draft was written under
+            // whatever threadId() held at the time. Clearing is idempotent.
+            // Settle the composer's 400 ms debounce against the disposition
+            // BEFORE touching the stored draft. On Keep, a user who typed and
+            // hit Close inside that window would otherwise lose the text (the
+            // timer is a child of the panel and dies unfired); on Forget, a
+            // still-pending timer would write the draft back after the clear
+            // below — and the panel outlives this function by one event-loop
+            // turn, because teardown is deleteLater.
+            if (drafts == DraftDisposition::Forget) {
+                panel->dropPendingDraftWrite();
+            } else {
+                panel->flushDraft();
+            }
+            if (drafts == DraftDisposition::Forget) {
+                DraftStore::clear(DraftStore::threadKey(goneThread));
+                DraftStore::clear(DraftStore::threadKey(panel->threadId()));
+                bool projectStillHasAgents = false;
+                for (const Entry &other : std::as_const(m_agents)) {
+                    if (other.project == goneProject) {
+                        projectStillHasAgents = true;
+                        break;
+                    }
+                }
+                if (!projectStillHasAgents) {
+                    DraftStore::clear(DraftStore::workspaceKey(goneProject));
+                }
+            }
             m_stack->removeWidget(panel);
             // Sever any core->panel wiring before tearing it down so no further
             // core notifications or in-flight replies reach the doomed panel.
@@ -1389,9 +1519,9 @@ void AgentDock::removeAgentEntry(int agentId)
     }
 }
 
-void AgentDock::closeAgent(int agentId)
+void AgentDock::closeAgent(int agentId, DraftDisposition drafts)
 {
-    removeAgentEntry(agentId);
+    removeAgentEntry(agentId, drafts);
     if (m_agents.isEmpty() && !m_projects.isEmpty()) {
         addAgent(m_projects.constFirst()); // keep one agent available
     }

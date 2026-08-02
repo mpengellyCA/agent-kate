@@ -1,6 +1,9 @@
 #include "AgentRoster.h"
+#include "AgentActions.h"
 #include "AgentCardDelegate.h"
 #include "shell/FlowLayout.h"
+#include "state/RateLimitState.h"
+#include "theme/ThemeManager.h"
 
 #include <QAction>
 #include <QApplication>
@@ -134,74 +137,21 @@ AgentRoster::AgentRoster(QWidget *parent)
         if (!item) {
             return;
         }
-        QMenu menu(this);
         if (item->parent()) {
             const int id = item->data(0, Qt::UserRole).toInt();
-            const bool dormant = item->data(0, AgentRoles::Dormant).toBool();
-            QAction *resumeAct = nullptr;
-            if (dormant) {
-                resumeAct = menu.addAction(
-                    QIcon::fromTheme(QStringLiteral("media-playback-start")),
-                    i18n("Resume agent"));
-                menu.addSeparator();
+            // Built by a callable that does not exec(), so a test can assert on
+            // the enable-state of every entry — see AgentActionsTest.
+            const AgentRowMenu built = buildAgentRowMenu(id, this);
+            if (!built.menu) {
+                return;
             }
-            QAction *renameAct = menu.addAction(
-                QIcon::fromTheme(QStringLiteral("document-edit")), i18n("Rename…"));
-            QAction *forkAct = menu.addAction(
-                QIcon::fromTheme(QStringLiteral("edit-copy")), i18n("Fork…"));
-            forkAct->setToolTip(
-                i18n("Continue this conversation as a new agent on a different model."));
-            menu.addSeparator();
-            const int number = item->data(0, AgentRoles::Number).toInt();
-            QAction *termAct = menu.addAction(
-                QIcon::fromTheme(QStringLiteral("utilities-terminal")),
-                i18n("Open Terminal in Worktree"));
-            // A worktree exists only once the agent has been assigned a #N and
-            // is not dormant; otherwise there is no directory to open.
-            termAct->setEnabled(number > 0 && !dormant);
-            menu.addSeparator();
-            QAction *commitAct = menu.addAction(i18n("Commit changes…"));
-            QAction *prAct = menu.addAction(i18n("Create pull request…"));
-            // Not "into local main": agent.land merges into whatever branch the
-            // workspace is currently on (audit F50).
-            QAction *landAct = menu.addAction(i18n("Merge the agent's changes…"));
-            QAction *discardAct = menu.addAction(i18n("Discard worktree"));
-            menu.addSeparator();
-
-            // Tags submenu: a checkable entry per tag already used anywhere in
-            // this agent's project, checked when the agent carries it. Toggling
-            // emits add/removeTagRequested; "Edit tags…" opens the full editor.
-            QMenu *tagsMenu = menu.addMenu(
-                QIcon::fromTheme(QStringLiteral("tag")), i18n("Tags"));
-            const QString projectPath =
-                item->parent() ? item->parent()->data(0, Qt::UserRole).toString()
-                               : QString();
-            const QStringList own = item->data(0, Tags).toStringList();
-            QSet<QString> ownLower;
-            for (const QString &t : own) {
-                ownLower.insert(t.toLower());
-            }
-            QHash<QAction *, QString> tagActions;
-            const QStringList all = projectTags(projectPath);
-            for (const QString &tag : all) {
-                QAction *a = tagsMenu->addAction(tag);
-                a->setCheckable(true);
-                a->setChecked(ownLower.contains(tag.toLower()));
-                tagActions.insert(a, tag);
-            }
-            if (!all.isEmpty()) {
-                tagsMenu->addSeparator();
-            }
-            QAction *editTagsAct = tagsMenu->addAction(i18n("Edit tags…"));
-            menu.addSeparator();
-
-            QAction *closeAct = menu.addAction(i18n("Close agent"));
-            QAction *chosen = menu.exec(m_tree->viewport()->mapToGlobal(pos));
+            QAction *chosen = built.menu->exec(m_tree->viewport()->mapToGlobal(pos));
+            built.menu->deleteLater();
             if (!chosen) {
                 return;
             }
-            if (tagActions.contains(chosen)) {
-                const QString tag = tagActions.value(chosen);
+            if (built.tagActions.contains(chosen)) {
+                const QString tag = built.tagActions.value(chosen);
                 if (chosen->isChecked()) {
                     emit addTagRequested(id, tag);
                 } else {
@@ -209,30 +159,31 @@ AgentRoster::AgentRoster(QWidget *parent)
                 }
                 return;
             }
-            if (chosen == editTagsAct) {
+            if (chosen == built.editTags) {
                 emit editTagsRequested(id);
                 return;
             }
-            if (chosen == resumeAct) {
+            if (chosen == built.action(QStringLiteral("resume"))) {
                 emit resumeRequested(id);
-            } else if (chosen == termAct) {
+            } else if (chosen == built.action(QStringLiteral("terminal"))) {
                 emit openWorktreeTerminalRequested(id);
-            } else if (chosen == renameAct) {
+            } else if (chosen == built.action(QStringLiteral("rename"))) {
                 emit renameRequested(id);
-            } else if (chosen == forkAct) {
+            } else if (chosen == built.action(QStringLiteral("fork"))) {
                 emit forkRequested(id);
-            } else if (chosen == commitAct) {
+            } else if (chosen == built.action(QStringLiteral("commit"))) {
                 emit commitRequested(id);
-            } else if (chosen == prAct) {
+            } else if (chosen == built.action(QStringLiteral("pr"))) {
                 emit prRequested(id);
-            } else if (chosen == landAct) {
+            } else if (chosen == built.action(QStringLiteral("merge"))) {
                 emit landRequested(id);
-            } else if (chosen == discardAct) {
+            } else if (chosen == built.action(QStringLiteral("discard"))) {
                 emit discardRequested(id);
-            } else if (chosen == closeAct) {
+            } else if (chosen == built.action(QStringLiteral("close"))) {
                 emit closeRequested(id);
             }
         } else {
+            QMenu menu(this);
             const QString path = item->data(0, Qt::UserRole).toString();
             QAction *newAct = menu.addAction(
                 QIcon::fromTheme(QStringLiteral("list-add")),
@@ -307,9 +258,25 @@ AgentRoster::AgentRoster(QWidget *parent)
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(8, 8, 8, 8);
     layout->setSpacing(8);
+    // Fleet-level usage-limit strip (audit F43). A rate limit belongs to the
+    // ACCOUNT, not to one agent — so it gets one line under the tree rather
+    // than a badge repeated on every card, which would read as N separate
+    // problems. Amber, because "parked until quota reset" is the only state
+    // here worth pulling the eye; hidden entirely while nothing is limited.
+    m_rateLimitStrip = new QLabel(this);
+    m_rateLimitStrip->setWordWrap(true);
+    m_rateLimitStrip->setVisible(false);
+    m_rateLimitStrip->setToolTip(
+        i18n("These agents cannot make progress until the usage window resets. "
+             "Open one to see which limit it hit."));
+    connect(agentkate::RateLimitState::self(), &agentkate::RateLimitState::changed,
+            this, &AgentRoster::updateRateLimitStrip);
+    updateRateLimitStrip();
+
     layout->addLayout(buttons);
     layout->addLayout(filterRow);
     layout->addWidget(m_tree, 1);
+    layout->addWidget(m_rateLimitStrip);
 
     // Empty-state hint, centred over the tree viewport when no projects exist.
     m_emptyHint = new QLabel(i18n("No projects open.\nUse “Open Project…” to begin."),
@@ -677,6 +644,125 @@ void AgentRoster::setAgentDormant(int agentId, bool dormant)
         item->setData(0, AgentRoles::Dormant, dormant);
         // A worker going dormant (or waking) changes its controller's live tally.
         recomputeWorkerCount(item->parent());
+    }
+}
+
+AgentRowMenu AgentRoster::buildAgentRowMenu(int agentId, QWidget *parent) const
+{
+    AgentRowMenu out;
+    QTreeWidgetItem *item = agentItem(agentId);
+    if (!item) {
+        return out;
+    }
+    const bool dormant = item->data(0, AgentRoles::Dormant).toBool();
+    const bool isolated = item->data(0, AgentActions::IsolatedRole).toBool();
+    // The card's own facts decide what this menu may offer — the same decision,
+    // from the same function, that the window's &Agent menu makes. This menu is
+    // the PRIMARY way users reach these actions and was the ungated one:
+    // "Create pull request…" and "Merge the agent's changes…" were live on
+    // agents with no branch to do either from, and the only feedback was the
+    // core's refusal, after the user had typed a PR title.
+    //
+    // `running` only ever decides Stop, which this menu does not offer; the
+    // closest fact a row carries is a turn in flight.
+    const AgentActions::AgentActionEnablement en = AgentActions::compute(
+        /*exists=*/true,
+        /*running=*/item->data(0, AgentRoles::StatusRole).toInt()
+            == int(AgentRoles::AgentStatus::Working),
+        dormant, isolated,
+        /*hasPath=*/item->data(0, AgentActions::HasPathRole).toBool());
+
+    out.menu = new QMenu(parent);
+    QMenu &menu = *out.menu;
+    if (dormant) {
+        out.byKey.insert(QStringLiteral("resume"),
+                         menu.addAction(
+                             QIcon::fromTheme(QStringLiteral("media-playback-start")),
+                             i18n("Resume agent")));
+        menu.addSeparator();
+    }
+    out.byKey.insert(QStringLiteral("rename"),
+                     menu.addAction(QIcon::fromTheme(QStringLiteral("document-edit")),
+                                    i18n("Rename…")));
+    QAction *forkAct = menu.addAction(QIcon::fromTheme(QStringLiteral("edit-copy")),
+                                      i18n("Fork…"));
+    forkAct->setToolTip(
+        i18n("Continue this conversation as a new agent on a different model."));
+    out.byKey.insert(QStringLiteral("fork"), forkAct);
+    menu.addSeparator();
+    // The folder this opens is the user's OWN checkout when the agent has no
+    // private copy, so the entry is named for whichever it is (it stays
+    // enabled either way — a terminal in your project is useful).
+    QAction *termAct = menu.addAction(QIcon::fromTheme(QStringLiteral("utilities-terminal")),
+                                      AgentActions::terminalActionLabel(isolated));
+    termAct->setToolTip(AgentActions::terminalActionTooltip(isolated));
+    termAct->setEnabled(en.terminal);
+    out.byKey.insert(QStringLiteral("terminal"), termAct);
+    menu.addSeparator();
+    QAction *commitAct = menu.addAction(i18n("Commit changes…"));
+    commitAct->setEnabled(en.commit);
+    out.byKey.insert(QStringLiteral("commit"), commitAct);
+    QAction *prAct = menu.addAction(i18n("Create pull request…"));
+    prAct->setEnabled(en.pullRequest);
+    out.byKey.insert(QStringLiteral("pr"), prAct);
+    // Not "into local main": agent.land merges into whatever branch the
+    // workspace is currently on (audit F50).
+    QAction *landAct = menu.addAction(i18n("Merge the agent's changes…"));
+    landAct->setEnabled(en.merge);
+    out.byKey.insert(QStringLiteral("merge"), landAct);
+    if (!isolated) {
+        // The one greyed-out state a user will not guess: the agent IS started
+        // and does have changes, it simply has no branch of its own.
+        const QString why = i18n("This agent works directly in your project, so "
+                                 "it has no separate branch.");
+        prAct->setToolTip(why);
+        landAct->setToolTip(why);
+    }
+    QAction *discardAct = menu.addAction(AgentActions::discardActionLabel(isolated));
+    discardAct->setToolTip(AgentActions::discardActionTooltip(isolated));
+    discardAct->setEnabled(en.discard);
+    out.byKey.insert(QStringLiteral("discard"), discardAct);
+    menu.addSeparator();
+
+    // Tags submenu: a checkable entry per tag already used anywhere in this
+    // agent's project, checked when the agent carries it. Toggling emits
+    // add/removeTagRequested; "Edit tags…" opens the full editor.
+    QMenu *tagsMenu = menu.addMenu(QIcon::fromTheme(QStringLiteral("tag")), i18n("Tags"));
+    const QString projectPath = item->parent()
+        ? item->parent()->data(0, Qt::UserRole).toString()
+        : QString();
+    const QStringList own = item->data(0, Tags).toStringList();
+    QSet<QString> ownLower;
+    for (const QString &t : own) {
+        ownLower.insert(t.toLower());
+    }
+    const QStringList all = projectTags(projectPath);
+    for (const QString &tag : all) {
+        QAction *a = tagsMenu->addAction(tag);
+        a->setCheckable(true);
+        a->setChecked(ownLower.contains(tag.toLower()));
+        out.tagActions.insert(a, tag);
+    }
+    if (!all.isEmpty()) {
+        tagsMenu->addSeparator();
+    }
+    out.editTags = tagsMenu->addAction(i18n("Edit tags…"));
+    menu.addSeparator();
+    out.byKey.insert(QStringLiteral("close"), menu.addAction(i18n("Close agent")));
+    return out;
+}
+
+void AgentRoster::setAgentIsolated(int agentId, bool isolated)
+{
+    if (QTreeWidgetItem *item = agentItem(agentId)) {
+        item->setData(0, AgentActions::IsolatedRole, isolated);
+    }
+}
+
+void AgentRoster::setAgentHasWorktreePath(int agentId, bool hasPath)
+{
+    if (QTreeWidgetItem *item = agentItem(agentId)) {
+        item->setData(0, AgentActions::HasPathRole, hasPath);
     }
 }
 
@@ -1055,6 +1141,27 @@ void AgentRoster::updateEmptyState()
     if (empty) {
         m_emptyHint->setGeometry(m_tree->viewport()->rect());
     }
+}
+
+// updateRateLimitStrip republishes the shared, account-level usage-limit state
+// (audit F43). It reads RateLimitState rather than any per-agent field: the
+// panels report into that, and the roster only renders what the fleet's window
+// currently is.
+void AgentRoster::updateRateLimitStrip()
+{
+    if (!m_rateLimitStrip) {
+        return;
+    }
+    const QString text = agentkate::RateLimitState::self()->summary();
+    m_rateLimitStrip->setVisible(!text.isEmpty());
+    if (text.isEmpty()) {
+        return;
+    }
+    // The theme's own "warning / caution" colour, not a literal — this tracks a
+    // runtime Breeze light/dark switch exactly like the card delegate's badges.
+    m_rateLimitStrip->setText(
+        QStringLiteral("<span style='color:%1'>⏳ %2</span>")
+            .arg(ThemeManager::palette().neutral.name(), text.toHtmlEscaped()));
 }
 
 void AgentRoster::resizeEvent(QResizeEvent *event)

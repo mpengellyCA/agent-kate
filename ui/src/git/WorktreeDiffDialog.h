@@ -28,9 +28,15 @@ class WorktreeDiffDialog : public QDialog
 {
     Q_OBJECT
 public:
+    // `isolated` and `ahead` come straight off the dashboard row: together they
+    // decide both what the header may claim (a workspace-mode thread is the
+    // user's own checkout, not a worktree — audit F41) and whether landing this
+    // thread is meaningful at all (WorktreeReviewCopy::canLand — audit F29's
+    // asymmetry). `path` is the directory the agent actually runs in, named in
+    // the workspace-mode header so the blast radius is visible.
     WorktreeDiffDialog(CoreClient *core, const QString &threadId,
-                       const QString &branch, int number, bool canMerge,
-                       QWidget *parent = nullptr);
+                       const QString &branch, const QString &path, int number,
+                       bool isolated, int ahead, QWidget *parent = nullptr);
     ~WorktreeDiffDialog() override;
 
 Q_SIGNALS:
@@ -49,6 +55,9 @@ private:
     CoreClient *m_core = nullptr;
     QString m_threadId;
     QString m_branch;
+    // Whether this thread has a copy of its own. Decides the empty-state
+    // wording, so it has to outlive the constructor.
+    bool m_isolated = false;
 
     QLabel *m_header = nullptr;
     QListWidget *m_files = nullptr;

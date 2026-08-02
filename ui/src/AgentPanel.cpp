@@ -2,6 +2,10 @@
 #include "AgentCardDelegate.h"
 #include "AgentChatHelpers.h"
 #include "AttachmentBuilder.h"
+// For IsolationCopy — the shared isolation wording (see NewAgentDialog.h). This
+// panel shows no dialog from that header; it uses the copy, which lives beside
+// the probe that decides which of it is true.
+#include "NewAgentDialog.h"
 #include "SafeContent.h"
 #include "ImageView.h"
 #include "ProviderConfig.h"
@@ -13,6 +17,8 @@
 #include "WorkflowMonitorDialog.h"
 #include "ipc/CoreClient.h"
 #include "shell/FlowLayout.h"
+#include "state/EngineAvailability.h"
+#include "state/RateLimitState.h"
 #include "theme/ThemeManager.h"
 
 #include <KConfigGroup>
@@ -88,6 +94,46 @@
 #include <utility>
 
 namespace {
+// Grey out one row of a combo. QComboBox has no per-entry enabled flag; its
+// default model is a QStandardItemModel, so the item carries it — the idiom
+// applyModelEffortSupport below already uses for efforts a model cannot run.
+void setComboEntryEnabled(QComboBox *combo, int index, bool on,
+                          const QString &whyNot = QString())
+{
+    auto *model = qobject_cast<QStandardItemModel *>(combo->model());
+    QStandardItem *item = model ? model->item(index) : nullptr;
+    if (!item) {
+        return; // a custom model: annotated but selectable, which is still honest
+    }
+    item->setEnabled(on);
+    if (!on && !whyNot.isEmpty()) {
+        item->setToolTip(whyNot);
+    }
+}
+
+// Move off a refused entry. A combo whose current row is disabled still SHOWS
+// it and still reports its data, so leaving the selection there would hand the
+// launch exactly the choice the row was disabled to prevent.
+void selectFirstEnabled(QComboBox *combo)
+{
+    auto *model = qobject_cast<QStandardItemModel *>(combo->model());
+    if (!model) {
+        return;
+    }
+    const int cur = combo->currentIndex();
+    if (cur >= 0 && model->item(cur) && model->item(cur)->isEnabled()) {
+        return;
+    }
+    for (int i = 0; i < combo->count(); ++i) {
+        if (model->item(i) && model->item(i)->isEnabled()) {
+            combo->setCurrentIndex(i);
+            return;
+        }
+    }
+    // Nothing is startable at all — the choice is moot and the roster's
+    // missing-engines banner is the surface that says why.
+}
+
 // Custom drag MIME carrying per-hit line ranges, mirrored in SearchPanel.cpp.
 constexpr char kAttachMime[] = "application/x-agentkate-attachment+json";
 
@@ -564,6 +610,30 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
                 }
             });
 
+    // Empty state (audit F44). Every secondary panel — Jobs, Cooperation, Agent
+    // Activity, Cowork, the roster — tells a first-time user what it is for
+    // while it is empty; the one panel they actually land on was a blank box.
+    // A label over the viewport rather than a seeded note, so a restored agent's
+    // replayed transcript never has to step around it and it cannot survive
+    // into a conversation. Text is composed lazily (updateFeedEmptyState) — it
+    // names whichever isolation the picker is currently on, and that picker is
+    // built further down this constructor.
+    m_feedEmptyHint = new QLabel(m_view->viewport());
+    m_feedEmptyHint->setAlignment(Qt::AlignCenter);
+    m_feedEmptyHint->setWordWrap(true);
+    m_feedEmptyHint->setTextFormat(Qt::RichText);
+    // Bind the foreground ROLE, not a baked colour, so it follows a runtime
+    // Breeze light/dark switch (same rule as the roster's hint).
+    m_feedEmptyHint->setForegroundRole(QPalette::PlaceholderText);
+    m_feedEmptyHint->setAttribute(Qt::WA_TransparentForMouseEvents);
+    m_feedEmptyHint->setVisible(false);
+    connect(m_model, &QAbstractItemModel::rowsInserted, this,
+            &AgentPanel::updateFeedEmptyState);
+    connect(m_model, &QAbstractItemModel::rowsRemoved, this,
+            &AgentPanel::updateFeedEmptyState);
+    connect(m_model, &QAbstractItemModel::modelReset, this,
+            &AgentPanel::updateFeedEmptyState);
+
     // --- in-place selectable text overlay (plan 13 phase 1) ----------------
     // A click on a message body opens a persistent, frameless QTextBrowser over
     // that row's text so an arbitrary substring can be selected and copied. The
@@ -731,15 +801,23 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     m_streamFlush->setInterval(50);
     connect(m_streamFlush, &QTimer::timeout, this, &AgentPanel::flushStreamedText);
     connect(m_input, &QPlainTextEdit::textChanged, this, [this] {
-        m_draftTimer->start();
         updateSlashPopup();
         // Typing leaves the history walk (audit F50) — the edited text is the
         // human's again, not an entry to keep stepping through. The guard keeps
         // OUR own programmatic setPlainText from cancelling the walk it makes.
-        if (!m_historyNavigating) {
-            m_historyIndex = -1;
-            m_historyDraft.clear();
+        if (m_historyNavigating) {
+            // …and it must not persist the walked-to entry as the DRAFT either.
+            // Walking history and closing the panel used to replace the unsent
+            // message the user had been writing with an old sent one — the
+            // history feature eating the very draft the draft feature exists to
+            // protect. The walk is transient; only real edits are saved (the
+            // Down that ends the walk restores the draft, which is what is
+            // already on disk).
+            return;
         }
+        m_draftTimer->start();
+        m_historyIndex = -1;
+        m_historyDraft.clear();
     });
 
     // Slash-command autocomplete popup: an overlay list above the composer,
@@ -823,24 +901,18 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     });
 
     m_isolationCombo = new QComboBox(this);
-    m_isolationCombo->addItem(QStringLiteral("Automatic"), QStringLiteral("auto"));
-    // "sandbox" is the word this control must never use (audit F30):
-    // docs/security-model.md says in bold that a worktree is NOT a sandbox and
-    // does not pretend to be one — it isolates checkout state, not the process
-    // (no filesystem, network or credential containment). NewAgentDialog's
-    // "(git worktree)" is the honest form; this reuses it verbatim.
-    m_isolationCombo->addItem(QStringLiteral("In a private copy (git worktree)"),
-                              QStringLiteral("isolated"));
-    m_isolationCombo->addItem(QStringLiteral("Directly in my files"),
-                              QStringLiteral("workspace"));
-    m_isolationCombo->setToolTip(QStringLiteral(
-        "Whether the agent works on a private copy of your project or directly\n"
-        "in your files. Fixed once it starts:\n"
-        "• Automatic — a private copy when the project is a git repo, else your files\n"
-        "• In a private copy — always its own git worktree; merge it back when you're happy\n"
-        "• Directly in my files — changes land in your project immediately\n"
-        "A private copy separates the agent's CHANGES from yours. It does not\n"
-        "confine the program: it runs as you, with your files and network."));
+    // The wording is IsolationCopy's, not this file's (audit F30/F49). Three
+    // controls choose isolation and this is the one people actually use — the
+    // Ctrl+N path — so it was the one still calling "auto" "Automatic … a
+    // private copy when the project is a git repo", which is false for a git
+    // repo with nothing committed: there "auto" hands the agent the user's own
+    // files. Every label and the tooltip now come from the shared namespace, so
+    // this combo, the guided dialog and the ensemble editor say one thing.
+    for (const char *mode : {"auto", "isolated", "workspace"}) {
+        const QString id = QString::fromLatin1(mode);
+        m_isolationCombo->addItem(IsolationCopy::modeLabel(id), id);
+    }
+    m_isolationCombo->setToolTip(IsolationCopy::modeTooltip());
     // Sticky: the last choice becomes the default for the next agent.
     {
         const QString saved = KSharedConfig::openConfig()
@@ -855,6 +927,12 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
         KSharedConfig::openConfig()
             ->group(QStringLiteral("Agent"))
             .writeEntry("isolation", m_isolationCombo->currentData().toString());
+        // The empty-state hint describes what will happen to the user's files
+        // when they send (audit F44), and it reads this very combo. Without
+        // this, changing isolation left the previous promise on screen — a
+        // stale sentence about the user's own files is exactly the falsehood
+        // F44's copy rule was written to avoid.
+        updateFeedEmptyState();
     });
 
     m_effortCombo = new QComboBox(this);
@@ -1281,6 +1359,12 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
 
 AgentPanel::~AgentPanel()
 {
+    // A closed agent cannot still be waiting on a usage window: leaving its
+    // report behind would hold the roster's "N agents paused" strip up forever
+    // (audit F43).
+    if (!m_threadId.isEmpty()) {
+        agentkate::RateLimitState::self()->forget(m_threadId);
+    }
     // Closing a panel ends its agent so the core does not keep it running.
     // A dormant thread has no live process — leave it for a later resume.
     if (!m_threadId.isEmpty() && !m_dormant && m_core->isConnected()) {
@@ -1585,12 +1669,31 @@ void AgentPanel::rebuildEngineCombo()
     const QString before = m_engineCombo->currentData().toString();
     m_engineCombo->clear();
     for (const HarnessTraits &t : HarnessRegistry::self()->all()) {
-        m_engineCombo->addItem(t.displayName, t.id);
+        // An engine whose CLI is not installed is still LISTED — it is how the
+        // engine is discoverable at all — but it says so and cannot be picked,
+        // instead of being a choice that could only end in "executable file not
+        // found" after the user had written a task (audit F37). The label is
+        // EngineAvailability's, not this file's: the roster's quick menu and
+        // the New Agent dialog render the same string, so the three cannot
+        // drift into three spellings of "dead".
+        const bool present = EngineAvailability::isPresent(t.id);
+        const QString engineLabel =
+            EngineAvailability::pickerLabel(t.id, t.displayName);
+        m_engineCombo->addItem(engineLabel, t.id);
+        setComboEntryEnabled(
+            m_engineCombo, m_engineCombo->count() - 1, present,
+            i18n("Agent Kate drives an agent command-line program, and this "
+                 "engine's is not installed on this machine."));
         if (!t.providerRouting) {
             continue;
         }
         // Provider overlays: the same harness routed at a third-party
-        // Anthropic-compatible API ("Claude Code via Fireworks").
+        // Anthropic-compatible API ("Claude Code via Fireworks"). The two
+        // presets ship with no key, so on a fresh profile these were offered as
+        // routes that could only ever abort at send (audit F46). ProviderStore
+        // owns the wording — a route with no resolvable key is labelled, not
+        // hidden, so the user can see the option exists and go configure it —
+        // and, like a missing CLI, it is not selectable while it cannot start.
         const QList<ProviderProfile> profiles = ProviderStore::load();
         for (const ProviderProfile &p : profiles) {
             if (!p.routed()) {
@@ -1598,8 +1701,16 @@ void AgentPanel::rebuildEngineCombo()
             }
             m_engineCombo->addItem(
                 i18nc("engine entry: harness via provider", "%1 via %2",
-                      t.displayName, p.name),
+                      engineLabel, ProviderStore::pickerLabel(p)),
                 t.id + QLatin1Char('|') + p.id);
+            setComboEntryEnabled(
+                m_engineCombo, m_engineCombo->count() - 1,
+                present && ProviderStore::keyResolvable(p),
+                present ? i18n("No API key is stored for %1 — add one under "
+                               "Options ▸ Configure API Providers….", p.name)
+                        : i18n("Agent Kate drives an agent command-line "
+                               "program, and this engine's is not installed on "
+                               "this machine."));
         }
     }
     // Sticky, with one-time migration from the legacy backend+provider keys.
@@ -1621,6 +1732,11 @@ void AgentPanel::rebuildEngineCombo()
     if (idx >= 0) {
         m_engineCombo->setCurrentIndex(idx);
     }
+    // The sticky choice can be an engine that has since been uninstalled, or a
+    // provider whose key has gone. Landing on it would start an agent that
+    // cannot run, so fall through to the first entry that can — the same
+    // fallback applyModelEffortSupport does for a refused effort tier.
+    selectFirstEnabled(m_engineCombo);
 }
 
 // optionValues reads a persisted discovered-option enumeration ("value|name"
@@ -1898,6 +2014,9 @@ void AgentPanel::applyChatSettings()
 
     const bool showTools = cfg.readEntry("showTools", true);
     m_model->setToolsVisible(showTools);
+    // The empty state quotes the send key, so it has to be re-composed when the
+    // setting flips (audit F44).
+    updateFeedEmptyState();
 }
 
 bool AgentPanel::eventFilter(QObject *obj, QEvent *event)
@@ -1907,6 +2026,7 @@ bool AgentPanel::eventFilter(QObject *obj, QEvent *event)
     if (m_view && obj == m_view->viewport()
         && event->type() == QEvent::Resize) {
         positionJumpButton();
+        updateFeedEmptyState(); // the hint is sized to the viewport
         // Defer the exact row re-measure until the resize settles.
         if (m_resizeSettle) {
             m_resizeSettle->start();
@@ -2065,6 +2185,11 @@ bool AgentPanel::eventFilter(QObject *obj, QEvent *event)
 void AgentPanel::setDormant(const QString &threadId, const QString &title, bool isolated,
                             const QString &backend)
 {
+    // Whatever this panel was showing belongs to the outgoing thread, including
+    // any usage-limit claim: a dormant agent has no process and is waiting on
+    // nothing (audit F43). Withdrawn before the id is overwritten, or the old
+    // thread's claim would be stranded in the shared state forever.
+    clearRateLimitClaim();
     m_threadId = threadId;
     Q_EMIT threadIdChanged(m_threadId);
     // Same rebind rule as bindStartedThread: the outgoing thread's provisional
@@ -2786,6 +2911,26 @@ void AgentPanel::showFeedContextMenu(const QModelIndex &idx, const QPoint &globa
                 openToolInspector(pidx);
             }
         });
+        // A tool row is paint-only too, and it is where the command that failed
+        // and the error it printed actually live — the strings a user pastes
+        // into a bug report (audit F48). The inspector could always show them;
+        // it could not put them on the clipboard, and getting there was a modal
+        // for a copy. Full result, not the display-clipped one.
+        const QString full =
+            idx.data(TranscriptModel::ToolFullResultRole).toString();
+        const QString shown = idx.data(TranscriptModel::ToolResultRole).toString();
+        QStringList parts{idx.data(TranscriptModel::ToolNameRole).toString(),
+                          idx.data(TranscriptModel::ToolDetailRole).toString(),
+                          full.isEmpty() ? shown : full};
+        parts.removeAll(QString());
+        if (!parts.isEmpty()) {
+            const QString text = parts.join(QStringLiteral("\n"));
+            QAction *copy = toolMenu.addAction(
+                QIcon::fromTheme(QStringLiteral("edit-copy")), i18n("Copy text"));
+            connect(copy, &QAction::triggered, this, [text] {
+                QGuiApplication::clipboard()->setText(text);
+            });
+        }
         toolMenu.exec(globalPos);
         return;
     }
@@ -2914,6 +3059,47 @@ void AgentPanel::remeasureVisibleRows()
     }
 }
 
+// --- empty state ------------------------------------------------------------
+
+// updateFeedEmptyState paints the "nothing here yet" hint over an empty feed
+// (audit F44): first launch lands chat-forward on a completely blank box, with
+// nothing saying what to type, what will happen to the user's files, or that a
+// command palette exists at all.
+//
+// Two rules the copy obeys:
+//   * It names whichever isolation the picker is ACTUALLY on. Promising a
+//     private copy to an agent set to "Directly in my files" would be the same
+//     class of falsehood F30 removed from the word "sandbox".
+//   * It claims no containment. A worktree separates the agent's CHANGES from
+//     yours; it does not confine the process, so the sentence is about merging,
+//     not about safety (the wording follows NewAgentDialog's).
+void AgentPanel::updateFeedEmptyState()
+{
+    if (!m_feedEmptyHint || !m_view) {
+        return;
+    }
+    const bool empty = m_model->count() == 0;
+    m_feedEmptyHint->setVisible(empty);
+    if (!empty) {
+        return;
+    }
+    const bool enterSends = KSharedConfig::openConfig()
+                                ->group(QStringLiteral("Agent"))
+                                .readEntry("enterSends", true);
+    const QString send = enterSends ? i18nc("the composer's send key", "Enter")
+                                    : i18nc("the composer's send key", "Ctrl+Enter");
+    // Before a thread exists the picker decides; afterwards the thread's own
+    // isolation is the truth (and the picker is frozen).
+    const QString isolation = m_threadId.isEmpty() && m_isolationCombo
+        ? m_isolationCombo->currentData().toString()
+        : (m_isolated ? QStringLiteral("isolated") : QStringLiteral("workspace"));
+    m_feedEmptyHint->setText(agentkate::feedEmptyStateHtml(isolation, send));
+    // Centre it on the viewport, inset so long lines wrap instead of touching
+    // the edges.
+    const QRect vp = m_view->viewport()->rect();
+    m_feedEmptyHint->setGeometry(vp.adjusted(24, 0, -24, 0));
+}
+
 // --- jump-to-latest floating button ----------------------------------------
 
 void AgentPanel::positionJumpButton()
@@ -2976,6 +3162,26 @@ void AgentPanel::saveDraft()
         cfg.writeEntry(key, text);
     }
     cfg.sync();
+}
+
+void AgentPanel::flushDraft()
+{
+    // Settle the debounce before teardown. Without this, "type a sentence, hit
+    // Close" loses it whenever the close lands inside the 400 ms window — the
+    // exact case the draft feature exists for.
+    if (m_draftTimer && m_draftTimer->isActive()) {
+        m_draftTimer->stop();
+        saveDraft();
+    }
+}
+
+void AgentPanel::dropPendingDraftWrite()
+{
+    // The thread is being destroyed and the dock has already cleared the stored
+    // draft; a pending debounce firing after that would write it straight back.
+    if (m_draftTimer) {
+        m_draftTimer->stop();
+    }
 }
 
 void AgentPanel::restoreDraft()
@@ -3107,6 +3313,15 @@ void AgentPanel::runFind(int direction)
         m_findIndex = (m_findIndex + direction + m_findHits.size()) % m_findHits.size();
     }
     const int curRow = m_findHits.at(m_findIndex);
+    // A tool or thinking row matches on its BODY — the command, the output, the
+    // reasoning — and that body lives behind a collapsed header. Scrolling to a
+    // row whose match is not on screen is barely better than "No matches"
+    // (audit F48), so the row being landed on is opened. Only the current hit:
+    // expanding every match would rewrite the whole feed's layout.
+    const TranscriptModel::Kind kind = m_model->itemAt(curRow).kind;
+    if (kind == TranscriptModel::Tool || kind == TranscriptModel::Thinking) {
+        m_model->setExpanded(curRow, true);
+    }
     m_model->setFind(needle, curRow);
     m_stickBottom = false;
     m_view->scrollTo(m_model->index(curRow), QAbstractItemView::PositionAtCenter);
@@ -3136,15 +3351,20 @@ void AgentPanel::onSendClicked()
     if (!m_core->isConnected()) {
         // Without this guard, the message lands in the feed but the RPC is
         // dropped silently by CoreClient — the user just sees a dead chat.
+        //
         // The advice used to say "Restart Agent Kate to recover" WHILE the
         // reconnect ladder that usually succeeds seconds later was still
-        // running — telling the user to throw away a session that was about to
-        // come back (audit F50). Say what is actually happening; the ladder's
-        // own terminal state is what earns a restart.
-        emit statusMessage(QStringLiteral("Core is not connected — reconnecting"));
-        addNote(QStringLiteral("Core process is not connected — the message was not "
-                               "sent. Agent Kate is reconnecting; your text is still "
-                               "in the composer, so send it again in a moment."),
+        // running; round 2 replaced it with an unconditional "reconnecting",
+        // which is the same falsehood mirrored — the ladder has a terminal
+        // state, and after it the banner says it gave up while this said to
+        // wait (audit F50, round 3). Ask the client which of the three states
+        // it is actually in and say that one.
+        const agentkate::LinkState link =
+            m_core->reconnectGaveUp()  ? agentkate::LinkState::GaveUp
+            : m_core->isReconnecting() ? agentkate::LinkState::Reconnecting
+                                       : agentkate::LinkState::NeverConnected;
+        emit statusMessage(agentkate::disconnectedSendStatus(link));
+        addNote(agentkate::disconnectedSendNote(link).toHtmlEscaped(),
                 QStringLiteral("err"));
         return;
     }
@@ -4540,7 +4760,10 @@ void AgentPanel::onStopClicked()
                      }
                      // Archived on the core — drop the panel and roster entry. We
                      // clear m_threadId first so ~AgentPanel doesn't re-issue a
-                     // stop against the now-unknown thread.
+                     // stop against the now-unknown thread — which is also why
+                     // the usage-limit claim has to be withdrawn HERE: after
+                     // the clear the destructor's forget() has no id to use.
+                     self->clearRateLimitClaim();
                      self->m_threadId.clear();
                      Q_EMIT self->closeRequested();
                  },
@@ -4603,11 +4826,18 @@ void AgentPanel::onChangesClicked()
                          // sentence stays true either way, because a file
                          // written outside the project or into a git-ignored
                          // path is invisible to any diff we can compute.
-                         emit statusMessage(
-                             i18n("Nothing to show for %1 — its diff came back empty. "
-                                  "Files written outside the project, or into paths "
-                                  "git ignores, never appear here.",
-                                  tid));
+                         //
+                         // Said in TWO places, and about "this agent" rather
+                         // than a thread UUID the human never chose and cannot
+                         // match to a row: the status bar clears itself, and the
+                         // whole complaint behind F41 is a user who could not
+                         // find out where their code went. The feed keeps it.
+                         const QString why =
+                             i18n("Nothing to show — this agent's diff came back "
+                                  "empty. Files written outside the project, or into "
+                                  "paths git ignores, never appear here.");
+                         emit statusMessage(why);
+                         addNote(why.toHtmlEscaped(), QStringLiteral("dim"));
                          return;
                      }
                      emit openDiff(tid + QStringLiteral(" — changes.diff"), diff);
@@ -5269,9 +5499,21 @@ void AgentPanel::applyRateLimit(const QJsonObject &info)
             when = QDateTime::fromString(resets.toString(), Qt::ISODate);
         }
     }
+    m_rateLimitResetsAt = when;
     m_rateLimitResets = when.isValid()
         ? QLocale().toString(when.toLocalTime().time(), QLocale::ShortFormat)
         : QString();
+
+    // Hoist it out of this widget (audit F43). Until now this state fed the
+    // header chip and nothing else, so a parked agent kept showing the roster's
+    // green "Working" arc and the only way to learn otherwise was to open it.
+    // The shared state is also plan 28 §Phase 2's input — it wants the
+    // timestamp, which is why the QDateTime and not the formatted string goes.
+    if (!m_threadId.isEmpty()) {
+        agentkate::RateLimitState::self()->report(
+            m_threadId, agentkate::RateLimitReport{status, m_rateLimitType, when,
+                                                   m_rateLimitOverage});
+    }
 
     if (!previous.isEmpty() && previous != status) {
         const bool ok = status == QLatin1String("allowed");
@@ -5282,6 +5524,22 @@ void AgentPanel::applyRateLimit(const QJsonObject &info)
                           .toHtmlEscaped(),
                 ok ? QStringLiteral("ok") : QStringLiteral("err"));
     }
+    refresh();
+}
+
+void AgentPanel::clearRateLimitClaim()
+{
+    if (!m_threadId.isEmpty()) {
+        agentkate::RateLimitState::self()->forget(m_threadId);
+    }
+    if (m_rateLimitStatus.isEmpty()) {
+        return; // nothing claimed; don't repaint the header for nothing
+    }
+    m_rateLimitStatus.clear();
+    m_rateLimitType.clear();
+    m_rateLimitResets.clear();
+    m_rateLimitResetsAt = QDateTime();
+    m_rateLimitOverage = false;
     refresh();
 }
 
@@ -6311,6 +6569,10 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             // The turn died without a `result`: settle whatever streamed and
             // drop the state, so a later start doesn't claim these rows.
             resetStreamState();
+            // Including the usage-limit claim: a dead turn is not waiting on a
+            // quota window, and m_threadId is about to be cleared, after which
+            // nothing could withdraw it (audit F43).
+            clearRateLimitClaim();
             m_idle = false;
             m_promoting = false;
             m_errored = true; // roster card shows Error until the next send/resume
@@ -6356,6 +6618,12 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             // and no authoritative `assistant` will arrive, so settle the
             // partial rows here rather than leaving them raw and claimable.
             resetStreamState();
+            // A stopped or interrupted agent is not parked on a usage window —
+            // it is not running at all. Its last rate_limit_event would
+            // otherwise keep the roster's "N agents paused" strip up until the
+            // panel was closed (audit F43); a resume re-reports on its first
+            // turn.
+            clearRateLimitClaim();
             // The session stopped before the queued follow-ups could fire (and,
             // if it died before it ever started, before the opening prompt did
             // either). Don't discard the human's text — put it back in the

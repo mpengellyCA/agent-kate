@@ -2,8 +2,11 @@
 // SPDX-FileCopyrightText: 2026 The Agent Kate developers
 
 #include "EnsembleDialog.h"
+// For IsolationCopy — the shared isolation wording (see NewAgentDialog.h).
+#include "NewAgentDialog.h"
 #include "ProviderConfig.h"
 #include "ipc/CoreClient.h"
+#include "state/EngineAvailability.h"
 #include "state/HarnessTraits.h"
 
 #include <KLocalizedString>
@@ -26,13 +29,19 @@
 #include <QVBoxLayout>
 
 namespace {
-// Isolation is the same three-value vocabulary agent.start takes; the labels
-// are the ones the New Agent dialog already uses in plain language.
+// Isolation is the same three-value vocabulary agent.start takes, and the
+// labels are IsolationCopy's rather than this file's (audit F30/F49). They used
+// to be local, and local is how "auto" ended up called "Private copy
+// (recommended)" here long after the guided dialog had stopped promising a copy
+// it may not get: on a project with no commit to branch from, "auto" hands the
+// agent the user's own files. One namespace, one wording, or this drifts again.
 void fillIsolation(QComboBox *combo)
 {
-    combo->addItem(i18n("Private copy (recommended)"), QStringLiteral("auto"));
-    combo->addItem(i18n("Always a private copy"), QStringLiteral("isolated"));
-    combo->addItem(i18n("Directly in the workspace"), QStringLiteral("workspace"));
+    for (const char *mode : {"auto", "isolated", "workspace"}) {
+        const QString id = QString::fromLatin1(mode);
+        combo->addItem(IsolationCopy::modeLabel(id), id);
+    }
+    combo->setToolTip(IsolationCopy::modeTooltip());
 }
 
 void selectData(QComboBox *combo, const QString &data)
@@ -195,12 +204,23 @@ EnsembleDialog::EnsembleDialog(CoreClient *core, QWidget *parent)
     resize(880, 620);
 }
 
+// fillBackends lists every engine, annotating the ones whose CLI is not
+// installed with EngineAvailability's own suffix (audit F37) — the same string
+// the panel's combo and the roster's quick menu show.
+//
+// ANNOTATED, NOT DISABLED, and unlike the two launchers that is deliberate.
+// This is an editor: an ensemble is a recipe, saved now and run later, possibly
+// on another machine or after installing the engine, so refusing to author one
+// for an engine this box happens to lack would be refusing a legitimate edit.
+// The gate lives where the crew is actually started — the roster's quick menu
+// already disables an ensemble whose CONTROLLER engine is missing.
 void EnsembleDialog::fillBackends(QComboBox *backends, const QString &keep)
 {
     QSignalBlocker block(backends);
     backends->clear();
     for (const HarnessTraits &t : HarnessRegistry::self()->all()) {
-        backends->addItem(t.displayName, t.id);
+        backends->addItem(EngineAvailability::pickerLabel(t.id, t.displayName),
+                          t.id);
     }
     selectData(backends, keep);
 }
