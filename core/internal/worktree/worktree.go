@@ -405,8 +405,17 @@ func Land(wt Worktree) (string, error) {
 // must have no uncommitted tracked changes in either case.
 func LandWithOptions(wt Worktree, keepConflicts bool) (LandResult, error) {
 	res := LandResult{Branch: wt.Branch}
+	// The isolation gate, not just a branch-name check. A NON-isolated record
+	// still carries a branch — the workspace's own ("main", say) — and git.land
+	// reaches this from a UI whose enablement is computed from a snapshot that
+	// reports a path for every thread, isolated or not (the same asymmetry that
+	// made "Discard changes" a data-loss bug, audit F29). Landing such a thread
+	// would ask git to merge the workspace's current branch into itself; refuse
+	// it here so the refusal does not depend on a button being greyed out.
 	if !wt.Isolated || wt.Branch == "" {
-		return res, fmt.Errorf("this agent is not running on its own branch")
+		return res, fmt.Errorf(
+			"this agent works directly in your files rather than on a branch of " +
+				"its own, so there is nothing to merge")
 	}
 	ahead, err := git(wt.RepoRoot, "rev-list", "--count", wt.Base+".."+wt.Branch)
 	if err != nil {
@@ -575,8 +584,12 @@ func OpenPR(wt Worktree, title string) (string, error) {
 // UI's "Open PR" can short-circuit straight from a button without showing the
 // dialog when the user wants the quick path.
 func OpenPRWithOptions(wt Worktree, opts PROptions) (string, error) {
+	// Same gate, same words as LandWithOptions: a non-isolated thread has no
+	// branch of its own to push, whatever branch name its record carries.
 	if !wt.Isolated {
-		return "", fmt.Errorf("this agent is not running on its own branch")
+		return "", fmt.Errorf(
+			"this agent works directly in your files rather than on a branch of " +
+				"its own, so there is nothing to open a pull request from")
 	}
 	if _, err := exec.LookPath("gh"); err != nil {
 		return "", fmt.Errorf("the GitHub CLI (gh) is not installed")

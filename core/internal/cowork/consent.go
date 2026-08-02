@@ -701,6 +701,39 @@ func (a *Authority) SelfWindowRects(wins []WindowRect) []WindowRect {
 	return out
 }
 
+// SelfRectsIntersecting returns the Agent-Kate-owned rectangles in wins that overlap the
+// requested rectangle r (same identity evidence and same half-open convention as
+// SelfWindowRects / IsSelfPoint).
+//
+// SECURITY (audit F35, round 4): this is the ENFORCEABLE half of the capture guard that
+// SelfWindowRects is not. The window refusal covers a capture that names one of our
+// windows; the full-frame case cannot be refused and waits on a blackout that does not
+// exist yet. A capture whose frame is a NAMED RECTANGLE sits between the two and had
+// neither: cowork.Target{Kind: "region"} is handed to KWin's CaptureArea verbatim, so an
+// agent that cannot name our window can still draw a box around it and get the same
+// pixel-exact picture of the consent dialog, the policy switches and the kill switch that
+// the F25/F26 pointer attacks need. Unlike a full frame this needs no redaction: the rect
+// is known before the shutter, so an overlap is simply refused.
+//
+// A non-positive r cannot be verified against anything, so it reports EVERY self window
+// and the caller fails closed — an empty region silently becomes a whole-screen grab
+// further down the pipeline (CoworkPortal::kwinCaptureCall falls back to
+// CaptureActiveScreen), which is the one shape that must never pass as "a small region".
+func (a *Authority) SelfRectsIntersecting(r Rect, wins []WindowRect) []WindowRect {
+	self := a.SelfWindowRects(wins)
+	if r.W <= 0 || r.H <= 0 {
+		return self
+	}
+	var out []WindowRect
+	for _, w := range self {
+		// Half-open [X, X+W) x [Y, Y+H): touching edges do not overlap.
+		if r.X < w.X+w.W && w.X < r.X+r.W && r.Y < w.Y+w.H && w.Y < r.Y+r.H {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
 // --- Pull surfaces ---------------------------------------------------------------
 
 func (a *Authority) ListGrants(threadID string) ([]*Grant, bool) {

@@ -112,6 +112,15 @@ type Target struct {
 	VDesktopID    string     `json:"vdesktopId,omitempty"`
 	SandboxID     string     `json:"sandboxId,omitempty"`
 	Label         string     `json:"label,omitempty"`
+
+	// IncludesAgentKate is set by the CORE — never read from what the agent sent — on a
+	// whole-frame capture whose pixels will contain one of Agent Kate's own windows, so
+	// the consent dialog can tell the human exactly that (audit F35, round 4). The
+	// blackout SelfWindowRects exists for is not implemented in the capture pipeline, and
+	// an unenforceable refusal would be worse than the gap: what is owed to the human is
+	// an honest sentence, not a safety property that is not there. It plays no part in
+	// grant matching (targetCovers), so it cannot fragment a session grant.
+	IncludesAgentKate bool `json:"includesAgentKate,omitempty"`
 }
 
 // Grant is a recorded user consent. GrantedBy is always "user" and is re-derived

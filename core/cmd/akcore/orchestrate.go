@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -175,6 +176,11 @@ var orchActionGloss = map[string]string{
 	"wait_agent":    "wait for it, and READ its reply",
 	"close_agent":   "stop it and archive it",
 	"discard_agent": "delete it, worktree and all",
+	// enable_cowork reaches this table through cowork.requestEnable, which
+	// gates a cross-subtree ask like any other verb. Its name says nothing
+	// about the desktop, and what it widens is the one authority that leaves
+	// the workspace entirely.
+	"enable_cowork": "let it see and control your desktop",
 }
 
 func actionGloss(action string) string {
@@ -212,6 +218,76 @@ func compositeApprovalTool(action string, alsoGrant []string) string {
 	return strings.Join(names, " + ") + " (one approval, several actions)"
 }
 
+// humanDuration renders a window for the sentence a human reads at a decision
+// point. It exists because the obvious spelling LIES.
+//
+// standingGrantClause used to say strconv.Itoa(int(orchGrantTTL.Minutes())),
+// which TRUNCATES: shorten the window to 45 seconds — the direction a security
+// review would push it — and the approval dialog reads "stay allowed for 0 min",
+// i.e. "this expires immediately", for a grant that in fact stands for the next
+// three quarters of a minute and slides on every use. This is the one place in
+// the product where a wrong number directly misinforms a security decision, and
+// the failure mode is silent: the constant changes, the sentence keeps
+// compiling, and the human reads a number nobody chose.
+//
+// So it is honest for EVERY value the constant can take, not just round
+// minutes, and it never rounds a non-zero window down to zero of anything.
+func humanDuration(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	switch {
+	case d < time.Second:
+		// Sub-second is not a plausible grant window, but "0 sec" would be the
+		// same lie in a smaller unit, so it says what it is.
+		return strconv.FormatInt(d.Milliseconds(), 10) + " ms"
+	case d < time.Minute:
+		return strconv.FormatInt(int64(d.Seconds()), 10) + " sec"
+	case d < time.Hour:
+		out := strconv.FormatInt(int64(d.Minutes()), 10) + " min"
+		if sec := int64(d.Seconds()) % 60; sec != 0 {
+			out += " " + strconv.FormatInt(sec, 10) + " sec"
+		}
+		return out
+	default:
+		out := strconv.FormatInt(int64(d.Hours()), 10) + " h"
+		if min := int64(d.Minutes()) % 60; min != 0 {
+			out += " " + strconv.FormatInt(min, 10) + " min"
+		}
+		return out
+	}
+}
+
+// standingGrantClause says the thing the recorded authority does and the
+// displayed authority used to leave out (audit F35 pass 5).
+//
+// Approving does not authorise ONE exchange. authorizeAgentTarget writes a
+// grant per (caller, target, action) with a TTL, `has` SLIDES that TTL on every
+// use, and the composite writes one for each named action INDEPENDENTLY — so a
+// single click on "send and wait" also buys unlimited later `wait_agent` calls
+// on that thread, standalone, for as long as the caller keeps using them at
+// least once per window. That is the F35 read channel, re-opened by consent the
+// human did not know they were giving: they were shown a one-off exchange and
+// the ledger recorded a standing, self-renewing pair of permissions.
+//
+// The clause is derived from orchGrantTTL rather than spelling "15" out, so a
+// change to the window cannot leave the dialog quoting the old number — the
+// exact drift that turns an honest prompt into a false one. `actions` is the
+// number of grants this one click writes, because "both" is only true of two:
+// a single-action ask (enable_cowork) and a hypothetical third verb would each
+// have been described by a sentence that was wrong about its own subject.
+func standingGrantClause(actions int) string {
+	subject := "it stays"
+	switch {
+	case actions == 2:
+		subject = "both stay"
+	case actions > 2:
+		subject = "all " + strconv.Itoa(actions) + " stay"
+	}
+	return "Then " + subject + " allowed for " + humanDuration(orchGrantTTL) +
+		", renewed by use."
+}
+
 // compositeApprovalSummary is the sentence the human decides on when one call
 // asks for several actions. Built to the bar's 240-character budget rather than
 // trimmed by it (escalationSummaryLimit, authority.go), facts first:
@@ -219,7 +295,14 @@ func compositeApprovalTool(action string, alsoGrant []string) string {
 //  1. that approving covers MORE THAN ONE action, counted;
 //  2. what each of them does, in plain words, in the order they happen;
 //  3. which thread they happen to, and who is asking;
-//  4. the message body — the agent's own words, and therefore last and fitted.
+//  4. that the approval STANDS — see standingGrantClause;
+//  5. the message body — the agent's own words, and therefore last and fitted.
+//
+// 4 is unconditional and 5 is not: the message is attacker-controlled text and
+// the standing-grant clause is the scope of the authority, so when the budget
+// runs out it is the agent's prose that goes. The wording of 1-3 is kept dense
+// for exactly that reason — every character spent on phrasing is a character
+// of the agent's own words the human does not get to read.
 func compositeApprovalSummary(fromID, targetID string, actions []string, message string) string {
 	const (
 		idCap          = 40
@@ -229,11 +312,30 @@ func compositeApprovalSummary(fromID, targetID string, actions []string, message
 	for i, a := range actions {
 		glossed = append(glossed, fmt.Sprintf("(%d) %s", i+1, actionGloss(a)))
 	}
+	// The two clauses that state the AUTHORITY are budgeted first, and
+	// everything else is fitted to what they leave. Written the other way round
+	// — ids capped at idCap, scope clause appended last — a forged 40-character
+	// fromThreadId, or a fifth cooperation verb, pushed the standing-grant
+	// sentence onto the wrong side of the final clipTo and the human was back to
+	// reading a one-off exchange. The facts must not be losable by an input the
+	// asker chooses.
+	const idFrame = len("Thread , outside 's own workers.")
+	standing := standingGrantClause(len(actions))
+	lead := clipTo(fmt.Sprintf("Approve = %d actions, not 1: %s.",
+		len(actions), strings.Join(glossed, "; ")),
+		escalationSummaryLimit-len(standing)-idFrame-2*8-2)
+	idRoom := (escalationSummaryLimit - len(lead) - len(standing) - idFrame - 2) / 2
+	if idRoom > idCap {
+		idRoom = idCap
+	}
+	if idRoom < 8 {
+		idRoom = 8
+	}
 	parts := []string{
-		fmt.Sprintf("Approve = %d actions on one thread, not 1: %s.",
-			len(actions), strings.Join(glossed, "; ")),
-		"Thread " + clipTo(targetID, idCap) + ", which is outside " +
-			clipTo(fromID, idCap) + "'s own workers.",
+		lead,
+		"Thread " + clipTo(targetID, idRoom) + ", outside " +
+			clipTo(fromID, idRoom) + "'s own workers.",
+		standing,
 	}
 	used := len(strings.Join(parts, " "))
 	if msg := strings.TrimSpace(message); msg != "" {
@@ -246,6 +348,75 @@ func compositeApprovalSummary(fromID, targetID string, actions []string, message
 	// does not read: with more actions than today's two the lead alone could
 	// outgrow the budget, and the cut has to land on the agent's text, which is
 	// last, rather than wherever 240 characters happens to fall.
+	return clipTo(strings.Join(parts, " "), escalationSummaryLimit)
+}
+
+// uiDigestedVerbs are the cooperation verbs ui/src/AgentChatHelpers.cpp's
+// mcpSummary has a branch for. For those, "mcp__cooperation__<verb>" IS the
+// human-readable prompt: the bar prints the target (and, for a send, the
+// message) from the payload's own fields.
+//
+// A verb that is NOT in here renders through permSummary's last resort, which
+// dumps the whole input object as compact JSON into a 240-character bar — so
+// the human deciding whether to widen an authority reads
+// `{"grantRenewedByUse":true,"grantTtlMinutes":15,"grantedActions":["enab…`
+// and never reaches the facts. enable_cowork, the ask that hands an agent the
+// screen, keyboard and pointer, was exactly that case: no branch, no sentence,
+// and the structured grant-scope fields added in pass 5 spending the budget
+// that the facts needed.
+//
+// Keeping the list here rather than "everything has a description" is
+// deliberate: a description on a digested verb is dead weight the digest never
+// shows, and TestUndigestedVerbsCarryASentence pins the two halves against each
+// other. Update it when the C++ grows or loses a branch.
+var uiDigestedVerbs = map[string]bool{
+	"send_agent":    true,
+	"wait_agent":    true,
+	"close_agent":   true,
+	"discard_agent": true,
+}
+
+// singleActionApprovalSummary is compositeApprovalSummary's counterpart for the
+// one-action asks the UI has no digest for.
+//
+// It reaches the human the same way the composite does — permSummary's generic
+// key scan, which reads file_path, path, pattern and THEN description — so the
+// same constraint applies: a detail key called file_path, path or pattern would
+// be printed in place of this sentence. TestUndigestedVerbsCarryASentence pins
+// that none of the three is in the payload.
+//
+// Same budget discipline as the composite, same order:
+// what it does, to whom, on whose behalf, that the approval STANDS — and the
+// agent's own words (its stated reason) last, because they are the part an
+// attacker chooses and therefore the part that may be cut.
+func singleActionApprovalSummary(fromID, targetID, action, reason string) string {
+	const (
+		idCap         = 40
+		reasonReserve = 24
+	)
+	standing := standingGrantClause(1)
+	const idFrame = len("Approve =  on thread , outside 's own workers.")
+	lead := clipTo("Approve = "+actionGloss(action), escalationSummaryLimit-
+		len(standing)-idFrame-2*8-2)
+	idRoom := (escalationSummaryLimit - len(lead) - len(standing) - idFrame - 2) / 2
+	if idRoom > idCap {
+		idRoom = idCap
+	}
+	if idRoom < 8 {
+		idRoom = 8
+	}
+	parts := []string{
+		lead + " on thread " + clipTo(targetID, idRoom) + ", outside " +
+			clipTo(fromID, idRoom) + "'s own workers.",
+		standing,
+	}
+	used := len(strings.Join(parts, " "))
+	if why := strings.TrimSpace(reason); why != "" {
+		room := escalationSummaryLimit - used - len(" Its reason: ")
+		if room >= reasonReserve {
+			parts = append(parts, "Its reason: "+clipTo(why, room))
+		}
+	}
 	return clipTo(strings.Join(parts, " "), escalationSummaryLimit)
 }
 
@@ -291,7 +462,24 @@ func (d handlerDeps) authorizeAgentTarget(fromID, targetID, action string,
 	if covered {
 		return nil
 	}
-	input := map[string]any{"targetThreadId": targetID}
+	// The scope of what is being RECORDED, as structured fields, on every ask —
+	// composite or not (audit F35 pass 5). The composite states it in words too
+	// (compositeApprovalSummary), because a composite is rendered by the generic
+	// summariser and there is room for a sentence. A single-action ask keeps the
+	// digested `mcp__cooperation__<verb>` name, whose UI branch prints the target
+	// and the message and nothing else, so for those these fields are the only
+	// place the standing grant exists at all — a KNOWN gap on the display side,
+	// not a closed one: a bare send_agent still LOOKS one-off.
+	//
+	// grantTtlMinutes is NOT int(Minutes()): the truncation that made
+	// standingGrantClause say "0 min" for a 45-second window said "0" here too,
+	// and a surface reading the field would have rendered the same falsehood.
+	input := map[string]any{
+		"targetThreadId":    targetID,
+		"grantTtlMinutes":   orchGrantTTL.Minutes(),
+		"grantRenewedByUse": true,
+		"grantedActions":    append([]string{action}, alsoGrant...),
+	}
 	for k, v := range detail {
 		input[k] = v
 	}
@@ -302,13 +490,23 @@ func (d handlerDeps) authorizeAgentTarget(fromID, targetID, action string,
 	// the target (and, for a send, the message) is the summary. A composite has
 	// nowhere in that digest for its second action to appear, so it moves to the
 	// generic renderer with a sentence we build (audit F35 pass 4).
+	//
+	// ...and a verb the UI does not digest AT ALL has the same problem in a
+	// worse form: no branch means the bar prints this payload as raw JSON, so
+	// the grant-scope fields above are spending a budget the facts needed and
+	// the human reads brace-and-quote soup instead of "let it see and control
+	// your desktop". Those get a written sentence too (uiDigestedVerbs).
 	promptTool := "mcp__cooperation__" + action
-	if len(alsoGrant) > 0 {
+	switch {
+	case len(alsoGrant) > 0:
 		input["alsoPerforms"] = alsoGrant
 		msg, _ := detail["message"].(string)
 		input["description"] = compositeApprovalSummary(fromID, targetID,
 			append([]string{action}, alsoGrant...), msg)
 		promptTool = compositeApprovalTool(action, alsoGrant)
+	case !uiDigestedVerbs[action]:
+		why, _ := detail["reason"].(string)
+		input["description"] = singleActionApprovalSummary(fromID, targetID, action, why)
 	}
 	rawInput, _ := json.Marshal(input)
 	dec, ok := askHumanPermission(d.srv, d.broker, fromID, promptTool, rawInput)

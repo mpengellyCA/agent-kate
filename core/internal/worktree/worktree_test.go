@@ -463,11 +463,105 @@ func TestLandNoCommits(t *testing.T) {
 	}
 }
 
-func TestLandNonIsolated(t *testing.T) {
+// TestLandNonIsolatedWithABranchIsRefused is the isolation gate's pin, with the
+// escape hatch closed.
+//
+// It replaces a TestLandNonIsolated that sat here until the convergence round
+// of 2026-08-01 and proved nothing: it built its thread with
+// Create(ModeWorkspace), which leaves Branch and Base empty, so with the
+// isolation gate deleted the `rev-list Base..Branch` step errored out anyway
+// and the refusal it asserted was git's, not the gate's. Two tests, one gate,
+// and only one of them could fail — which reads to the next person as double
+// coverage. Deleted rather than repaired: repairing it produces this test.
+//
+// The record that actually matters is a WORKSPACE thread that does carry a
+// branch and a base — which is what the session layer hands to git.land for a
+// thread that degraded into the user's checkout (audit F29's asymmetry in its
+// merge form; the UI's own guard is WorktreeReviewCopy::canLand). Without the
+// isolation gate this merges a real branch into the user's real checkout.
+func TestLandNonIsolatedWithABranchIsRefused(t *testing.T) {
 	repo := initRepo(t)
-	wt, _ := Create(repo, "t-ws", ModeWorkspace)
-	if _, err := Land(wt); err == nil {
-		t.Fatal("Land should fail for a non-isolated thread")
+	base := strings.TrimSpace(mustGit(t, repo, "rev-parse", "HEAD"))
+
+	// A branch with a commit on it, exactly as an isolated thread would have.
+	run(t, repo, "git", "checkout", "-q", "-b", "agent-work")
+	if err := os.WriteFile(filepath.Join(repo, "b.txt"), []byte("agent\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, repo, "git", "add", ".")
+	run(t, repo, "git", "commit", "-q", "-m", "agent work")
+	run(t, repo, "git", "checkout", "-q", "-")
+	headBefore := strings.TrimSpace(mustGit(t, repo, "rev-parse", "HEAD"))
+
+	wt := Worktree{
+		ThreadID: "t-ws",
+		RepoRoot: repo,
+		Path:     repo, // the user's own checkout
+		Branch:   "agent-work",
+		Base:     base,
+		Isolated: false,
+	}
+	if _, err := LandWithOptions(wt, false); err == nil {
+		t.Fatal("Land must refuse a thread that is not isolated, branch or no branch")
+	}
+	if head := strings.TrimSpace(mustGit(t, repo, "rev-parse", "HEAD")); head != headBefore {
+		t.Fatalf("the workspace was merged into anyway: HEAD %s -> %s", headBefore, head)
+	}
+}
+
+// TestOpenPRNonIsolated is the same gate on the other destructive-to-the-user
+// verb, and until this round it was held up by nothing but code inspection.
+//
+// OpenPRWithOptions refuses a non-isolated thread first, before it looks for
+// gh or for an origin remote — and that ORDER is the whole of the protection.
+// A non-isolated thread's "branch" is the user's own current branch, so without
+// the gate the first thing that happens is `git push -u origin <the user's
+// branch>` from the user's real checkout: their work-in-progress published to
+// the remote by an agent asking for a review.
+//
+// So the test gives the repo everything the gate stands in front of — a real
+// origin, a real branch with a real commit — and asserts two things a deleted
+// gate cannot satisfy: the refusal is the ISOLATION one (with gh installed, a
+// gateless run gets as far as a different error, or none), and origin received
+// nothing.
+func TestOpenPRNonIsolated(t *testing.T) {
+	repo := initRepo(t)
+	base := strings.TrimSpace(mustGit(t, repo, "rev-parse", "HEAD"))
+
+	// A real remote, so "no 'origin' git remote is configured" cannot be the
+	// reason this passes.
+	origin := t.TempDir()
+	run(t, origin, "git", "init", "-q", "--bare")
+	run(t, repo, "git", "remote", "add", "origin", origin)
+
+	// A branch with a commit on it, exactly as an isolated thread would have.
+	run(t, repo, "git", "checkout", "-q", "-b", "agent-work")
+	if err := os.WriteFile(filepath.Join(repo, "b.txt"), []byte("agent\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, repo, "git", "add", ".")
+	run(t, repo, "git", "commit", "-q", "-m", "agent work")
+	run(t, repo, "git", "checkout", "-q", "-")
+
+	wt := Worktree{
+		ThreadID: "t-ws",
+		RepoRoot: repo,
+		Path:     repo, // the user's own checkout
+		Branch:   "agent-work",
+		Base:     base,
+		Isolated: false,
+	}
+	_, err := OpenPR(wt, "please review")
+	if err == nil {
+		t.Fatal("OpenPR must refuse a thread that is not isolated")
+	}
+	if !strings.Contains(err.Error(), "nothing to open a pull request from") {
+		t.Errorf("the refusal is not the isolation gate's: %v\n"+
+			"(a refusal that happens to come from a missing gh, or a missing "+
+			"remote, would pass on this machine and fail on the user's)", err)
+	}
+	if refs := strings.TrimSpace(mustGit(t, origin, "for-each-ref", "--format=%(refname)")); refs != "" {
+		t.Fatalf("the branch was pushed to origin anyway: %q", refs)
 	}
 }
 

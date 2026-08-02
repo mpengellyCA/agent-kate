@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1099,6 +1100,38 @@ func TestCompositeApprovalPromptNamesBothActions(t *testing.T) {
 			t.Errorf("the bar never says %q.\nrendered: %s", want, rendered)
 		}
 	}
+
+	// THE PASS-5 RESIDUE: the approval is not one-off, and the bar has to say
+	// so. authorizeAgentTarget writes a grant per action with orchGrantTTL, and
+	// orchGrants.has SLIDES that TTL on every use — so this one click also buys
+	// unlimited later send_agent AND standalone wait_agent calls on t-x for as
+	// long as the caller keeps using them. Pass 4 displayed the two actions and
+	// still described a single exchange; the recorded authority stayed wider
+	// than the displayed one, which is the defect this whole item is about.
+	//
+	// The window is asserted against orchGrantTTL, not against the string "15",
+	// so shortening or lengthening it cannot leave the dialog quoting a number
+	// that is no longer true.
+	wantWindow := strconv.Itoa(int(orchGrantTTL.Minutes())) + " min"
+	if !strings.Contains(rendered, wantWindow) {
+		t.Errorf("the bar never tells the human the approval STANDS for %s — it "+
+			"reads as one exchange while the ledger records a renewable pair of "+
+			"permissions.\nrendered: %s", wantWindow, rendered)
+	}
+	if !strings.Contains(rendered, "renewed by use") {
+		t.Errorf("the bar states a window but not that USING the grant renews it, "+
+			"so an agent that polls every %s keeps it open for ever on one "+
+			"click.\nrendered: %s", wantWindow, rendered)
+	}
+	// The same fact, structured, for any surface that reads fields rather than
+	// prose — and on the single-action asks too, which have nowhere to put a
+	// sentence (see the plain-send contrast at the end of this test).
+	if got := ask.input["grantTtlMinutes"]; got != float64(orchGrantTTL.Minutes()) {
+		t.Errorf("grantTtlMinutes = %v, want %v", got, orchGrantTTL.Minutes())
+	}
+	if ask.input["grantRenewedByUse"] != true {
+		t.Errorf("grantRenewedByUse = %v, want true", ask.input["grantRenewedByUse"])
+	}
 	// ...and it fits, so nothing was elided off the end of the dialog.
 	summary := strings.TrimPrefix(renderedBar(ask.tool, ask.input),
 		"Allow the agent to use "+ask.tool+"? ")
@@ -1145,6 +1178,14 @@ func TestCompositeApprovalPromptNamesBothActions(t *testing.T) {
 	if got := sendAgentDigest(plain.input); got != "t-y: fyi" {
 		t.Errorf("the plain send digests to %q, want the target and the message", got)
 	}
+	// ...but it carries the scope in its payload all the same. The digest has
+	// nowhere to render it, so a bare send_agent still LOOKS one-off to the
+	// human — a known, recorded gap on the display side (it needs the UI's
+	// send_agent branch to grow a clause, which is not this file's to change).
+	// The payload is what a future surface will read, and it is honest now.
+	if plain.input["grantRenewedByUse"] != true {
+		t.Error("a single-action ask does not carry the standing-grant fact at all")
+	}
 }
 
 // TestCompositeApprovalSummaryFitsTheBar: the message body is the agent's own
@@ -1158,11 +1199,29 @@ func TestCompositeApprovalSummaryFitsTheBar(t *testing.T) {
 	if n := len([]rune(got)); n > escalationSummaryLimit {
 		t.Errorf("summary is %d characters, over the bar's budget:\n%s", n, got)
 	}
-	// The facts survive the squeeze; only the agent's own text is cut.
-	for _, want := range []string{"2 actions", "send it a message", "READ its reply"} {
+	// The facts survive the squeeze; only the agent's own text is cut. The
+	// standing-grant clause is one of those facts (audit F35 pass 5): it states
+	// the SCOPE of what is granted, so an asker with a 400-character thread id
+	// must not be able to push it off the end of the dialog and leave the human
+	// reading a one-off exchange. Every input here is attacker-chosen.
+	for _, want := range []string{"2 actions", "send it a message", "READ its reply",
+		strconv.Itoa(int(orchGrantTTL.Minutes())) + " min", "renewed by use"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("the budget ate %q:\n%s", want, got)
 		}
+	}
+	// ...and it still holds when the ACTION list grows, which is the other way
+	// the lead can crowd the budget out.
+	many := compositeApprovalSummary(strings.Repeat("from", 100),
+		strings.Repeat("target", 100),
+		[]string{"send_agent", "wait_agent", "close_agent", "discard_agent"},
+		strings.Repeat("filler ", 500))
+	if n := len([]rune(many)); n > escalationSummaryLimit {
+		t.Errorf("four-action summary is %d characters:\n%s", n, many)
+	}
+	if !strings.Contains(many, "renewed by use") {
+		t.Errorf("a longer action list pushed the standing-grant clause off the "+
+			"end:\n%s", many)
 	}
 	// An unglossed verb is NAMED, never described with an invented meaning —
 	// the failure mode this whole round is about.

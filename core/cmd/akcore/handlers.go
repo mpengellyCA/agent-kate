@@ -353,7 +353,17 @@ func registerHandlers(d handlerDeps) {
 	// (model / thinking / mode enumerations, with display names) WITHOUT
 	// starting a thread, so the UI can offer real pickers before the first
 	// agent ever runs. Static-vocabulary harnesses return an empty list.
-	d.srv.Handle("agent.discoverOptions", func(_ context.Context, raw json.RawMessage) (any, error) {
+	//
+	// UI-only (audit F36 pass 5). "Metadata" undersold it: the caller-supplied
+	// `backend` picks which CLI is SPAWNED — kimi's discovery is a real `kimi
+	// acp` handshake — so an agent bridge could drive process launches at will.
+	// The authority gate's own read of the same vocabulary
+	// (engineDefaultPermissionMode, authority.go) calls the harness in-process
+	// and does not come through here, so this gate cannot starve it.
+	d.srv.Handle("agent.discoverOptions", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			Backend string `json:"backend"`
 		}
@@ -381,7 +391,23 @@ func registerHandlers(d handlerDeps) {
 	// effort tiers); a routed provider from its /v1/models. It is best-effort:
 	// harnesses that don't implement discovery, or a probe that fails, return an
 	// empty list so the UI keeps its last cached catalogue.
-	d.srv.Handle("agent.discoverModels", func(_ context.Context, raw json.RawMessage) (any, error) {
+	//
+	// UI-only (audit F36 pass 5 — the MOVED half of F34/F36). This is the
+	// handler with the widest caller-supplied reach in the file, and it was the
+	// last one classified as harmless "engine metadata": the Provider it accepts
+	// carries a BaseURL and an EnvVar, and harness_claude.go's DiscoverModels
+	// resolves the EnvVar out of AKCORE'S OWN ENVIRONMENT and sends it as the
+	// bearer token to that BaseURL. An agent bridge could therefore name
+	// ANTHROPIC_API_KEY (or any other variable in the daemon's environment) and
+	// a URL it controls, and have the core post the human's credential to it —
+	// in-band, with no human in the chain, from the one handler nobody thought
+	// needed a gate. Unrouted, it still spawns `claude -p /model`. Only the UI
+	// may supply a Provider, and the UI is the only caller there has ever been
+	// (ui/src/state/HarnessTraits.cpp).
+	d.srv.Handle("agent.discoverModels", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			Backend  string          `json:"backend"`
 			Provider *agent.Provider `json:"provider"`
@@ -1157,8 +1183,10 @@ func registerHandlers(d handlerDeps) {
 		return map[string]any{"url": url}, nil
 	})
 
-	// agent.land merges a thread's branch into the workspace's main branch — a
-	// local integration, separate from agent.openPR which targets GitHub.
+	// agent.land merges a thread's branch into whatever branch the workspace is
+	// checked out on right now (`git branch --show-current`) — NOT necessarily
+	// "main". A local integration, separate from agent.openPR which targets
+	// GitHub. The UI's land label says the same thing (WorktreeReviewCopy.h).
 	d.srv.Handle("agent.land", func(ctx context.Context, raw json.RawMessage) (any, error) {
 		if err := requireUIWindow(d.srv, ctx); err != nil {
 			return nil, err
@@ -1973,7 +2001,16 @@ func registerHandlers(d handlerDeps) {
 		return map[string]any{"ok": true}, nil
 	})
 
+	// UI-only (audit F36 pass 5). "Installed extension ids" was an honest
+	// description of the list and a misleading one of the CALL: every
+	// invocation fans out one marketplace request per installed extension, so a
+	// bridge that could reach it held a parameterless outbound amplifier — and
+	// nothing on the agent side has ever wanted the human's extension
+	// inventory (the only caller is ui/src/ExtensionsDialog.cpp).
 	d.srv.Handle("vsix.list", func(ctx context.Context, _ json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		exts, err := d.extensions.List()
 		if err != nil {
 			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
@@ -2026,7 +2063,15 @@ func registerHandlers(d handlerDeps) {
 	// best effort — a failure returns an error the UI surfaces inline rather
 	// than blocking the dialog. Hits already installed are tagged like the
 	// curated catalog so the UI can disable their Install button.
+	//
+	// UI-only (audit F36 pass 5): "no local state" was true and beside the
+	// point — the caller-supplied query is put on the wire, so an agent bridge
+	// held an outbound channel with attacker-chosen content. The install half
+	// was already gated; searching is the same reach with a smaller payload.
 	d.srv.Handle("vsix.search", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			Query string `json:"query"`
 		}
@@ -2099,7 +2144,16 @@ func registerHandlers(d handlerDeps) {
 
 	// skills.listInstalled enumerates target/.claude/skills, flagging the
 	// entries the catalog owns so the UI can show their install state.
-	d.srv.Handle("skills.listInstalled", func(_ context.Context, raw json.RawMessage) (any, error) {
+	//
+	// UI-only (audit F36 pass 5). `target` is a caller-supplied DIRECTORY, so
+	// "installed skill names" described the reply while hiding the parameter:
+	// an agent bridge could walk it across the filesystem and read back which
+	// paths carry a .claude/skills tree. Its three mutating siblings were gated
+	// in pass 4; the read that names the same arbitrary path was not.
+	d.srv.Handle("skills.listInstalled", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
 		var p struct {
 			Target string `json:"target"`
 		}

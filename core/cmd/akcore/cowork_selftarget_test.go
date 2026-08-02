@@ -368,6 +368,13 @@ func TestWholeFrameCaptureReportsOurRectsAndSaysSo(t *testing.T) {
 	if !strings.Contains(got.Target.Label, "Agent Kate") {
 		t.Fatalf("the human approving a screen capture must be told it includes us, got %q", got.Target.Label)
 	}
+	// …and it reaches the consent DIALOG as a fact it can render, not as a sentence the
+	// dialog would have to parse out of a noun phrase (audit F35, round 4: for a screen
+	// target ConsentDialog::targetText discarded the Label entirely, so the warning the
+	// core had computed was never shown to the human approving the grab).
+	if !got.Target.IncludesAgentKate {
+		t.Fatal("the prompt must be told, in a field it can render, that the frame includes us")
+	}
 
 	// With none of our windows on screen there is nothing to redact and nothing to warn about.
 	clean, err := resolveCaptureTarget(auth, []kde.Window{foreignWindow()}, nil,
@@ -378,7 +385,155 @@ func TestWholeFrameCaptureReportsOurRectsAndSaysSo(t *testing.T) {
 	if len(clean.RedactRects) != 0 {
 		t.Fatalf("nothing of ours is on screen, got %+v", clean.RedactRects)
 	}
-	if clean.Target.Label != "active screen" {
+	if clean.Target.IncludesAgentKate {
+		t.Fatalf("no warning should be raised when there is nothing to warn about, got %+v", clean.Target)
+	}
+	if strings.Contains(clean.Target.Label, "Agent Kate") {
 		t.Fatalf("no warning should be added when there is nothing to warn about, got %q", clean.Target.Label)
+	}
+
+	// The Label the human and the audit log see is OURS. A screen target has no live
+	// compositor description to fall back on, so the agent's own string used to be written
+	// into the record of what was approved.
+	loud, err := resolveCaptureTarget(auth, []kde.Window{foreignWindow()}, nil,
+		cowork.Target{Kind: cowork.TargetScreen, Label: "a tiny harmless corner of one window"})
+	if err != nil {
+		t.Fatalf("a clean screen capture must work: %v", err)
+	}
+	if strings.Contains(loud.Target.Label, "harmless") {
+		t.Fatalf("the agent must not write the sentence describing its own capture: %q", loud.Target.Label)
+	}
+	// And a lie in the honesty flag itself is discarded, not trusted.
+	lying, err := resolveCaptureTarget(auth, wins, nil,
+		cowork.Target{Kind: cowork.TargetWindow, WindowID: "w-firefox", IncludesAgentKate: true})
+	if err != nil {
+		t.Fatalf("capturing an ordinary window must still work: %v", err)
+	}
+	if lying.Target.IncludesAgentKate {
+		t.Fatal("the honesty flag must be derived by the core, never carried in from the request")
+	}
+}
+
+// --- F35 (round 4): a REGION capture is the shape the window refusal never saw ----------
+//
+// desktop_screenshot's `target` is unmarshalled straight into a cowork.Target, and a
+// {"kind":"region","region":{…}} one reaches KWin's CaptureArea verbatim. So an agent that
+// cannot NAME our window can draw a box around it and get the same pixel-exact picture of
+// the consent dialog, the policy switches and the kill switch — through the one read
+// capability the earlier rounds left permitted. Unlike a full frame this needs no
+// redaction: the rectangle is known before the shutter.
+func TestRegionCaptureRefusesAnyOverlapWithOurOwnWindows(t *testing.T) {
+	auth := selfAuthority(t)
+	// Our window occupies [100,100)–(500,400).
+	ak := kde.Window{InternalID: "w-ak", ResourceClass: "org.kde.agentkate", PID: 99,
+		X: 100, Y: 100, Width: 400, Height: 300}
+	akNoClass := kde.Window{InternalID: "w-ak2", ResourceClass: "", PID: 4242,
+		X: 1000, Y: 1000, Width: 200, Height: 200}
+	wins := []kde.Window{ak, akNoClass, foreignWindow()}
+
+	region := func(x, y, w, h int) cowork.Target {
+		return cowork.Target{Kind: cowork.TargetRegion, Region: &cowork.Rect{X: x, Y: y, W: w, H: h}}
+	}
+	refused := []struct {
+		name string
+		t    cowork.Target
+	}{
+		{"exactly our window", region(100, 100, 400, 300)},
+		{"a crop of our window (the button-sized grab)", region(200, 150, 60, 30)},
+		{"a box that merely clips our top-left corner", region(0, 0, 101, 101)},
+		{"a box that swallows the whole desktop", region(0, 0, 4000, 3000)},
+		{"our window found by PID alone, no class", region(1100, 1100, 20, 20)},
+	}
+	for _, c := range refused {
+		got, err := resolveCaptureTarget(auth, wins, nil, c.t)
+		if err == nil {
+			t.Fatalf("%s: this region capture must be refused, got %+v", c.name, got.Target)
+		}
+		if errors.Is(err, errNoCaptureTarget) {
+			t.Fatalf("%s: this is a refusal, not a missing-target error: %v", c.name, err)
+		}
+		if !strings.Contains(err.Error(), "Agent Kate") {
+			t.Fatalf("%s: the refusal must name the self-target case: %v", c.name, err)
+		}
+	}
+
+	// Touching edges do not overlap (half-open, as every other geometric guard here).
+	// This is the honest-user half: an ordinary crop next to our window still works.
+	for _, c := range []struct {
+		name string
+		t    cowork.Target
+	}{
+		{"flush against our left edge", region(0, 100, 100, 300)},
+		{"flush below our bottom edge", region(100, 400, 400, 300)},
+		{"nowhere near us", region(2000, 1500, 300, 200)},
+	} {
+		got, err := resolveCaptureTarget(auth, wins, nil, c.t)
+		if err != nil {
+			t.Fatalf("%s: an ordinary region capture must still work: %v", c.name, err)
+		}
+		if len(got.RedactRects) != 0 {
+			t.Fatalf("%s: a cleared region needs no redaction list, got %+v", c.name, got.RedactRects)
+		}
+		if got.Target.IncludesAgentKate {
+			t.Fatalf("%s: a cleared region does not include us", c.name)
+		}
+		// Described by us, from the numbers that will really be captured.
+		if !strings.Contains(got.Target.Label, "region") {
+			t.Fatalf("%s: the prompt must describe the rectangle, got %q", c.name, got.Target.Label)
+		}
+	}
+
+	// An empty or missing region is a CALLER MISTAKE, and must not fall through: the portal
+	// turns a zero-area region into a whole-screen grab (CaptureActiveScreen), which is not
+	// what a "region" prompt asked the human about.
+	for _, c := range []struct {
+		name string
+		t    cowork.Target
+	}{
+		{"no region at all", cowork.Target{Kind: cowork.TargetRegion}},
+		{"zero width", region(0, 0, 0, 100)},
+		{"negative height", region(0, 0, 100, -5)},
+	} {
+		_, err := resolveCaptureTarget(auth, wins, nil, c.t)
+		if err == nil {
+			t.Fatalf("%s: an unbounded region must not be captured", c.name)
+		}
+		if !errors.Is(err, errNoCaptureTarget) {
+			t.Fatalf("%s: should be reported as a bad target, got %v", c.name, err)
+		}
+	}
+
+	// A target shape that CANNOT be captured must not be silently turned into one that can.
+	// "app"/"vdesktop"/"sandbox" reach the portal as CaptureActiveScreen while the prompt
+	// says "the application 'Firefox'" — the human approves a named application and a whole
+	// screen is photographed.
+	for _, k := range []cowork.TargetKind{cowork.TargetApp, cowork.TargetVDesktop, cowork.TargetSandbox} {
+		got, err := resolveCaptureTarget(auth, wins, nil,
+			cowork.Target{Kind: k, ResourceClass: "firefox", Label: "just Firefox"})
+		if err == nil {
+			t.Fatalf("%s: a target that is not a capturable shape must be refused, got %+v", k, got.Target)
+		}
+		if !errors.Is(err, errNoCaptureTarget) {
+			t.Fatalf("%s: should be reported as a bad target, got %v", k, err)
+		}
+	}
+	// …while the shapes that ARE capturable still are.
+	for _, tgt := range []cowork.Target{
+		{Kind: cowork.TargetScreen},
+		{Kind: cowork.TargetAny},
+		{},
+	} {
+		if _, err := resolveCaptureTarget(auth, []kde.Window{foreignWindow()}, nil, tgt); err != nil {
+			t.Fatalf("%q must still capture: %v", tgt.Kind, err)
+		}
+	}
+
+	// And the fail-closed corners: no authority, or a window list we could not read, refuse
+	// a region exactly as they refuse every other capture.
+	if _, err := resolveCaptureTarget(nil, wins, nil, region(2000, 1500, 10, 10)); err == nil {
+		t.Fatal("a missing self-identity authority must refuse a region capture")
+	}
+	if _, err := resolveCaptureTarget(auth, nil, errors.New("kwin gone"), region(2000, 1500, 10, 10)); err == nil {
+		t.Fatal("an unreadable window list must refuse a region capture")
 	}
 }

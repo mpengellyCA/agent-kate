@@ -134,7 +134,7 @@ func registerCoworkHandlers(d handlerDeps) {
 		if !dec.Allow {
 			return nil, ipc.Errorf(codeCoworkDenied, dec.Reason)
 		}
-		wins, err := cw.KDE().ListWindows(8 * time.Second)
+		wins, err := coworkListWindows(cw, 8*time.Second)
 		if err != nil {
 			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
 		}
@@ -165,7 +165,7 @@ func registerCoworkHandlers(d handlerDeps) {
 		// the agent writes its ResourceClass itself, so Authorize's IsSelfTarget could be
 		// walked straight past by naming a window id with a blank or borrowed class. Here the
 		// window id is resolved against LIVE KWin data and its owner checked.
-		wins, listErr := cw.KDE().ListWindows(5 * time.Second)
+		wins, listErr := coworkListWindows(cw, 5*time.Second)
 		shot, gerr := resolveCaptureTarget(cw.Authority, wins, listErr, p.Target)
 		if gerr != nil {
 			if errors.Is(gerr, errNoCaptureTarget) {
@@ -1165,7 +1165,7 @@ func registerCoworkHandlers(d handlerDeps) {
 		}
 		// Resolve AND clear the target in one decision, BEFORE the prompt, exactly as on the
 		// R2 action path: reading our own UI is refused too (audit F50).
-		wins, listErr := cw.KDE().ListWindows(5 * time.Second)
+		wins, listErr := coworkListWindows(cw, 5*time.Second)
 		win, target, gerr := resolveA11yReadWindow(cw.Authority, wins, listErr, p.TargetWindowID)
 		if gerr != nil {
 			if errors.Is(gerr, errNoA11yTarget) {
@@ -1209,7 +1209,7 @@ func registerCoworkHandlers(d handlerDeps) {
 		// Same fused resolve+guard as listElements: the exact bounds and labels of our own
 		// consent dialog and policy toggles are the targeting data an injection attack needs
 		// (audit F50), and no legitimate agent use for reading our own UI exists.
-		wins, listErr := cw.KDE().ListWindows(5 * time.Second)
+		wins, listErr := coworkListWindows(cw, 5*time.Second)
 		win, target, gerr := resolveA11yReadWindow(cw.Authority, wins, listErr, p.TargetWindowID)
 		if gerr != nil {
 			if errors.Is(gerr, errNoA11yTarget) {
@@ -1463,11 +1463,24 @@ type captureDecision struct {
 // KWin list and cleared by the owner-and-class matrix every other guard uses
 // (guardA11yReadWindow: PID first, class second, and no evidence at all is a refusal).
 //
+// A REGION target (audit F35, round 4) is the shape between the two, and it used to have
+// neither guard: an agent that cannot name our window can still draw a box around it —
+// cowork.Target.Region reaches KWin's CaptureArea verbatim (CoworkPortal::kwinCaptureCall) —
+// and get exactly the pixel-exact picture of the consent dialog, the policy switches and the
+// kill switch the F25/F26 pointer attacks need. That one IS enforceable without any
+// redaction, because the rectangle is known before the shutter: it is intersected with our
+// live windows and refused on overlap. A region that misses us is untouched, which is the
+// ordinary use (crop a browser pane), so this costs the honest agent nothing.
+//
 // The whole-frame case (no window named — the default) is NOT closed by any refusal, and
 // this function is deliberate about that: our windows are in those pixels and the only
 // enforceable answer is to black them out where the frame exists, which is the UI's capture
 // pipeline. What is enforced here is the precondition — the rectangles are computed, and a
-// capture whose frame we cannot even enumerate is refused rather than taken blind. The
+// capture whose frame we cannot even enumerate is refused rather than taken blind — plus
+// the one thing that is owed to the human meanwhile: the decision says, in the prompt they
+// are answering, that the frame will include Agent Kate itself and that nothing in it is
+// hidden (Target.IncludesAgentKate). An unenforceable refusal here would be worse than the
+// gap, because it would certify a safety property that is not there. The
 // remaining exposure, in plain words: a full-screen screenshot still shows whatever of Agent
 // Kate is on screen. What that does NOT give an agent is a way to act on us — every click,
 // keystroke, a11y read and a11y action against our own windows is refused by identity, not
@@ -1475,6 +1488,9 @@ type captureDecision struct {
 // now, is refused by the prompt-pending rule in Authorize.
 func resolveCaptureTarget(auth *cowork.Authority, wins []kde.Window, listErr error, t cowork.Target) (captureDecision, error) {
 	out := captureDecision{Target: t}
+	// The agent unmarshals straight into this Target, so the honesty flag is cleared before
+	// anything else and only ever set below, from what we established ourselves.
+	out.Target.IncludesAgentKate = false
 	if auth == nil {
 		return out, fmt.Errorf("refused: the self-target guard is unavailable, so what would be captured cannot be verified as not Agent Kate's own UI")
 	}
@@ -1511,29 +1527,77 @@ func resolveCaptureTarget(auth *cowork.Authority, wins []kde.Window, listErr err
 		return out, nil
 	}
 
+	rects := coworkWindowRects(wins)
+
+	if t.Kind == cowork.TargetRegion {
+		// A bounded rectangle is refusable outright — see the note above and
+		// Authority.SelfRectsIntersecting. A missing or empty region is refused too: the
+		// portal turns it into a whole-screen grab, which is not what the human would have
+		// been asked about.
+		if t.Region == nil {
+			return out, fmt.Errorf("%w: a region target needs region {x,y,w,h}; omit the target to capture the screen", errNoCaptureTarget)
+		}
+		if t.Region.W <= 0 || t.Region.H <= 0 {
+			return out, fmt.Errorf("%w: a region needs a positive width and height", errNoCaptureTarget)
+		}
+		if hits := auth.SelfRectsIntersecting(*t.Region, rects); len(hits) > 0 {
+			return out, fmt.Errorf("refused: that region overlaps Agent Kate's own window — its consent prompts, policy switches and kill switch are not a legitimate subject; capture a specific application window instead")
+		}
+		// Described by us, from the numbers that will really be captured: a region target
+		// carries no live compositor description to fall back on, and the agent's own Label
+		// must never be what the human reads.
+		out.Target.Label = fmt.Sprintf("a %d×%d region of the screen at (%d,%d)",
+			t.Region.W, t.Region.H, t.Region.X, t.Region.Y)
+		return out, nil
+	}
+
+	// Everything that is left captures a whole frame. Only the shapes the tool documents may
+	// get that far: an "app" / "vdesktop" / "sandbox" target reaches the portal as
+	// CaptureActiveScreen (kwinCaptureCall's fallback) while the consent prompt reads "the
+	// application 'Firefox'" — the human approves a named application and a whole screen is
+	// photographed. Refuse the mismatch rather than describe it; a capture target is a
+	// window, a region, or a screen.
+	if t.Kind != cowork.TargetScreen && t.Kind != cowork.TargetAny && t.Kind != "" {
+		return out, fmt.Errorf("%w: a screenshot target is a window, a region or a screen — %q is not a shape that can be captured", errNoCaptureTarget, string(t.Kind))
+	}
+
 	// Whole-frame capture: nothing is named, so nothing can be refused by name.
+	out.RedactRects = auth.SelfWindowRects(rects)
+	// Say so in the prompt. The human approving "capture the screen" should be told when the
+	// frame will include Agent Kate itself — this is the one place that fact is known. The
+	// flag is what the consent dialog renders its warning from; the Label carries the same
+	// fact into the activity log and the audit line. (Neither plays any part in grant
+	// matching, so this does not fragment a session grant.)
+	//
+	// The sentence is OURS, not orDefault(t.Label, …) as it was: for a window we already
+	// describe the target from live compositor data and never from what the caller claimed,
+	// and a screen target has no live description to fall back on — so the agent's own
+	// string was the one being written into the record of what the human approved.
+	out.Target.Label = "the whole screen"
+	if len(out.RedactRects) > 0 {
+		out.Target.IncludesAgentKate = true
+		out.Target.Label = "the whole screen — includes the Agent Kate window"
+	}
+	return out, nil
+}
+
+// coworkWindowRects translates the compositor's window list into the rectangle shape the
+// consent authority's geometric queries take (it keeps package cowork decoupled from kde).
+func coworkWindowRects(wins []kde.Window) []cowork.WindowRect {
 	rects := make([]cowork.WindowRect, 0, len(wins))
 	for _, w := range wins {
 		rects = append(rects, cowork.WindowRect{
 			X: w.X, Y: w.Y, W: w.Width, H: w.Height, PID: w.PID, ResourceClass: w.ResourceClass,
 		})
 	}
-	out.RedactRects = auth.SelfWindowRects(rects)
-	// Say so in the prompt. The human approving "capture the screen" should be told when the
-	// frame will include Agent Kate itself — this is the one place that fact is known, and
-	// the Label reaches both the consent dialog and the activity log. (Label plays no part in
-	// grant matching, so this does not fragment a session grant.)
-	if len(out.RedactRects) > 0 {
-		out.Target.Label = orDefault(t.Label, "the screen") + " — includes the Agent Kate window"
-	}
-	return out, nil
+	return rects
 }
 
 // resolveTargetWindow returns the KWin window the agent wants to inspect: the one
 // matching windowID, or the active window when windowID is empty. ok is false if no
 // such window can be found (so the caller can ask for an explicit target).
 func resolveTargetWindow(cw *cowork.Service, windowID string) (kde.Window, bool) {
-	wins, err := cw.KDE().ListWindows(5 * time.Second)
+	wins, err := coworkListWindows(cw, 5*time.Second)
 	if err != nil {
 		return kde.Window{}, false
 	}
@@ -1563,7 +1627,7 @@ func bestEffortWindowTarget(cw *cowork.Service, windowID string) cowork.Target {
 	if windowID == "" {
 		return t
 	}
-	wins, err := cw.KDE().ListWindows(4 * time.Second)
+	wins, err := coworkListWindows(cw, 4*time.Second)
 	if err != nil {
 		return t
 	}
@@ -1730,7 +1794,7 @@ func startInjectFocusPoll(cw *cowork.Service, target cowork.Target) (func(), <-c
 				return
 			case <-t.C:
 			}
-			wins, err := cw.KDE().ListWindows(4 * time.Second)
+			wins, err := coworkListWindows(cw, 4*time.Second)
 			reason := injectFocusAbortReason(auth, target, activeWindowEventFrom(wins, err))
 			if reason == "" {
 				continue
@@ -1825,7 +1889,7 @@ func opsHaveKey(ops []map[string]any) bool {
 // input_inject toggle pre-authorized, an agent that could type into "whatever is focused"
 // could type the typed-phrase consent dialog's phrase and approve its own R2 request.
 func resolveInjectTarget(cw *cowork.Service, windowID string) (cowork.Target, error) {
-	wins, err := cw.KDE().ListWindows(4 * time.Second)
+	wins, err := coworkListWindows(cw, 4*time.Second)
 	return resolveInjectTargetFrom(cw.Authority, wins, err, windowID)
 }
 
@@ -1990,7 +2054,7 @@ func elementTargetWindowErr(cw *cowork.Service, info kde.ElementContext) (cowork
 	var listErr error
 	if info.PID > 0 {
 		var wins []kde.Window
-		wins, listErr = cw.KDE().ListWindows(4 * time.Second)
+		wins, listErr = coworkListWindows(cw, 4*time.Second)
 		if listErr == nil {
 			for _, w := range wins {
 				if w.PID == info.PID {
@@ -2159,6 +2223,19 @@ func pointerTarget(label string) cowork.Target {
 	return cowork.Target{Kind: cowork.TargetScreen, Label: label}
 }
 
+// coworkListWindows is every live compositor read the Cowork guards make.
+//
+// It is a package variable for exactly one reason (audit F25/F26 wiring, round 4): the
+// handler wiring tests drive the REAL registered handlers — over a real IPC connection,
+// from an identified agent bridge — against a known desktop that contains one of Agent
+// Kate's own windows, with no KDE session bus anywhere. That is the only way "this handler
+// forgot to route through the guard" can be OBSERVED rather than read off the source, and
+// reading it off the source is what let three rounds of verifiers delete a handler's guard
+// with the suite still green. Production never reassigns it.
+var coworkListWindows = func(cw *cowork.Service, timeout time.Duration) ([]kde.Window, error) {
+	return cw.KDE().ListWindows(timeout)
+}
+
 // coworkGeometry is the production cursorGeometry: live KWin rectangles plus the consent
 // authority's own-identity match. It exists so the guard's INPUT is an interface a test can
 // supply, which is what lets the real guard→fire decision be driven without a session bus
@@ -2166,17 +2243,11 @@ func pointerTarget(label string) cowork.Target {
 type coworkGeometry struct{ cw *cowork.Service }
 
 func (g coworkGeometry) Windows() ([]cowork.WindowRect, error) {
-	wins, err := g.cw.KDE().ListWindows(4 * time.Second)
+	wins, err := coworkListWindows(g.cw, 4*time.Second)
 	if err != nil {
 		return nil, err
 	}
-	rects := make([]cowork.WindowRect, 0, len(wins))
-	for _, w := range wins {
-		rects = append(rects, cowork.WindowRect{
-			X: w.X, Y: w.Y, W: w.Width, H: w.Height, PID: w.PID, ResourceClass: w.ResourceClass,
-		})
-	}
-	return rects, nil
+	return coworkWindowRects(wins), nil
 }
 
 func (g coworkGeometry) IsSelfPoint(x, y int, wins []cowork.WindowRect) bool {

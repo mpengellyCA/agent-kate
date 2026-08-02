@@ -187,6 +187,43 @@ func TestSelfWindowRectsPicksOutOurOwnWindows(t *testing.T) {
 	}
 }
 
+// SelfRectsIntersecting is the enforceable sibling: a capture whose frame is a NAMED
+// RECTANGLE needs no blackout, because the rect is known before the shutter and an overlap
+// can simply be refused (audit F35, round 4).
+func TestSelfRectsIntersectingIsHalfOpenAndFailsClosedOnAnEmptyRect(t *testing.T) {
+	svc := newTestService(t, &fakeNotifier{})
+	svc.SetSelfIdentity(nil, []int{4242})
+
+	wins := []WindowRect{
+		{X: 0, Y: 0, W: 2000, H: 1500, PID: 11, ResourceClass: "org.mozilla.firefox"},
+		{X: 100, Y: 100, W: 400, H: 300, PID: 4242}, // ours: [100,500) x [100,400)
+	}
+	hit := func(x, y, w, h int) bool {
+		return len(svc.SelfRectsIntersecting(Rect{X: x, Y: y, W: w, H: h}, wins)) > 0
+	}
+	// Overlaps, however small, and however far the box extends past us.
+	for _, c := range [][4]int{{100, 100, 400, 300}, {200, 150, 10, 10}, {0, 0, 101, 101}, {0, 0, 4000, 3000}} {
+		if !hit(c[0], c[1], c[2], c[3]) {
+			t.Fatalf("region %v overlaps our window and must be reported", c)
+		}
+	}
+	// Touching edges do not overlap — the honest crop right next to our window still works.
+	for _, c := range [][4]int{{0, 100, 100, 300}, {500, 100, 100, 300}, {100, 400, 400, 300}, {1500, 1000, 100, 100}} {
+		if hit(c[0], c[1], c[2], c[3]) {
+			t.Fatalf("region %v does not overlap our window and must be cleared", c)
+		}
+	}
+	// A rectangle with no extent cannot be verified against anything, and the pipeline turns
+	// it into a whole-screen grab — so it reports every self window and the caller refuses.
+	if len(svc.SelfRectsIntersecting(Rect{}, wins)) != 1 {
+		t.Fatal("an empty region must fail closed, not clear")
+	}
+	// Nothing of ours on screen is still a clean answer.
+	if len(svc.SelfRectsIntersecting(Rect{X: 0, Y: 0, W: 10, H: 10}, wins[:1])) != 0 {
+		t.Fatal("no self windows means no overlap")
+	}
+}
+
 // SECURITY (audit F35): the panic button latches on disk, so restarting akcore does not
 // silently un-press it. The post-restart authority was already identical (Kill revokes
 // every grant and clears every toggle), but a control that reports itself as un-pressed
