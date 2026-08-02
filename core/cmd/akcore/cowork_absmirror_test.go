@@ -53,15 +53,15 @@ func TestAbsoluteMoveOffEveryScreenInvalidatesTheMirror(t *testing.T) {
 	ps.commitPointer(thread, play, target, true)
 
 	// The mirror must be GONE — not the old point, and above all not the requested one.
-	if p, ok := ps.last(thread); ok {
+	if p, ok := ps.last(); ok {
 		t.Fatalf("the mirror survived an unlanded move: %+v", p)
 	}
-	if why := ps.mirrorLoss(thread); why != mirrorLostUnproven {
+	if why := ps.mirrorLoss(); why != mirrorLostUnproven {
 		t.Fatalf("mirror loss reason = %q, want %q", why, mirrorLostUnproven)
 	}
 	// ...and a following BARE click (the low-level injectInput path) refuses, with a
 	// message that explains what happened rather than reading like a bug.
-	msg := bareClickRefusal(ps.mirrorLoss(thread))
+	msg := bareClickRefusal(ps.mirrorLoss())
 	if !strings.HasPrefix(msg, "refused:") {
 		t.Fatalf("a bare click after an unlanded move must be refused: %q", msg)
 	}
@@ -87,10 +87,10 @@ func TestNormalMoveThenClickStillCommitsTheMirror(t *testing.T) {
 		t.Fatal("a fully played batch that ends on the requested point must count as landed")
 	}
 	ps.commitPointer(thread, play, to, true)
-	if p, ok := ps.last(thread); !ok || p != to {
+	if p, ok := ps.last(); !ok || p != to {
 		t.Fatalf("mirror = %+v/%v, want %+v", p, ok, to)
 	}
-	if why := ps.mirrorLoss(thread); why != "" {
+	if why := ps.mirrorLoss(); why != "" {
 		t.Fatalf("a landed move must clear the loss mark, got %q", why)
 	}
 	// The bare-click guard now has a position to check, and it is outside our windows.
@@ -103,7 +103,7 @@ func TestNormalMoveThenClickStillCommitsTheMirror(t *testing.T) {
 	cres := okReply(to.X, to.Y, len(clicks))
 	cplay := pointerPlay{played: true, landed: opsLandedAsAimed(clicks, cres)}
 	ps.commitPointer(thread, cplay, to, true)
-	if p, ok := ps.last(thread); !ok || p != to {
+	if p, ok := ps.last(); !ok || p != to {
 		t.Fatalf("mirror after the click = %+v/%v, want %+v", p, ok, to)
 	}
 }
@@ -118,10 +118,10 @@ func TestMidPlayFailureInvalidatesTheMirror(t *testing.T) {
 	// ALLOWED to cross Agent Kate's windows, because motion alone is harmless. Leaving the
 	// pre-move mirror standing would clear the next bare click against a fiction.
 	ps.commitPointer(thread, pointerPlay{played: true, landed: false}, point{1500, 1500}, true)
-	if p, ok := ps.last(thread); ok {
+	if p, ok := ps.last(); ok {
 		t.Fatalf("a mid-play failure must destroy the mirror, got %+v", p)
 	}
-	if why := ps.mirrorLoss(thread); why != mirrorLostUnproven {
+	if why := ps.mirrorLoss(); why != mirrorLostUnproven {
 		t.Fatalf("mirror loss reason = %q, want %q", why, mirrorLostUnproven)
 	}
 }
@@ -134,7 +134,7 @@ func TestRefusalBeforePlaybackLeavesTheMirrorAlone(t *testing.T) {
 	// moved. Destroying the mirror here would be fail-closed theatre that costs the agent a
 	// re-established position for an action the desktop never saw.
 	ps.commitPointer(thread, pointerPlay{}, point{10, 10}, true)
-	if p, ok := ps.last(thread); !ok || p != (point{640, 480}) {
+	if p, ok := ps.last(); !ok || p != (point{640, 480}) {
 		t.Fatalf("mirror = %+v/%v, want the untouched (640,480)", p, ok)
 	}
 }
@@ -177,7 +177,7 @@ func TestLastAbsMoveIsTheExactTargetEvenWithHumanJitter(t *testing.T) {
 	// A drag ends with the release AFTER the final move; the target is still found.
 	ps := newPointerState()
 	ps.setLast("t", from)
-	drag := ps.dragOps("t", from, to, PointerProfile{Speed: 900, Accuracy: 1}, rand.New(rand.NewSource(7)))
+	drag := ps.dragOps(from, to, PointerProfile{Speed: 900, Accuracy: 1}, rand.New(rand.NewSource(7)))
 	if got, ok := lastAbsMove(drag); !ok || got != to {
 		t.Fatalf("lastAbsMove(drag) = %+v/%v, want %+v", got, ok, to)
 	}
@@ -205,10 +205,10 @@ func TestRelativeMoveIntoMultiMonitorDeadSpaceInvalidates(t *testing.T) {
 	if _, known := ps.applyRelative(thread, 1500, 0, layout); known {
 		t.Fatal("a nudge into inter-screen dead space must invalidate the mirror")
 	}
-	if _, ok := ps.last(thread); ok {
+	if _, ok := ps.last(); ok {
 		t.Fatal("the mirror must not survive a nudge the compositor could not honour")
 	}
-	if why := ps.mirrorLoss(thread); why != mirrorLostRelative {
+	if why := ps.mirrorLoss(); why != mirrorLostRelative {
 		t.Fatalf("mirror loss reason = %q, want %q", why, mirrorLostRelative)
 	}
 

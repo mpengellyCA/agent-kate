@@ -26,6 +26,16 @@ import (
 // on the absolute timeline (absolutize), then re-derive a single global delta pass so the
 // whole thing is one monotonic stream. The UI ignores op[0]'s delayMs (its timer starts at
 // 0), so we normalize the earliest op to fire at t=0.
+//
+// SECURITY (audit F25): a sub-op list occupies WALL CLOCK — a profiled move expands to up
+// to 240 ops × 12 ms ≈ 2.9 s of flight — and every sub-list is pinned at its own event's
+// fire-time and then globally re-sorted. So two pointer events scheduled close together
+// interleave, and the compiler's threaded cursor (which advances in EVENT order) stops
+// describing where the cursor actually is in STREAM order. That is not cosmetic: a bare
+// button's guard point is the threaded position, so the guard clears one point while the
+// button fires at another, and the mirror the handler commits afterwards is a fiction.
+// Hence the invariant enforced below: pointer events may not overlap. Keyboard events stay
+// exempt — overlapping holds are the whole point of a timeline.
 
 // timelineEvent is one authored event in the score.
 type timelineEvent struct {
@@ -86,6 +96,13 @@ type timelinePlan struct {
 	// account for. The handler must then DESTROY the thread's mirror rather than leave
 	// the pre-script position standing (audit F3).
 	RelLost bool
+	// UsedSeedPos means at least one guard point was taken from the SEEDED mirror position
+	// (a bare button/scroll before the script commanded any absolute motion), rather than
+	// from a coordinate the script itself names. Such a plan is only meaningful while the
+	// mirror still holds that position — and the mirror is global, so another thread can
+	// move the cursor while this call waits on consent. The handler re-proves the seed
+	// under the fire lock before firing (audit F26).
+	UsedSeedPos bool
 }
 
 // Duration caps. A tap's dwell is a pure duration → safe to CLAMP. But an explicit
@@ -169,6 +186,16 @@ func buildTimelineOps(
 	var resolved []resolvedEvent
 	cursor := 0 // running authoring clock (ms)
 	seq := 0
+	// Predicted end of the pointer's flight, threaded in authoring order. A RELATIVE gap
+	// (afterMs, or none at all) is measured from the moment the previous event's pointer
+	// action finishes rather than from the moment it starts, so the natural `[click A,
+	// click B]` / `[ctrl-down, click, ctrl-up]` score chains instead of colliding with the
+	// no-overlap invariant in step 3 (and so a modifier is released AFTER the click it was
+	// held for, which the old start-relative chaining got wrong). It is only a scheduling
+	// hint — an explicit atMs/frame is never moved, and soundness is enforced in step 3
+	// against the REAL lowered ops.
+	predPos, predHave := start, haveStart
+	predBusy := 0
 	for i, ev := range script.Events {
 		// Mutual exclusivity: at most one scheduling dialect per event.
 		set := 0
@@ -195,6 +222,9 @@ func buildTimelineOps(
 			if gap < 0 {
 				gap = 0
 			}
+			if predBusy > cursor {
+				cursor = predBusy // "wait 500 after the move" means after it ARRIVES
+			}
 			cursor += gap
 			continue
 		}
@@ -214,13 +244,17 @@ func buildTimelineOps(
 			if ev.AfterMs != nil {
 				gap = *ev.AfterMs
 			}
-			fireAt = cursor + gap
+			base := cursor
+			if predBusy > base {
+				base = predBusy
+			}
+			fireAt = base + gap
 		}
 		// A following relative event measures from here.
 		cursor = fireAt
 
-		// Expand repeat: n copies at fireAt + i*step. After a repeat the cursor sits on the
-		// LAST copy's time so a following relative event chains off it.
+		// Expand repeat: n copies. After a repeat the cursor sits on the LAST copy's time
+		// so a following relative event chains off it.
 		n := ev.Repeat
 		if n < 1 {
 			n = 1
@@ -240,13 +274,43 @@ func buildTimelineOps(
 		if n > 1 && step > 0 && n-1 > timelineMaxSpanMs/step {
 			return plan, fmt.Errorf("event %d repeat extent (%d copies every %dms) exceeds the %dms ceiling", i, n, step, timelineMaxSpanMs)
 		}
+		// SECURITY (audit F25, part 2): copies CHAIN off one another instead of piling onto
+		// the first copy's flight. `{click x,y repeat:3 repeatEveryMs:100}` used to place
+		// every copy 100 ms apart from a common base, so copies 2 and 3 were scheduled while
+		// copy 1's ~600 ms path was still in the air — and the no-overlap invariant below,
+		// correctly, refused the whole script. Repeated clicking at one spot is an ordinary
+		// script (the tool docs advertise it), and the invariant is not what needed relaxing:
+		// the SCHEDULE was wrong. A repeat cadence is a relative gap, and relative gaps in
+		// this compiler are already measured from the END of the previous pointer action
+		// (predBusy above) — copies now follow the same rule, so only the FIRST copy carries
+		// the travel and the rest fire, in place, at the requested cadence or as soon after
+		// as the previous copy's own ops have finished. `repeatEveryMs:0` therefore means "as
+		// fast as the stream allows", not "all at once on top of each other".
+		//
+		// This does NOT reopen F25: a copy is a byte-identical event at an identical point,
+		// so nothing here can schedule motion under another event's button — and anything
+		// that is NOT a copy (a differently-targeted event, an absolutely-scheduled event
+		// landing mid-burst) still meets the invariant unchanged.
+		copyPos, copyHave := predPos, predHave
+		copyEnd, lastAt := 0, fireAt
 		for c := 0; c < n; c++ {
 			at := fireAt + c*step
+			if c > 0 && at < copyEnd {
+				at = copyEnd
+			}
 			resolved = append(resolved, resolvedEvent{ev: ev, fireAt: at, seq: seq})
 			seq++
+			// Advance the flight prediction over THIS copy (see predPos above). A pointer
+			// event's predicted duration is exactly opsSpanMs of the ops it lowers to, so a
+			// copy placed at copyEnd meets the invariant rather than tripping it.
+			var dur int
+			dur, copyPos, copyHave = predictPointerEvent(ev, copyPos, copyHave, script.Bounds, resolveProfile)
+			copyEnd, lastAt = at+dur, at
 		}
-		if n > 1 {
-			cursor = fireAt + (n-1)*step
+		cursor = lastAt
+		predPos, predHave = copyPos, copyHave
+		if copyEnd > predBusy {
+			predBusy = copyEnd
 		}
 	}
 
@@ -271,10 +335,29 @@ func buildTimelineOps(
 	var descParts []string
 	prof := PointerProfile{} // reused per move/click/scroll
 
+	// SECURITY (audit F25): the no-overlap invariant. busyUntil is the absolute time the
+	// last-lowered pointer event's ops finish; a pointer event scheduled before that would
+	// interleave with it on the globally re-sorted stream, and then neither its guard point
+	// nor the threaded final position describes where the cursor really is when it fires.
+	// So it is a compile error, not a caveat: overlapping absolute motion is never
+	// semantically meaningful, and refusing here is what keeps event order == flight order
+	// (which is what makes every GuardPt, and FinalPos, sound). We track the end of the
+	// whole sub-op list, not just of the motion inside it: a later event that fires between
+	// an earlier click's last move op and its press would displace the cursor out from
+	// under that press. movedAbs / UsedSeedPos record whether a guard point came from the
+	// SEEDED mirror rather than from a coordinate the script names (audit F26).
+	busyUntil, haveBusy := 0, false
+	movedAbs := false
+
 	for _, r := range resolved {
 		ev := r.ev
 		fireAt := r.fireAt
 		var sub []map[string]any
+
+		if isTimelinePointerEvent(ev.Type) && haveBusy && fireAt < busyUntil {
+			return plan, fmt.Errorf("pointer event %q scheduled at %dms would fire while the previous pointer action is still running (it finishes at %dms) — there is only ONE cursor, so pointer events may not overlap, and a click fired while the cursor is still in flight lands somewhere that cannot be verified. Repair it any of these ways: (1) drop this event's atMs/frame and use afterMs instead (or omit scheduling entirely) — a RELATIVE gap is measured from the END of the previous pointer action, so [click A, click B] chains by itself; (2) keep absolute scheduling but move this event to atMs >= %d; (3) raise profile.speed so the previous move lands sooner; (4) if you meant a burst at one spot, fold it into that event's count/repeat rather than scheduling a second event on top of it",
+				strings.ToLower(ev.Type), fireAt, busyUntil, busyUntil)
+		}
 
 		switch strings.ToLower(ev.Type) {
 		case "key", "":
@@ -342,6 +425,9 @@ func buildTimelineOps(
 				return plan, fmt.Errorf("%s at the current pointer, but no position is known yet — move first or pass a positioned click", strings.ToLower(ev.Type))
 			}
 			plan.GuardPts = append(plan.GuardPts, lastPos)
+			if !movedAbs {
+				plan.UsedSeedPos = true
+			}
 
 			switch strings.ToLower(ev.Type) {
 			case "button":
@@ -385,6 +471,7 @@ func buildTimelineOps(
 			sub = expandMove(lastPos, haveLast, to, prof, rng)
 			lastPos = to
 			haveLast = true
+			movedAbs = true
 			descParts = append(descParts, fmt.Sprintf("move→(%d,%d)", to.X, to.Y))
 			// Motion over AK windows is allowed — NOT a guard point.
 
@@ -429,6 +516,7 @@ func buildTimelineOps(
 			sub = clickOps(mv, bc, ev.Count, prof.SettleMs)
 			lastPos = to
 			haveLast = true
+			movedAbs = true
 			plan.GuardPts = append(plan.GuardPts, to)
 			descParts = append(descParts, clickDesc(buttonName(bc), ev, to))
 
@@ -441,6 +529,7 @@ func buildTimelineOps(
 				sub = append(sub, expandMove(lastPos, haveLast, to, prof, rng)...)
 				lastPos = to
 				haveLast = true
+				movedAbs = true
 				plan.GuardPts = append(plan.GuardPts, to)
 			} else {
 				// Scroll at the current cursor — fail closed if we can't verify where it lands
@@ -452,6 +541,9 @@ func buildTimelineOps(
 					return plan, fmt.Errorf("scroll at the current pointer, but no position is known yet — pass x,y or move first")
 				}
 				plan.GuardPts = append(plan.GuardPts, lastPos)
+				if !movedAbs {
+					plan.UsedSeedPos = true
+				}
 			}
 			// Mirror cowork.scroll: positive dy = down (axis 0), positive dx = right (axis 1).
 			if ev.DY != 0 {
@@ -466,7 +558,21 @@ func buildTimelineOps(
 			return plan, fmt.Errorf("unknown timeline event type %q", ev.Type)
 		}
 
+		// The sub-list's own span has to be read BEFORE absolutize, which strips delayMs.
+		if isTimelinePointerEvent(ev.Type) {
+			busyUntil, haveBusy = fireAt+opsSpanMs(sub), true
+		}
 		timed = append(timed, absolutize(sub, fireAt)...)
+	}
+
+	// A pointer script that never commanded an absolute target derives BOTH its guard
+	// points and its final position from the seeded mirror (a bare button at the cursor,
+	// a move_rel accumulation, or a plan that only presses buttons) — so the whole plan is
+	// seed-dependent, not just the guard points marked above (audit F26). With NO seed
+	// there is nothing to depend on: a mouse-look burst from an unknown position stays
+	// legal, it just commits no position (HaveFinal false / RelLost).
+	if plan.HasPointer && !movedAbs && haveStart {
+		plan.UsedSeedPos = true
 	}
 
 	// --- 4. Every hold must be released by the end. ------------------------------------
@@ -503,11 +609,121 @@ func buildTimelineOps(
 	}
 	plan.Ops = ops
 
-	// --- 6/7. Description, final position, return. ------------------------------------
+	// --- 6. Defence in depth: derive the final position from the COMPILED stream. ------
+	// SECURITY (audit F25): the handler commits FinalPos as the mirror the NEXT call's
+	// bare-click guard will trust, so it may never be the compiler's intention — it must be
+	// what the op stream actually does. Under the no-overlap invariant the two agree by
+	// construction; walking the stream proves it instead of assuming it, and a disagreement
+	// refuses the script rather than publishing a position the cursor may not be at.
+	derived, haveDerived := start, haveStart
+	for _, t := range timed {
+		switch kind, _ := t.op["t"].(string); kind {
+		case "move":
+			x, okx := t.op["x"].(int)
+			y, oky := t.op["y"].(int)
+			if !okx || !oky {
+				return plan, fmt.Errorf("internal: a compiled move op carries no readable target")
+			}
+			derived, haveDerived = point{x, y}, true
+		case "move_rel":
+			if !haveDerived {
+				continue
+			}
+			dx, _ := t.op["dx"].(float64)
+			dy, _ := t.op["dy"].(float64)
+			to := point{derived.X + int(math.Round(dx)), derived.Y + int(math.Round(dy))}
+			if script.Bounds.Contains(to.X, to.Y) {
+				derived = to
+			} else {
+				haveDerived = false
+			}
+		}
+	}
+	if haveDerived != haveLast || (haveDerived && derived != lastPos) {
+		return plan, fmt.Errorf("internal: the compiled stream leaves the pointer at %v (known=%v) but the timeline threaded %v (known=%v) — refusing rather than recording a position the cursor may not be at",
+			derived, haveDerived, lastPos, haveLast)
+	}
+
+	// The same treatment for the GUARD points. The compiler collected them while threading
+	// its own cursor in EVENT order; effectPoints re-derives them by walking the ops the UI
+	// will actually play, which is also what the fire-time section guards against
+	// (cursorAction.run). Under the no-overlap invariant the two agree by construction — so
+	// a disagreement means the invariant has a hole, and the honest answer is to refuse the
+	// script rather than guard points it does not act on (audit F25, defence in depth).
+	derivedPts, ptsOK := effectPoints(plan.Ops, start, haveStart, script.Bounds)
+	if !ptsOK {
+		return plan, fmt.Errorf("internal: the compiled stream fires a button or wheel at a position this script cannot account for — refusing rather than releasing ops whose landing point cannot be checked")
+	}
+	if !samePointSet(derivedPts, plan.GuardPts) {
+		return plan, fmt.Errorf("internal: the compiled stream acts at %v but the timeline guarded %v — refusing rather than checking points the script does not act on",
+			derivedPts, plan.GuardPts)
+	}
+
+	// --- 7. Description, final position, return. --------------------------------------
 	plan.Desc = strings.Join(descParts, "; ")
 	plan.FinalPos = lastPos
 	plan.HaveFinal = haveLast
 	return plan, nil
+}
+
+// isTimelinePointerEvent reports whether an event type commands the pointer — the events
+// the no-overlap invariant applies to (audit F25). Keyboard events are deliberately absent:
+// overlapping key holds are a feature, and keystrokes follow focus, not the cursor.
+func isTimelinePointerEvent(t string) bool {
+	switch strings.ToLower(t) {
+	case "move", "move_rel", "click", "scroll", "button", "button_down", "button_up":
+		return true
+	}
+	return false
+}
+
+// predictPointerEvent estimates how long one event keeps the pointer busy and where it
+// leaves it, threading in AUTHORING order. It mirrors the lowering below closely enough to
+// schedule relative gaps from the end of a motion (see predPos in step 1) — it is not a
+// guard, and it does not need to be exact: the no-overlap invariant is enforced in step 3
+// against the ops the lowering really produced, so an under-prediction costs a refusal, not
+// a bypass.
+func predictPointerEvent(ev timelineEvent, from point, haveFrom bool, bounds kde.DesktopLayout,
+	resolveProfile func(*pointerProfilePatch) PointerProfile) (int, point, bool) {
+	switch strings.ToLower(ev.Type) {
+	case "move":
+		prof := resolveProfile(ev.Profile)
+		to := point{ev.X, ev.Y}
+		return movePathMs(from, haveFrom, to, prof), to, true
+	case "click":
+		prof := resolveProfile(ev.Profile)
+		to := point{ev.X, ev.Y}
+		return movePathMs(from, haveFrom, to, prof) + prof.SettleMs, to, true
+	case "scroll":
+		if ev.X == 0 && ev.Y == 0 {
+			return 0, from, haveFrom // at the cursor: no motion
+		}
+		prof := resolveProfile(ev.Profile)
+		to := point{ev.X, ev.Y}
+		return movePathMs(from, haveFrom, to, prof), to, true
+	case "move_rel":
+		if !haveFrom {
+			return 0, point{}, false
+		}
+		to := point{
+			X: from.X + int(math.Round(clampRelDelta(float64(ev.DX)))),
+			Y: from.Y + int(math.Round(clampRelDelta(float64(ev.DY)))),
+		}
+		if !bounds.Contains(to.X, to.Y) {
+			return 0, point{}, false
+		}
+		return 0, to, true
+	case "button":
+		hold := ev.HoldMs
+		if hold < 0 {
+			hold = 0
+		}
+		if hold > timelineMaxHoldMs {
+			hold = timelineMaxHoldMs
+		}
+		return hold, from, haveFrom
+	}
+	return 0, from, haveFrom
 }
 
 // tapDesc summarizes a tap (key or button), folding in repeat count and hold dwell.

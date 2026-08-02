@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"math/rand"
@@ -73,8 +74,8 @@ func clampProfile(p, bounds PointerProfile) PointerProfile {
 }
 
 // pointerState holds the per-thread session-default profiles, the user-set bounds, and
-// the last commanded pointer position per thread (the m_ptr mirror — the UI tracks its
-// own, but the core needs a start point to expand a path). All access is mutex-guarded.
+// the last commanded pointer position (the m_ptr mirror — the UI tracks its own, but the
+// core needs a start point to expand a path). All access is mutex-guarded.
 //
 // SECURITY (audit F3, pointer half): the mirror is not bookkeeping, it is the ONLY
 // evidence the bare-click / bare-scroll guards have about where a button will fire. A
@@ -86,11 +87,44 @@ type pointerState struct {
 	mu        sync.Mutex
 	bounds    PointerProfile
 	perThread map[string]PointerProfile
-	lastPos   map[string]point
-	// lostWhy records WHY a thread's mirror was DESTROYED (one of the mirrorLost*
-	// constants), so the refusal can say what happened — and steer the agent to the fix —
-	// instead of claiming the pointer was never moved. Absent = never established.
-	lostWhy map[string]string
+
+	// SECURITY (audit F26): ONE mirror for the whole core, never one per thread. The
+	// cursor is a single global resource, so per-thread evidence about it was unsound:
+	// thread A parked the real pointer on an Agent Kate window (motion is deliberately
+	// unguarded, and A's own mirror stayed honest about it) while thread B's untouched
+	// mirror still read B's earlier clean position — B's bare click then passed its
+	// geometric guard and fired at A's parked point. Every thread's pointer action now
+	// updates or destroys the same evidence. The availability cost (threads invalidate
+	// each other) is deliberate; the refusals already steer the agent to re-establish a
+	// position with an absolute move.
+	lastPos  point
+	haveLast bool
+	// lostWhy records WHY the mirror was DESTROYED (one of the mirrorLost* constants), so
+	// the refusal can say what happened — and steer the agent to the fix — instead of
+	// claiming the pointer was never moved. Empty = never established.
+	lostWhy string
+	// lastBy is the thread whose action last moved (or destroyed) the mirror. Diagnostics
+	// only — it is deliberately NOT a key: see the block above.
+	lastBy string
+
+	// fire serializes the window between a pointer guard and the portal reply (audit F26,
+	// part 2). Without it two threads interleave between the geometric check and the use
+	// of the cursor, so a check that passed describes a position the other thread has
+	// already changed. It is NEVER held across cw.Authorize, which can wait minutes on a
+	// human.
+	//
+	// It is a 1-slot channel and not a sync.Mutex because the section is held across a
+	// portal round-trip of up to 60 s (a timeline may legitimately play for 30). Mutex.Lock
+	// is neither bounded nor context-aware, so one agent's long script parked EVERY other
+	// agent's pointer call behind it with no cancellation and no diagnostic — a self-
+	// inflicted denial of service in a multi-agent arena, and the kind of collateral that
+	// gets a security fix reverted. Waiting is now bounded (fireWaitMax), cancellable by
+	// the caller's ctx, and refused with a contention message that is deliberately NOT a
+	// guard refusal (see fireBusyErr).
+	fire chan struct{}
+	// fireBy is the thread inside the section, read only to word a contention message.
+	// Guarded by mu — it says nothing about who may enter, only who is already in.
+	fireBy string
 
 	// Cached desktop layout (the screens the compositor clamps the pointer into). Short
 	// TTL: screens change rarely, and a stale answer only ever costs an extra invalidation.
@@ -120,8 +154,7 @@ func newPointerState() *pointerState {
 	return &pointerState{
 		bounds:    defaultPointerProfile(),
 		perThread: map[string]PointerProfile{},
-		lastPos:   map[string]point{},
-		lostWhy:   map[string]string{},
+		fire:      make(chan struct{}, 1),
 	}
 }
 
@@ -185,39 +218,281 @@ func (s *pointerState) resolve(thread string, patch *pointerProfilePatch) Pointe
 	return clampProfile(s.baseLocked(thread).applyPatch(patch), s.bounds)
 }
 
-func (s *pointerState) last(thread string) (point, bool) {
+// last reads the global mirror. It takes no thread: the answer is about the one cursor
+// every thread shares (audit F26), and a per-thread read is exactly the bug.
+func (s *pointerState) last() (point, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	p, ok := s.lastPos[thread]
-	return p, ok
+	return s.lastPos, s.haveLast
 }
 
 // setLast records an EXACT commanded position (absolute move/click/drag/scroll). It also
 // clears the relative-drift mark: an absolute move re-establishes a known position, which
-// is the documented way back from a mirror that relative motion invalidated.
+// is the documented way back from a mirror that relative motion invalidated. thread is
+// recorded for diagnostics only — the position itself is global.
 func (s *pointerState) setLast(thread string, p point) {
 	s.mu.Lock()
-	s.lastPos[thread] = p
-	delete(s.lostWhy, thread)
+	s.lastPos, s.haveLast = p, true
+	s.lostWhy = ""
+	s.lastBy = thread
 	s.mu.Unlock()
 }
 
-// invalidate destroys the mirror for a thread: after this, every guard that depends on
-// knowing where the cursor is refuses until an absolute move re-establishes it. why is one
-// of the mirrorLost* constants and only shapes the refusal wording.
+// invalidate destroys the mirror: after this, every guard that depends on knowing where
+// the cursor is refuses — for EVERY thread, because there is only one cursor — until an
+// absolute move re-establishes it. why is one of the mirrorLost* constants and only shapes
+// the refusal wording.
 func (s *pointerState) invalidate(thread, why string) {
 	s.mu.Lock()
-	delete(s.lastPos, thread)
-	s.lostWhy[thread] = why
+	s.lastPos, s.haveLast = point{}, false
+	s.lostWhy = why
+	s.lastBy = thread
 	s.mu.Unlock()
 }
 
 // mirrorLoss reports why the mirror is missing: one of the mirrorLost* constants, or ""
-// when it was simply never established (no positioned action this session).
-func (s *pointerState) mirrorLoss(thread string) string {
+// when it was simply never established (no positioned action yet).
+func (s *pointerState) mirrorLoss() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.lostWhy[thread]
+	return s.lostWhy
+}
+
+// fireWaitMax bounds how long one pointer action waits for the shared guard→fire section.
+// It is deliberately shorter than the longest legitimate hold (a 30 s timeline behind a
+// 60 s portal timeout): past this point the honest answer to the waiting agent is "the
+// cursor is busy, retry", not an unbounded stall it cannot observe or cancel.
+// (A var, not a const, only so the contention tests can shorten it — production never
+// writes it.)
+var fireWaitMax = 10 * time.Second
+
+// cursorHold is proof that its bearer is inside the guard→fire section over the shared
+// cursor. Only acquireFire mints one, and release invalidates it, so a geometric guard —
+// or a dispatch of cursor-affecting ops — cannot be run from a call site that never took
+// the section: it has no hold to pass, and nil FAILS CLOSED (audit F26). A hold never
+// escapes the goroutine that took it.
+type cursorHold struct {
+	ps       *pointerState
+	released bool
+}
+
+func (h *cursorHold) valid() bool { return h != nil && h.ps != nil && !h.released }
+
+// acquireFire takes the guard→fire critical section over the shared cursor and returns a
+// hold plus its release. It is NEVER called across cw.Authorize, which can wait minutes on
+// a human.
+//
+// SECURITY (audit F26): the section is what makes a geometric check describe the cursor at
+// the moment the ops are released. Waiting for it is bounded and cancellable so that
+// keeping that property cannot deadlock the arena — see the `fire` field comment.
+func (s *pointerState) acquireFire(ctx context.Context, thread string) (*cursorHold, func(), error) {
+	enter := func() (*cursorHold, func(), error) {
+		s.mu.Lock()
+		s.fireBy = thread
+		s.mu.Unlock()
+		h := &cursorHold{ps: s}
+		return h, func() {
+			h.released = true
+			s.mu.Lock()
+			s.fireBy = ""
+			s.mu.Unlock()
+			<-s.fire
+		}, nil
+	}
+	// Uncontended fast path: no timer, no allocation beyond the hold.
+	select {
+	case s.fire <- struct{}{}:
+		return enter()
+	default:
+	}
+	t := time.NewTimer(fireWaitMax)
+	defer t.Stop()
+	select {
+	case s.fire <- struct{}{}:
+		return enter()
+	case <-ctx.Done():
+		return nil, nil, s.fireBusyErr(thread, "the call was cancelled while it waited its turn")
+	case <-t.C:
+		return nil, nil, s.fireBusyErr(thread, fmt.Sprintf("gave up after %s", fireWaitMax))
+	}
+}
+
+// fireBusyErr words a CONTENTION failure. It must not read like a guard refusal: an agent
+// that mistakes "the cursor is busy" for "that target is forbidden" learns the wrong lesson
+// and either gives up on a legitimate action or retries a different, worse shape. So it
+// says busy (never "refused"), states that nothing was checked and nothing ran, and asks
+// for a plain retry.
+func (s *pointerState) fireBusyErr(thread, why string) error {
+	s.mu.Lock()
+	by := s.fireBy
+	s.mu.Unlock()
+	who := "another agent"
+	if by != "" && by == thread {
+		who = "another call on this same thread"
+	}
+	return cursorBusy{fmt.Errorf("busy: %s is currently controlling the shared pointer, so this action could not take its turn (%s). Nothing was checked and NOTHING WAS DONE — this is not a refusal and the target is not forbidden; simply try again in a moment", who, why)}
+}
+
+// cursorBusy marks a CONTENTION failure over the shared cursor: no check ran and no op was
+// released. Typed so the handler maps it to codeCoworkBusy and never to a denial.
+type cursorBusy struct{ err error }
+
+func (e cursorBusy) Error() string { return e.err.Error() }
+func (e cursorBusy) Unwrap() error { return e.err }
+
+// cursorAction is the guard→fire decision of one pointer-affecting action, lifted out of
+// the handler closures so it can be driven — and its refuse-vs-fire outcome asserted — in a
+// unit test that needs no portal and no KDE bus (audit F26 wiring). Every handler that
+// touches the shared cursor routes through run; acquireFire has no other caller.
+//
+// SECURITY (audit F25/F26 wiring, third report): it is DECLARATIVE on purpose. Each handler
+// used to hand in its own Guard closure and its own guard points, so "this handler forgot to
+// guard" and "this handler has nothing to guard (a pure move)" were the same program — and
+// the verifier could delete injectInput's guard, and then runPointerAction's, with the whole
+// suite still green. There is no guard closure to delete now: the caller hands over the OPS
+// IT IS ABOUT TO RELEASE, and run derives the points those ops act at (effectPoints), proves
+// the mirror, checks the geometry and only then fires. A handler cannot opt out of the guard
+// without also not releasing any ops.
+type cursorAction struct {
+	// Geometry is the live-window source the geometric self-target guard reads. nil FAILS
+	// CLOSED for any action whose ops act somewhere.
+	Geometry cursorGeometry
+	// Ops is the exact op stream Fire is about to release. The guard points are DERIVED
+	// from it, never declared alongside it.
+	Ops []map[string]any
+	// Seed, when non-nil, is the mirror position this action was COMPILED against (a bare
+	// click/button/scroll fires wherever the cursor IS, and the consent prompt the human
+	// answered names that point). It is re-proven INSIDE the section, because the consent
+	// wait that precedes run is exactly where another thread's pointer action lands. It is
+	// REQUIRED — nil fails closed — whenever Ops act before naming an absolute point.
+	Seed *point
+	// Bounds is the screen layout relative motion inside Ops is accounted against. An
+	// invalid layout means "unknown", so any op acting after a nudge fails closed.
+	Bounds kde.DesktopLayout
+	// Fire releases ops to the UI portal and reports whether the UI PROVED they landed as
+	// aimed. Reached only once the section is held and every check above passed.
+	//
+	// It is HANDED the ops rather than closing over its own copy, and that is not a style
+	// choice: a Fire that carried its own list could be dispatched while a different — or an
+	// empty — list was the one the section checked, which is the same "guarded one thing,
+	// did another" shape as the deleted guards this design exists to make impossible. What
+	// is guarded and what is released are now the same slice.
+	Fire func(hold *cursorHold, ops []map[string]any) (landed bool, err error)
+	// Commit records what became of the ops, still inside the section — that is what stops
+	// another thread from reading the mirror in the gap between the portal's reply and the
+	// update. It is called even when the action was refused (played=false: nothing moved,
+	// so the mirror stands). nil for actions that cannot move the pointer.
+	Commit func(pointerPlay)
+	// Refused audits a refusal decided inside the section. Contention is NOT routed here:
+	// a busy cursor is an availability outcome, not a security one, and logging it as a
+	// refusal would bury the real ones. nil to skip.
+	Refused func(error)
+}
+
+// cursorGeometry is the live geometry the self-target guard reads: the compositor's current
+// window rectangles, plus Agent Kate's own identity to match them against. *cowork.Service
+// is the production implementation (coworkGeometry, cowork.go); a test supplies a fake,
+// which is what lets the REAL guard→fire decision be driven with no KDE session bus — the
+// reason the previous rounds' tests re-implemented the decision instead of driving it.
+type cursorGeometry interface {
+	Windows() ([]cowork.WindowRect, error)
+	IsSelfPoint(x, y int, wins []cowork.WindowRect) bool
+}
+
+// cursorRefusal marks an error that the section itself decided (stale seed, geometric
+// guard). Handlers map it to codeCoworkDenied; a contention error, which is not one of
+// these, maps to codeCoworkBusy.
+type cursorRefusal struct{ err error }
+
+func (e cursorRefusal) Error() string { return e.err.Error() }
+func (e cursorRefusal) Unwrap() error { return e.err }
+
+func (a cursorAction) run(ctx context.Context, ps *pointerState, thread string) error {
+	hold, release, err := ps.acquireFire(ctx, thread)
+	if err != nil {
+		// Contention: nothing was checked, nothing ran, the mirror is untouched. Returning
+		// before Commit is deliberate — there is no play to record.
+		return err
+	}
+	defer release()
+
+	var play pointerPlay
+	if a.Commit != nil {
+		defer func() { a.Commit(play) }()
+	}
+	refuse := func(err error) error {
+		if a.Refused != nil {
+			a.Refused(err)
+		}
+		return cursorRefusal{err}
+	}
+	// The mirror, read ONCE and inside the section: it is both the subject of the seed
+	// re-proof and the position every derived guard point is threaded from.
+	at, haveAt := ps.last()
+	if needSeed := opsNeedSeed(a.Ops); a.Seed != nil || needSeed {
+		if a.Seed == nil {
+			// FAIL CLOSED: these ops act wherever the cursor already is, and nothing told the
+			// section which position the human's prompt and this call's checks were about.
+			return refuse(fmt.Errorf("refused: this action fires at the pointer's current position but was never checked against a known one (internal: no seed) — use desktop_click(x,y), which targets and guards an exact point"))
+		}
+		if err := ps.seedStillHolds(thread, *a.Seed); err != nil {
+			return refuse(err)
+		}
+	}
+	// Every point these ops will actually ACT at, derived from the ops themselves.
+	pts, ok := effectPoints(a.Ops, at, haveAt, a.Bounds)
+	if !ok {
+		return refuse(fmt.Errorf("%s", bareClickRefusal(ps.mirrorLoss())))
+	}
+	if len(pts) > 0 {
+		if err := guardPointerTargets(a.Geometry, hold, pts); err != nil {
+			return refuse(err)
+		}
+	}
+	if a.Fire == nil {
+		return nil
+	}
+	// FAIL CLOSED on an empty stream: an action that dispatches must have handed the section
+	// the ops it is about to dispatch, so "nothing to check" and "nothing to send" are the
+	// same state. Without this, blanking Ops in a handler would leave the guard with nothing
+	// to derive and the portal with everything to play.
+	if len(a.Ops) == 0 {
+		return refuse(fmt.Errorf("refused: a pointer action must hand the safety check the ops it is about to run (internal: no ops)"))
+	}
+	// From here the ops are in the UI's hands: whatever comes back, the cursor may have
+	// moved (a failure can strand it part-way along an interpolated path).
+	play.played = true
+	landed, err := a.Fire(hold, a.Ops)
+	play.landed = landed
+	return err
+}
+
+// seedStillHolds re-proves, under the fire lock, that the mirror is still the position an
+// action's guard evidence was compiled against. A bare click/button/scroll fires wherever
+// the cursor IS, so its guard point is only meaningful while the mirror still says what it
+// said at compile time — and with a global mirror another thread may have moved it (or
+// destroyed it) while this call waited on consent (audit F26).
+//
+// thread is the caller, used only to tell it whether ANOTHER agent took the cursor: that is
+// the availability cost of a global mirror, and a refusal the agent cannot explain reads
+// like a bug. The other thread is never named.
+func (s *pointerState) seedStillHolds(thread string, seed point) error {
+	s.mu.Lock()
+	now, ok, why, by := s.lastPos, s.haveLast, s.lostWhy, s.lastBy
+	s.mu.Unlock()
+	who := "this agent"
+	if by != "" && by != thread {
+		who = "another agent"
+	}
+	if !ok {
+		return fmt.Errorf("refused: the pointer position this action was checked against was lost before it could run (%s, by %s) — the cursor is shared, so re-establish a known position with desktop_move_pointer(x,y), or use desktop_click(x,y), which targets and guards an exact point",
+			orDefault(why, "a pointer action"), who)
+	}
+	if now != seed {
+		return fmt.Errorf("refused: the pointer moved from (%d,%d) to (%d,%d) between the safety check and this action (%s moved it) — the cursor is shared with every other agent, so where a bare click would land can no longer be verified. Re-check the position, or use desktop_click(x,y), which targets and guards an exact point",
+			seed.X, seed.Y, now.X, now.Y, who)
+	}
+	return nil
 }
 
 // applyRelative folds a relative delta into the mirror.
@@ -240,11 +515,11 @@ func (s *pointerState) mirrorLoss(thread string) string {
 func (s *pointerState) applyRelative(thread string, dx, dy float64, bounds kde.DesktopLayout) (point, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	from, ok := s.lastPos[thread]
+	from, ok := s.lastPos, s.haveLast
 	if !ok {
 		// Nothing to drift: the mirror was already unknown, and a relative move cannot
 		// establish one. Mark it as relative loss anyway so the refusal names the cause.
-		s.lostWhy[thread] = mirrorLostRelative
+		s.lostWhy, s.lastBy = mirrorLostRelative, thread
 		return point{}, false
 	}
 	to := point{
@@ -255,12 +530,12 @@ func (s *pointerState) applyRelative(thread string, dx, dy float64, bounds kde.D
 		// Either we never learned the desktop's extent, or the cursor ran into an edge (a
 		// screen edge, or the dead space between mis-aligned screens) and the compositor
 		// clamped it. Both mean the accumulated point is not where the cursor is.
-		delete(s.lastPos, thread)
-		s.lostWhy[thread] = mirrorLostRelative
+		s.lastPos, s.haveLast = point{}, false
+		s.lostWhy, s.lastBy = mirrorLostRelative, thread
 		return point{}, false
 	}
-	s.lastPos[thread] = to
-	delete(s.lostWhy, thread)
+	s.lastPos, s.haveLast = to, true
+	s.lostWhy, s.lastBy = "", thread
 	return to, true
 }
 
@@ -352,13 +627,23 @@ func expandMove(from point, haveFrom bool, to point, prof PointerProfile, rng *r
 	return ops
 }
 
-// moveOps expands a move to (x,y) from the thread's last commanded position. It does
-// NOT record the new position — the caller commits it with setLast only after the portal
-// op succeeds, so a denied/failed action never desyncs the mirror the bare-click guard
+// moveOps expands a move to (x,y) from the last commanded position. It does NOT record
+// the new position — the caller commits it with setLast only after the portal op
+// succeeds, so a denied/failed action never desyncs the mirror the bare-click guard
 // trusts (plan 09 §7 / review H1).
-func (s *pointerState) moveOps(thread string, x, y int, prof PointerProfile, rng *rand.Rand) []map[string]any {
-	from, ok := s.last(thread)
+func (s *pointerState) moveOps(x, y int, prof PointerProfile, rng *rand.Rand) []map[string]any {
+	from, ok := s.last()
 	return expandMove(from, ok, point{x, y}, prof, rng)
+}
+
+// movePathMs is how long the path expandMove emits keeps the cursor in flight. The op
+// COUNT is independent of the jitter rng, so a throwaway seed gives the exact answer the
+// real expansion will produce — the timeline compiler uses it to schedule a relative gap
+// from the end of a motion rather than its start (audit F25), and nothing but scheduling
+// depends on it (the overlap invariant itself is enforced against the real lowered ops).
+func movePathMs(from point, haveFrom bool, to point, prof PointerProfile) int {
+	ops := expandMove(from, haveFrom, to, prof, rand.New(rand.NewSource(1)))
+	return opsSpanMs(ops)
 }
 
 // btnOp builds one pointer-button op (state 1 = press, 0 = release).
@@ -445,8 +730,8 @@ func relMoveOps(dx, dy float64, steps int) []map[string]any {
 // dragOps composes move(from)→press(left)→move(to, stepped)→release(left). It threads
 // the intermediate position (the cursor is at `from` once the first leg lands) without
 // mutating the mirror — the caller commits the final position (to) after success.
-func (s *pointerState) dragOps(thread string, from, to point, prof PointerProfile, rng *rand.Rand) []map[string]any {
-	start, ok := s.last(thread)
+func (s *pointerState) dragOps(from, to point, prof PointerProfile, rng *rand.Rand) []map[string]any {
+	start, ok := s.last()
 	ops := expandMove(start, ok, from, prof, rng)
 	press := btnOp(0x110, 1)
 	if prof.SettleMs > 0 {
@@ -529,6 +814,35 @@ func (s *pointerState) commitPointer(thread string, play pointerPlay, want point
 	}
 }
 
+// playMirrorOutcome decides what a finished cowork.playInput does to the GLOBAL pointer
+// mirror. Pure, so the fail-closed matrix is testable without a portal: commit means
+// "record plan.FinalPos", a non-empty lostWhy means "destroy the mirror with that reason",
+// and neither means "leave it exactly as it is".
+//
+// SECURITY (audit F26): a script with NO pointer events cannot have moved the cursor, so it
+// must not write the mirror at all. Its FinalPos is merely the seed it was compiled with,
+// and with one mirror shared by every thread, another thread may have moved — or destroyed
+// — the real position while this call waited on consent. Re-committing the seed would
+// resurrect a stale position as fresh evidence, which is the very bypass being closed.
+func playMirrorOutcome(plan timelinePlan, landed bool) (commit bool, lostWhy string) {
+	if !plan.HasPointer {
+		return false, ""
+	}
+	switch {
+	case plan.HaveFinal && landed:
+		return true, ""
+	case plan.HaveFinal:
+		// The UI could not prove the batch finished on the point it aimed for: an aborted or
+		// failed timeline strands the cursor mid-path (and an interpolated path is allowed to
+		// cross Agent Kate's windows).
+		return false, mirrorLostUnproven
+	case plan.RelLost:
+		// A relative nudge outran what the compiler could account for.
+		return false, mirrorLostRelative
+	}
+	return false, ""
+}
+
 // bareClickRefusal is the message for a bare button/scroll whose landing point cannot be
 // verified. `why` (a mirrorLost* constant, or "" for "never established") distinguishes the
 // ways that happens, because "you never moved the pointer", "the pointer moved somewhere I
@@ -552,23 +866,140 @@ func bareClickRefusal(why string) string {
 		"use desktop_click(x,y) (it targets and guards an exact point), or move the pointer first with desktop_move_pointer"
 }
 
+// --- what an op stream actually does, derived from the stream ------------------------
+//
+// SECURITY (audit F25/F26 wiring): these two are the reason there is no guard closure left
+// in any handler. The guard's real question is "where will the ops I am about to release
+// press a button or turn a wheel?", and the ops are the only honest answer to it — a list
+// handed in beside them can be wrong, or forgotten, and nothing downstream can tell.
+
+// effectPoints walks an op stream and returns every absolute position at which it will have
+// an EFFECT (a pointer button, a wheel notch), threading the cursor from `at` — the live
+// mirror, read inside the guard→fire section. Consecutive duplicates are collapsed (a
+// double-click and a two-axis scroll act at one place). Pure absolute motion produces NO
+// points: passing over Agent Kate's windows has no side effect, and only landing on one
+// does.
+//
+// It FAILS CLOSED (ok=false) whenever an effect op's position cannot be determined: no
+// known starting position, a move op with an unreadable target, or a relative nudge that
+// walked outside the known desktop (where the compositor clamps and the accumulation stops
+// being true).
+func effectPoints(ops []map[string]any, at point, haveAt bool, bounds kde.DesktopLayout) ([]point, bool) {
+	var pts []point
+	for _, op := range ops {
+		switch kind, _ := op["t"].(string); kind {
+		case "move":
+			x, okx := op["x"].(int)
+			y, oky := op["y"].(int)
+			if !okx || !oky {
+				return nil, false
+			}
+			at, haveAt = point{x, y}, true
+		case "move_rel":
+			if !haveAt {
+				continue
+			}
+			dx, _ := op["dx"].(float64)
+			dy, _ := op["dy"].(float64)
+			to := point{at.X + int(math.Round(dx)), at.Y + int(math.Round(dy))}
+			if !bounds.Contains(to.X, to.Y) {
+				haveAt = false
+				continue
+			}
+			at = to
+		case "btn", "axis_discrete":
+			if !haveAt {
+				return nil, false
+			}
+			if n := len(pts); n == 0 || pts[n-1] != at {
+				pts = append(pts, at)
+			}
+		}
+	}
+	return pts, true
+}
+
+// opsNeedSeed reports whether the stream ACTS somewhere before it names an absolute point —
+// a bare click/button/scroll, or one that follows only relative motion. The position such
+// an op fires at is inherited from the mirror, which is global and shared, so the section
+// must re-prove that the mirror still says what it said when the ops were compiled and the
+// human was prompted (audit F26). A stream that moves somewhere first names its own target
+// and needs no seed.
+func opsNeedSeed(ops []map[string]any) bool {
+	for _, op := range ops {
+		switch kind, _ := op["t"].(string); kind {
+		case "move":
+			return false
+		case "btn", "axis_discrete":
+			return true
+		}
+	}
+	return false
+}
+
+// opsHaveRelative reports whether a stream contains relative motion — the only case whose
+// derived positions need the desktop layout, and so the only case worth a KWin round trip.
+func opsHaveRelative(ops []map[string]any) bool {
+	for _, op := range ops {
+		if kind, _ := op["t"].(string); kind == "move_rel" {
+			return true
+		}
+	}
+	return false
+}
+
+// samePointSet reports whether two point lists cover the same set of positions (order and
+// repetition are not meaningful — a repeat fires many times at one place).
+func samePointSet(a, b []point) bool {
+	set := func(pts []point) map[point]bool {
+		m := make(map[point]bool, len(pts))
+		for _, p := range pts {
+			m[p] = true
+		}
+		return m
+	}
+	ma, mb := set(a), set(b)
+	if len(ma) != len(mb) {
+		return false
+	}
+	for p := range ma {
+		if !mb[p] {
+			return false
+		}
+	}
+	return true
+}
+
 // guardPointerTargets is the geometric self-target guard (plan 09 §7): it refuses if any
 // action point (a click/scroll location) falls inside an Agent-Kate-owned window. It
 // re-fetches live KWin geometry at execute time (windows move) and fails CLOSED if that
 // geometry cannot be read — an unverifiable target is never clicked.
-func guardPointerTargets(cw *cowork.Service, pts []point) error {
-	wins, err := cw.KDE().ListWindows(4 * time.Second)
+//
+// SECURITY (audit F26): hold proves the caller is inside the guard→fire section. The
+// verdict is only worth anything while nothing else can move the cursor, so a call site
+// that never took the section has nothing to pass and FAILS CLOSED here rather than
+// returning an answer that is already stale. The one deliberately advisory caller — the
+// pre-consent courtesy check in cowork.injectInput, which exists so the human is not
+// prompted for something that will be refused anyway — calls pointerTargetsClear directly.
+func guardPointerTargets(geom cursorGeometry, hold *cursorHold, pts []point) error {
+	if !hold.valid() {
+		return fmt.Errorf("refused: the pointer target cannot be verified without exclusive control of the shared cursor, so the check would already be stale (internal: no cursor hold)")
+	}
+	return pointerTargetsClear(geom, pts)
+}
+
+// pointerTargetsClear is guardPointerTargets' body without the section proof. Only two
+// callers may use it: guardPointerTargets itself, and an ADVISORY pre-consent preview.
+func pointerTargetsClear(geom cursorGeometry, pts []point) error {
+	if geom == nil {
+		return fmt.Errorf("refused: the self-target guard is unavailable, so the pointer target cannot be verified as not Agent Kate's own UI")
+	}
+	rects, err := geom.Windows()
 	if err != nil {
 		return fmt.Errorf("refused: cannot read window geometry to verify the pointer target is not Agent Kate's own UI")
 	}
-	rects := make([]cowork.WindowRect, 0, len(wins))
-	for _, w := range wins {
-		rects = append(rects, cowork.WindowRect{
-			X: w.X, Y: w.Y, W: w.Width, H: w.Height, PID: w.PID, ResourceClass: w.ResourceClass,
-		})
-	}
 	for _, p := range pts {
-		if cw.IsSelfPoint(p.X, p.Y, rects) {
+		if geom.IsSelfPoint(p.X, p.Y, rects) {
 			return fmt.Errorf("refused: (%d,%d) is inside an Agent Kate window — the agent may not point at or click its own controls", p.X, p.Y)
 		}
 	}

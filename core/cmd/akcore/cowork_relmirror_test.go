@@ -39,7 +39,7 @@ func TestRelativeWalkOntoSelfWindowIsSeenByTheGeometricGuard(t *testing.T) {
 
 	// Park the cursor somewhere provably safe with the absolute tool.
 	ps.setLast(thread, point{1800, 900})
-	if start, ok := ps.last(thread); !ok || auth.IsSelfPoint(start.X, start.Y, rects) {
+	if start, ok := ps.last(); !ok || auth.IsSelfPoint(start.X, start.Y, rects) {
 		t.Fatalf("precondition: the start position must be known and outside Agent Kate")
 	}
 
@@ -52,7 +52,7 @@ func TestRelativeWalkOntoSelfWindowIsSeenByTheGeometricGuard(t *testing.T) {
 	if got != (point{300, 200}) {
 		t.Fatalf("mirror did not accumulate the delta: got %+v, want (300,200)", got)
 	}
-	mirror, ok := ps.last(thread)
+	mirror, ok := ps.last()
 	if !ok || mirror != (point{300, 200}) {
 		t.Fatalf("stored mirror is %v/%v, want (300,200)", mirror, ok)
 	}
@@ -77,14 +77,14 @@ func TestLegitimateRelativeMoveThenActionElsewhereStillWorks(t *testing.T) {
 			t.Fatalf("nudge %d must keep a known position", i)
 		}
 	}
-	mirror, ok := ps.last(thread)
+	mirror, ok := ps.last()
 	if !ok || mirror != (point{1160, 860}) {
 		t.Fatalf("mirror after four nudges is %v/%v, want (1160,860)", mirror, ok)
 	}
 	if auth.IsSelfPoint(mirror.X, mirror.Y, rects) {
 		t.Fatal("a legitimate relative move away from Agent Kate must remain clickable")
 	}
-	if ps.mirrorLoss(thread) == mirrorLostRelative {
+	if ps.mirrorLoss() == mirrorLostRelative {
 		t.Fatal("an accounted-for relative move must not mark the mirror as lost")
 	}
 }
@@ -99,10 +99,10 @@ func TestRelativeMoveIntoTheScreenEdgeFailsClosed(t *testing.T) {
 	if _, known := ps.applyRelative(thread, -500, 0, testBounds()); known {
 		t.Fatal("a delta that runs off the desktop must not leave a known position")
 	}
-	if _, ok := ps.last(thread); ok {
+	if _, ok := ps.last(); ok {
 		t.Fatal("the mirror must be destroyed, not left at the pre-nudge position")
 	}
-	if !(ps.mirrorLoss(thread) == mirrorLostRelative) {
+	if !(ps.mirrorLoss() == mirrorLostRelative) {
 		t.Fatal("the refusal must be attributable to the relative move")
 	}
 	if msg := bareClickRefusal(mirrorLostRelative); !strings.Contains(strings.ToLower(msg), "relative") {
@@ -111,10 +111,10 @@ func TestRelativeMoveIntoTheScreenEdgeFailsClosed(t *testing.T) {
 
 	// An absolute move is the documented way back.
 	ps.setLast(thread, point{400, 400})
-	if p, ok := ps.last(thread); !ok || p != (point{400, 400}) {
+	if p, ok := ps.last(); !ok || p != (point{400, 400}) {
 		t.Fatal("an absolute move must re-establish a known position")
 	}
-	if ps.mirrorLoss(thread) == mirrorLostRelative {
+	if ps.mirrorLoss() == mirrorLostRelative {
 		t.Fatal("an absolute move must clear the relative-loss mark")
 	}
 }
@@ -128,7 +128,7 @@ func TestRelativeMoveWithUnknownDesktopBoundsFailsClosed(t *testing.T) {
 	if _, known := ps.applyRelative(thread, 10, 10, kde.DesktopLayout{}); known {
 		t.Fatal("unknown desktop bounds must invalidate the mirror, not accumulate blindly")
 	}
-	if _, ok := ps.last(thread); ok {
+	if _, ok := ps.last(); ok {
 		t.Fatal("the mirror must not survive an unbounded relative move")
 	}
 }
@@ -139,10 +139,10 @@ func TestRelativeMoveWithNoKnownStartStaysUnknown(t *testing.T) {
 	if _, known := ps.applyRelative(thread, 5, 5, testBounds()); known {
 		t.Fatal("a relative move cannot establish a position out of nothing")
 	}
-	if _, ok := ps.last(thread); ok {
+	if _, ok := ps.last(); ok {
 		t.Fatal("no position may be invented")
 	}
-	if !(ps.mirrorLoss(thread) == mirrorLostRelative) {
+	if !(ps.mirrorLoss() == mirrorLostRelative) {
 		t.Fatal("the refusal must still be attributed to relative motion")
 	}
 }

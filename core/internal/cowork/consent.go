@@ -104,6 +104,13 @@ func (b *grantBroker) Close(id string) {
 	b.mu.Unlock()
 }
 
+// open reports how many consent prompts are currently in front of the human.
+func (b *grantBroker) open() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.pending)
+}
+
 // Authority is the consent brain: grant store + audit + interactive prompt + kill
 // switch + teardown registry + anti-escalation guards.
 type Authority struct {
@@ -129,7 +136,7 @@ func newAuthority(store *Store, audit *Audit, policy *Policy, notify Notifier, l
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Authority{
+	a := &Authority{
 		store:     store,
 		audit:     audit,
 		policy:    policy,
@@ -144,6 +151,13 @@ func newAuthority(store *Store, audit *Audit, policy *Policy, notify Notifier, l
 		promptTimeoutR0R1: 5 * time.Minute,
 		promptTimeoutR2:   3 * time.Minute,
 	}
+	// SECURITY (audit F35): the panic button keeps its position across a restart. It was
+	// in-memory only, so quitting akcore silently un-pressed it and the panel came back
+	// claiming desktop access was live. Re-arming stays an explicit, confirmed human act.
+	if policy != nil {
+		a.killed = policy.Killed()
+	}
+	return a
 }
 
 // Authorize is the single gate every cowork capability calls before acting. It is
@@ -164,17 +178,86 @@ func (a *Authority) Authorize(ctx context.Context, req AuthRequest) (Decision, e
 		a.log.Error("cowork: consent audit chain failed verification; denying all access")
 		return Decision{Reason: "consent audit integrity check failed; desktop access disabled"}, nil
 	}
-	if tier == TierR2 && a.IsSelfTarget(req.Target) {
+	// SECURITY (audit F35): Agent Kate's own UI is off limits to EVERY capability, not
+	// only control. This refusal used to be gated on tier == TierR2, which left
+	// desktop_screenshot (R1) free to hand an agent a pixel-exact picture of the consent
+	// dialog, the policy toggles and the kill switch — exactly the targeting data the
+	// F25/F26 pointer attacks need, obtained through the one read capability round 1 left
+	// permitted after it closed the a11y read path.
+	//
+	// Scope, stated plainly — and this check is WEAKER than it looks, so read it as what it
+	// is rather than as the guard for the whole class:
+	//
+	//   - It inspects Target.ResourceClass and Target.Label, both of which the AGENT writes,
+	//     and a Target carries no PID at all. So it cannot be the whole answer for any caller
+	//     that names a window: an agent supplying a window id with a blank or borrowed class
+	//     walks straight through here. Every such caller must ALSO resolve the id against
+	//     live compositor data and check the owner — resolveA11yReadWindow and
+	//     resolveCaptureTarget (package main) are the two that do, and both fail closed.
+	//     This one is the backstop, not the gate.
+	//   - A full-screen capture names no window at all, so nothing here can see it, and our
+	//     windows are still in those pixels. The enforceable answer for that case is
+	//     redaction inside the capture pipeline, where the frame and the live rects both
+	//     exist; SelfWindowRects is the query for it and cowork.screenshot now hands the
+	//     rectangles to the UI, but the blackout itself is not implemented yet — so a
+	//     full-screen screenshot DOES still show whatever of Agent Kate is on screen. What is
+	//     enforced meanwhile is the prompt-pending rule immediately below (the sharpest frame
+	//     — the dialog being answered right now — is refused outright) and everything
+	//     downstream: IsSelfPoint refuses any click or keystroke that lands on us however the
+	//     agent worked out where we are, and the a11y read/action guards refuse our windows
+	//     by identity. Pixels of our UI are an information leak, not a route to act on it.
+	//   - desktop_screencast inherits all of the above the day it lands.
+	if a.IsSelfTarget(req.Target) {
 		a.auditDeny(req, "refused: target is Agent Kate's own UI")
-		return Decision{Reason: "refused: Agent Kate cannot control its own interface"}, nil
+		return Decision{Reason: "refused: Agent Kate cannot read or act on its own interface"}, nil
+	}
+
+	// SECURITY (audit F35, plan 29): no capture while a consent prompt is on screen.
+	//
+	// The self-target refusal above closes the capture that NAMES one of our windows. A
+	// full-screen capture names nothing, so it cannot see one — and the sharpest thing in
+	// those pixels is the dialog the human is answering RIGHT NOW: its exact wording, the
+	// phrase the R2 dialog asks them to type, the position of every button, and, when the
+	// prompt belongs to a DIFFERENT agent, what that agent is doing — the cross-agent read
+	// channel NotifyUI was introduced to close (audit F6), reopened through a camera.
+	//
+	// Unlike frame redaction (which needs the pixels, and so the UI process — see
+	// resolveCaptureTarget), this is enforceable right here, and it costs nothing in normal
+	// use: prompts are rare, last seconds, and the refusal asks for a plain retry. It sits
+	// ABOVE the policy toggle deliberately — a standing "always allow screenshots" is not a
+	// decision to photograph the next decision.
+	//
+	// Known residue: it covers the prompts THIS broker owns (every capability grant). The
+	// "let this agent use the desktop at all" dialog is raised through the permission broker
+	// in package main (askCoworkEnable), which this object cannot see, so a capture is not
+	// paused for that one. Closing it needs a shared "a decision is on screen" signal the
+	// consent authority can read — handed on rather than faked here.
+	if capturesTheFrame(req.Capability) && a.broker != nil && a.broker.open() > 0 {
+		a.auditDeny(req, "refused: a consent prompt was on screen")
+		return Decision{Reason: "refused: an Agent Kate consent prompt is open on the user's screen right now, and a capture would include it — nothing was captured; try again in a moment"}, nil
 	}
 
 	// Global pre-authorization (the toggle switchboard — Phase 2). A capability the
 	// user has switched on is allowed with NO prompt, for any cowork-enabled agent,
-	// overriding even the R2 per-action default. Still audited; the kill-switch /
-	// audit-tamper / self-target guards above still hard-block it.
+	// overriding even the R2 per-action default. The kill-switch / audit-tamper /
+	// self-target guards above still hard-block it.
+	//
+	// SECURITY (audit F35, plan 29): NOTHING is written to the audit log here, and nothing
+	// at the reused-grant branch below either. Both used to append an AuditAction entry —
+	// the kind whose meaning is "a granted capability was EXERCISED" — reading
+	// "pre-authorized (toggle on)" / "reused existing grant", BEFORE the capability action
+	// had happened, and often before it could: the geometric guard, the focus guard, the
+	// compiler and the portal all refuse downstream of this point. The consent model treats
+	// this log as authoritative and the panel shows it to the user as the record of what
+	// agents DID, so an entry claiming an action occurred when it may not have is the same
+	// record-before-outcome lie SetPolicy carried.
+	//
+	// The outcome is recorded where it is known instead: every caller of Authorize follows a
+	// successful action with AuditCapture, whose GrantID is "policy" for a toggle and the
+	// grant's own id for a reuse — so a pre-authorized use is still identifiable in the log,
+	// and now appears once, when it really happened, rather than twice, once in advance. A
+	// refusal after this point is recorded by AuditRefusal at the site that refuses.
 	if a.policy != nil && a.policy.Allows(req.Capability) {
-		a.auditAction(req, "policy", "", "pre-authorized (toggle on)")
 		return Decision{Allow: true, GrantID: "policy", Reason: "pre-authorized (toggle on)"}, nil
 	}
 
@@ -186,7 +269,6 @@ func (a *Authority) Authorize(ctx context.Context, req AuthRequest) (Decision, e
 			if g.Scope == ScopeOnce {
 				a.store.ConsumeOnce(g.ID)
 			}
-			a.auditAction(req, g.ID, "", "reused existing grant")
 			return Decision{Allow: true, GrantID: g.ID, Reason: "existing grant"}, nil
 		}
 	}
@@ -237,6 +319,10 @@ func (a *Authority) Authorize(ctx context.Context, req AuthRequest) (Decision, e
 		}
 		g, err := a.store.Add(req.ThreadID, req.Capability, req.Target, scope, exp, d.Redact)
 		if err != nil {
+			// SECURITY (audit F35): record the OUTCOME. The user said allow, the grant did
+			// not happen, and nothing at all used to be written — so the log showed neither
+			// the request nor its refusal. Whatever the human answered, no access was given.
+			a.auditDeny(req, "refused: failed to persist grant: "+err.Error())
 			return Decision{Reason: "failed to persist grant"}, err
 		}
 		a.auditGrant(g)
@@ -248,6 +334,14 @@ func (a *Authority) Authorize(ctx context.Context, req AuthRequest) (Decision, e
 		a.auditDeny(req, "consent prompt timed out")
 		return Decision{Reason: "consent prompt timed out"}, nil
 	}
+}
+
+// capturesTheFrame reports whether a capability returns PIXELS of whatever is on screen, as
+// opposed to a named, guardable object. Those are the capabilities whose target refusal
+// cannot see what is in the frame, so they carry the prompt-pending rule above.
+// desktop_screencast inherits it the day it lands, which is why it is listed now.
+func capturesTheFrame(c Capability) bool {
+	return c == CapScreenshot || c == CapScreencast
 }
 
 // Respond delivers the user's decision (called by the cowork.respondGrant handler,
@@ -323,8 +417,15 @@ func (a *Authority) Kill(reason string) []string {
 	// from a clean (deny-all) posture rather than silently restoring standing access.
 	if a.policy != nil {
 		a.policy.Clear()
+		// …and latch the button down on disk, so a restart does not silently un-press it
+		// (audit F35). Best effort by necessity — the in-memory kill above is already in
+		// force for this run — but loud, because a kill that lapses at the next launch is
+		// exactly the surprise this is meant to remove.
+		if perr := a.policy.SetKilled(true); perr != nil {
+			a.log.Error("cowork: could not persist kill-switch state; it will not survive a restart", "err", perr)
+		}
 	}
-	_ = a.audit.Append(AuditEntry{Kind: AuditKill, Detail: reason})
+	a.appendAudit(AuditEntry{Kind: AuditKill, Detail: reason})
 	if a.notify != nil {
 		// restoreDesktopFlags is the kill-switch's contract with the UI: "stop ALL desktop
 		// access" must also put the desktop-wide org.a11y.Status flags (IsEnabled /
@@ -372,12 +473,29 @@ func (a *Authority) SetPolicy(c Capability, on bool) error {
 	if a.policy == nil {
 		return nil
 	}
-	if on {
-		_ = a.audit.Append(AuditEntry{Kind: AuditGrant, Capability: c, Detail: "policy toggle on"})
-	} else {
-		_ = a.audit.Append(AuditEntry{Kind: AuditRevoke, Capability: c, Detail: "policy toggle off"})
+	// SECURITY (audit F35): record the OUTCOME, never the intent. This used to append the
+	// entry BEFORE calling Set, so F32's refusal path (a capability with no tool behind it
+	// can no longer be armed) left an AuditGrant reading "policy toggle on" for a toggle
+	// that was then REFUSED — the activity log claiming a standing no-prompt grant exists
+	// when it does not. The state is now re-read from the policy after the write, so the
+	// entry says what actually happened and a refusal is recorded as a refusal.
+	err := a.policy.Set(c, on)
+	armed := a.policy.Allows(c)
+	e := AuditEntry{Capability: c}
+	switch {
+	case armed:
+		e.Kind, e.Detail = AuditGrant, "policy toggle on"
+	case on:
+		// Asked to arm, and it is not armed: a refusal, not a grant.
+		e.Kind, e.Detail = AuditDeny, "policy toggle on refused"
+	default:
+		e.Kind, e.Detail = AuditRevoke, "policy toggle off"
 	}
-	return a.policy.Set(c, on)
+	if err != nil {
+		e.Detail += " (" + err.Error() + ")"
+	}
+	a.appendAudit(e)
+	return err
 }
 
 // Rearm re-enables access after a kill (grants are NOT restored).
@@ -385,7 +503,14 @@ func (a *Authority) Rearm(reason string) {
 	a.mu.Lock()
 	a.killed = false
 	a.mu.Unlock()
-	_ = a.audit.Append(AuditEntry{Kind: AuditRearm, Detail: reason})
+	// Un-latch on disk before announcing it, so the audit entry and the notification
+	// describe a state that survives a restart (audit F35).
+	if a.policy != nil {
+		if perr := a.policy.SetKilled(false); perr != nil {
+			a.log.Error("cowork: could not persist kill-switch re-arm", "err", perr)
+		}
+	}
+	a.appendAudit(AuditEntry{Kind: AuditRearm, Detail: reason})
 	if a.notify != nil {
 		a.notify.NotifyUI("cowork.killSwitch", map[string]any{"on": false, "reason": reason, "at": time.Now()})
 	}
@@ -402,7 +527,7 @@ func (a *Authority) RevokeGrant(id, reason string) *Grant {
 	g := a.store.Revoke(id, reason)
 	if g != nil {
 		a.runTeardownFor(id)
-		_ = a.audit.Append(AuditEntry{Kind: AuditRevoke, ThreadID: g.ThreadID, Capability: g.Capability, GrantID: id, Detail: reason})
+		a.appendAudit(AuditEntry{Kind: AuditRevoke, ThreadID: g.ThreadID, Capability: g.Capability, GrantID: id, Detail: reason})
 	}
 	return g
 }
@@ -414,7 +539,7 @@ func (a *Authority) RevokeThread(threadID, reason string) []string {
 		a.runTeardownFor(id)
 	}
 	if len(ids) > 0 {
-		_ = a.audit.Append(AuditEntry{Kind: AuditRevoke, ThreadID: threadID, Detail: reason})
+		a.appendAudit(AuditEntry{Kind: AuditRevoke, ThreadID: threadID, Detail: reason})
 	}
 	return ids
 }
@@ -544,6 +669,38 @@ func (a *Authority) IsSelfPoint(x, y int, wins []WindowRect) bool {
 	return false
 }
 
+// SelfWindowRects returns the Agent-Kate-owned rectangles in wins (same PID / resourceClass
+// evidence as IsSelfPoint, same half-open rect convention).
+//
+// SECURITY (audit F35): it is the list a capture path must black out before handing a frame
+// to an agent. The self-target refusal in Authorize covers a capture that NAMES one of our
+// windows; a full-screen capture names nothing, so our consent dialog, policy toggles and
+// kill switch are still in the pixels and the refusal cannot see it. Redaction has to happen
+// where the frame is, which is the portal capture path, not here — this is the query it
+// needs. cowork.screenshot calls it (resolveCaptureTarget, package main) and ships the
+// rectangles to the UI in the portal request as `redactRects`; the blackout itself is the
+// UI half and is NOT implemented yet, so today this is a supplied precondition rather than
+// an enforced one, and the gap is stated as such wherever it is visible.
+// desktop_screencast inherits the same requirement when it lands.
+// Zero-area rects are skipped; an empty result means "no evidence of self", which for a
+// full-screen capture is not the same as "verified clean" — a caller that cannot enumerate
+// windows at all must fail closed rather than assume nothing of ours is on screen.
+func (a *Authority) SelfWindowRects(wins []WindowRect) []WindowRect {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var out []WindowRect
+	for _, win := range wins {
+		if win.W <= 0 || win.H <= 0 {
+			continue
+		}
+		if a.selfPIDs[win.PID] ||
+			(win.ResourceClass != "" && a.selfClasses[strings.ToLower(win.ResourceClass)]) {
+			out = append(out, win)
+		}
+	}
+	return out
+}
+
 // --- Pull surfaces ---------------------------------------------------------------
 
 func (a *Authority) ListGrants(threadID string) ([]*Grant, bool) {
@@ -560,21 +717,35 @@ func (a *Authority) Tampered() bool { return a.audit.Tampered() }
 // guard caught a click aimed at Agent Kate's own UI) so the log shows the attempt, not
 // only the successes.
 func (a *Authority) AuditRefusal(threadID string, cap Capability, t Target, reason string) {
-	_ = a.audit.Append(AuditEntry{
+	a.appendAudit(AuditEntry{
 		Kind: AuditDeny, ThreadID: threadID, Capability: cap, Target: &t, Detail: reason,
 	})
 }
 
 // AuditCapture records a successful capture/read with a content hash (never content).
 func (a *Authority) AuditCapture(threadID string, cap Capability, t Target, grantID, artifactHash string) {
-	_ = a.audit.Append(AuditEntry{
+	a.appendAudit(AuditEntry{
 		Kind: AuditAction, ThreadID: threadID, Capability: cap, Target: &t,
 		GrantID: grantID, ArtifactHash: artifactHash, Detail: "capture",
 	})
 }
 
+// appendAudit writes one entry, and says so loudly when it cannot. Every caller used to
+// discard the error (`_ = a.audit.Append(...)`), which meant a full disk or a permission
+// problem silently produced a log with holes in it — and this log is what the consent
+// model treats as authoritative (Authorize fails closed on a chain it cannot verify, and
+// the panel presents it to the user as the record of what agents did). We still do not
+// fail the operation on it: refusing to revoke a grant because we could not journal the
+// revocation would be strictly worse.
+func (a *Authority) appendAudit(e AuditEntry) {
+	if err := a.audit.Append(e); err != nil {
+		a.log.Error("cowork: audit append failed — the consent log is now incomplete",
+			"kind", e.Kind, "capability", e.Capability, "threadId", e.ThreadID, "err", err)
+	}
+}
+
 func (a *Authority) auditGrant(g *Grant) {
-	_ = a.audit.Append(AuditEntry{
+	a.appendAudit(AuditEntry{
 		Kind: AuditGrant, ThreadID: g.ThreadID, Capability: g.Capability,
 		Target: &g.Target, GrantID: g.ID, Detail: string(g.Scope),
 	})
@@ -582,16 +753,13 @@ func (a *Authority) auditGrant(g *Grant) {
 
 func (a *Authority) auditDeny(req AuthRequest, reason string) {
 	t := req.Target
-	_ = a.audit.Append(AuditEntry{
+	a.appendAudit(AuditEntry{
 		Kind: AuditDeny, ThreadID: req.ThreadID, Capability: req.Capability,
 		Target: &t, Detail: reason,
 	})
 }
 
-func (a *Authority) auditAction(req AuthRequest, grantID, artifactHash, detail string) {
-	t := req.Target
-	_ = a.audit.Append(AuditEntry{
-		Kind: AuditAction, ThreadID: req.ThreadID, Capability: req.Capability,
-		Target: &t, GrantID: grantID, ArtifactHash: artifactHash, Detail: detail,
-	})
-}
+// (auditAction is deliberately gone: the only two callers wrote an "exercised" entry from
+// inside Authorize, before the action had happened — see the record-before-outcome note
+// there. AuditCapture, called by the handler once the action has really run, is the one
+// place an AuditAction entry is written.)

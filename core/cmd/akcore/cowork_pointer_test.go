@@ -139,22 +139,22 @@ func TestPointerStateResolvePatch(t *testing.T) {
 
 func TestPointerLastPositionMirror(t *testing.T) {
 	s := newPointerState()
-	if _, ok := s.last("t1"); ok {
+	if _, ok := s.last(); ok {
 		t.Fatalf("no last position should be known initially")
 	}
 	prof := PointerProfile{Speed: 1600, Accuracy: 1}
 	// moveOps must NOT mutate the mirror — the handler commits only after the portal op
 	// succeeds (review H1), so a denied/failed move can't desync the bare-click guard.
-	first := s.moveOps("t1", 300, 300, prof, fixedRNG())
+	first := s.moveOps(300, 300, prof, fixedRNG())
 	if len(first) != 1 {
 		t.Fatalf("first move (unknown start) should teleport, got %d ops", len(first))
 	}
-	if _, ok := s.last("t1"); ok {
+	if _, ok := s.last(); ok {
 		t.Fatalf("moveOps must not record the position; the caller commits on success")
 	}
 	// Once the caller commits the position, a later move has a start ⇒ a real path.
 	s.setLast("t1", point{300, 300})
-	second := s.moveOps("t1", 900, 300, prof, fixedRNG())
+	second := s.moveOps(900, 300, prof, fixedRNG())
 	if len(second) < 2 {
 		t.Fatalf("second move should be a path, got %d ops", len(second))
 	}
