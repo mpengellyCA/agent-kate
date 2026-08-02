@@ -170,14 +170,47 @@ already names as the proof. And forking a *running* thread can silently
 truncate the fork's tail, because the source's wire is flushed only when its
 handle is live in the forking process.
 
-**Reaching fork means running a local HTTP server far more powerful than the
-job** — `kimi web` exposes full session control plus `/terminals/*` and
-`/files/*` behind one bearer token readable by any same-uid process. Bind
-127.0.0.1, use an ephemeral port, and shut it down immediately.
+### DECISION (owner, 2026-08-02): **do not use the HTTP server**
 
-**Sequencing:** Phase 1b (relocation + credentialed round-trip) → Phase 2
-`ExportSession`, which is independent of all this and shippable immediately →
-Phase 4 fork. This holds plan 20's ordering of 25 before 23.
+The spike's own risk section is the reason. Reaching fork this way means
+spawning `kimi web`, which exposes **full session control plus `/terminals/*`
+and `/files/*` behind a single bearer token readable by any same-uid process**.
+This product's entire threat model is that agents run at the user's own uid, and
+four rounds of audit remediation were spent ensuring a prompt-injected agent
+cannot widen its own authority. Standing up a general-purpose control server —
+however briefly, however bound to 127.0.0.1 — to obtain one fork inverts that
+for a convenience. The token file alone is a credential any agent on the box can
+read.
+
+So the mechanism is rejected on authority grounds, not on whether it works. It
+works; it costs too much.
+
+**What the spike is still worth.** It established that kimi *does* implement
+fork internally (`ISessionLifecycleService.fork`) and what a correct fork
+produces: a byte-faithful copy of the wire journal plus a `forked` boundary,
+with the source untouched. That is the specification to hit — we just have to
+reach it without the server.
+
+**The remaining route, and what it needs.** Candidate A (copy the session
+directory) was dismissed as "wrong as written" because a naive copy misses the
+operations kimi's own fork performs. That is now a solvable problem rather than
+a blocker: probe exactly what `ISessionLifecycleService.fork` writes to disk —
+which files, which ids rewritten, what the `forked` boundary record looks like —
+and replicate it directly. **This is the next investigation, and it should read
+the on-disk result of a fork rather than the minified implementation.**
+
+If that probe shows the on-disk shape cannot be reproduced faithfully, the
+honest outcome is not a lower-fidelity fork wearing the word "fork". It is the
+summary-seeded flavour, which the owner already made universal and
+user-selectable, labelled as exactly what it is — and `Capabilities.Fork` stays
+false for kimi. This codebase treats a label that overstates its mechanism as a
+defect; a "fork" that silently drops the conversation would be one.
+
+**Sequencing, revised:** Phase 2 `ExportSession` first — it is independent of
+all of this, uses the plain `kimi export` CLI, and is shippable immediately.
+Then the on-disk fork probe. Then Phase 1b (worktree relocation + the
+credentialed recall round-trip) only if the probe succeeds. Plan 20's ordering
+of 25 before 23 still holds.
 
 ## Phase 2 — `ExportSession` on the harness
 
