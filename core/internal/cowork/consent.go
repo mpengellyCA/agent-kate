@@ -21,9 +21,14 @@ var errKilled = errors.New("cowork: desktop access disabled (kill-switch engaged
 //     a broadcast consent prompt hands every other agent in the arena the id to
 //     race the human on, plus a description of what the asking agent is doing
 //     (audit F6, third site).
+//
+// NotifyUI returns how many UI connections the frame was queued to, mirroring
+// ipc.Server.NotifyUI: a caller that then BLOCKS waiting for the human to
+// answer must treat zero as "there is nobody to ask" and refuse on the spot
+// rather than park on its timeout (audit F35 pass 3 / F53).
 type Notifier interface {
 	Notify(method string, params any)
-	NotifyUI(method string, params any)
+	NotifyUI(method string, params any) int
 }
 
 // ActionDescriptor is the concrete, literal action shown to the user for R2
@@ -285,7 +290,17 @@ func (a *Authority) Authorize(ctx context.Context, req AuthRequest) (Decision, e
 	// the text destined for a field. Broadcast, it would let any other agent's
 	// bridge read one agent's desktop activity and answer the human's prompt
 	// before they can. The consent dialog is the human's, so the frame is too.
-	a.notify.NotifyUI("cowork.grantRequested", a.grantRequestPayload(reqID, req, tier))
+	//
+	// NOBODY TO ASK (audit F35 pass 3 / F53): the delivery count is the
+	// authority — taken from the same snapshot as the send, it cannot race a UI
+	// that disconnects in between. Zero means no window received the prompt, so
+	// parking on the consent timer would hold the caller for minutes on a
+	// question nothing will ever display. Still FAIL CLOSED — no window means
+	// no grant — only promptly.
+	if a.notify.NotifyUI("cowork.grantRequested", a.grantRequestPayload(reqID, req, tier)) == 0 {
+		a.auditDeny(req, "no Agent Kate window is connected, so nobody could be asked")
+		return Decision{Reason: "no Agent Kate window is connected, so nobody could be asked"}, nil
+	}
 
 	timeout := a.promptTimeoutR0R1
 	if tier == TierR2 {

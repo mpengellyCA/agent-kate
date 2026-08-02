@@ -167,6 +167,10 @@ type handlerDeps struct {
 	socketPath    string
 	exePath       string
 	log           *slog.Logger
+	// agentExitWait overrides how long the destructive paths wait for a stopped
+	// process to exit before refusing (waitAgentExit); zero means the default.
+	// Set by tests only — a fake harness has no real backstops to wait out.
+	agentExitWait time.Duration
 }
 
 // --- harness routing -------------------------------------------------------
@@ -213,6 +217,36 @@ func (d handlerDeps) agentStop(threadID string) error {
 
 func (d handlerDeps) agentInterrupt(threadID string) error {
 	return d.harnessFor(threadID).Interrupt(threadID)
+}
+
+// defaultAgentExitWait bounds waitAgentExit. Stop already escalates to a
+// process-group SIGKILL through the supervisor's own backstops (the interrupt
+// backstop and closeStdin's kill timer), whose worst case on a busy thread is
+// ~11 s — so a thread still running past this window survived even SIGKILL
+// and cannot be waited out.
+const defaultAgentExitWait = 15 * time.Second
+
+// waitAgentExit polls until the thread's process is gone, or the deadline.
+// Every worktree-destroying path must call it between agentStop and
+// worktree.Remove: Stop returns immediately and finishes on a background
+// goroutine, so removing straight away deletes a live process's cwd and
+// leaves it running — with an authenticated bridge that can keep messaging
+// siblings — after the human believes it destroyed (audit F54). Returns false
+// when the process is still alive; destructive callers must refuse rather
+// than proceed.
+func waitAgentExit(d handlerDeps, threadID string) bool {
+	wait := d.agentExitWait
+	if wait <= 0 {
+		wait = defaultAgentExitWait
+	}
+	deadline := time.Now().Add(wait)
+	for d.agentRunning(threadID) {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return true
 }
 
 // unsupportedDetail is THE capability-gate wording: one message shape for
@@ -1469,6 +1503,13 @@ func registerHandlers(d handlerDeps) {
 		// Resolved BEFORE the record is dropped below — harnessFor needs it.
 		h := d.harnessFor(p.ThreadID)
 		_ = d.agentStop(p.ThreadID)
+		// Stop returns immediately — a graceful busy-stop takes up to ~11 s —
+		// and the next step deletes the process's cwd, so wait for the exit
+		// first and refuse when it never comes (audit F54).
+		if !waitAgentExit(d, p.ThreadID) {
+			return nil, ipc.Errorf(ipc.CodeInternalError,
+				"the agent process did not exit; nothing was removed — try again")
+		}
 		if err := worktree.Remove(wt); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
 		}
@@ -2501,6 +2542,15 @@ func registerHandlers(d handlerDeps) {
 		}
 		// Resolved BEFORE the record is dropped below — harnessFor needs it.
 		h := d.harnessFor(p.ThreadID)
+		// Defensive stop — "running" was refused above, but a process can start
+		// between that check and the removal (the same race
+		// cleanup.archiveAndRemove guards against), and Remove deletes its cwd
+		// (audit F54).
+		_ = d.agentStop(p.ThreadID)
+		if !waitAgentExit(d, p.ThreadID) {
+			return nil, ipc.Errorf(ipc.CodeInternalError,
+				"the agent process did not exit; nothing was removed — try again")
+		}
 		if err := worktree.Remove(wt); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
 		}
@@ -3069,8 +3119,15 @@ func registerHandlers(d handlerDeps) {
 		}
 
 		// 5. Defensive stop — even though "running" is a blocker, guard against
-		//    a process that started between analysis and now.
+		//    a process that started between analysis and now — and wait for the
+		//    exit before anything destructive: step 7 deletes the process's cwd
+		//    (audit F54). Refusing here leaves the record un-archived and the
+		//    worktree intact.
 		_ = d.agentStop(p.ThreadID)
+		if !waitAgentExit(d, p.ThreadID) {
+			return nil, ipc.Errorf(ipc.CodeInternalError,
+				"the agent process did not exit; nothing was removed — try again")
+		}
 
 		// 6. Archive the record BEFORE touching git, so a failed Remove leaves
 		//    the record (and transcript) intact and recoverable.

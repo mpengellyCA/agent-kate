@@ -37,8 +37,14 @@ const codeCoworkBusy = -32011
 // broadcast at all — see cowork.Notifier.
 type coworkNotifier struct{ srv *ipc.Server }
 
-func (n coworkNotifier) Notify(method string, params any)   { n.srv.Notify(method, params) }
-func (n coworkNotifier) NotifyUI(method string, params any) { n.srv.NotifyUI(method, params) }
+func (n coworkNotifier) Notify(method string, params any) { n.srv.Notify(method, params) }
+
+// The delivery count passes through untouched: the consent authority fails
+// closed on zero — nobody to ask — instead of parking on its prompt timeout
+// (audit F35 pass 3 / F53).
+func (n coworkNotifier) NotifyUI(method string, params any) int {
+	return n.srv.NotifyUI(method, params)
+}
 
 // screenshotMaxDim caps the longest edge of a returned still (plan 02 §3): keeps the
 // base64 image well under the 16 MiB IPC frame cap and within model vision limits.

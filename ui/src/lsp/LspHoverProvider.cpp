@@ -1,6 +1,7 @@
 #include "LspHoverProvider.h"
 #include "LspClient.h"
 #include "MarkdownUtil.h"
+#include "SafeContent.h"
 
 #include <KTextEditor/Cursor>
 #include <KTextEditor/View>
@@ -11,7 +12,6 @@
 #include <QJsonValue>
 #include <QPointer>
 #include <QStringList>
-#include <QTextDocument>
 #include <QToolTip>
 #include <QUrl>
 
@@ -83,9 +83,12 @@ QString LspHoverProvider::textHint(KTextEditor::View *view, const KTextEditor::C
             // renders headings/code rather than raw markup.
             QString tip = trimmed;
             if (hover.markdown) {
-                QTextDocument md;
-                // Server-authored text about workspace code: raw HTML off at the
-                // parser, which is also what keeps "std::vector<int>" intact.
+                // GuardedTextDocument, not QTextDocument: hover markdown is
+                // server-authored, and server output tracks workspace content,
+                // so an image reference in it must never become a local read.
+                agentkate::GuardedTextDocument md;
+                // Raw HTML off at the parser, which is also what keeps
+                // "std::vector<int>" intact.
                 agentkate::setMarkdownSafe(md, trimmed);
                 tip = md.toHtml();
             }

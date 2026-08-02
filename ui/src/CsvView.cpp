@@ -8,15 +8,19 @@
 #include <QHeaderView>
 #include <QLabel>
 #include <QSortFilterProxyModel>
-#include <QStringConverter>
 #include <QTableView>
-#include <QTextStream>
 #include <QTimer>
 #include <QVBoxLayout>
 
 #include <utility>
 
 namespace {
+
+// Bounded-read budgets (audit F55). Generous for real files, fatal for bombs:
+// a delimited file past 32 MB or 100k records renders truncated with a visible
+// note instead of freezing the GUI thread or ballooning the model.
+constexpr qsizetype kMaxCsvBytes = 32 * 1024 * 1024;
+constexpr int kMaxCsvRecords = 100000;
 
 // Auto-detect the delimiter from the header line, counting only separators that
 // sit outside quotes. Tab wins over comma only when tabs actually appear,
@@ -40,8 +44,10 @@ QChar detectDelimiter(const QString &firstLine)
 
 // RFC-4180-style parse of `text` into records of fields: doubled quotes become a
 // literal quote, and delimiters/newlines inside quotes are kept verbatim. Both
-// CRLF and bare LF/CR terminate a record.
-QVector<QStringList> parseDelimited(const QString &text, QChar delim)
+// CRLF and bare LF/CR terminate a record. Parsing stops at kMaxCsvRecords
+// records; `recordCapped` reports whether input remained past the cut.
+QVector<QStringList> parseDelimited(const QString &text, QChar delim,
+                                    bool *recordCapped = nullptr)
 {
     QVector<QStringList> records;
     QStringList fields;
@@ -59,7 +65,11 @@ QVector<QStringList> parseDelimited(const QString &text, QChar delim)
     };
 
     const int n = text.size();
-    for (int i = 0; i < n; ++i) {
+    int i = 0;
+    for (; i < n; ++i) {
+        if (records.size() >= kMaxCsvRecords) {
+            break;
+        }
         const QChar c = text.at(i);
         if (inQuotes) {
             if (c == QLatin1Char('"')) {
@@ -87,8 +97,14 @@ QVector<QStringList> parseDelimited(const QString &text, QChar delim)
             cur.append(c);
         }
     }
-    // Flush a final record that wasn't newline-terminated.
-    if (!cur.isEmpty() || !fields.isEmpty()) {
+    if (records.size() >= kMaxCsvRecords) {
+        // Capped mid-file: anything left (unscanned text or a half-built
+        // record) is dropped, and only then does the cap count as truncation.
+        if (recordCapped && (i < n || !cur.isEmpty() || !fields.isEmpty())) {
+            *recordCapped = true;
+        }
+    } else if (!cur.isEmpty() || !fields.isEmpty()) {
+        // Flush a final record that wasn't newline-terminated.
         endRecord();
     }
     return records;
@@ -132,15 +148,27 @@ bool CsvModel::load(const QString &path)
     if (!file.open(QIODevice::ReadOnly)) {
         return false;
     }
-    QTextStream in(&file);
-    in.setEncoding(QStringConverter::Utf8);
-    const QString text = in.readAll();
+    // Bound the read BEFORE parsing (audit F55), one byte past the cap so
+    // "exactly the cap" and "the cap, and there was more" are distinguishable —
+    // AttachmentBuilder's readCapped idiom. The capped read is the bound itself,
+    // never readAll(): a stat'd size can lie (procfs, a file still growing).
+    QByteArray raw = file.read(kMaxCsvBytes + 1);
+    m_byteTruncated = raw.size() > kMaxCsvBytes;
+    if (m_byteTruncated) {
+        raw.truncate(kMaxCsvBytes);
+    }
+    QString text = QString::fromUtf8(raw);
+    if (text.startsWith(QChar(0xFEFF))) {
+        text.remove(0, 1); // strip a UTF-8 BOM so it can't pollute the header
+    }
 
     const int firstBreak = text.indexOf(QLatin1Char('\n'));
     const QString firstLine = firstBreak < 0 ? text : text.left(firstBreak);
     const QChar delim = detectDelimiter(firstLine);
 
-    setRecords(parseDelimited(text, delim));
+    bool recordCapped = false;
+    setRecords(parseDelimited(text, delim, &recordCapped));
+    m_recordTruncated = recordCapped;
     return true;
 }
 
@@ -235,6 +263,7 @@ CsvView::CsvView(const QString &path, QWidget *parent)
                         m_currentSheet = i;
                         m_model->setRecords(m_sheets.at(i).rows);
                         m_table->resizeColumnsToContents();
+                        updateTruncationNote();
                     }
                 });
                 bar->addWidget(picker);
@@ -254,6 +283,14 @@ CsvView::CsvView(const QString &path, QWidget *parent)
         layout->addWidget(msg);
         return;
     }
+
+    // Truncation is a data-integrity fact the user must see (audit F55): when a
+    // size budget cut the grid short, say so instead of silently showing less.
+    m_truncNote = new QLabel(this);
+    m_truncNote->setContentsMargins(6, 4, 6, 4);
+    m_truncNote->setStyleSheet(QStringLiteral("color: palette(mid);"));
+    m_truncNote->setVisible(false);
+    layout->addWidget(m_truncNote);
 
     auto *proxy = new CsvSortProxy(this);
     proxy->setSourceModel(m_model);
@@ -277,6 +314,7 @@ CsvView::CsvView(const QString &path, QWidget *parent)
     m_table->resizeColumnsToContents();
 
     layout->addWidget(m_table);
+    updateTruncationNote();
 
     // Re-read when an agent rewrites the file on disk. A short debounce
     // coalesces the burst of events an editor's save can emit, and the path is
@@ -315,12 +353,37 @@ void CsvView::reload()
     } else if (m_model->load(m_path)) {
         m_table->resizeColumnsToContents();
     }
+    updateTruncationNote();
     // An atomic rewrite replaces the inode, so the watcher silently stops
     // tracking the file after the first change. Re-add the path if it dropped.
     if (m_watcher && !m_watcher->files().contains(m_path)
         && QFileInfo::exists(m_path)) {
         m_watcher->addPath(m_path);
     }
+}
+
+void CsvView::updateTruncationNote()
+{
+    if (!m_truncNote || !m_model) {
+        return;
+    }
+    const QString suffix = QFileInfo(m_path).suffix().toLower();
+    const bool isWorkbook =
+        suffix == QLatin1String("xlsx") || suffix == QLatin1String("xlsm");
+    QString note;
+    if (isWorkbook) {
+        if (m_currentSheet >= 0 && m_currentSheet < m_sheets.size()
+            && m_sheets.at(m_currentSheet).truncated) {
+            note = tr("Sheet truncated — too large to display fully");
+        }
+    } else if (m_model->byteTruncated()) {
+        note = tr("Truncated at %1 MB — the file is larger")
+                   .arg(kMaxCsvBytes / (1024 * 1024));
+    } else if (m_model->recordTruncated()) {
+        note = tr("Truncated at %1 rows — the file has more").arg(kMaxCsvRecords);
+    }
+    m_truncNote->setText(note);
+    m_truncNote->setVisible(!note.isEmpty());
 }
 
 #include "CsvView.moc"

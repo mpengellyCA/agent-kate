@@ -21,8 +21,11 @@ class QTimer;
 // The file is append-only and grows while the sub-agent runs, so the dialog
 // tails it live: a QFileSystemWatcher (plus a poll fallback) re-reads only the
 // bytes appended since last time and appends their rendered blocks, staying
-// pinned to the bottom when the reader is already there. Non-modal (show(),
-// WA_DeleteOnClose) with its size remembered in KConfig.
+// pinned to the bottom when the reader is already there. No status feed reaches
+// this dialog, so the poll infers "finished" instead: consecutive empty pulls
+// stretch the interval (reset by any new bytes), and a hidden dialog does not
+// poll at all. Non-modal (show(), WA_DeleteOnClose) with its size remembered in
+// KConfig.
 class SubAgentTranscriptDialog : public QDialog
 {
     Q_OBJECT
@@ -33,10 +36,19 @@ public:
                              QWidget *parent = nullptr);
     ~SubAgentTranscriptDialog() override;
 
-private:
+protected:
+    // The poll only runs while someone can see it: stopped on hide, restarted
+    // (with an immediate catch-up pull) on show.
+    void showEvent(QShowEvent *event) override;
+    void hideEvent(QHideEvent *event) override;
+
+private Q_SLOTS:
     // Read the bytes appended since the last read and append their rendered
     // chat blocks. Handles a truncated/rotated file by reloading from scratch.
+    // A slot so the regression test can drive polls without waiting them out.
     void pullNew();
+
+private:
 
     // Drop blocks off the FRONT until the document is back inside both caps
     // (block count and character count). Called after every append.

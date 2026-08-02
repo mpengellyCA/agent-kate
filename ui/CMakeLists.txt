@@ -408,6 +408,20 @@ if(Qt6Test_FOUND)
     set_tests_properties(AttachmentBuilderTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
+    # Audit F55/F56: the CSV/XLSX viewers must stay bounded against hostile
+    # files — a crafted cell ref must not balloon a row past OOXML's 16384
+    # column maximum, an oversized zip part is refused before it is ever
+    # decompressed, and an oversize CSV truncates visibly instead of freezing
+    # the GUI thread. Fixtures are real KZip-written .xlsx packages.
+    add_executable(CsvXlsxBoundsTest tests/CsvXlsxBoundsTest.cpp
+        src/CsvView.cpp src/XlsxReader.cpp)
+    target_include_directories(CsvXlsxBoundsTest PRIVATE src)
+    target_link_libraries(CsvXlsxBoundsTest PRIVATE Qt6::Widgets Qt6::Test
+        KF6::Archive)
+    add_test(NAME CsvXlsxBoundsTest COMMAND CsvXlsxBoundsTest)
+    set_tests_properties(CsvXlsxBoundsTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
     # Plan 19: the Jobs panel aggregates work it does not own — agents publish
     # snapshots and it replaces their rows wholesale. Guards the three ways that
     # loses or invents work: one agent's snapshot clobbering another's, rows

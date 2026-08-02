@@ -9,6 +9,7 @@
 #include <QWidget>
 
 class QFileSystemWatcher;
+class QLabel;
 class QTableView;
 class QTimer;
 
@@ -28,6 +29,11 @@ public:
     // treating the first record as the header — same shape `load()` produces.
     void setRecords(QVector<QStringList> records);
 
+    // Whether the last load() hit a size budget (audit F55): the byte cap on
+    // the read, or the record cap on the parse. The view surfaces both.
+    bool byteTruncated() const { return m_byteTruncated; }
+    bool recordTruncated() const { return m_recordTruncated; }
+
     int rowCount(const QModelIndex &parent = QModelIndex()) const override;
     int columnCount(const QModelIndex &parent = QModelIndex()) const override;
     QVariant data(const QModelIndex &index, int role = Qt::DisplayRole) const override;
@@ -38,6 +44,8 @@ private:
     QStringList m_header;
     QVector<QStringList> m_rows;
     int m_columns = 0;
+    bool m_byteTruncated = false;
+    bool m_recordTruncated = false;
 };
 
 // CsvView renders a CSV/TSV file — or an .xlsx/.xlsm workbook — as a sortable,
@@ -63,8 +71,12 @@ private:
     // and when the on-disk file changes (an agent rewrote it).
     void reload();
 
+    // Show/hide the "truncated" banner from the current model/sheet state.
+    void updateTruncationNote();
+
     QString m_path;
     QTableView *m_table = nullptr;
+    QLabel *m_truncNote = nullptr; // visible only when a size budget truncated the grid
     CsvModel *m_model = nullptr;
     QVector<XlsxSheet> m_sheets; // workbook sheets, kept for the sheet selector
     int m_currentSheet = 0;      // selected workbook sheet, preserved across reloads

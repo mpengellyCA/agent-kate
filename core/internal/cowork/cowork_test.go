@@ -17,8 +17,12 @@ type fakeNotifier struct {
 }
 
 // NotifyUI is where the grant prompt now goes (audit F6). The fake treats both
-// as "the human saw it", so the auto-answer path is identical.
-func (f *fakeNotifier) NotifyUI(method string, params any) { f.Notify(method, params) }
+// as "the human saw it", so the auto-answer path is identical. It reports one
+// delivery: a connected UI, whether or not the human ever answers (F53).
+func (f *fakeNotifier) NotifyUI(method string, params any) int {
+	f.Notify(method, params)
+	return 1
+}
 
 func (f *fakeNotifier) Notify(method string, params any) {
 	f.events = append(f.events, method)

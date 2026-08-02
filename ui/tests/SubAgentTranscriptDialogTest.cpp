@@ -23,12 +23,18 @@
 #include <QTemporaryDir>
 #include <QTextBrowser>
 #include <QTextDocument>
+#include <QTimer>
 #include <QtTest>
 
 namespace {
 // LOCKSTEP with kMaxDocChars in SubAgentTranscriptDialog.cpp. If that moves,
 // this moves with it — there is no reason to widen it silently.
 constexpr int kMaxDocChars = 200000;
+// LOCKSTEP with kPollMs / kPollMaxMs / kMarkdownMaxChars in the dialog, for the
+// same reason.
+constexpr int kPollMs = 1200;
+constexpr int kPollMaxMs = 15000;
+constexpr int kMarkdownMaxChars = 16 * 1024;
 
 // One transcript line in the shape both engines' logs share.
 QByteArray assistantLine(const QString &text)
@@ -56,6 +62,17 @@ QTextBrowser *browserOf(SubAgentTranscriptDialog *dlg)
 {
     return dlg->findChild<QTextBrowser *>();
 }
+
+QTimer *pollOf(SubAgentTranscriptDialog *dlg)
+{
+    return dlg->findChild<QTimer *>(QStringLiteral("pollTimer"));
+}
+
+// One poll tick, without waiting the interval out.
+bool pull(SubAgentTranscriptDialog *dlg)
+{
+    return QMetaObject::invokeMethod(dlg, "pullNew", Qt::DirectConnection);
+}
 } // namespace
 
 class SubAgentTranscriptDialogTest : public QObject
@@ -66,6 +83,9 @@ private Q_SLOTS:
     void fewHugeBlocksAreBounded();
     void oneOversizeBlockCannotSurvive();
     void ordinaryTranscriptIsNotTrimmed();
+    void idlePollBacksOffAndResetsOnChange();
+    void pollStopsWhileHidden();
+    void oversizeTextRendersEscapedNotMarkdown();
 
 private:
     QTemporaryDir m_dir;
@@ -148,6 +168,90 @@ void SubAgentTranscriptDialogTest::ordinaryTranscriptIsNotTrimmed()
     const QString text = b->document()->toPlainText();
     QVERIFY(text.contains(QStringLiteral("OLDESTMARKER")));
     QVERIFY(text.contains(QStringLiteral("NEWESTMARKER")));
+}
+
+void SubAgentTranscriptDialogTest::idlePollBacksOffAndResetsOnChange()
+{
+    // No status feed reaches this dialog, so a finished sub-agent must not keep
+    // a 1.2 s parse cadence alive forever: empty pulls double the interval up
+    // to the cap, and new bytes snap it back.
+    const QString path = m_dir.filePath(QStringLiteral("idle.jsonl"));
+    QFile f(path);
+    QVERIFY(f.open(QIODevice::WriteOnly));
+    f.write(assistantLine(QStringLiteral("only line")));
+    f.close();
+
+    QScopedPointer<SubAgentTranscriptDialog> dlg(
+        new SubAgentTranscriptDialog(path, QString()));
+    QTimer *poll = pollOf(dlg.data());
+    QVERIFY(poll);
+    QCOMPARE(poll->interval(), kPollMs); // the constructor's fill consumed the file
+
+    QVERIFY(pull(dlg.data()));
+    QCOMPARE(poll->interval(), kPollMs * 2); // first empty pull: one doubling
+    for (int i = 0; i < 10; ++i) {
+        QVERIFY(pull(dlg.data()));
+    }
+    QCOMPARE(poll->interval(), kPollMaxMs); // capped, not unbounded
+
+    QVERIFY(f.open(QIODevice::Append));
+    f.write(assistantLine(QStringLiteral("woke up")));
+    f.close();
+    QVERIFY(pull(dlg.data()));
+    QCOMPARE(poll->interval(), kPollMs); // new bytes: back to base cadence
+}
+
+void SubAgentTranscriptDialogTest::pollStopsWhileHidden()
+{
+    const QString path = m_dir.filePath(QStringLiteral("hidden.jsonl"));
+    QFile f(path);
+    QVERIFY(f.open(QIODevice::WriteOnly));
+    f.write(assistantLine(QStringLiteral("hello")));
+    f.close();
+
+    QScopedPointer<SubAgentTranscriptDialog> dlg(
+        new SubAgentTranscriptDialog(path, QString()));
+    QTimer *poll = pollOf(dlg.data());
+    QVERIFY(poll);
+
+    dlg->show();
+    QVERIFY(poll->isActive());
+    dlg->hide();
+    QVERIFY(!poll->isActive()); // nobody reading, no cadence at all
+
+    // Appended while hidden; re-showing catches up and resumes at base cadence.
+    QVERIFY(f.open(QIODevice::Append));
+    f.write(assistantLine(QStringLiteral("HIDDENMARKER while you were away")));
+    f.close();
+    dlg->show();
+    QVERIFY(poll->isActive());
+    QCOMPARE(poll->interval(), kPollMs);
+    QTextBrowser *b = browserOf(dlg.data());
+    QVERIFY(b);
+    QVERIFY(b->document()->toPlainText().contains(QStringLiteral("HIDDENMARKER")));
+}
+
+void SubAgentTranscriptDialogTest::oversizeTextRendersEscapedNotMarkdown()
+{
+    // Below the threshold markdown is parsed: "**SMALLBOLD**" loses its
+    // asterisks. Above it the text must be escaped, not parsed, so the literal
+    // "**BIGBOLD**" survives into the document.
+    const QString path = m_dir.filePath(QStringLiteral("dump.jsonl"));
+    QFile f(path);
+    QVERIFY(f.open(QIODevice::WriteOnly));
+    f.write(assistantLine(QStringLiteral("**SMALLBOLD** short and parsed")));
+    f.write(assistantLine(QStringLiteral("**BIGBOLD** ")
+                          + paragraph(QStringLiteral("pad"), kMarkdownMaxChars)));
+    f.close();
+
+    QScopedPointer<SubAgentTranscriptDialog> dlg(
+        new SubAgentTranscriptDialog(path, QString()));
+    QTextBrowser *b = browserOf(dlg.data());
+    QVERIFY(b);
+    const QString text = b->document()->toPlainText();
+    QVERIFY(text.contains(QStringLiteral("SMALLBOLD")));
+    QVERIFY(!text.contains(QStringLiteral("**SMALLBOLD**")));
+    QVERIFY(text.contains(QStringLiteral("**BIGBOLD**")));
 }
 
 QTEST_MAIN(SubAgentTranscriptDialogTest)

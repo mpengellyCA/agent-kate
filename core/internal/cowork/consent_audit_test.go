@@ -383,8 +383,12 @@ func TestAuthorizeRecordsNoActionUntilTheActionHappens(t *testing.T) {
 // fakeNotifier's event slice is not built for that.
 type silentNotifier struct{}
 
-func (silentNotifier) Notify(string, any)   {}
-func (silentNotifier) NotifyUI(string, any) {}
+func (silentNotifier) Notify(string, any) {}
+
+// One delivery: the UI is connected, the human just never answers — the shape
+// that must leave the prompt STANDING rather than fail closed (F53 refuses on
+// zero deliveries, not on silence).
+func (silentNotifier) NotifyUI(string, any) int { return 1 }
 
 func TestCaptureIsRefusedWhileAConsentPromptIsOpen(t *testing.T) {
 	// A notifier that leaves the prompt standing: the human has not answered yet.

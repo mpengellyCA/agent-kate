@@ -31,7 +31,17 @@ namespace {
 // full text remains in the on-disk transcript.
 constexpr int kResultClip = 800;
 // Poll cadence — a backstop for the file watcher while the transcript grows.
+// Nothing tells this dialog when its sub-agent finishes (it is handed a path,
+// not a job), so idleness stands in for "finished": every pull that finds no
+// new bytes doubles the interval up to the cap, and any new bytes snap it back
+// to the base cadence.
 constexpr int kPollMs = 1200;
+constexpr int kPollMaxMs = 15000;
+// A text block past this size is a dump, not prose: it renders as escaped plain
+// text. markdownToHtml is a full md4c parse + QTextDocument + toHtml round trip
+// on the GUI thread, and the block's length is the sub-agent's choice — escaping
+// keeps the per-pull cost a plain O(n) copy instead.
+constexpr int kMarkdownMaxChars = 16 * 1024;
 
 // --- Bounds. This dialog tails a file a SUB-AGENT writes, so its size, its line
 // lengths and its growth rate are all attacker-influenced (repo content shapes
@@ -88,22 +98,26 @@ void renderBlocks(const QJsonValue &content, const QString &role, QString &html,
             if (text.isEmpty()) {
                 continue;
             }
+            // A user block is either the launch prompt or an echoed tool result
+            // narration; the core also synthesizes "Attached file …" text which
+            // isn't part of the conversation.
+            if (!assistant && text.startsWith(QLatin1String("Attached file `"))) {
+                continue;
+            }
+            const QString body = text.size() > kMarkdownMaxChars
+                ? QStringLiteral("<div style=\"white-space:pre-wrap\">%1</div>")
+                      .arg(text.toHtmlEscaped())
+                : agentkate::markdownToHtml(text);
             if (assistant) {
                 html += QStringLiteral(
                             "<div style=\"margin:10px 0 2px\"><b style=\"color:%1\">"
                             "Agent</b></div><div style=\"margin:0 0 8px\">%2</div>")
-                            .arg(c.accent.name(), agentkate::markdownToHtml(text));
+                            .arg(c.accent.name(), body);
             } else {
-                // A user block is either the launch prompt or an echoed tool
-                // result narration; the core also synthesizes "Attached file …"
-                // text which isn't part of the conversation.
-                if (text.startsWith(QLatin1String("Attached file `"))) {
-                    continue;
-                }
                 html += QStringLiteral(
                             "<div style=\"margin:10px 0 2px\"><b style=\"color:%1\">"
                             "Prompt</b></div><div style=\"margin:0 0 8px\">%2</div>")
-                            .arg(c.neutral.name(), agentkate::markdownToHtml(text));
+                            .arg(c.neutral.name(), body);
             }
 
         } else if (bt == QLatin1String("tool_use")) {
@@ -295,6 +309,7 @@ SubAgentTranscriptDialog::SubAgentTranscriptDialog(const QString &jsonlPath,
     connect(m_watcher, &QFileSystemWatcher::fileChanged, this,
             &SubAgentTranscriptDialog::pullNew);
     m_poll = new QTimer(this);
+    m_poll->setObjectName(QStringLiteral("pollTimer")); // regression-test handle
     m_poll->setInterval(kPollMs);
     connect(m_poll, &QTimer::timeout, this, &SubAgentTranscriptDialog::pullNew);
     m_poll->start();
@@ -305,6 +320,28 @@ SubAgentTranscriptDialog::~SubAgentTranscriptDialog()
     KConfigGroup cfg =
         KSharedConfig::openConfig()->group(QStringLiteral("SubAgentTranscriptDialog"));
     cfg.writeEntry("size", size());
+}
+
+void SubAgentTranscriptDialog::showEvent(QShowEvent *event)
+{
+    QDialog::showEvent(event);
+    if (m_poll && !m_poll->isActive()) {
+        // Back from hidden: catch up on whatever was appended meanwhile, and
+        // resume at the base cadence — being shown again is a change signal.
+        m_poll->setInterval(kPollMs);
+        m_poll->start();
+        pullNew();
+    }
+}
+
+void SubAgentTranscriptDialog::hideEvent(QHideEvent *event)
+{
+    QDialog::hideEvent(event);
+    // Nobody is reading: no cadence at all. The watcher stays armed so the
+    // offset keeps up cheaply, and showEvent() pulls whatever it missed.
+    if (m_poll) {
+        m_poll->stop();
+    }
 }
 
 void SubAgentTranscriptDialog::pullNew()
@@ -318,6 +355,16 @@ void SubAgentTranscriptDialog::pullNew()
     // and a file that outran the cap is skipped forward rather than swallowed.
     const agentkate::TailRead tail =
         agentkate::readBoundedTail(m_path, m_offset, kMaxTailBytes);
+    // Idle backoff (null during the constructor's initial fill): a finished
+    // sub-agent stops appending, so consecutive empty pulls stretch the cadence
+    // 1.2 s → 2.4 → 4.8 → … → 15 s; any new bytes (or a rewrite) snap it back.
+    if (m_poll) {
+        if (!tail.bytes.isEmpty() || tail.restarted) {
+            m_poll->setInterval(kPollMs);
+        } else {
+            m_poll->setInterval(qMin(m_poll->interval() * 2, kPollMaxMs));
+        }
+    }
     if (tail.restarted) {
         // Truncated / rewritten — start over so we don't render garbage.
         m_partial.clear();

@@ -3,9 +3,11 @@ package kimi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -24,6 +26,8 @@ import (
 //     then answers stopReason "end_turn";
 //   - a prompt containing "wait-cancel" streams one delta and holds the
 //     response until session/cancel arrives, then answers "cancelled";
+//   - a prompt containing "tail-frame" exits the leader at once and delivers
+//     the turn's last frames from a grandchild 300ms later (the F51 shape);
 //   - a prompt containing "perm" asks permission (reverse request, numeric id
 //     0 — kimi's style) and echoes the selected optionId in its reply text;
 //   - a prompt containing "always-only" asks permission with an option set
@@ -43,7 +47,7 @@ func fakeKimiScript(t *testing.T) string {
 	}
 	path := filepath.Join(t.TempDir(), "fake-kimi")
 	script := `#!/usr/bin/env python3
-import json, sys, os, signal
+import json, sys, os, signal, time
 
 sid = "session_fake-0001"
 pending_prompt = None  # prompt id held until session/cancel
@@ -148,6 +152,19 @@ for line in sys.stdin:
                  "title": "Bash", "kind": "execute", "status": "in_progress",
                  "rawInput": {"command": "sleep 600"}})
             # No response, no pending_prompt: session/cancel is ignored too.
+        elif "tail-frame" in text:
+            # The process dies with the turn's last frames still to come: a
+            # grandchild keeps the stdout pipe open and delivers them (and the
+            # prompt response) 300ms AFTER the leader has exited. reap() must
+            # wait for that tail before it emits "exited" and closes the event
+            # log (audit F51).
+            if os.fork() == 0:
+                time.sleep(0.3)
+                upd({"sessionUpdate": "agent_message_chunk",
+                     "content": {"type": "text", "text": "tail frame"}})
+                send({"jsonrpc": "2.0", "id": fid, "result": {"stopReason": "end_turn"}})
+                os._exit(0)
+            os._exit(0)
         elif "die-mid-turn" in text:
             # The process exits mid-turn without ever answering the prompt — the
             # supervisor must NOT synthesise a result for a turn that isn't coming.
@@ -1430,6 +1447,177 @@ func TestKimiMidTurnDeath(t *testing.T) {
 		t.Error("thread still running after mid-turn death")
 	}
 	sup.StopAll()
+}
+
+// TestKimiFinalTurnFramesLandBeforeExited pins the reap ordering (audit F51,
+// the kimi port of the claude backend's F24 protection): frames still in the
+// pipe when the process dies must be translated and logged BEFORE the "exited"
+// lifecycle event closes the event log — kimi's only transcript. The fake's
+// "tail-frame" prompt exits the leader at once and delivers the turn's last
+// frames from a grandchild 300ms later; with the drain wait wired before
+// cmd.Wait (the inverted order) the grace is burnt at thread start against
+// channels that only close at EOF, so at actual exit the tail is dropped on a
+// nil logFile and emitted after "exited".
+func TestKimiFinalTurnFramesLandBeforeExited(t *testing.T) {
+	kimiBin := fakeKimiScript(t)
+	eventDir := t.TempDir()
+	col := &eventCollector{}
+	sup := NewSupervisor(kimiBin, testLogger(), col.add, nil, eventDir)
+	sup.drainGrace = 1 * time.Second
+
+	th, err := sup.Start(StartOptions{ID: "t-tail", WorkDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	// Outlive the drain grace before the final turn: only a thread older than
+	// the grace exposes the inverted order's missing wait at actual exit.
+	time.Sleep(sup.drainGrace + 500*time.Millisecond)
+	if err := sup.Send(th.ID, "tail-frame", nil); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	col.waitFor(t, "exited lifecycle", isLifecycle("exited"))
+
+	tail := col.indexOf(assistantText("tail frame"))
+	exited := col.indexOf(isLifecycle("exited"))
+	if tail < 0 {
+		t.Fatal("the tail frame never surfaced as an assistant event")
+	}
+	if tail > exited {
+		t.Fatalf("tail frame emitted at index %d, after exited at %d", tail, exited)
+	}
+
+	logged, err := ReadTranscript(eventDir, th.ID)
+	if err != nil {
+		t.Fatalf("ReadTranscript: %v", err)
+	}
+	loggedTail, loggedExited := -1, -1
+	for i, raw := range logged {
+		var ev map[string]any
+		if json.Unmarshal(raw, &ev) != nil {
+			continue
+		}
+		if loggedTail < 0 && assistantText("tail frame")(ev) {
+			loggedTail = i
+		}
+		if loggedExited < 0 && isLifecycle("exited")(ev) {
+			loggedExited = i
+		}
+	}
+	if loggedTail < 0 {
+		t.Fatal("the tail frame is missing from the event log — the final turn was lost")
+	}
+	if loggedExited >= 0 && loggedTail > loggedExited {
+		t.Fatalf("event log holds the tail frame at %d, after exited at %d", loggedTail, loggedExited)
+	}
+	sup.StopAll()
+}
+
+// TestKimiACPWriteDeadline pins the F52 stdin write bound: a frame written to
+// a child that has stopped draining stdin must fail within the write deadline
+// rather than parking wmu forever — every notify, respond and send serializes
+// behind that mutex, Interrupt's session/cancel and Stop's kill path among
+// them. And once a write has failed (possibly part-written) the framing is
+// untrustworthy, so later writes must be refused fast rather than appended to
+// a torn line.
+func TestKimiACPWriteDeadline(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { r.Close(); w.Close() })
+	c := newACPClient(w, testLogger())
+	c.writeTimeout = 200 * time.Millisecond
+
+	// A frame far larger than the 64 KiB pipe buffer, and nobody reading: the
+	// write can only end via the deadline.
+	pad := strings.Repeat("x", 512*1024)
+	done := make(chan error, 1)
+	go func() { done <- c.notify("session/cancel", map[string]any{"pad": pad}) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("write to a full pipe reported success")
+		}
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("blocked write failed with %v, want a deadline error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("write to a full pipe never returned; the stdin deadline is gone")
+	}
+	if err := c.notify("session/cancel", nil); !errors.Is(err, errStdinBroken) {
+		t.Fatalf("write after a torn frame = %v, want errStdinBroken", err)
+	}
+}
+
+// TestKimiInterruptWedgedStdin pins the F52 ordering: Interrupt must return
+// promptly and its kill backstop must still fire when the child has stopped
+// draining stdin. The session/cancel notify blocks on the full pipe; before
+// the fix it ran synchronously BEFORE the backstop was armed, so a wedged kimi
+// could not be interrupted — and abortThenClose, StopAll's shutdown behind it,
+// hung on the same write.
+func TestKimiInterruptWedgedStdin(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { r.Close(); w.Close() })
+
+	col := &eventCollector{}
+	s := NewSupervisor("", testLogger(), col.add, nil, t.TempDir())
+	s.cancelBackstopDelay = 100 * time.Millisecond
+	s.cancelKillDelay = 50 * time.Millisecond
+
+	th := &Thread{
+		ID:            "t-wedged",
+		alive:         true,
+		sessionID:     "sess-wedged",
+		client:        newACPClient(w, testLogger()),
+		cmd:           &exec.Cmd{}, // no Process: the backstop's signals are no-ops
+		activePrompts: 1,           // a turn is in flight, so Interrupt is not a no-op
+	}
+	// Long enough that a notify sent synchronously before the backstop is
+	// armed (the reverted order) holds Interrupt past the assertion below.
+	th.client.writeTimeout = 5 * time.Second
+	s.mu.Lock()
+	s.threads[th.ID] = th
+	s.mu.Unlock()
+
+	// Fill the pipe so the next write blocks: the wedged-child state.
+	junk := make([]byte, 64*1024)
+	_ = w.SetWriteDeadline(time.Now().Add(50 * time.Millisecond))
+	for {
+		if _, err := w.Write(junk); err != nil {
+			break
+		}
+	}
+	_ = w.SetWriteDeadline(time.Time{})
+
+	done := make(chan error, 1)
+	go func() { done <- s.Interrupt(th.ID) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("interrupt: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Interrupt blocked behind the wedged stdin write")
+	}
+
+	// The backstop must escalate regardless of the parked notify: it marks the
+	// thread interrupted before signalling.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		th.mu.Lock()
+		fired := th.interrupted
+		th.mu.Unlock()
+		if fired {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the kill backstop never fired while the cancel write was wedged")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // TestKimiListSessionsFiltersProbes covers session/list's probe filtering: a

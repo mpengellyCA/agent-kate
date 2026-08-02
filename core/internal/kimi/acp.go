@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"strconv"
 	"sync"
+	"time"
 
 	"agentkate/internal/safe"
 )
@@ -29,6 +30,25 @@ const (
 // errStreamClosed fails every pending call when the child's stdout closes —
 // the process died (or is dying), so no request will ever be answered.
 var errStreamClosed = errors.New("kimi acp stream closed")
+
+// errStdinBroken is returned once the stdin stream's framing can no longer be
+// trusted (see acpClient.writeBroken).
+var errStdinBroken = errors.New("kimi stdin is no longer writable (a previous frame failed mid-write)")
+
+// stdinWriteTimeout bounds a single frame write to the child's stdin. The pipe
+// is pollable, so a deadline turns "wedged kimi" from an unbounded park on wmu
+// — which Interrupt, Stop's closeStdin and every notify serialize behind —
+// into a bounded, reportable failure (the F9 fix, ported from the claude
+// backend). Generous enough that a large attachment on a healthy-but-busy CLI
+// never trips it.
+const stdinWriteTimeout = 30 * time.Second
+
+// deadlineWriter is the subset of *os.File a pipe from exec.Cmd.StdinPipe
+// satisfies. Type-asserted rather than required: if a future writer cannot take
+// a deadline we still write (correctness first), we just lose the bound.
+type deadlineWriter interface {
+	SetWriteDeadline(time.Time) error
+}
 
 // acpError is the error half of a JSON-RPC response.
 type acpError struct {
@@ -59,6 +79,13 @@ type acpClient struct {
 
 	wmu sync.Mutex // serialises writes to the child's stdin
 	w   io.Writer
+	// writeTimeout bounds one frame write (stdinWriteTimeout; shrunk in tests).
+	writeTimeout time.Duration
+	// writeBroken latches once a stdin write fails or times out. The frame that
+	// failed may have been written in part, so the stream's framing is no longer
+	// trustworthy: every later write fails fast instead of appending a fragment
+	// to a torn line. Guarded by wmu.
+	writeBroken bool
 
 	mu      sync.Mutex
 	nextID  int64
@@ -76,9 +103,10 @@ type acpClient struct {
 
 func newACPClient(w io.Writer, log *slog.Logger) *acpClient {
 	return &acpClient{
-		log:     log,
-		w:       w,
-		pending: make(map[string]func(acpFrame)),
+		log:          log,
+		w:            w,
+		writeTimeout: stdinWriteTimeout,
+		pending:      make(map[string]func(acpFrame)),
 	}
 }
 
@@ -245,6 +273,20 @@ func (c *acpClient) write(v any) error {
 	}
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
-	_, err = c.w.Write(append(b, '\n'))
-	return err
+	if c.writeBroken {
+		return errStdinBroken
+	}
+	if dw, ok := c.w.(deadlineWriter); ok {
+		if err := dw.SetWriteDeadline(time.Now().Add(c.writeTimeout)); err == nil {
+			defer func() { _ = dw.SetWriteDeadline(time.Time{}) }()
+		}
+	}
+	if _, err := c.w.Write(append(b, '\n')); err != nil {
+		// Includes the deadline case (os.ErrDeadlineExceeded): a partial frame
+		// may be on the wire, so refuse every later write rather than corrupt
+		// the CLI's parser with a fragment.
+		c.writeBroken = true
+		return err
+	}
+	return nil
 }

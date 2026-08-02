@@ -40,7 +40,10 @@ type paramNotifier struct {
 	params map[string]map[string]any
 }
 
-func (p *paramNotifier) NotifyUI(method string, params any) { p.Notify(method, params) }
+func (p *paramNotifier) NotifyUI(method string, params any) int {
+	p.Notify(method, params)
+	return 1
+}
 
 func (p *paramNotifier) Notify(method string, params any) {
 	p.mu.Lock()
@@ -88,7 +91,7 @@ func (r *routeNotifier) Notify(method string, params any) {
 	r.mu.Unlock()
 }
 
-func (r *routeNotifier) NotifyUI(method string, params any) {
+func (r *routeNotifier) NotifyUI(method string, params any) int {
 	r.mu.Lock()
 	r.uiOnly = append(r.uiOnly, method)
 	r.mu.Unlock()
@@ -100,6 +103,7 @@ func (r *routeNotifier) NotifyUI(method string, params any) {
 			}
 		}
 	}
+	return 1
 }
 
 func (r *routeNotifier) sent() ([]string, []string) {

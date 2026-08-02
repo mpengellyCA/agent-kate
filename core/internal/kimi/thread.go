@@ -139,8 +139,8 @@ type Thread struct {
 	authMethods []AuthMethod
 	logFile     *os.File
 	// stdoutDrained / stderrDrained are closed when the ACP reader and the
-	// stderr pump return. reap() waits on them before cmd.Wait, which closes
-	// the pipes.
+	// stderr pump return. reap() waits on them after cmd.Wait, before it emits
+	// "exited" and closes the event log.
 	stdoutDrained chan struct{}
 	stderrDrained chan struct{}
 	// logBytes is the event log's size as far as this thread knows (its size at
@@ -384,6 +384,12 @@ type Supervisor struct {
 	cancelBackstopDelay time.Duration
 	cancelKillDelay     time.Duration
 
+	// drainGrace bounds how long reap waits, after cmd.Wait returns, for the
+	// output readers to reach EOF — a reader kept alive by a leaked grandchild
+	// must not leak the reaper (and with it the thread's "exited" event).
+	// Overridable in tests.
+	drainGrace time.Duration
+
 	// reapWG tracks every in-flight reap() goroutine; StopAll waits on it so
 	// each thread's "exited" lifecycle event has been delivered before shutdown
 	// proceeds (same guarantee agent.Supervisor makes).
@@ -436,6 +442,7 @@ func NewSupervisor(kimiBin string, log *slog.Logger, emit EventFunc, perm Permis
 		eventDir:            eventDir,
 		cancelBackstopDelay: 3 * time.Second,
 		cancelKillDelay:     2 * time.Second,
+		drainGrace:          5 * time.Second,
 		threads:             make(map[string]*Thread),
 	}
 }
@@ -641,10 +648,10 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 		s.onNotification(t, method, params)
 	}
 	t.client.onRequest = func(f acpFrame) { s.onAgentRequest(t, f) }
-	// reap() waits on stdoutDrained before cmd.Wait(): os/exec closes the pipes
-	// as part of Wait, so reaping while the ACP reader is still draining can
-	// discard the tail of the stream — the last frames of the final turn
-	// (audit F24).
+	// reap() waits on stdoutDrained after cmd.Wait(): the last frames of the
+	// final turn may still be in the pipe when the process dies, and the exited
+	// event must not close the event log under the reader translating them
+	// (audits F24/F51).
 	t.stdoutDrained = make(chan struct{})
 	readingOut = true
 	safe.Go("kimi.acpRead", func() {
@@ -1549,11 +1556,13 @@ func (s *Supervisor) Interrupt(threadID string) error {
 	proc := t.cmd.Process
 	t.mu.Unlock()
 
-	if err := t.client.notify("session/cancel", map[string]any{"sessionId": sid}); err != nil {
-		s.log.Warn("session/cancel write failed; relying on signal backstop",
-			"thread", threadID, "err", err)
-	}
-
+	// The backstop is armed BEFORE the cancel is sent, and the notify itself
+	// runs asynchronously (audit F52, mirroring the claude backend's F9 fix):
+	// Interrupt is the UI's escape hatch, so it must return promptly even when
+	// the child has stopped draining stdin — in that state the pipe is full and
+	// the notify blocks until its write deadline. The backstop is exactly the
+	// recovery for "the cancel never landed", so it must not sit behind that
+	// write.
 	safe.Go("kimi.interruptBackstop", func() {
 		time.Sleep(s.cancelBackstopDelay)
 		// Signal only the exact thread this backstop was armed for. If the
@@ -1579,6 +1588,13 @@ func (s *Supervisor) Interrupt(threadID string) error {
 			_ = syscall.Kill(-pgid, syscall.SIGKILL)
 		} else if proc != nil {
 			_ = proc.Kill()
+		}
+	})
+
+	safe.Go("kimi.interruptCancel", func() {
+		if err := t.client.notify("session/cancel", map[string]any{"sessionId": sid}); err != nil {
+			s.log.Warn("session/cancel write failed; relying on signal backstop",
+				"thread", threadID, "err", err)
 		}
 	})
 	return nil
@@ -2343,16 +2359,20 @@ func (s *Supervisor) pumpStderr(t *Thread, r io.Reader, done chan<- struct{}) {
 	}
 }
 
-// drainGrace bounds how long reap waits for the output readers before calling
-// cmd.Wait anyway — a reader kept alive by a leaked grandchild must not leak
-// the reaper (and with it the thread's "exited" event) with it.
-const drainGrace = 5 * time.Second
-
 func (s *Supervisor) reap(t *Thread) {
 	defer s.reapWG.Done()
-	// Let the readers finish before Wait closes the pipes under them (audit
-	// F24). One absolute deadline shared by both waits.
-	end := time.Now().Add(drainGrace)
+	err := t.cmd.Wait()
+	// The pipes are ours (os.Pipe, not cmd.StdoutPipe), so Wait did NOT close
+	// them under the readers — that close is what could discard the tail of
+	// the stream, i.e. the final turn's frames (audit F24). Give the readers
+	// their moment to reach real EOF so those frames land in the event log —
+	// kimi's only transcript — BEFORE the "exited" lifecycle event closes it,
+	// not after (audit F51: waiting here at thread start instead burnt the
+	// whole grace against channels that only close at EOF, leaving zero drain
+	// wait at actual exit).
+	// One absolute deadline shared by both waits (a single Timer would be
+	// consumed by the first and could never fire for the second).
+	end := time.Now().Add(s.drainGrace)
 	for _, drained := range []chan struct{}{t.stdoutDrained, t.stderrDrained} {
 		if drained == nil {
 			continue
@@ -2360,11 +2380,10 @@ func (s *Supervisor) reap(t *Thread) {
 		select {
 		case <-drained:
 		case <-time.After(time.Until(end)):
-			s.log.Warn("output reader still running at reap; closing pipes anyway",
+			s.log.Warn("output reader still running at reap; proceeding without its tail",
 				"thread", t.ID)
 		}
 	}
-	err := t.cmd.Wait()
 
 	t.mu.Lock()
 	t.alive = false

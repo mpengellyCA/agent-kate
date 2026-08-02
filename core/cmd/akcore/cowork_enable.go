@@ -292,7 +292,13 @@ func coworkPreflight(ctx context.Context, d handlerDeps, threadID string, announ
 // permission.respond RPC) as every other human decision.
 func askCoworkEnable(d handlerDeps, fromThreadID, targetThreadID, targetTitle, reason string) bool {
 	id, ch := d.broker.Open()
-	d.srv.NotifyUI("cowork.enableRequested", map[string]any{
+	// NOBODY TO ASK (audit F35 pass 3 / F53): the delivery count is the
+	// authority, exactly as in askHumanPermission — taken from the same
+	// snapshot as the send, it cannot race a UI that disconnects in between.
+	// Zero means no window received the prompt, so parking on the 8-minute
+	// timer would hold the caller on a question nothing will ever display.
+	// Still FAIL CLOSED — no window means no approval — only promptly.
+	if d.srv.NotifyUI("cowork.enableRequested", map[string]any{
 		"requestId":      id,
 		"fromThreadId":   fromThreadID,
 		"threadId":       targetThreadID,
@@ -300,7 +306,10 @@ func askCoworkEnable(d handlerDeps, fromThreadID, targetThreadID, targetTitle, r
 		"reason":         reason,
 		"self":           fromThreadID == targetThreadID,
 		"timeoutSeconds": int(permissionTimeout / time.Second),
-	})
+	}) == 0 {
+		d.broker.Close(id)
+		return false
+	}
 	select {
 	case dec := <-ch:
 		return dec.Allow
@@ -419,8 +428,15 @@ func registerCoworkEnableHandlers(d handlerDeps) {
 				"applied": coworkApplyLive, "alreadyEnabled": true}, nil
 		}
 		if !askCoworkEnable(d, p.FromThreadID, target, coworkEnableTitle(d, target), p.Reason) {
-			return nil, ipc.Errorf(codeCoworkDenied,
-				"the human did not approve desktop access for this agent")
+			why := "the human did not approve desktop access for this agent"
+			if !d.srv.HasUI() {
+				// Fail-closed, but name the closed door (audit F35 pass 3 /
+				// F53): no window is connected, so there was nobody to ask —
+				// refused in about a millisecond, not after the 8-minute
+				// permission window.
+				why = "no Agent Kate window is connected, so nobody could be asked"
+			}
+			return nil, ipc.Errorf(codeCoworkDenied, why)
 		}
 		return setCoworkEnabled(d, target, true)
 	})

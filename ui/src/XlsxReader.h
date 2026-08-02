@@ -10,6 +10,10 @@
 struct XlsxSheet {
     QString name;
     QVector<QStringList> rows;
+    // True when the grid is incomplete because a size budget intervened (audit
+    // F55): an oversized zip part was refused before decompression, or the
+    // per-sheet row/cell cap cut parsing short. The view shows an indicator.
+    bool truncated = false;
 };
 
 // Minimal, dependency-light reader for the OOXML spreadsheet (.xlsx/.xlsm)

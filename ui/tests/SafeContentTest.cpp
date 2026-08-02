@@ -23,6 +23,7 @@
 #include <QFile>
 #include <QImage>
 #include <QPainter>
+#include <QRegularExpression>
 #include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QTextDocument>
@@ -504,16 +505,24 @@ void SafeContentTest::guardedBrowserAlsoRefuses()
 // The guard is only worth having if there is no way around it. Every
 // heap-allocated QTextDocument in ui/src is one that outlives its statement —
 // i.e. one that gets laid out and painted — so it must be a
-// GuardedTextDocument. (The handful of stack-local QTextDocuments that only
-// call setMarkdown()+toHtml() are outside this property: nothing lays them out,
-// so no image handler ever runs against them. Probed. If one of them ever grows
-// a setTextWidth()/drawContents(), it needs the guard too.)
+// GuardedTextDocument. Stack-local QTextDocuments are held to the same bar
+// unless they are on the exempt list below: those only call
+// setMarkdown()+toHtml(), nothing lays them out, so no image handler ever runs
+// against them. Probed. If one of them ever grows a
+// setTextWidth()/drawContents(), it needs the guard too — and any NEW
+// stack-local either takes the guard or argues its way onto the list here.
 void SafeContentTest::noUnguardedRenderedDocument()
 {
     const QString src = uiSrcDir();
     if (src.isEmpty()) {
         QSKIP("source tree not reachable from the test binary");
     }
+    // The probed setMarkdown()+toHtml()-only documents (both markdownToHtml
+    // helpers). LspHoverProvider.cpp used to be the third; it now takes the
+    // guard (plan 30 carried item), which is what this ratchet preserves.
+    const QStringList exempt{QStringLiteral("RichTextView.cpp"),
+                             QStringLiteral("AgentChatHelpers.cpp")};
+    const QRegularExpression stackLocal(QStringLiteral("\\bQTextDocument\\s+\\w+;"));
     QStringList offenders;
     QDirIterator it(src, {QStringLiteral("*.cpp"), QStringLiteral("*.h")}, QDir::Files,
                     QDirIterator::Subdirectories);
@@ -525,9 +534,11 @@ void SafeContentTest::noUnguardedRenderedDocument()
             continue;
         }
         ++scanned;
+        const QString name = QFileInfo(path).fileName();
         const QString text = QString::fromUtf8(f.readAll());
-        if (text.contains(QStringLiteral("new QTextDocument"))) {
-            offenders << QFileInfo(path).fileName();
+        if (text.contains(QStringLiteral("new QTextDocument"))
+            || (!exempt.contains(name) && text.contains(stackLocal))) {
+            offenders << name;
         }
     }
     QVERIFY2(scanned > 10, "source scan found almost nothing — wrong directory?");
