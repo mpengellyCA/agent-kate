@@ -27,6 +27,7 @@ import (
 	"agentkate/internal/modes"
 	"agentkate/internal/permission"
 	"agentkate/internal/safe"
+	"agentkate/internal/schedule"
 	"agentkate/internal/session"
 	"agentkate/internal/skills"
 	"agentkate/internal/vsix"
@@ -250,10 +251,20 @@ func runCore() {
 	// after handlers are registered, well past that point.
 	var harnesses *harness.Registry
 
+	// Same shape for the handler bundle: the relay needs it (the rate-window
+	// waker resumes through the ordinary handler paths) and it is assembled
+	// below, after every store and service it names exists.
+	var deps handlerDeps
+
 	// Turn tracker: the backend-agnostic idle/busy mirror agent.wait blocks on.
 	// The handlers mark turns queued; the relay below feeds every event back in
 	// (results end turns, terminal lifecycles end threads).
 	turns := agent.NewTurnTracker()
+
+	// Rate-window auto-resume (plan 28 §Phase 2). Built below, once deps exist
+	// — the relay only needs the handle, and no event can reach it before
+	// handlers are registered.
+	var rateWakes *schedule.RateWaker
 
 	// The agent supervisors relay every thread event to the UI as a
 	// notification, so the agent panel can render the conversation live. Events
@@ -279,9 +290,16 @@ func runCore() {
 				Type      string `json:"type"`
 				Phase     string `json:"phase"`
 				SessionID string `json:"session_id"`
+				// The account's usage window, carried on every turn by every
+				// engine. Plan 28 §Phase 2 turns it from a readout into a
+				// resume: the machine already knows when it may continue.
+				RateLimitInfo json.RawMessage `json:"rate_limit_info"`
 			}
 			if json.Unmarshal(event, &probe) != nil {
 				continue
+			}
+			if probe.Type == "rate_limit_event" {
+				noteRateLimit(deps, rateWakes, threadID, probe.RateLimitInfo)
 			}
 			// Persist a changed session id (rare — only on an in-session compaction)
 			// so resume follows it. UpdateQuiet: bookkeeping, not user activity.
@@ -419,10 +437,17 @@ func runCore() {
 		)
 	}
 
-	deps := handlerDeps{
+	// The waker takes a POINTER to deps, which is assigned on the next
+	// statement: a wake matures minutes or hours later, long after this, and
+	// firing it must go through the same fully wired handlers a human's Resume
+	// does — that is the whole point of the rule it enforces.
+	rateWakes = newRateWaker(&deps)
+
+	deps = handlerDeps{
 		srv:        srv,
 		harnesses:  harnesses,
 		turns:      turns,
+		rateWakes:  rateWakes,
 		orchGrants: newOrchGrants(),
 		// The fan-out reservation ledger. Absent, every worker launch fails
 		// closed (authority.go) rather than running uncapped.
@@ -466,6 +491,9 @@ func runCore() {
 			// cache-warm; it emits its own per-agent "compacting" progress.
 			runHotCompactsAtShutdown(deps, progress)
 			progress("stopping", "", 0, running)
+			// Disarm every pending auto-resume first: a wake maturing into a
+			// half-torn-down core would relaunch a thread we are stopping.
+			rateWakes.Stop()
 			for _, h := range harnesses.All() {
 				h.StopAll()
 			}

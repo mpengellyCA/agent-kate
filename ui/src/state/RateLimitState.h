@@ -89,12 +89,44 @@ public:
     // held is silent — the CLI repeats itself every turn and a redundant
     // changed() would repaint the roster on every single event.
     void report(const QString &threadId, const RateLimitReport &r);
-    // The agent is gone (closed, archived, stopped): drop its report so a dead
-    // thread cannot hold the fleet notice up forever.
+    // The agent is gone (closed, archived, rebound): drop everything it claimed
+    // so a dead thread cannot hold the fleet notice up forever.
     void forget(const QString &threadId);
+    // Narrower: the thread's PROCESS ended, but the thread has not. Its last
+    // report is stale (nothing is mid-turn any more) while an armed automatic
+    // resume is not — an engine that exits when the window is exhausted is the
+    // very case the resume exists for, so dropping the schedule here would
+    // erase the one piece of state saying this agent is waiting rather than
+    // finished. The core is authoritative about the schedule and cancels it
+    // itself when the human stops the agent.
+    void forgetReport(const QString &threadId);
 
-    // How many live agents are currently on a non-"allowed" status whose reset
-    // time has not already passed. See RateLimitReport::expiredAt.
+    // An automatic resume the CORE has armed for this thread, at `at` (plan 28
+    // §Phase 2 — the `_ratewake` event). This is the ONLY thing that licenses
+    // the words "resumes at" anywhere in the UI: the core arms the wake, the
+    // core fires it, and if it never armed one we must not promise one. A wake
+    // whose moment has passed stops counting for the same reason a stale reset
+    // time does — a claim that outlives its condition teaches the user to
+    // disbelieve every other claim we make.
+    void noteWake(const QString &threadId, const QDateTime &at);
+    void clearWake(const QString &threadId);
+    // The soonest armed resume, invalid when none is armed.
+    QDateTime resumesAt() const;
+    // Is an automatic resume armed for this one thread?
+    bool resumeArmed(const QString &threadId) const;
+    // The caveat that makes "resuming at 14:37" honest, empty when nothing is
+    // armed. akcore lives only as long as the window it serves (it shuts down
+    // when the last client disconnects), so a wake can only fire while Agent
+    // Kate is open. Firing with the app CLOSED is plan 28 §Phase 3's visible
+    // resurrection, which does not exist yet — so we say so instead of letting
+    // the user infer it.
+    QString resumeCaveat() const;
+
+    // How many live agents are currently parked: a non-"allowed" status whose
+    // reset time has not already passed, or an armed automatic resume still in
+    // the future. The second half matters because an engine that EXITS on a
+    // usage limit takes its report with it — the wake is then the only
+    // remaining evidence that the agent is waiting rather than finished.
     int limitedCount() const;
     bool limited() const { return limitedCount() > 0; }
     // The soonest reset among the limited threads, invalid when none is known.
@@ -137,6 +169,11 @@ private:
     void rearmExpiry();
 
     QHash<QString, RateLimitReport> m_byThread;
+    // Thread id → the moment the core says it will resume that thread. Kept
+    // apart from the reports because the two have different lifetimes: the
+    // report belongs to a running turn, the wake outlives the process that
+    // stalled.
+    QHash<QString, QDateTime> m_wakes;
     // True while the fleet is in a limited state and its notice has been taken:
     // the latch that turns one event per turn into one notice per episode.
     bool m_announced = false;

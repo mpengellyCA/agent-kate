@@ -1,8 +1,24 @@
 # 28 — Native scheduling and resume: long-running autonomy without self-escalation
 
-**Status: PLANNED.** Covers IDEAS #15 (extended timer and resume support),
-added to IDEAS.md on 2026-08-01 after the rest of this program was clustered.
+**Status: PHASE 2 LANDED; PHASES 1, 3–5 PLANNED.** Covers IDEAS #15 (extended
+timer and resume support), added to IDEAS.md on 2026-08-01 after the rest of
+this program was clustered.
 Program context: [20-approved-features-program.md](20-approved-features-program.md).
+
+> **Phase 2 (rate-window auto-resume) shipped on its own**, as plan 20's
+> execution order allows — it depends only on `rate_limit_event` and it is the
+> completion of audit F43. What exists now: `core/internal/schedule/`
+> (the package rule, the `Window`/`Wake` types, the staggered `RateWaker`),
+> `core/cmd/akcore/ratewake.go` (arming from the event relay, and firing through
+> the ordinary `resumeThread` path), `AgentStatus::RateLimited` on the roster
+> card, and `RateLimitState`'s armed-wake half so the strip says *"resuming at
+> 14:37"* only when a resume is genuinely scheduled. The rule at the top of this
+> plan is enforced by `TestScheduledResumeUsesRecordPermissionMode` and the
+> source-level `TestNoSchedulerPathCanSetBypassPermissions`, both
+> mutation-tested. Two deliberate limits, stated where the UI says them: akcore
+> lives only while its window does, so a wake fires only while Agent Kate is
+> open (Phase 3's job), and a wake whose thread, permission mode or credentials
+> moved is **skipped with a reason in the conversation**, never silently.
 
 **Size: L.**
 

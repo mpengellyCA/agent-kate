@@ -18,14 +18,19 @@
 // agent, not only when the panel is destroyed.
 
 #include "AgentPanel.h"
+#include "AgentCardDelegate.h"
 #include "AgentChatHelpers.h"
+#include "TranscriptModel.h"
 #include "NewAgentDialog.h" // IsolationCopy — the shared isolation wording
 #include "ipc/CoreClient.h"
 #include "state/DraftStore.h"
 #include "state/RateLimitState.h"
 
+#include <QAbstractItemModel>
 #include <QComboBox>
+#include <QJsonArray>
 #include <QLabel>
+#include <QListView>
 #include <QPlainTextEdit>
 #include <QStandardPaths>
 #include <QtTest>
@@ -63,6 +68,47 @@ QLabel *emptyStateHint(QWidget *panel)
     return nullptr;
 }
 
+// One event, wrapped in the "agent.event" notification shape the core sends,
+// addressed to the thread these tests bind.
+QJsonObject threadEvent(const QJsonObject &event)
+{
+    return QJsonObject{
+        {QStringLiteral("threadId"), QStringLiteral("t-one")},
+        {QStringLiteral("events"), QJsonArray{event}},
+    };
+}
+
+// The conversation feed's model, found by content rather than by widget tree.
+QAbstractItemModel *feedModel(QWidget *panel)
+{
+    const auto views = panel->findChildren<QListView *>();
+    for (QListView *v : views) {
+        if (v->model()) {
+            return v->model();
+        }
+    }
+    return nullptr;
+}
+
+int feedRowCount(QWidget *panel)
+{
+    QAbstractItemModel *m = feedModel(panel);
+    return m ? m->rowCount() : -1;
+}
+
+// The plain-text source of the last feed row (PlainRole is what copy + search
+// read, so it is the honest "what does this row say").
+QString lastFeedText(QWidget *panel)
+{
+    QAbstractItemModel *m = feedModel(panel);
+    if (!m || m->rowCount() == 0) {
+        return {};
+    }
+    const QModelIndex idx = m->index(m->rowCount() - 1, 0);
+    const QString plain = m->data(idx, TranscriptModel::PlainRole).toString();
+    return plain.isEmpty() ? m->data(idx, TranscriptModel::HtmlRole).toString() : plain;
+}
+
 agentkate::RateLimitReport limitedReport()
 {
     agentkate::RateLimitReport r;
@@ -81,6 +127,8 @@ private Q_SLOTS:
     void initTestCase();
     void cleanup();
 
+    void aParkedAgentStopsClaimingItIsWorking();
+    void aSkippedResumeIsAnnouncedNotSwallowed();
     void isolationLabelsComeFromTheSharedCopy();
     void changingIsolationRepaintsTheEmptyState();
     void rebindingTheThreadWithdrawsItsUsageLimitClaim();
@@ -99,6 +147,105 @@ void AgentPanelTest::cleanup()
 {
     agentkate::RateLimitState::self()->forget(QStringLiteral("t-one"));
     agentkate::RateLimitState::self()->forget(QStringLiteral("t-two"));
+}
+
+// Plan 28 §Phase 2 / audit F43's other half. An agent parked on the account's
+// usage window is not working, and its card must stop saying so — the green
+// "computing" arc over a thread that cannot spend a token until 14:37 is the
+// symptom people actually reported. And once the core arms the resume, the
+// panel says WHEN, because that is the entire difference between "stalled until
+// someone comes back" and "resumes at 14:37".
+//
+// Driven through onNotification, the real wire: what was missing here has
+// always been wiring, and a test on the private helpers would not see it.
+void AgentPanelTest::aParkedAgentStopsClaimingItIsWorking()
+{
+    CoreClient core;
+    AgentPanel panel(&core);
+    auto *state = agentkate::RateLimitState::self();
+    // A bound thread always has a workspace; without one the header is still in
+    // its "open a folder to begin" state and no thread status applies.
+    panel.setWorkspace(QStringLiteral("/tmp/agentkate-ratewake-test"));
+    panel.setDormant(QStringLiteral("t-one"), QStringLiteral("one"), false,
+                     QStringLiteral("claude"));
+
+    QSignalSpy status(&panel, &AgentPanel::statusChanged);
+    QSignalSpy subtitle(&panel, &AgentPanel::subtitleChanged);
+
+    // The engine reports the account's window as exhausted.
+    const QDateTime resets = QDateTime::currentDateTimeUtc().addSecs(900);
+    panel.onNotification(QStringLiteral("agent.event"), threadEvent(QJsonObject{
+        {QStringLiteral("type"), QStringLiteral("rate_limit_event")},
+        {QStringLiteral("rate_limit_info"), QJsonObject{
+            {QStringLiteral("status"), QStringLiteral("rejected")},
+            {QStringLiteral("rateLimitType"), QStringLiteral("five_hour")},
+            {QStringLiteral("resetsAt"), double(resets.toSecsSinceEpoch())},
+        }},
+    }));
+
+    QVERIFY(!status.isEmpty());
+    QCOMPARE(status.constLast().at(0).toInt(),
+             int(AgentRoles::AgentStatus::RateLimited));
+    QCOMPARE(state->limitedCount(), 1);
+
+    // ...and the core arms the resume.
+    const QDateTime wakeAt = resets.addSecs(30);
+    panel.onNotification(QStringLiteral("agent.event"), threadEvent(QJsonObject{
+        {QStringLiteral("type"), QStringLiteral("_ratewake")},
+        {QStringLiteral("state"), QStringLiteral("armed")},
+        {QStringLiteral("at"), double(wakeAt.toSecsSinceEpoch())},
+    }));
+
+    QCOMPARE(status.constLast().at(0).toInt(),
+             int(AgentRoles::AgentStatus::RateLimited));
+    QVERIFY(state->resumeArmed(QStringLiteral("t-one")));
+    const QString said = subtitle.constLast().at(0).toString();
+    QVERIFY2(said.contains(QStringLiteral("resumes at")),
+             qPrintable(QStringLiteral("the card does not say when it resumes: ") + said));
+    QVERIFY2(!said.contains(QStringLiteral("Working")), qPrintable(said));
+}
+
+// The honesty half. A resume the core declined to perform — the thread's
+// permission mode moved, the agent was closed, the key is in the wallet — has
+// to be SAID. Being promised "resumes at 14:37" and finding an agent that never
+// moved, with nothing in the conversation explaining why, is worse than never
+// having been promised anything.
+void AgentPanelTest::aSkippedResumeIsAnnouncedNotSwallowed()
+{
+    CoreClient core;
+    AgentPanel panel(&core);
+    auto *state = agentkate::RateLimitState::self();
+    // A bound thread always has a workspace; without one the header is still in
+    // its "open a folder to begin" state and no thread status applies.
+    panel.setWorkspace(QStringLiteral("/tmp/agentkate-ratewake-test"));
+    panel.setDormant(QStringLiteral("t-one"), QStringLiteral("one"), false,
+                     QStringLiteral("claude"));
+
+    const QDateTime wakeAt = QDateTime::currentDateTimeUtc().addSecs(900);
+    panel.onNotification(QStringLiteral("agent.event"), threadEvent(QJsonObject{
+        {QStringLiteral("type"), QStringLiteral("_ratewake")},
+        {QStringLiteral("state"), QStringLiteral("armed")},
+        {QStringLiteral("at"), double(wakeAt.toSecsSinceEpoch())},
+    }));
+    QVERIFY(state->resumeArmed(QStringLiteral("t-one")));
+    const int before = feedRowCount(&panel);
+
+    const QString why = QStringLiteral("its \"when to ask\" setting changed after "
+                                       "the resume was scheduled");
+    panel.onNotification(QStringLiteral("agent.event"), threadEvent(QJsonObject{
+        {QStringLiteral("type"), QStringLiteral("_ratewake")},
+        {QStringLiteral("state"), QStringLiteral("skipped")},
+        {QStringLiteral("reason"), why},
+    }));
+
+    QVERIFY2(!state->resumeArmed(QStringLiteral("t-one")),
+             "a resume that did not happen was still being promised");
+    QCOMPARE(state->limitedCount(), 0);
+    QVERIFY2(feedRowCount(&panel) > before,
+             "the skipped resume left nothing in the conversation");
+    QVERIFY2(lastFeedText(&panel).contains(QStringLiteral("when to ask")),
+             qPrintable(QStringLiteral("the reason was swallowed: ")
+                        + lastFeedText(&panel)));
 }
 
 // The convergence: this picker's words are the shared ones, so "auto" cannot go

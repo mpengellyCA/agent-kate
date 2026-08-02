@@ -1155,8 +1155,15 @@ void AgentRoster::updateRateLimitStrip()
     const QString text = agentkate::RateLimitState::self()->summary();
     m_rateLimitStrip->setVisible(!text.isEmpty());
     if (text.isEmpty()) {
+        m_rateLimitStrip->setToolTip(QString());
         return;
     }
+    // When the strip promises a resume, it also carries the condition that
+    // promise depends on (plan 28 §Phase 2): akcore only lives while this
+    // window does, so a scheduled resume happens while Agent Kate is open and
+    // not otherwise. Empty when nothing is armed — there is no promise to
+    // qualify.
+    m_rateLimitStrip->setToolTip(agentkate::RateLimitState::self()->resumeCaveat());
     // The theme's own "warning / caution" colour, not a literal — this tracks a
     // runtime Breeze light/dark switch exactly like the card delegate's badges.
     m_rateLimitStrip->setText(

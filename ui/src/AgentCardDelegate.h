@@ -42,6 +42,12 @@ enum class AgentStatus {
     NeedsInput, // a permission prompt is waiting on the user
     Dormant,    // resumable, no live process
     Error,      // the last start/turn failed
+    // Parked by the account's usage window (plan 28 §Phase 2). Deliberately
+    // NOT Working: a thread that cannot spend a token until 14:37 painting the
+    // green "computing" arc was the most visible half of audit F43, and it is
+    // the state the auto-resume exists to end. New values go on the END — the
+    // enum is persisted into item data as an int.
+    RateLimited,
 };
 } // namespace AgentRoles
 

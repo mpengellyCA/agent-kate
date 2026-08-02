@@ -1352,6 +1352,19 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     // drops any still-queued events after the receiver is destroyed.
     connect(m_core, &CoreClient::notification, this, &AgentPanel::onNotification,
             Qt::QueuedConnection);
+    // The shared usage-limit state runs the one timer that fires when a window
+    // rolls over or an armed resume comes due — the only two moments this
+    // panel's parked state changes with no event of its own to hang off (a
+    // parked agent emits nothing until it is unparked). Repaint only when OUR
+    // answer actually moved: changed() fires for every agent's report, and this
+    // panel's header must not re-layout on the whole fleet's traffic. `this` is
+    // the connection context, so nothing is delivered after destruction.
+    connect(agentkate::RateLimitState::self(), &agentkate::RateLimitState::changed,
+            this, [this] {
+                if (rateLimitParked() != m_rateParkedShown) {
+                    refresh();
+                }
+            });
 
     applyChatSettings();
     refresh();
@@ -2647,8 +2660,14 @@ void AgentPanel::refresh()
     m_promoteBar->setVisible(!m_threadId.isEmpty() && !m_isolated && !m_promoting
                              && traits.promote);
 
+    // Parked on the account's usage window: nothing is computing, whatever the
+    // last turn state said, so neither the working indicator nor the roster's
+    // green arc may claim otherwise (audit F43 / plan 28 §Phase 2).
+    const bool parked = rateLimitParked();
+    m_rateParkedShown = parked;
+
     // "Agent Kate at work" indicator: animate while a turn is actually computing.
-    m_working->setActive(running && !m_idle && m_permQueue.isEmpty());
+    m_working->setActive(running && !m_idle && !parked && m_permQueue.isEmpty());
 
     QString dot;
     QString text;
@@ -2664,6 +2683,22 @@ void AgentPanel::refresh()
         dot = QStringLiteral("#5d6471");
         text = QStringLiteral("Open a workspace folder to begin");
         st = AgentRoles::AgentStatus::Idle;
+    } else if (parked) {
+        // Ahead of dormant/idle/working on purpose: "waiting for quota" is the
+        // true account of an agent whose engine stopped because the window was
+        // exhausted, and "Dormant — Resume to continue" would invite the user
+        // to do by hand the thing that is already scheduled.
+        dot = QStringLiteral("#e0a030");
+        const QString clock =
+            m_rateWakeAt.isValid()
+                ? QLocale().toString(m_rateWakeAt.toLocalTime().time(), QLocale::ShortFormat)
+                : QString();
+        text = clock.isEmpty()
+            ? i18nc("@info roster subtitle, agent parked on the account's usage limit",
+                    "Paused by a usage limit")
+            : i18nc("@info roster subtitle, parked agent with an automatic resume armed",
+                    "Paused by a usage limit — resumes at %1", clock);
+        st = AgentRoles::AgentStatus::RateLimited;
     } else if (m_dormant) {
         dot = QStringLiteral("#5d6471");
         text = QStringLiteral("Dormant — Resume to continue this session");
@@ -5527,10 +5562,103 @@ void AgentPanel::applyRateLimit(const QJsonObject &info)
     refresh();
 }
 
-void AgentPanel::clearRateLimitClaim()
+// applyRateWake folds one `_ratewake` event in: the core's account of what the
+// automatic resume (plan 28 §Phase 2) is doing for THIS thread.
+//
+// Every state is spoken aloud, and the skip is the important one. Being told
+// "resuming at 14:37" and then finding an agent that never moved is worse than
+// never having been promised anything, so a resume the core declined to perform
+// says so, with its reason, in the conversation it declined to resume.
+void AgentPanel::applyRateWake(const QJsonObject &ev)
+{
+    if (m_replaying) {
+        return; // a schedule from a past run is not news on replay
+    }
+    const QString state = ev.value(QStringLiteral("state")).toString();
+    const QString reason = ev.value(QStringLiteral("reason")).toString();
+    const QJsonValue at = ev.value(QStringLiteral("at"));
+    const QDateTime when = at.isDouble()
+        ? QDateTime::fromSecsSinceEpoch(qint64(at.toDouble()))
+        : QDateTime();
+    const QString clock = when.isValid()
+        ? QLocale().toString(when.toLocalTime().time(), QLocale::ShortFormat)
+        : QString();
+
+    if (state == QLatin1String("armed")) {
+        m_rateWakeAt = when;
+        if (!m_threadId.isEmpty()) {
+            agentkate::RateLimitState::self()->noteWake(m_threadId, when);
+        }
+        addNote(clock.isEmpty()
+                    ? i18n("Paused by a usage limit — this agent will resume "
+                           "itself when the window reopens.")
+                          .toHtmlEscaped()
+                    : i18n("Paused by a usage limit — this agent will resume "
+                           "itself at %1, as long as Agent Kate is still open.",
+                           clock)
+                          .toHtmlEscaped(),
+                QStringLiteral("sys"));
+    } else if (state == QLatin1String("fired")) {
+        m_rateWakeAt = QDateTime();
+        if (!m_threadId.isEmpty()) {
+            agentkate::RateLimitState::self()->clearWake(m_threadId);
+        }
+        addNote(i18n("The usage window reopened — resuming this agent now.")
+                    .toHtmlEscaped(),
+                QStringLiteral("sys"));
+    } else if (state == QLatin1String("skipped")) {
+        m_rateWakeAt = QDateTime();
+        if (!m_threadId.isEmpty()) {
+            agentkate::RateLimitState::self()->clearWake(m_threadId);
+        }
+        addNote(reason.isEmpty()
+                    ? i18n("The scheduled resume did not run.").toHtmlEscaped()
+                    : i18n("The scheduled resume did not run: %1", reason).toHtmlEscaped(),
+                QStringLiteral("err"));
+    } else if (state == QLatin1String("cancelled")) {
+        // No feed row: a cancellation means the stall is over, which the status
+        // transition note already reports. Just stop claiming a resume.
+        m_rateWakeAt = QDateTime();
+        if (!m_threadId.isEmpty()) {
+            agentkate::RateLimitState::self()->clearWake(m_threadId);
+        }
+    } else {
+        return; // a state this build does not know: change nothing
+    }
+    refresh();
+}
+
+// rateLimitParked: see the header. The armed wake counts on its own because an
+// engine that EXITS on an exhausted window takes its last report with it — the
+// schedule is then the only remaining evidence that this agent is waiting
+// rather than finished.
+bool AgentPanel::rateLimitParked() const
+{
+    const QDateTime now = QDateTime::currentDateTime();
+    if (m_rateWakeAt.isValid() && m_rateWakeAt > now) {
+        return true;
+    }
+    if (m_rateLimitStatus.isEmpty()
+        || m_rateLimitStatus == QLatin1String("allowed")
+        || m_rateLimitStatus == QLatin1String("allowed_warning")) {
+        return false;
+    }
+    // A limit whose reset time has passed is over, whatever the last event
+    // said — the parked agent sends nothing more to correct it.
+    return !m_rateLimitResetsAt.isValid() || m_rateLimitResetsAt > now;
+}
+
+void AgentPanel::clearRateLimitClaim(bool alsoDropArmedResume)
 {
     if (!m_threadId.isEmpty()) {
-        agentkate::RateLimitState::self()->forget(m_threadId);
+        if (alsoDropArmedResume) {
+            agentkate::RateLimitState::self()->forget(m_threadId);
+        } else {
+            agentkate::RateLimitState::self()->forgetReport(m_threadId);
+        }
+    }
+    if (alsoDropArmedResume) {
+        m_rateWakeAt = QDateTime();
     }
     if (m_rateLimitStatus.isEmpty()) {
         return; // nothing claimed; don't repaint the header for nothing
@@ -6435,6 +6563,11 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
         // on a status transition (see applyRateLimit).
         applyRateLimit(ev.value(QStringLiteral("rate_limit_info")).toObject());
 
+    } else if (type == QLatin1String("_ratewake")) {
+        // The core's automatic resume for this thread: armed / cancelled /
+        // firing now / deliberately skipped (plan 28 §Phase 2).
+        applyRateWake(ev);
+
     } else if (type == QLatin1String("_commands")) {
         // The kimi CLI's command list (translated from ACP
         // available_commands_update) — replaces the autocomplete feed. Not a
@@ -6623,7 +6756,14 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             // otherwise keep the roster's "N agents paused" strip up until the
             // panel was closed (audit F43); a resume re-reports on its first
             // turn.
-            clearRateLimitClaim();
+            //
+            // Its ARMED automatic resume survives, though: an engine that exits
+            // because the account's window is exhausted is precisely the case
+            // plan 28 §Phase 2 exists for, and the core still holds that
+            // schedule. When the human is the one who stopped the agent, the
+            // core cancels the wake and says so — this panel does not have to
+            // guess which of the two just happened.
+            clearRateLimitClaim(/*alsoDropArmedResume=*/false);
             // The session stopped before the queued follow-ups could fire (and,
             // if it died before it ever started, before the opening prompt did
             // either). Don't discard the human's text — put it back in the

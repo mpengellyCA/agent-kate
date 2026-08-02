@@ -94,6 +94,10 @@ Badge badgeFor(AgentRoles::AgentStatus s, const QPalette &pal)
         return {QStringLiteral("⚠"), ak.neutral, false};     // ⚠ amber
     case AgentRoles::AgentStatus::Error:
         return {QStringLiteral("✖"), ak.negative, false};    // ✖ negative
+    case AgentRoles::AgentStatus::RateLimited:
+        // Parked on the account's usage window: the same caution colour as
+        // "needs input", and emphatically NOT animated — nothing is computing.
+        return {QStringLiteral("⏳"), ak.neutral, false};
     case AgentRoles::AgentStatus::Dormant:
         return {QStringLiteral("⏸"), pal.color(QPalette::PlaceholderText),
                 false}; // ⏸ muted

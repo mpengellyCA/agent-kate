@@ -210,6 +210,17 @@ public:
     void flushDraft();
     void dropPendingDraftWrite();
 
+    // The core's push channel into this panel: every agent event, permission
+    // prompt and per-thread notification arrives here (wired to
+    // CoreClient::notification in the constructor).
+    //
+    // Public because it is the only honest way to test what this panel does
+    // with an event. The behaviours that matter — a usage-limited agent that
+    // must stop painting the "working" arc, a scheduled resume that must be
+    // announced when it is SKIPPED — are wiring, and a test that calls the
+    // private helpers directly cannot see whether the wire reaches them.
+    void onNotification(const QString &method, const QJsonObject &params);
+
 Q_SIGNALS:
     void statusMessage(const QString &text);
     void titleChanged(const QString &title);
@@ -317,7 +328,6 @@ private:
     // Surface why files were rejected (binary, too large, unreadable) in a
     // prominent inline banner rather than a transient status-bar message.
     void showAttachNotice(const QString &text);
-    void onNotification(const QString &method, const QJsonObject &params);
     void renderEvent(const QJsonObject &event);
     // --- claude stream channel (--include-partial-messages) ----------------
     // One `stream_event`: the raw Anthropic SSE envelope the CLI forwards.
@@ -374,7 +384,22 @@ private:
     // limit" for as long as its panel stayed open, which is a status that
     // outlives its condition — the same class of falsehood as a limit that
     // survives its own reset time.
-    void clearRateLimitClaim();
+    //
+    // alsoDropArmedResume distinguishes the two teardowns: true when this panel
+    // stops being that agent at all (rebind, close) and everything it claimed
+    // must go, false when only its PROCESS ended — an armed automatic resume
+    // survives that, because the core is still holding it (plan 28 §Phase 2).
+    void clearRateLimitClaim(bool alsoDropArmedResume = true);
+    // Fold one `_ratewake` event — the core telling this thread that an
+    // automatic resume was armed, cancelled, is firing now, or was deliberately
+    // NOT performed and why (plan 28 §Phase 2).
+    void applyRateWake(const QJsonObject &ev);
+    // Is this agent parked on the account's usage window right now? True while
+    // a non-"allowed" status stands whose reset has not passed, or while the
+    // core holds an armed resume for it. It is what stops the roster card
+    // painting the green "computing" arc over a thread that cannot spend a
+    // token until 14:37.
+    bool rateLimitParked() const;
     // Drive the mode/model/thinking pickers to the values a kimi `_options`
     // event reports, for each id it lists as changed.
     void adoptDiscoveredOptions(const QJsonArray &configOptions,
@@ -661,6 +686,15 @@ private:
     // (audit F43).
     QDateTime m_rateLimitResetsAt;
     bool m_rateLimitOverage = false;
+    // When the core has armed an automatic resume for this thread (plan 28
+    // §Phase 2's `_ratewake` event); invalid when it has not. Kept separately
+    // from the reset time because they answer different questions — "when does
+    // the window reopen" versus "when will something actually happen" — and
+    // only the second one licenses the words "resumes at".
+    QDateTime m_rateWakeAt;
+    // The parked state the last refresh() painted, so the shared state's
+    // expiry tick can repaint this panel only when its own answer moved.
+    bool m_rateParkedShown = false;
     // Stable key of the plan checklist card (-1 = none yet). Each TodoWrite /
     // ACP plan update rewrites this one card in place, so the feed carries the
     // current plan rather than a trail of stale copies.

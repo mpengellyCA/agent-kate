@@ -22,6 +22,7 @@ import (
 	"agentkate/internal/modes"
 	"agentkate/internal/permission"
 	"agentkate/internal/safe"
+	"agentkate/internal/schedule"
 	"agentkate/internal/search"
 	"agentkate/internal/session"
 	"agentkate/internal/skills"
@@ -135,9 +136,13 @@ type handlerDeps struct {
 	// kept for hot compaction) went away with plan 16 P6: compaction is a
 	// Harness method now, and the running/stop checks that used it silently
 	// reported a live kimi thread as not running.
-	harnesses  *harness.Registry
-	turns      *agent.TurnTracker // backend-agnostic idle/busy mirror (agent.wait)
-	orchGrants *orchGrants        // one-shot human approvals for cross-subtree agent control
+	harnesses *harness.Registry
+	turns     *agent.TurnTracker // backend-agnostic idle/busy mirror (agent.wait)
+	// rateWakes arms the automatic resume that unparks a thread when the
+	// account's usage window reopens (plan 28 §Phase 2, ratewake.go). Nil in
+	// tests that do not exercise it — every call on it is nil-safe.
+	rateWakes  *schedule.RateWaker
+	orchGrants *orchGrants // one-shot human approvals for cross-subtree agent control
 	// workerSlots reserves a worker slot for the whole duration of a launch, so
 	// the fan-out caps hold against CONCURRENT launch_agent calls — the persisted
 	// records they otherwise count only appear after the launch (authority.go).
@@ -542,6 +547,10 @@ func registerHandlers(d handlerDeps) {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams,
 				"thread has no "+h.Capabilities().DisplayName+" session to resume")
 		}
+		// The human got here first: drop any usage-window auto-resume armed for
+		// this thread, so the schedule stops promising something that has
+		// already happened (plan 28 §Phase 2).
+		d.rateWakes.Cancel(p.ThreadID, "you resumed it yourself")
 		safe.Go("agent.resumeThread", func() { resumeThread(d, h, rec, p.Provider) })
 		return map[string]any{"threadId": rec.ThreadID, "sessionId": rec.SessionID}, nil
 	})
@@ -952,6 +961,12 @@ func registerHandlers(d handlerDeps) {
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
+		// A human stopping an agent means they do not want it starting itself
+		// again at 14:37 — so an armed usage-window resume is cancelled here,
+		// and the cancellation is reported. Only the process EXITING on its own
+		// (which arrives as the same lifecycle event) leaves the schedule
+		// standing, because that is the stall this feature exists to end.
+		d.rateWakes.Cancel(p.ThreadID, "you stopped it")
 		// Hot-Opus runs against the live session so it has to happen BEFORE
 		// the supervisor terminates the process; cold strategies fire from
 		// the exit lifecycle handler instead.
@@ -1022,6 +1037,9 @@ func registerHandlers(d handlerDeps) {
 		d.gitCache.Forget(p.ThreadID)
 		d.turns.Forget(p.ThreadID)
 		d.threads.remove(p.ThreadID)
+		// An archived thread must not be woken by a usage-window resume armed
+		// while it was still live.
+		d.rateWakes.Cancel(p.ThreadID, "the agent was closed")
 		d.log.Info("agent stopped & closed (archived)", "thread", p.ThreadID)
 		return map[string]any{"ok": true}, nil
 	})
@@ -1464,6 +1482,10 @@ func registerHandlers(d handlerDeps) {
 		}
 		d.gitCache.Forget(p.ThreadID)
 		d.turns.Forget(p.ThreadID)
+		// A discarded thread has no worktree left to resume into, so any
+		// usage-window wake armed for it is disarmed here rather than left to
+		// fail at 3am.
+		d.rateWakes.Cancel(p.ThreadID, "the agent was discarded")
 		// Approval grants that named this thread (as granter or target) are
 		// meaningless now — and must not silently cover a future thread that
 		// happens to reuse the id.

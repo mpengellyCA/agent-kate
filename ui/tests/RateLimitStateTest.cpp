@@ -224,6 +224,103 @@ private Q_SLOTS:
         QTRY_VERIFY_WITH_TIMEOUT(spy.count() >= 1, 5000);
         QVERIFY(!s->limited());
     }
+
+    // --- plan 28 §Phase 2: the armed automatic resume ------------------------
+
+    // "Resets at" and "resumes at" are different promises, and only one of them
+    // is ours to make. The window reopening is a fact about the account; an
+    // agent CONTINUING is a thing the core has to have scheduled. So the words
+    // change only when a wake is actually armed — this is the honest-labelling
+    // rule applied to the feature's headline string.
+    void onlyAnArmedWakeLicensesTheResumesAtClaim()
+    {
+        RateLimitState *s = RateLimitState::self();
+        const QDateTime resets = QDateTime::currentDateTimeUtc().addSecs(600);
+        s->report(QStringLiteral("t1"), rejected(resets));
+
+        const QString beforeArming = s->summary();
+        QVERIFY2(!beforeArming.contains(QStringLiteral("resum")),
+                 "the strip promised a resume nobody had scheduled");
+        QVERIFY(beforeArming.contains(QStringLiteral("resets")));
+        QVERIFY2(s->resumeCaveat().isEmpty(),
+                 "a caveat was offered for a promise that was never made");
+        QVERIFY(!s->resumeArmed(QStringLiteral("t1")));
+
+        s->noteWake(QStringLiteral("t1"), resets);
+
+        QVERIFY(s->resumeArmed(QStringLiteral("t1")));
+        QCOMPARE(s->resumesAt(), resets);
+        const QString armed = s->summary();
+        QVERIFY2(armed.contains(QStringLiteral("resuming")),
+                 qPrintable(QStringLiteral("an armed resume is not surfaced: ") + armed));
+        // And the condition it depends on is available to whatever renders it:
+        // akcore only lives while this window does.
+        QVERIFY(!s->resumeCaveat().isEmpty());
+    }
+
+    // The engine EXITS when the window is exhausted, taking its last report
+    // with it. The armed resume is then the only remaining evidence that this
+    // agent is waiting rather than finished — so it alone keeps the agent
+    // counted, or the strip would go quiet on a fleet that is still parked.
+    void anArmedWakeAloneKeepsTheAgentParked()
+    {
+        RateLimitState *s = RateLimitState::self();
+        const QDateTime resets = QDateTime::currentDateTimeUtc().addSecs(600);
+        s->report(QStringLiteral("t1"), rejected(resets));
+        s->noteWake(QStringLiteral("t1"), resets);
+
+        s->forgetReport(QStringLiteral("t1")); // the process exited
+        QCOMPARE(s->limitedCount(), 1);
+        QVERIFY(s->summary().contains(QStringLiteral("resuming")));
+
+        // One agent is one agent: a report AND a wake for the same thread must
+        // not be counted twice.
+        s->report(QStringLiteral("t1"), rejected(resets));
+        QCOMPARE(s->limitedCount(), 1);
+
+        // Closing the agent for real drops both halves.
+        s->forget(QStringLiteral("t1"));
+        QCOMPARE(s->limitedCount(), 0);
+        QVERIFY(s->summary().isEmpty());
+    }
+
+    // A resume time that has passed promises nothing. Same rule as an expired
+    // reset time, and for the same reason: at 14:40 the words "resuming at
+    // 14:37" teach the user to disbelieve everything else the strip says.
+    void aPassedWakeStopsPromisingAResume()
+    {
+        RateLimitState *s = RateLimitState::self();
+        const QDateTime resets = QDateTime::currentDateTimeUtc().addSecs(600);
+        s->report(QStringLiteral("t1"), rejected(resets));
+        s->noteWake(QStringLiteral("t1"), QDateTime::currentDateTimeUtc().addSecs(-30));
+
+        QVERIFY(!s->resumesAt().isValid());
+        QVERIFY(!s->resumeArmed(QStringLiteral("t1")));
+        const QString text = s->summary();
+        QVERIFY2(!text.contains(QStringLiteral("resuming")), qPrintable(text));
+        QVERIFY(text.contains(QStringLiteral("resets"))); // the window is still shut
+    }
+
+    // The core cancels a wake when the human resumes or stops the agent itself.
+    // The claim has to go with it, immediately — and repeats of the same armed
+    // wake must stay silent, since the core re-states it as it folds in reports.
+    void cancellingAWakeWithdrawsTheClaim()
+    {
+        RateLimitState *s = RateLimitState::self();
+        const QDateTime resets = QDateTime::currentDateTimeUtc().addSecs(600);
+        s->report(QStringLiteral("t1"), rejected(resets));
+        s->noteWake(QStringLiteral("t1"), resets);
+
+        QSignalSpy spy(s, &RateLimitState::changed);
+        s->noteWake(QStringLiteral("t1"), resets); // same wake, again
+        QCOMPARE(spy.count(), 0);
+
+        s->clearWake(QStringLiteral("t1"));
+        QCOMPARE(spy.count(), 1);
+        QVERIFY(!s->resumeArmed(QStringLiteral("t1")));
+        QVERIFY2(!s->summary().contains(QStringLiteral("resuming")),
+                 "a cancelled resume was still being promised");
+    }
 };
 
 QTEST_MAIN(RateLimitStateTest)
