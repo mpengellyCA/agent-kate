@@ -1,5 +1,7 @@
 #include "ConsentDialog.h"
 
+#include "CapabilityText.h"
+
 #include <KLocalizedString>
 #include <KMessageWidget>
 
@@ -13,29 +15,17 @@
 
 namespace {
 
-QString capabilityVerb(const QString &cap)
-{
-    if (cap == QLatin1String("window_list")) {
-        return i18n("see the list of windows open on your desktop");
-    }
-    if (cap == QLatin1String("a11y_read")) {
-        return i18n("read the on-screen text and controls of an application");
-    }
-    if (cap == QLatin1String("screenshot")) {
-        return i18n("take a screenshot");
-    }
-    if (cap == QLatin1String("screencast")) {
-        return i18n("continuously watch your screen");
-    }
-    return i18n("access your desktop (%1)", cap);
-}
-
+// The target sentence fragment. Window titles and resource classes are ATTACKER
+// CONTROLLABLE (any app on the desktop picks its own title) and this fragment is
+// substituted into a Qt::RichText label, so every interpolated value is escaped
+// here — a consent prompt whose text can be rewritten by the thing being consented
+// to is not a consent prompt.
 QString targetText(const QJsonObject &t)
 {
     const QString kind = t.value(QStringLiteral("kind")).toString();
-    const QString label = t.value(QStringLiteral("label")).toString();
+    const QString label = t.value(QStringLiteral("label")).toString().toHtmlEscaped();
     if (kind == QLatin1String("window")) {
-        const QString rc = t.value(QStringLiteral("resourceClass")).toString();
+        const QString rc = t.value(QStringLiteral("resourceClass")).toString().toHtmlEscaped();
         if (!label.isEmpty()) {
             return i18n("the window “%1”", label);
         }
@@ -45,13 +35,16 @@ QString targetText(const QJsonObject &t)
         return i18n("a specific window");
     }
     if (kind == QLatin1String("app")) {
-        return i18n("the application “%1”", t.value(QStringLiteral("resourceClass")).toString());
+        return i18n("the application “%1”",
+                    t.value(QStringLiteral("resourceClass")).toString().toHtmlEscaped());
     }
     if (kind == QLatin1String("screen")) {
         return i18n("a whole screen");
     }
     if (kind == QLatin1String("vdesktop") || kind == QLatin1String("sandbox")) {
-        return i18n("the sandbox virtual desktop");
+        // Honesty (audit F32): a separate virtual desktop is an ORGANIZATIONAL
+        // boundary, not containment — never call it a sandbox in the UI.
+        return i18n("a separate virtual desktop");
     }
     if (kind == QLatin1String("any")) {
         return i18n("your desktop");
@@ -78,7 +71,7 @@ ConsentDialog::ConsentDialog(const QJsonObject &request, QWidget *parent)
     banner->setMessageType(KMessageWidget::Warning);
     banner->setCloseButtonVisible(false);
     banner->setIcon(QIcon::fromTheme(QStringLiteral("dialog-password")));
-    banner->setText(i18n("An agent is asking to %1.", capabilityVerb(cap)));
+    banner->setText(i18n("An agent is asking to %1.", CoworkCaps::verb(cap)));
     layout->addWidget(banner);
 
     auto *detail = new QLabel(this);
@@ -87,7 +80,7 @@ ConsentDialog::ConsentDialog(const QJsonObject &request, QWidget *parent)
     detail->setText(i18n("<b>%1</b> wants to <b>%2</b><br>on <b>%3</b>.<br><br>"
                          "Only allow this if you understand what the agent will see. "
                          "Anything visible may be read by the AI.",
-                         thread.toHtmlEscaped(), capabilityVerb(cap), targetText(target)));
+                         thread.toHtmlEscaped(), CoworkCaps::verb(cap), targetText(target)));
     layout->addWidget(detail);
 
     auto *form = new QFormLayout;
@@ -96,12 +89,12 @@ ConsentDialog::ConsentDialog(const QJsonObject &request, QWidget *parent)
     m_scope->addItem(i18n("For this agent session"), QStringLiteral("session"));
     m_scope->addItem(i18n("For 15 minutes"), QStringLiteral("timed"));
     m_scope->addItem(i18n("Until I revoke it"), QStringLiteral("until_revoked"));
-    // Default to the request's suggestion if present, else the safest (once).
-    const QString suggested = request.value(QStringLiteral("suggestedScope")).toString();
-    int idx = m_scope->findData(suggested.isEmpty() ? QStringLiteral("once") : suggested);
-    if (idx >= 0) {
-        m_scope->setCurrentIndex(idx);
-    }
+    // SECURITY (audit F50): the preselection is ALWAYS the safest scope, never the
+    // core's `suggestedScope`. That suggestion is a convenience hint set per
+    // capability (session for browser/screencast) and it decided, by default, how long
+    // an agent keeps access — so the click-through path handed out the widest scope on
+    // offer. The wider scopes stay one keystroke away in the list; the user picks them.
+    m_scope->setCurrentIndex(m_scope->findData(QStringLiteral("once")));
     form->addRow(i18n("Allow for:"), m_scope);
     layout->addLayout(form);
 

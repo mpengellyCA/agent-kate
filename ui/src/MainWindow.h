@@ -66,6 +66,12 @@ private:
     void setupShellShortcuts();
     void setupPerspectives();
     void setupCore();
+    // Agent Kate contains no model: every agent is an external CLI akcore
+    // spawns off $PATH. If NOT ONE of them is installed the app is inert, and
+    // the user currently finds out only after writing and sending their first
+    // task (audit F37). One call, one banner, one seam — plan 26's preflight
+    // health card replaces this whole method. See state/EngineAvailability.h.
+    void updateEngineAvailabilityBanner();
     // Collect every leaf action in the window and show the searchable command
     // palette — the keyboard-first way to reach any feature.
     void showCommandPalette();
@@ -170,6 +176,11 @@ private:
     // Window-wide banner above the shell, used for states that outlast a
     // status-bar message — today, the core connection being lost and recovered.
     KMessageWidget *m_coreBanner = nullptr;
+    // Its sibling for "no agent CLI is installed" (audit F37). Kept separate
+    // from m_coreBanner so a transient connection notice cannot overwrite a
+    // condition that makes the whole app inert, and so plan 26's health card
+    // can take this one over on its own.
+    KMessageWidget *m_engineBanner = nullptr;
 
     ShellLayout *m_shell = nullptr;
     CommandPalette *m_commandPalette = nullptr; // lazily created on first use

@@ -397,9 +397,14 @@ void EnsembleDialog::onDelete()
     if (name.isEmpty() || !EnsembleCatalog::self()->contains(name)) {
         return;
     }
+    // UX (audit F50): warningContinueCancel defaults to Continue, so Enter deleted the
+    // ensemble. The Dangerous option moves the default onto Cancel (KF6 header contract,
+    // same as CleanupDialog's permanent-loss confirmation).
     if (KMessageBox::warningContinueCancel(
             this, i18n("Delete the ensemble “%1”?", name),
-            i18nc("@title:window", "Delete Ensemble"), KStandardGuiItem::del())
+            i18nc("@title:window", "Delete Ensemble"), KStandardGuiItem::del(),
+            KStandardGuiItem::cancel(), QString(),
+            KMessageBox::Options(KMessageBox::Notify | KMessageBox::Dangerous))
         != KMessageBox::Continue) {
         return;
     }

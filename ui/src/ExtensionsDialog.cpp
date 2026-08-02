@@ -348,7 +348,13 @@ void ExtensionsDialog::uninstallSelected()
     if (id.isEmpty() || !m_core || !m_core->isConnected()) {
         return;
     }
-    if (KMessageBox::questionTwoActions(
+    // SECURITY/UX (audit F31): warningTwoActions, not questionTwoActions — per the KF6
+    // header contract questionTwoActions defaults to the PRIMARY button, so Enter here
+    // uninstalled the extension. Uninstalling is destructive and irreversible from this
+    // dialog, and it is raised by a click the user has already made, which is exactly
+    // the shape where Enter gets pressed through. warningTwoActions defaults to the
+    // secondary (Cancel) button. This is the last questionTwoActions in ui/src.
+    if (KMessageBox::warningTwoActions(
             this,
             i18n("Uninstall the extension \"%1\"? Its language server will stop "
                  "being used in the editor.", id),

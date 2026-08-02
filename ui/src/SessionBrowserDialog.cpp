@@ -374,7 +374,11 @@ void SessionBrowserDialog::forgetSelected()
     }
     const QString sessionId = item->data(Qt::UserRole).toString();
     const QString title = item->data(Qt::UserRole + 2).toString();
-    if (KMessageBox::questionTwoActions(
+    // SECURITY/UX (audit F31): warningTwoActions, not questionTwoActions — the KF6
+    // header pins its default button to the SECONDARY action, so Enter cancels instead
+    // of permanently deleting a transcript. Same treatment as the cleanup dialog's
+    // Dangerous option.
+    if (KMessageBox::warningTwoActions(
             this,
             i18n("Permanently delete the on-disk transcript for \"%1\"? "
                  "This cannot be undone.", title),

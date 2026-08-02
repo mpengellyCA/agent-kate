@@ -26,11 +26,17 @@ struct EngineChoice {
     // ensemble owns them — and the row emits applyEnsembleRequested.
     QString ensemble;
     bool manage = false; // the "Manage ensembles…" row, which opens the editor
+    // available: this engine's command-line program was found on $PATH. A false
+    // row is still LISTED (so the engine is discoverable) but is not clickable
+    // — picking it could only ever end in "executable file not found" after the
+    // user had written a task (audit F37).
+    bool available = true;
 
     bool operator==(const EngineChoice &o) const
     {
         return backend == o.backend && model == o.model && label == o.label
-            && header == o.header && ensemble == o.ensemble && manage == o.manage;
+            && header == o.header && ensemble == o.ensemble && manage == o.manage
+            && available == o.available;
     }
 };
 
@@ -88,6 +94,10 @@ public:
     // up into a per-project count suffix. Busy ("working a turn") is intentionally
     // not surfaced in the roster — the status dot already conveys it.
     void setAgentAttention(int agentId, bool attention);
+    // How many agents are blocked on the user right now, across every project.
+    // Counts the RAW flag, not the painted marker: the marker is suppressed on
+    // whichever row is selected, but that agent is still waiting (audit F50).
+    int attentionCount() const;
     void removeAgent(int agentId);
     void removeProject(const QString &path);
     void setCurrentAgent(int agentId);
@@ -120,6 +130,11 @@ Q_SIGNALS:
     void closeOtherProjectsRequested(const QString &keepProjectPath);
     void openTerminalRequested(const QString &projectPath);
     void agentActivated(int agentId);
+    // Fired (change-gated) when the number of agents waiting on the user moves.
+    // The window turns this into a taskbar-level signal — title prefix plus a
+    // demand-attention hint — so a missed popup on another virtual desktop is
+    // no longer silence (audit F50).
+    void attentionCountChanged(int count);
     void projectFocused(const QString &projectPath);
     void resumeRequested(int agentId);
     void renameRequested(int agentId);
@@ -153,7 +168,15 @@ private:
     // Rebuild the tag-filter menu from the tags currently in use, preserving any
     // still-valid selections.
     void rebuildTagFilterMenu();
+    // Roster view state that used to die with the process: which project rows
+    // the user collapsed and which tags they were filtering by. Persisted in
+    // the [View] config group so a relaunch is not a manual redo (audit F47).
+    void loadViewState();
+    void saveCollapsedProjects();
+    void saveTagFilter();
     void applyAttentionDisplay(QTreeWidgetItem *item);
+    // Recount and emit attentionCountChanged when the total actually moved.
+    void publishAttentionCount();
     void recomputeProjectBadge(QTreeWidgetItem *project);
     // Start/stop the ~10fps working-animation timer based on whether any agent
     // is currently Working, and repaint only the working rows on each tick.
@@ -180,6 +203,14 @@ private:
     QLabel *m_emptyHint = nullptr;
     QString m_filter;
     QSet<QString> m_tagFilter; // lowercased tags the user is filtering by
+    // Restored filter tags that no agent carries YET. The roster is empty at
+    // construction, so folding these straight into m_tagFilter would let the
+    // menu rebuild's prune-departed-tags intersect erase the very selection we
+    // just restored. They graduate as their tag appears (audit F47).
+    QSet<QString> m_pendingTagFilter;
+    // Project paths the user has collapsed. Expanded is the default, so only
+    // the exceptions are stored and an unknown project opens expanded.
+    QSet<QString> m_collapsedProjects;
     // The tag-filter menu's per-tag checkable actions, keyed by lowercased tag,
     // so rebuildTagFilterMenu() can diff (add new / drop departed) instead of
     // clearing and repopulating the whole menu on every tag change.
@@ -188,6 +219,7 @@ private:
     QAction *m_tagFilterSeparator = nullptr;
     QAction *m_tagFilterClearAct = nullptr;
     QList<EngineChoice> m_engineChoices;
+    int m_lastAttentionCount = 0; // change gate for attentionCountChanged
     // Drives the Working status-badge arc sweep; runs only while at least one
     // agent is Working, and repaints just those rows (~10fps).
     QTimer *m_workingTimer = nullptr;

@@ -35,6 +35,7 @@ daily dogfooding. Each item has its own grounded plan file with the relevant
 | 26 | Engine services — the Kimi provider registry, and preflight health for both engines | Core (Go) + UI (C++) | [26-engine-services.md](26-engine-services.md) | M |
 | 27 | KDE presence — one KActionCollection, a system tray item, and global shortcuts | UI (C++) | [27-kde-presence.md](27-kde-presence.md) | M–L |
 | 28 | Native scheduling & resume — persistent timers, rate-window auto-resume, gated agent-requested schedules | Core (Go) + UI (C++) | [28-scheduling-and-autonomy.md](28-scheduling-and-autonomy.md) | L |
+| 29 | Pass-2 remediation — consent quality, honest labelling, destructive actions, first-run friction (F25–F50) | Core (Go) + UI (C++) | [29-pass2-remediation.md](29-pass2-remediation.md) | M (3 rounds) |
 
 Size key: **S** ≈ <½ day, **M** ≈ 1–2 days, **L** ≈ 3–5 days, **XL** ≈ a release of its own.
 

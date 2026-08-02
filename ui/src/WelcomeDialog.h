@@ -2,6 +2,7 @@
 
 #include <QDialog>
 #include <QString>
+#include <QStringList>
 
 class QListWidget;
 class QListWidgetItem;
@@ -24,20 +25,31 @@ public:
     explicit WelcomeDialog(QWidget *parent = nullptr);
 
     QString selectedPath() const { return m_selected; }
+    // Every project the user asked to open. One entry for a normal pick; the
+    // whole remembered set when they took "Reopen previous session" (audit
+    // F47). Always starts with selectedPath(), so a caller that only handles
+    // one project still behaves exactly as before.
+    QStringList selectedPaths() const { return m_selectedPaths; }
 
 private:
     void refreshList();
     void chooseFolder();
     void createNewProject();
     void reopenLast();
+    void reopenSession();
     void accept(const QString &path);
+    void acceptMany(const QStringList &paths);
     void onItemActivated(QListWidgetItem *item);
     void onRemoveCurrent();
     void onContextMenu(const QPoint &pos);
     void addRow(const QString &path, bool pinned);
 
     QString m_selected;
+    QStringList m_selectedPaths;
     QLabel *m_lastLabel = nullptr;
     QPushButton *m_reopenButton = nullptr;
+    QPushButton *m_sessionButton = nullptr; // "Reopen previous session (N projects)"
     QListWidget *m_list = nullptr;
+    QLabel *m_emptyHint = nullptr; // shown instead of an empty recents list
+    QLabel *m_listHint = nullptr;  // "Double-click to open · …", meaningless when empty
 };

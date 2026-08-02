@@ -46,8 +46,10 @@ find_package(KF6 6.0 QUIET COMPONENTS Wallet)
 add_executable(agentkate
     src/main.cpp
     src/state/HarnessTraits.cpp
+    src/state/EngineAvailability.cpp
     src/state/EnsembleCatalog.cpp
     src/state/Reactive.cpp
+    src/state/SessionProjects.cpp
     src/theme/ThemeManager.cpp
     src/AppearanceDialog.cpp
     src/CommandPalette.cpp
@@ -292,6 +294,20 @@ if(Qt6Test_FOUND)
     set_tests_properties(SafeContentTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
+    # The Cowork consent prompt is the last thing between a prompt-injected agent
+    # and the user's screen, so its copy and its preselected scope are security
+    # surface (audit F31/F32/F50): no raw capability keys, one shared vocabulary
+    # with the panel, narrowest scope preselected, window titles escaped before
+    # they reach a RichText label. CapabilityText.h is header-only.
+    add_executable(ConsentDialogTest tests/ConsentDialogTest.cpp
+        src/cowork/ConsentDialog.cpp)
+    target_include_directories(ConsentDialogTest PRIVATE src)
+    target_link_libraries(ConsentDialogTest PRIVATE Qt6::Widgets Qt6::Test
+        KF6::I18n KF6::WidgetsAddons)
+    add_test(NAME ConsentDialogTest COMMAND ConsentDialogTest)
+    set_tests_properties(ConsentDialogTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
     # The sub-agent transcript view's document bounds. A block COUNT does not
     # bound block SIZE, so the dialog's cap needs both — this pins the
     # few-but-huge shape the block cap sails past.
@@ -404,6 +420,79 @@ if(Qt6Test_FOUND)
     target_link_libraries(IpcTransportTest PRIVATE Qt6::Core Qt6::Test)
     add_test(NAME IpcTransportTest COMMAND IpcTransportTest)
     set_tests_properties(IpcTransportTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    # Audit F29: the Worktree Dashboard's discard confirmation. A non-isolated
+    # row's dirty count is the user's WHOLE checkout, so the prompt for it must
+    # not say "worktree #N", must name the real path, and must disclose that
+    # their own uncommitted work goes too. The copy lives in a header-only
+    # namespace precisely so it can be asserted on without exec()ing a modal.
+    add_executable(WorktreeCopyTest tests/WorktreeCopyTest.cpp)
+    target_include_directories(WorktreeCopyTest PRIVATE src)
+    target_link_libraries(WorktreeCopyTest PRIVATE Qt6::Widgets Qt6::Test KF6::I18n)
+    add_test(NAME WorktreeCopyTest COMMAND WorktreeCopyTest)
+    set_tests_properties(WorktreeCopyTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    # Audit F49/F30: the guided dialog's isolation control — the recommended
+    # default must be a mode that also works on a repo with no commits ("auto",
+    # not "isolated"), and neither its label nor its tooltip may call a git
+    # worktree a sandbox.
+    add_executable(NewAgentDialogTest tests/NewAgentDialogTest.cpp
+        src/NewAgentDialog.cpp src/ProviderConfig.cpp src/state/EnsembleCatalog.cpp
+        src/state/HarnessTraits.cpp src/ipc/CoreClient.cpp)
+    target_include_directories(NewAgentDialogTest PRIVATE src)
+    target_link_libraries(NewAgentDialogTest PRIVATE Qt6::Widgets Qt6::Test
+        Qt6::Network KF6::ConfigCore KF6::I18n KF6::WidgetsAddons)
+    add_test(NAME NewAgentDialogTest COMMAND NewAgentDialogTest)
+    set_tests_properties(NewAgentDialogTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    # Audit F37: whether the agent CLI the core will spawn actually exists. The
+    # probe runs against a real $PATH because its whole value is agreeing with
+    # what akcore finds; the fixture builds one.
+    add_executable(EngineAvailabilityTest tests/EngineAvailabilityTest.cpp
+        src/state/EngineAvailability.cpp src/state/HarnessTraits.cpp
+        src/ProviderConfig.cpp src/ipc/CoreClient.cpp)
+    target_include_directories(EngineAvailabilityTest PRIVATE src)
+    target_link_libraries(EngineAvailabilityTest PRIVATE Qt6::Widgets Qt6::Test
+        Qt6::Network KF6::ConfigCore KF6::I18n)
+    add_test(NAME EngineAvailabilityTest COMMAND EngineAvailabilityTest)
+    set_tests_properties(EngineAvailabilityTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    # Audit F47: the open-project SET, which relaunch used to throw away.
+    add_executable(SessionProjectsTest tests/SessionProjectsTest.cpp
+        src/state/SessionProjects.cpp)
+    target_include_directories(SessionProjectsTest PRIVATE src)
+    target_link_libraries(SessionProjectsTest PRIVATE Qt6::Core Qt6::Test
+        KF6::ConfigCore)
+    add_test(NAME SessionProjectsTest COMMAND SessionProjectsTest)
+    set_tests_properties(SessionProjectsTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    # Audit F46: a provider preset with no key is a choice that can only abort.
+    # Built without AK_HAVE_KWALLET, so this covers the env-var path — which is
+    # also the one that must be consulted first (a label must never provoke a
+    # KWallet unlock prompt).
+    add_executable(ProviderConfigTest tests/ProviderConfigTest.cpp
+        src/ProviderConfig.cpp)
+    target_include_directories(ProviderConfigTest PRIVATE src)
+    target_link_libraries(ProviderConfigTest PRIVATE Qt6::Core Qt6::Test
+        KF6::ConfigCore KF6::I18n)
+    add_test(NAME ProviderConfigTest COMMAND ProviderConfigTest)
+    set_tests_properties(ProviderConfigTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+    # Audit F47/F50: the welcome screen offers the whole previous session, and
+    # its recents list has an empty state like every other list in the app.
+    add_executable(WelcomeDialogTest tests/WelcomeDialogTest.cpp
+        src/WelcomeDialog.cpp src/RecentProjects.cpp src/state/SessionProjects.cpp)
+    target_include_directories(WelcomeDialogTest PRIVATE src)
+    target_link_libraries(WelcomeDialogTest PRIVATE Qt6::Widgets Qt6::Test
+        KF6::ConfigCore KF6::I18n KF6::KIOWidgets)
+    add_test(NAME WelcomeDialogTest COMMAND WelcomeDialogTest)
+    set_tests_properties(WelcomeDialogTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 endif()
 

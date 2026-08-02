@@ -81,6 +81,10 @@ HarnessTraits claudeDefaults()
     // core/cmd/akcore/harness_claude.go Capabilities().EffortLive.
     t.effortLive = true;
     t.subagentTranscripts = true; // subagents/agent-<id>.jsonl beside the session
+    // The reload_skills control request on the live session's stdin, so a skill
+    // installed mid-session lands without a relaunch. LOCKSTEP with
+    // core/cmd/akcore/harness_claude.go Capabilities().SkillReload.
+    t.skillReload = true;
     // Models are discovered live (`claude -p /model`, or a routed provider's
     // /v1/models); mode/effort stay static vocabularies below.
     t.modelPicker = QStringLiteral("discovered");
@@ -121,6 +125,11 @@ HarnessTraits kimiDefaults()
     t.compaction = true;
     // One wire log per subagent under <session-dir>/agents/<id>/ (probed on 0.30.0).
     t.subagentTranscripts = true;
+    // skillReload stays false: ACP has no reload-skills request and `kimi acp`
+    // resolves its skill directories once, at session/new — so a skill the
+    // human installs while a kimi thread runs needs a restart to take effect.
+    // The core says so in the thread's own transcript rather than skipping it
+    // in silence (audit F50). LOCKSTEP with harness_kimi.go.
     // transcriptPreview stays false: kimi's transcript is the core's event log,
     // not a previewable/forgettable on-disk store. systemPrompt and
     // customSubagents stay false too: `kimi acp` takes no system-prompt channel
@@ -155,6 +164,7 @@ HarnessTraits fromJson(const QJsonObject &o)
     t.strictMcpConfig = o.value(QStringLiteral("strictMcpConfig")).toBool();
     t.costBudget = o.value(QStringLiteral("costBudget")).toBool();
     t.subagentTranscripts = o.value(QStringLiteral("subagentTranscripts")).toBool();
+    t.skillReload = o.value(QStringLiteral("skillReload")).toBool();
     t.modelPicker = o.value(QStringLiteral("modelPicker")).toString();
     t.permissionModes.clear();
     const QJsonArray modes = o.value(QStringLiteral("permissionModes")).toArray();

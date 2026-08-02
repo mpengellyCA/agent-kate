@@ -10,7 +10,10 @@
 #include <QIcon>
 #include <QImage>
 #include <QPointer>
+#include <QStringList>
 #include <QWindow>
+
+#include <utility>
 
 #include <KAboutData>
 #include <KDBusService>
@@ -168,6 +171,12 @@ int main(int argc, char *argv[])
             }
         });
 
+    // Projects to open beyond the first — non-empty only when the user took the
+    // welcome screen's "Reopen session" action (audit F47). MainWindow takes one
+    // path at construction; the rest are fed through the same entry point a
+    // forwarded relaunch uses, once the window exists.
+    QStringList extraPaths;
+
     // No path on the command line? Show the welcome dialog so the user can
     // pick a recent project, open a folder, or create a new one — otherwise
     // we would silently fall back to the current working directory (which is
@@ -187,11 +196,21 @@ int main(int argc, char *argv[])
             if (openPath.isEmpty()) {
                 return 0;
             }
+            extraPaths = welcome.selectedPaths();
+            extraPaths.removeAll(openPath);
         }
     }
 
     auto *window = new MainWindow(openPath);
     window->show();
+    for (const QString &path : std::as_const(extraPaths)) {
+        window->openLaunchPath(path);
+    }
+    // openLaunchPath focuses each project as it lands, so the last one opened
+    // would be the one on screen. Put the user back where they left off.
+    if (!extraPaths.isEmpty()) {
+        window->openLaunchPath(openPath);
+    }
     if (!forwardedToken.isEmpty()) {
         window->raiseAndActivate(forwardedToken);
         forwardedToken.clear();

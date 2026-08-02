@@ -63,6 +63,16 @@ Q_SIGNALS:
     void coreLog(const QString &line);
     void failed(const QString &message);
 
+    // The core accepted the socket but REFUSED the "ui" role, so this client
+    // has no UI authority: every UI-only RPC (the git mutations, stop, rename,
+    // search, shutdown, the Cowork switchboard, …) will be rejected. connected()
+    // is deliberately NOT emitted in that case, so nothing downstream starts
+    // issuing those calls. The message is human-readable and ready to show:
+    // whoever owns the window MUST put it in front of the user, because the
+    // alternative — an app that looks connected and refuses everything — is
+    // indistinguishable from a broken build. See audit F13.
+    void handshakeRefused(const QString &message);
+
     // One request refused before it was written, because the frame would exceed
     // the core's inbound cap. NOT a failed(): the connection is unaffected — a
     // message the human composed was dropped, which is worth saying out loud.

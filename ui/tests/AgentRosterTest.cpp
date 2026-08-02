@@ -14,7 +14,15 @@
 #include "AgentCardDelegate.h"
 #include "AgentRoster.h"
 
+#include <KConfigGroup>
+#include <KSharedConfig>
+
+#include <QAction>
 #include <QLineEdit>
+#include <QMenu>
+#include <QSignalSpy>
+#include <QStandardPaths>
+#include <QToolButton>
 #include <QTreeWidget>
 #include <QTreeWidgetItem>
 #include <QtTest>
@@ -23,6 +31,7 @@ class AgentRosterTest : public QObject
 {
     Q_OBJECT
 private Q_SLOTS:
+    void initTestCase();
     void init();
     void cleanup();
 
@@ -34,6 +43,12 @@ private Q_SLOTS:
     void reparentKeepsSelection();
     void filterKeepsNestedMatchReachable();
 
+    // Audit F37 / F47 / F50.
+    void anUninstalledEngineIsListedButUnclickable();
+    void publishesHowManyAgentsAreWaiting();
+    void aCollapsedProjectStaysCollapsedNextSession();
+    void aTagFilterSurvivesAndAppliesOnceItsTagAppears();
+
 private:
     QTreeWidgetItem *projectRow() const { return m_tree->topLevelItem(0); }
     QTreeWidgetItem *rowFor(int agentId) const;
@@ -41,6 +56,13 @@ private:
     AgentRoster *m_roster = nullptr;
     QTreeWidget *m_tree = nullptr;
 };
+
+void AgentRosterTest::initTestCase()
+{
+    // The roster now reads and writes [View] state; never touch the
+    // developer's own agentkaterc.
+    QStandardPaths::setTestModeEnabled(true);
+}
 
 void AgentRosterTest::init()
 {
@@ -174,6 +196,146 @@ void AgentRosterTest::filterKeepsNestedMatchReachable()
 
     filter->setText(QString());
     QVERIFY(!rowFor(3)->isHidden());
+}
+
+// Audit F37: the "+ New Agent" dropdown listed every engine unconditionally,
+// including ones whose command-line program is not installed — a choice whose
+// only possible outcome is "executable file not found", after the user has
+// already written a task.
+void AgentRosterTest::anUninstalledEngineIsListedButUnclickable()
+{
+    QList<EngineChoice> choices;
+    EngineChoice liveHeader;
+    liveHeader.label = QStringLiteral("Claude Code");
+    liveHeader.header = true;
+    choices << liveHeader;
+    EngineChoice live;
+    live.backend = QStringLiteral("claude");
+    live.label = QStringLiteral("Claude Code (default model)");
+    choices << live;
+    EngineChoice deadHeader;
+    deadHeader.label = QStringLiteral("Kimi Code — not installed");
+    deadHeader.header = true;
+    deadHeader.available = false;
+    choices << deadHeader;
+    EngineChoice dead;
+    dead.backend = QStringLiteral("kimi");
+    dead.label = QStringLiteral("Kimi Code (default model)");
+    dead.available = false;
+    choices << dead;
+    m_roster->setEngineChoices(choices);
+
+    auto *newButton =
+        m_roster->findChild<QToolButton *>(QStringLiteral("newAgentButton"));
+    QVERIFY(newButton);
+    QVERIFY(newButton->menu());
+
+    QAction *liveAct = nullptr;
+    QAction *deadAct = nullptr;
+    const auto actions = newButton->menu()->actions();
+    for (QAction *a : actions) {
+        if (a->text() == live.label) {
+            liveAct = a;
+        }
+        if (a->text() == dead.label) {
+            deadAct = a;
+        }
+    }
+    QVERIFY2(liveAct, "an installed engine lost its menu entry");
+    QVERIFY(liveAct->isEnabled());
+    QVERIFY2(deadAct, "a missing engine was hidden instead of marked");
+    QVERIFY2(!deadAct->isEnabled(), "a dead engine choice is still clickable");
+}
+
+// Audit F50: a blocked agent produced no signal outside the roster, so a missed
+// popup plus a window on another virtual desktop equalled silence. The count is
+// the RAW truth, not the painted marker (which is suppressed on the selected
+// row), or selecting the blocked agent would zero the task-bar signal while the
+// agent is still waiting.
+void AgentRosterTest::publishesHowManyAgentsAreWaiting()
+{
+    QSignalSpy spy(m_roster, &AgentRoster::attentionCountChanged);
+    QCOMPARE(m_roster->attentionCount(), 0);
+
+    m_roster->setAgentAttention(2, true);
+    QCOMPARE(m_roster->attentionCount(), 1);
+    QCOMPARE(spy.count(), 1);
+    QCOMPARE(spy.takeLast().at(0).toInt(), 1);
+
+    m_roster->setAgentAttention(3, true);
+    QCOMPARE(m_roster->attentionCount(), 2);
+    QCOMPARE(spy.count(), 1);
+
+    // Looking at a blocked agent hides its marker but does not answer it.
+    m_roster->setCurrentAgent(2);
+    QCOMPARE(m_roster->attentionCount(), 2);
+
+    m_roster->setAgentAttention(2, false);
+    m_roster->setAgentAttention(3, false);
+    QCOMPARE(m_roster->attentionCount(), 0);
+    QCOMPARE(spy.takeLast().at(0).toInt(), 0);
+}
+
+// Audit F47: roster expand state was session-only, so every launch re-opened
+// project rows the user had deliberately collapsed.
+void AgentRosterTest::aCollapsedProjectStaysCollapsedNextSession()
+{
+    projectRow()->setExpanded(false);
+    QVERIFY(!projectRow()->isExpanded());
+
+    // A fresh roster, as a relaunch would build one.
+    AgentRoster next;
+    auto *tree = next.findChild<QTreeWidget *>();
+    QVERIFY(tree);
+    next.addProject(QStringLiteral("/p"), QStringLiteral("proj"));
+    QVERIFY2(!tree->topLevelItem(0)->isExpanded(),
+             "the collapsed project came back expanded");
+    // …and a restored agent landing in it must not silently undo that.
+    next.addAgent(QStringLiteral("/p"), 1, QStringLiteral("Restored"));
+    QVERIFY2(!tree->topLevelItem(0)->isExpanded(),
+             "the first restored agent re-expanded a collapsed project");
+
+    projectRow()->setExpanded(true); // leave the config clean for the next test
+}
+
+// Audit F47: the tag filter was session-only too. The subtle part is that the
+// roster is EMPTY when it restores, so a naive restore is erased by the filter
+// menu's own prune-departed-tags pass before any agent arrives.
+void AgentRosterTest::aTagFilterSurvivesAndAppliesOnceItsTagAppears()
+{
+    KSharedConfig::openConfig()
+        ->group(QStringLiteral("View"))
+        .writeEntry("rosterTagFilter", QStringList{QStringLiteral("backend")});
+
+    AgentRoster next;
+    auto *tree = next.findChild<QTreeWidget *>();
+    QVERIFY(tree);
+    next.addProject(QStringLiteral("/q"), QStringLiteral("q"));
+    next.addAgent(QStringLiteral("/q"), 10, QStringLiteral("Backend agent"));
+    next.addAgent(QStringLiteral("/q"), 11, QStringLiteral("Frontend agent"));
+    next.setAgentTags(10, {QStringLiteral("backend")});
+    next.setAgentTags(11, {QStringLiteral("ui")});
+
+    QTreeWidgetItem *project = tree->topLevelItem(0);
+    QVERIFY(project);
+    QTreeWidgetItem *tagged = nullptr;
+    QTreeWidgetItem *other = nullptr;
+    for (int i = 0; i < project->childCount(); ++i) {
+        QTreeWidgetItem *row = project->child(i);
+        if (row->data(0, Qt::UserRole).toInt() == 10) {
+            tagged = row;
+        } else {
+            other = row;
+        }
+    }
+    QVERIFY(tagged);
+    QVERIFY(other);
+    QVERIFY2(!tagged->isHidden(), "the restored filter hid its own match");
+    QVERIFY2(other->isHidden(), "the restored tag filter was not applied at all");
+
+    KSharedConfig::openConfig()
+        ->group(QStringLiteral("View"))
+        .writeEntry("rosterTagFilter", QStringList());
 }
 
 QTEST_MAIN(AgentRosterTest)

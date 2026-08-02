@@ -64,6 +64,13 @@ struct HarnessTraits {
     // subagentTranscripts: the engine writes a per-subagent conversation file
     // the UI can tail (the panel's "Helpers" menu).
     bool subagentTranscripts = false;
+    // skillReload: a RUNNING session can be told to re-read its skill
+    // directories, so a skill installed from the catalogue reaches an agent
+    // that is already working. False = the session read its skills at start
+    // and only a restart changes that, which the core says out loud in the
+    // thread's own transcript when a reload skips it (audit F50). LOCKSTEP
+    // with harness.Capabilities.SkillReload (core/internal/harness/harness.go).
+    bool skillReload = false;
 
     QString modelPicker = QStringLiteral("tiers"); // "tiers" | "discovered"
     // Static vocabularies (wire values; the UI owns the human labels). Empty =

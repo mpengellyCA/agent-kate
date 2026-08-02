@@ -3,6 +3,7 @@
 #include <QJsonObject>
 
 #include <KConfigGroup>
+#include <KLocalizedString>
 #include <KSharedConfig>
 
 #ifdef AK_HAVE_KWALLET
@@ -237,6 +238,32 @@ bool hasStoredKey(const QString &id)
 #endif
     Q_UNUSED(id);
     return false;
+}
+
+bool keyResolvable(const ProviderProfile &p)
+{
+    if (!p.routed()) {
+        return true; // Claude-direct: the CLI brings its own credential
+    }
+    // Environment variable FIRST, deliberately — the opposite of key()'s
+    // resolution order. This runs while a picker is being built, and reaching
+    // into KWallet can pop a synchronous unlock prompt; a profile whose env var
+    // is set must never provoke one just to render a label. The secret itself
+    // is never read here, only its existence.
+    if (!p.envVar.isEmpty()
+        && !qgetenv(p.envVar.toLocal8Bit().constData()).isEmpty()) {
+        return true;
+    }
+    return hasStoredKey(p.id);
+}
+
+QString pickerLabel(const ProviderProfile &p)
+{
+    if (keyResolvable(p)) {
+        return p.name;
+    }
+    return i18nc("provider entry in an engine picker with no credential stored",
+                 "%1 (no API key set)", p.name);
 }
 
 QJsonObject toJson(const ProviderProfile &p)

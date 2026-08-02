@@ -31,7 +31,9 @@
 #include <QUrl>
 #include <QVBoxLayout>
 
+#include <KConfigGroup>
 #include <KLocalizedString>
+#include <KSharedConfig>
 
 namespace {
 // Role layout lives in AgentCardDelegate.h (the delegate paints these). The
@@ -55,6 +57,7 @@ AgentRoster::AgentRoster(QWidget *parent)
     : QWidget(parent)
     , m_tree(new QTreeWidget(this))
 {
+    loadViewState(); // before anything reads m_tagFilter / m_collapsedProjects
     auto *openButton = new QToolButton(this);
     openButton->setText(i18n("Open Project…"));
     openButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
@@ -63,15 +66,18 @@ AgentRoster::AgentRoster(QWidget *parent)
     openButton->setCursor(Qt::PointingHandCursor);
     connect(openButton, &QToolButton::clicked, this, &AgentRoster::openProjectRequested);
 
-    // "+ New Agent" is a tool button with a model-pre-pick dropdown: a plain
-    // click starts an agent on the project's default model; the menu lets the
-    // user pick a model up front. The model is forwarded into the panel before
-    // its first start (agent.start already accepts a model — no new IPC).
+    // "+ New Agent" is a tool button with an engine/model pre-pick dropdown: a
+    // plain click opens the guided New Agent dialog (audit F45 — it used to
+    // create a blank agent and leave the user staring at five unlabeled
+    // combos); the menu is the shortcut for people who already know which
+    // engine and model they want, and skips straight to a prepared panel.
     m_newButton = new QToolButton(this);
+    m_newButton->setObjectName(QStringLiteral("newAgentButton"));
     m_newButton->setText(i18n("New Agent"));
     m_newButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
     m_newButton->setIcon(QIcon::fromTheme(QStringLiteral("list-add")));
-    m_newButton->setToolTip(i18n("Start a new agent in the selected project"));
+    m_newButton->setToolTip(
+        i18n("Describe a task and start a new agent in the selected project"));
     m_newButton->setPopupMode(QToolButton::MenuButtonPopup);
     m_newButton->setCursor(Qt::PointingHandCursor);
     connect(m_newButton, &QToolButton::clicked, this,
@@ -156,7 +162,9 @@ AgentRoster::AgentRoster(QWidget *parent)
             menu.addSeparator();
             QAction *commitAct = menu.addAction(i18n("Commit changes…"));
             QAction *prAct = menu.addAction(i18n("Create pull request…"));
-            QAction *landAct = menu.addAction(i18n("Merge into local main…"));
+            // Not "into local main": agent.land merges into whatever branch the
+            // workspace is currently on (audit F50).
+            QAction *landAct = menu.addAction(i18n("Merge the agent's changes…"));
             QAction *discardAct = menu.addAction(i18n("Discard worktree"));
             menu.addSeparator();
 
@@ -315,6 +323,26 @@ AgentRoster::AgentRoster(QWidget *parent)
     m_emptyHint->setAttribute(Qt::WA_TransparentForMouseEvents);
     updateEmptyState();
 
+    // Remember which projects the user collapsed. Only top-level rows: a
+    // controller's worker list is transient, and persisting it would fight the
+    // orchestration reconciliation that re-parents rows.
+    connect(m_tree, &QTreeWidget::itemExpanded, this, [this](QTreeWidgetItem *item) {
+        if (item && !item->parent()
+            && m_collapsedProjects.remove(item->data(0, Qt::UserRole).toString())) {
+            saveCollapsedProjects();
+        }
+    });
+    connect(m_tree, &QTreeWidget::itemCollapsed, this, [this](QTreeWidgetItem *item) {
+        if (!item || item->parent()) {
+            return;
+        }
+        const QString path = item->data(0, Qt::UserRole).toString();
+        if (!path.isEmpty() && !m_collapsedProjects.contains(path)) {
+            m_collapsedProjects.insert(path);
+            saveCollapsedProjects();
+        }
+    });
+
     // Ctrl+F focuses the filter box from anywhere in the roster.
     auto *findShortcut = new QShortcut(QKeySequence::Find, this);
     findShortcut->setContext(Qt::WidgetWithChildrenShortcut);
@@ -322,6 +350,44 @@ AgentRoster::AgentRoster(QWidget *parent)
         m_filterEdit->setFocus();
         m_filterEdit->selectAll();
     });
+}
+
+void AgentRoster::loadViewState()
+{
+    const KConfigGroup g =
+        KSharedConfig::openConfig()->group(QStringLiteral("View"));
+    const QStringList tags = g.readEntry("rosterTagFilter", QStringList());
+    for (const QString &t : tags) {
+        if (!t.isEmpty()) {
+            m_pendingTagFilter.insert(t.toLower());
+        }
+    }
+    const QStringList collapsed = g.readEntry("rosterCollapsedProjects", QStringList());
+    for (const QString &p : collapsed) {
+        if (!p.isEmpty()) {
+            m_collapsedProjects.insert(p);
+        }
+    }
+}
+
+void AgentRoster::saveCollapsedProjects()
+{
+    QStringList out(m_collapsedProjects.constBegin(), m_collapsedProjects.constEnd());
+    out.sort(); // stable on disk, so a diff of the config file is readable
+    KConfigGroup g = KSharedConfig::openConfig()->group(QStringLiteral("View"));
+    g.writeEntry("rosterCollapsedProjects", out);
+}
+
+void AgentRoster::saveTagFilter()
+{
+    // Union with the not-yet-arrived selections, or toggling one tag today
+    // would forget a filter on a project that simply is not open right now.
+    QSet<QString> all = m_tagFilter;
+    all.unite(m_pendingTagFilter);
+    QStringList out(all.constBegin(), all.constEnd());
+    out.sort();
+    KConfigGroup g = KSharedConfig::openConfig()->group(QStringLiteral("View"));
+    g.writeEntry("rosterTagFilter", out);
 }
 
 void AgentRoster::openFileManager(const QString &path) const
@@ -360,6 +426,14 @@ void AgentRoster::setEngineChoices(const QList<EngineChoice> &choices)
             continue;
         }
         QAction *act = menu->addAction(c.label);
+        if (!c.available) {
+            // Listed but dead: the engine's CLI is not installed, so this choice
+            // could only fail after the user had written a task (audit F37).
+            act->setEnabled(false);
+            act->setToolTip(
+                i18n("This agent program is not installed on this computer."));
+            continue;
+        }
         const QString backend = c.backend;
         const QString model = c.model;
         const QString ensemble = c.ensemble;
@@ -389,7 +463,10 @@ void AgentRoster::addProject(const QString &path, const QString &name)
     QFont font = item->font(0);
     font.setBold(true);
     item->setFont(0, font);
-    item->setExpanded(true);
+    // Expanded unless the user collapsed this project in a previous session
+    // (audit F47). Set before any child arrives, so no signal round-trip
+    // re-writes the state we are restoring.
+    item->setExpanded(!m_collapsedProjects.contains(path));
     updateEmptyState();
 }
 
@@ -406,7 +483,12 @@ void AgentRoster::addAgent(const QString &projectPath, int agentId, const QStrin
     item->setData(0, AgentRoles::StatusRole,
                   int(AgentRoles::AgentStatus::Idle));
     item->setText(0, composeLabel(0, title));
-    project->setExpanded(true);
+    // A new agent normally reveals its project — but never re-opens one the
+    // user deliberately collapsed, which would undo the restore on the first
+    // thread that comes back (audit F47).
+    if (!m_collapsedProjects.contains(projectPath)) {
+        project->setExpanded(true);
+    }
 }
 
 void AgentRoster::setAgentTitle(int agentId, const QString &title)
@@ -610,6 +692,31 @@ void AgentRoster::setAgentAttention(int agentId, bool attention)
     // marker the instant the user navigates away (see currentItemChanged).
     item->setData(0, AgentRoles::AttentionRaw, attention);
     applyAttentionDisplay(item);
+    publishAttentionCount();
+}
+
+int AgentRoster::attentionCount() const
+{
+    int n = 0;
+    for (int i = 0; i < m_tree->topLevelItemCount(); ++i) {
+        const QList<QTreeWidgetItem *> rows = agentRows(m_tree->topLevelItem(i));
+        for (QTreeWidgetItem *agent : rows) {
+            if (agent->data(0, AgentRoles::AttentionRaw).toBool()) {
+                ++n;
+            }
+        }
+    }
+    return n;
+}
+
+void AgentRoster::publishAttentionCount()
+{
+    const int n = attentionCount();
+    if (n == m_lastAttentionCount) {
+        return;
+    }
+    m_lastAttentionCount = n;
+    emit attentionCountChanged(n);
 }
 
 // applyAttentionDisplay sets the painted Attention flag from AttentionRaw,
@@ -653,6 +760,7 @@ void AgentRoster::removeAgent(int agentId)
     recomputeWorkerCount(parent);
     recomputeProjectBadge(project);
     updateWorkingAnimation(); // a removed Working agent may stop the timer
+    publishAttentionCount();  // a closed agent stops waiting on the user
 }
 
 void AgentRoster::removeProject(const QString &path)
@@ -665,6 +773,7 @@ void AgentRoster::removeProject(const QString &path)
     // timer must re-check whether it still has anything to animate, or it spins
     // forever after the last Working agent is gone.
     updateWorkingAnimation();
+    publishAttentionCount(); // and any of its agents that were waiting
 }
 
 void AgentRoster::setCurrentAgent(int agentId)
@@ -799,6 +908,14 @@ void AgentRoster::rebuildTagFilterMenu()
     for (const QString &t : all) {
         live.insert(t.toLower());
     }
+    // Graduate any restored selection whose tag has now appeared, BEFORE the
+    // prune below — otherwise the restore is erased by its own first rebuild.
+    if (!m_pendingTagFilter.isEmpty()) {
+        QSet<QString> arrived = m_pendingTagFilter;
+        arrived.intersect(live);
+        m_tagFilter.unite(arrived);
+        m_pendingTagFilter.subtract(arrived);
+    }
     m_tagFilter.intersect(live);
 
     // Diff the per-tag checkable actions against the live tag set: remove only
@@ -827,6 +944,7 @@ void AgentRoster::rebuildTagFilterMenu()
         m_tagFilterClearAct = menu->addAction(i18n("Clear tag filter"));
         connect(m_tagFilterClearAct, &QAction::triggered, this, [this] {
             m_tagFilter.clear();
+            saveTagFilter();
             rebuildTagFilterMenu();
             applyFilter();
         });
@@ -849,6 +967,7 @@ void AgentRoster::rebuildTagFilterMenu()
             } else {
                 m_tagFilter.remove(key);
             }
+            saveTagFilter();
             // Reflect the count in the button label without rebuilding the
             // open menu (which would invalidate the action being toggled).
             m_tagFilterButton->setText(m_tagFilter.isEmpty()

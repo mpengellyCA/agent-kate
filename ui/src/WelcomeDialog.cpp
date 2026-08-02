@@ -1,5 +1,6 @@
 #include "WelcomeDialog.h"
 #include "RecentProjects.h"
+#include "state/SessionProjects.h"
 
 #include <KIO/OpenFileManagerWindowJob>
 #include <KLocalizedString>
@@ -161,10 +162,22 @@ WelcomeDialog::WelcomeDialog(QWidget *parent)
     m_reopenButton = new QPushButton(
         QIcon::fromTheme(QStringLiteral("document-open-recent")),
         i18n("Reopen"), this);
+    m_reopenButton->setObjectName(QStringLiteral("reopenButton"));
     m_reopenButton->setDefault(true);
     m_reopenButton->setAutoDefault(true);
 
+    // Reopening the whole SET is the multi-project user's real intent, and
+    // until now they had to re-add every folder by hand on every launch (audit
+    // F47). Only offered when the last session held more than one project —
+    // with one, "Reopen" already is the whole session.
+    m_sessionButton = new QPushButton(
+        QIcon::fromTheme(QStringLiteral("view-restore")), QString(), this);
+    m_sessionButton->setObjectName(QStringLiteral("reopenSessionButton"));
+    m_sessionButton->setAutoDefault(true);
+    m_sessionButton->setVisible(false);
+
     heroRow->addLayout(heroText, 1);
+    heroRow->addWidget(m_sessionButton, 0, Qt::AlignVCenter);
     heroRow->addWidget(m_reopenButton, 0, Qt::AlignVCenter);
     outer->addWidget(heroFrame);
 
@@ -179,11 +192,23 @@ WelcomeDialog::WelcomeDialog(QWidget *parent)
     m_list->setContextMenuPolicy(Qt::CustomContextMenu);
     outer->addWidget(m_list, 1);
 
-    auto *hint = new QLabel(
+    // Every other list in the app says what fills it when it is empty; this one
+    // used to be a blank box on the very first screen a new user sees (F50).
+    m_emptyHint = new QLabel(
+        i18n("Nothing here yet — projects you open will be listed here so you "
+             "can come straight back to them."),
+        this);
+    m_emptyHint->setWordWrap(true);
+    m_emptyHint->setAlignment(Qt::AlignCenter);
+    m_emptyHint->setForegroundRole(QPalette::PlaceholderText);
+    m_emptyHint->setVisible(false);
+    outer->addWidget(m_emptyHint, 1);
+
+    m_listHint = new QLabel(
         i18n("Double-click to open · Right-click for more · Delete to remove"),
         this);
-    hint->setForegroundRole(QPalette::PlaceholderText);
-    outer->addWidget(hint);
+    m_listHint->setForegroundRole(QPalette::PlaceholderText);
+    outer->addWidget(m_listHint);
 
     // Bottom action bar — "Open folder…", "New project…", and Cancel/Quit.
     auto *buttons = new QDialogButtonBox(this);
@@ -199,6 +224,7 @@ WelcomeDialog::WelcomeDialog(QWidget *parent)
     outer->addWidget(buttons);
 
     connect(m_reopenButton, &QPushButton::clicked, this, &WelcomeDialog::reopenLast);
+    connect(m_sessionButton, &QPushButton::clicked, this, &WelcomeDialog::reopenSession);
     connect(openButton, &QPushButton::clicked, this, &WelcomeDialog::chooseFolder);
     connect(newButton, &QPushButton::clicked, this, &WelcomeDialog::createNewProject);
     connect(quitButton, &QPushButton::clicked, this, &QDialog::reject);
@@ -254,6 +280,25 @@ void WelcomeDialog::refreshList()
     const QStringList pins = RecentProjects::pinned();
     m_list->clear();
 
+    // The previous session's whole project set (existing folders only), which
+    // may be larger than "the most recent one" (audit F47).
+    const QStringList session = SessionProjects::load();
+    if (session.size() > 1) {
+        m_sessionButton->setText(i18np("Reopen Session (%1 Project)",
+                                       "Reopen Session (%1 Projects)",
+                                       session.size()));
+        m_sessionButton->setToolTip(session.join(QLatin1Char('\n')));
+        m_sessionButton->setVisible(true);
+        // The set is the better guess than its newest member, so it takes the
+        // Enter key. Both are safe, non-destructive actions.
+        m_sessionButton->setDefault(true);
+        m_reopenButton->setDefault(false);
+    } else {
+        m_sessionButton->setVisible(false);
+        m_sessionButton->setDefault(false);
+        m_reopenButton->setDefault(true);
+    }
+
     const QString last = recents.isEmpty() ? QString() : recents.constFirst();
     if (last.isEmpty()) {
         m_lastLabel->setText(
@@ -282,6 +327,14 @@ void WelcomeDialog::refreshList()
     }
     if (m_list->count() > 0) {
         m_list->setCurrentRow(0);
+    }
+    const bool empty = m_list->count() == 0;
+    m_list->setVisible(!empty);
+    if (m_emptyHint) {
+        m_emptyHint->setVisible(empty);
+    }
+    if (m_listHint) {
+        m_listHint->setVisible(!empty); // no list, nothing to say about using it
     }
 }
 
@@ -341,6 +394,15 @@ void WelcomeDialog::reopenLast()
         return;
     }
     accept(last);
+}
+
+void WelcomeDialog::reopenSession()
+{
+    const QStringList session = SessionProjects::load();
+    if (session.isEmpty()) {
+        return;
+    }
+    acceptMany(session);
 }
 
 void WelcomeDialog::chooseFolder()
@@ -426,6 +488,15 @@ void WelcomeDialog::onRemoveCurrent()
 
 void WelcomeDialog::accept(const QString &path)
 {
-    m_selected = path;
+    acceptMany({path});
+}
+
+void WelcomeDialog::acceptMany(const QStringList &paths)
+{
+    if (paths.isEmpty()) {
+        return;
+    }
+    m_selectedPaths = paths;
+    m_selected = paths.constFirst();
     QDialog::accept();
 }

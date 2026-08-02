@@ -30,6 +30,7 @@
 #include "git/GutterController.h"
 #include "git/LogViewer.h"
 #include "ipc/CoreClient.h"
+#include "state/EngineAvailability.h"
 #include "state/EnsembleCatalog.h"
 
 #include <KTextEditor/Cursor>
@@ -63,6 +64,7 @@
 #include <QCoreApplication>
 #include <QCursor>
 #include <QDebug>
+#include <QDesktopServices>
 #include <QDir>
 #include <QFileInfo>
 #include <QHBoxLayout>
@@ -87,6 +89,7 @@
 #include <QTimer>
 #include <QToolBar>
 #include <QToolButton>
+#include <QUrl>
 #include <QVBoxLayout>
 
 MainWindow::MainWindow(const QString &openPath, QWidget *parent)
@@ -111,6 +114,10 @@ MainWindow::MainWindow(const QString &openPath, QWidget *parent)
     setupPerspectives();
     setupCore();
     setupExperience();
+    // Before the first project, before the first task: say it if no agent CLI
+    // is installed (audit F37). The registry serves its built-in engine list
+    // immediately, so this is answerable without waiting for the core.
+    updateEngineAvailabilityBanner();
 
     openLaunchPath(openPath);
 
@@ -342,6 +349,33 @@ void MainWindow::setupUi()
         {m_keyTasks, i18n("Everything running in the background — detached shells, "
                           "sub-agents and Workflow runs — across every agent.")},
     };
+    // The rail's raise-by-ordinal accelerators (setupShellShortcuts) are raw
+    // QShortcuts: they appear in no menu, so the command palette — which walks
+    // the menu bar — cannot surface them either, and nothing on screen says
+    // they exist (audit F50). Naming the binding in the tooltip that is already
+    // there is the interim answer; plan 27 §1's KActionCollection refactor is
+    // the real one, and this line goes away with it.
+    const auto railShortcut = [this](SideBar *bar, int id) -> QString {
+        if (bar != m_leftBar && bar != m_rightBar) {
+            return QString(); // the bottom strip has no ordinal binding
+        }
+        int index = -1;
+        for (int i = 0; i < bar->panelCount(); ++i) {
+            if (bar->panelIdAt(i) == id) {
+                index = i;
+                break;
+            }
+        }
+        if (index < 0 || index > 8) {
+            return QString(); // bindRaise only binds 1…9
+        }
+        const Qt::KeyboardModifiers mods = (bar == m_leftBar)
+            ? Qt::KeyboardModifiers(Qt::AltModifier)
+            : Qt::KeyboardModifiers(Qt::ControlModifier | Qt::AltModifier);
+        return QKeySequence(QKeyCombination(mods,
+                                            static_cast<Qt::Key>(Qt::Key_1 + index)))
+            .toString(QKeySequence::NativeText);
+    };
     for (auto it = panelHelp.constBegin(); it != panelHelp.constEnd(); ++it) {
         SideBar *bar = panelBar(it.key());
         const int id = panelId(it.key());
@@ -351,8 +385,16 @@ void MainWindow::setupUi()
         if (auto *tab = bar->tabBar()->tab(id)) {
             QString title = bar->panelLabel(id);
             title.replace(QLatin1String("&&"), QLatin1String("&"));
-            tab->setToolTip(QStringLiteral("<b>%1</b><p>%2</p>")
-                                .arg(title.toHtmlEscaped(), it.value().toHtmlEscaped()));
+            QString tip = QStringLiteral("<b>%1</b><p>%2</p>")
+                              .arg(title.toHtmlEscaped(), it.value().toHtmlEscaped());
+            const QString seq = railShortcut(bar, id);
+            if (!seq.isEmpty()) {
+                tip += QStringLiteral("<p>%1</p>")
+                           .arg(i18nc("keyboard shortcut hint in a panel tooltip",
+                                      "Shortcut: %1", seq)
+                                    .toHtmlEscaped());
+            }
+            tab->setToolTip(tip);
         }
     }
     // Wire the Output panel to drain m_core's coreLog. m_core does not exist
@@ -387,10 +429,19 @@ void MainWindow::setupUi()
     m_coreBanner->setCloseButtonVisible(false);
     m_coreBanner->setVisible(false);
 
+    // "No agent CLI is installed" (audit F37). Its own strip, above the core's:
+    // it is the more fundamental condition, and the two must never overwrite
+    // each other's text.
+    m_engineBanner = new KMessageWidget(this);
+    m_engineBanner->setWordWrap(true);
+    m_engineBanner->setCloseButtonVisible(false);
+    m_engineBanner->setVisible(false);
+
     auto *centre = new QWidget(this);
     auto *centreLayout = new QVBoxLayout(centre);
     centreLayout->setContentsMargins(0, 0, 0, 0);
     centreLayout->setSpacing(0);
+    centreLayout->addWidget(m_engineBanner);
     centreLayout->addWidget(m_coreBanner);
     centreLayout->addWidget(m_shell, 1);
     setCentralWidget(centre);
@@ -557,6 +608,24 @@ void MainWindow::setupUi()
     // the current one, so the empty argument here means "use it", not "none".
     connect(m_agent, &AgentDock::raiseWindowRequested, this,
             [this] { raiseAndActivate(); });
+
+    // Task-bar-level "you are needed" (audit F50). A popup can be missed and
+    // the window can be on another virtual desktop, in which case a blocked
+    // agent produced no lasting signal anywhere. The title carries the count
+    // for as long as it lasts; demandAttention flashes the task-bar entry once
+    // per transition into "someone is waiting", and only while we are not the
+    // active window — the roster already says it plainly when we are.
+    connect(m_agent, &AgentDock::attentionCountChanged, this, [this](int count) {
+        setWindowTitle(count > 0
+                           ? i18np("(%1) Agent Kate", "(%1) Agent Kate", count)
+                           : i18n("Agent Kate"));
+        // QApplication::alert is the portable "demand attention" request (it
+        // no-ops when the window IS active), unlike KWindowSystem, which in KF6
+        // exposes activation but no state setter.
+        if (count > 0) {
+            QApplication::alert(this);
+        }
+    });
     connect(m_jobsPanel, &JobsPanel::clearFinishedRequested, m_agent,
             &AgentDock::forgetFinishedJobsEverywhere);
     connect(m_jobsPanel, &JobsPanel::openWorkflowRequested, m_agent,
@@ -727,8 +796,15 @@ void MainWindow::setupActions()
     welcomeAct->setToolTip(i18n("Pick a recent project, open a folder, or start a new one."));
     connect(welcomeAct, &QAction::triggered, this, [this] {
         WelcomeDialog dlg(this);
-        if (dlg.exec() == QDialog::Accepted && !dlg.selectedPath().isEmpty()) {
-            m_agent->addProject(dlg.selectedPath());
+        if (dlg.exec() != QDialog::Accepted) {
+            return;
+        }
+        // "Reopen session" hands back the whole set, not just one path (F47).
+        const QStringList paths = dlg.selectedPaths();
+        for (const QString &path : paths) {
+            if (!path.isEmpty()) {
+                m_agent->addProject(path);
+            }
         }
     });
     fileMenu->addAction(welcomeAct);
@@ -1031,9 +1107,16 @@ void MainWindow::setupActions()
     // The developer-only View actions are hidden in Simple mode. Collect them
     // now that all of them exist (terminals, worktree terminal, git blame), plus
     // the Agent menu's git/worktree lifecycle (built earlier in setupAgentMenu).
+    //
+    // m_agentMergeAct is deliberately NOT in this list (audit F38). Isolation is
+    // on by default and the promise made at the decision point is "changes don't
+    // touch my files until I approve" — so getting the changes back is the
+    // payoff of the whole flow, not a developer tool. Hiding it in Simple mode
+    // left the least technical user with no visible approval button anywhere and
+    // no way to answer "where did my changes go?".
     m_advancedActions = {m_blameToggle, newTermAct, focusTermAct, nextTermAct,
                          prevTermAct, m_openWorktreeTerminalAct,
-                         m_agentCommitAct, m_agentPrAct, m_agentMergeAct,
+                         m_agentCommitAct, m_agentPrAct,
                          m_agentTerminalAct, m_agentDiscardAct};
 
     m_codeMenu = menuBar()->addMenu(i18n("&Code"));
@@ -1137,9 +1220,17 @@ void MainWindow::setupActions()
         }
     });
 
-    codeMenu->addSeparator();
+    // Skills and language extensions used to live at the bottom of the Code
+    // menu, which Simple mode hides whole — so the two "install something that
+    // makes your agent better at a job" features were invisible to exactly the
+    // person they are for (audit F50). They are not editor navigation, so they
+    // move out rather than being duplicated: skills to the Agent menu (they are
+    // an agent capability), language extensions to Options (they configure the
+    // editor). Both menus are visible at every experience level.
     auto *extAct = new QAction(QIcon::fromTheme(QStringLiteral("install")),
                                i18n("Manage Language &Extensions…"), this);
+    extAct->setToolTip(i18n("Add language support — syntax, completion and error "
+                            "checking for more file types."));
     connect(extAct, &QAction::triggered, this, [this] {
         auto *dlg = new ExtensionsDialog(m_core, this);
         dlg->setAttribute(Qt::WA_DeleteOnClose);
@@ -1147,10 +1238,14 @@ void MainWindow::setupActions()
                 &MainWindow::reloadExtensionServers);
         dlg->show();
     });
-    codeMenu->addAction(extAct);
+    optionsMenu->addSeparator();
+    optionsMenu->addAction(extAct);
 
     auto *skillsAct = new QAction(QIcon::fromTheme(QStringLiteral("preferences-plugin")),
-                                  i18n("Manage Claude &Skills…"), this);
+                                  i18n("Manage Agent &Skills…"), this);
+    skillsAct->setToolTip(
+        i18n("Install skills — reusable instructions that teach your agents how "
+             "to do a particular job."));
     connect(skillsAct, &QAction::triggered, this, [this] {
         if (m_activeProject.isEmpty()) {
             return;
@@ -1159,10 +1254,52 @@ void MainWindow::setupActions()
         dlg->setAttribute(Qt::WA_DeleteOnClose);
         dlg->show();
     });
-    codeMenu->addAction(skillsAct);
+    if (m_agentMenu) {
+        m_agentMenu->addSeparator();
+        m_agentMenu->addAction(skillsAct);
+    }
 
     auto *helpMenu = new KHelpMenu(this, KAboutData::applicationData());
     menuBar()->addMenu(helpMenu->menu());
+}
+
+// updateEngineAvailabilityBanner puts the missing-CLI condition on screen
+// BEFORE the user writes a task, instead of after (audit F37). It fires only
+// for the state that actually strands someone — not one engine installed;
+// a single missing engine out of several is said in the picker instead
+// (AgentDock::seedEngineChoices), where the choice is being made.
+void MainWindow::updateEngineAvailabilityBanner()
+{
+    if (!m_engineBanner) {
+        return;
+    }
+    const QList<EngineAvailability::Engine> engines = EngineAvailability::scan();
+    const QString message = EngineAvailability::missingEnginesMessage(engines);
+    if (message.isEmpty()) {
+        m_engineBanner->animatedHide();
+        return;
+    }
+    // Rebuild the action every time: the set of missing engines (and so the
+    // link we can honestly offer) can change between calls.
+    const auto actions = m_engineBanner->actions();
+    for (QAction *a : actions) {
+        m_engineBanner->removeAction(a);
+    }
+    m_engineBanner->setMessageType(KMessageWidget::Warning);
+    m_engineBanner->setIcon(QIcon::fromTheme(QStringLiteral("dialog-warning")));
+    m_engineBanner->setCloseButtonVisible(false);
+    m_engineBanner->setText(message);
+    const QString url = EngineAvailability::installUrl(engines);
+    if (!url.isEmpty()) {
+        auto *install = new QAction(QIcon::fromTheme(QStringLiteral("install")),
+                                    i18n("How to Install…"), m_engineBanner);
+        // An app-authored constant URL — nothing model-controlled reaches here,
+        // so it does not need SafeContent's confirm-and-scheme gate (audit F14).
+        connect(install, &QAction::triggered, this,
+                [url] { QDesktopServices::openUrl(QUrl(url)); });
+        m_engineBanner->addAction(install);
+    }
+    m_engineBanner->animatedShow();
 }
 
 void MainWindow::showCommandPalette()
@@ -1244,6 +1381,22 @@ void MainWindow::setupAgentMenu()
     connect(m_agentChangesAct, &QAction::triggered, this,
             [this] { m_agent->showActiveAgentChanges(); });
 
+    // Review, then approve. This one is NOT part of the git/worktree section
+    // below and is not hidden in Simple mode (audit F38): an isolated agent's
+    // work is unreachable without it, so it belongs next to "Show Changes"
+    // where the user has just looked at what they are approving.
+    //
+    // It is no longer called "Merge into Local Main": agent.land merges into
+    // the workspace's CURRENT branch, whatever that is (audit F50).
+    m_agentMergeAct = m_agentMenu->addAction(
+        QIcon::fromTheme(QStringLiteral("vcs-merge")),
+        i18n("&Merge the Agent's Changes…"));
+    m_agentMergeAct->setToolTip(
+        i18n("Bring this agent's work out of its private copy and into your "
+             "project's current branch."));
+    connect(m_agentMergeAct, &QAction::triggered, this,
+            [this] { m_agent->mergeActiveAgent(); });
+
     m_agentStopAct = m_agentMenu->addAction(
         QIcon::fromTheme(QStringLiteral("process-stop")), i18n("&Stop Agent"));
     m_agentStopAct->setToolTip(i18n("Stop the running agent (it stays available to resume)."));
@@ -1260,9 +1413,6 @@ void MainWindow::setupAgentMenu()
     m_agentPrAct = m_agentMenu->addAction(i18n("Create &Pull Request…"));
     connect(m_agentPrAct, &QAction::triggered, this,
             [this] { m_agent->createPullRequestForActiveAgent(); });
-    m_agentMergeAct = m_agentMenu->addAction(i18n("&Merge into Local Main…"));
-    connect(m_agentMergeAct, &QAction::triggered, this,
-            [this] { m_agent->mergeActiveAgent(); });
     m_agentTerminalAct = m_agentMenu->addAction(
         QIcon::fromTheme(QStringLiteral("utilities-terminal")),
         i18n("Open &Terminal in Worktree"));
@@ -1910,6 +2060,21 @@ void MainWindow::setupCore()
     connect(m_core, &CoreClient::failed, this, [](const QString &msg) {
         qWarning().noquote() << "[core]" << msg;
     });
+    // The core took the socket but REFUSED this process the "ui" role, so every
+    // UI-only RPC will be rejected and CoreClient deliberately never emits
+    // connected(). Without this banner the window simply comes up inert and says
+    // nothing, which is indistinguishable from a broken build — so it gets the
+    // persistent, un-closable treatment, the same as losing the core outright.
+    // See CoreClient::handshakeRefused (audit F13).
+    connect(m_core, &CoreClient::handshakeRefused, this, [this](const QString &msg) {
+        qCritical().noquote() << "[core] handshake refused:" << msg;
+        m_coreBanner->setMessageType(KMessageWidget::Error);
+        m_coreBanner->setIcon(QIcon::fromTheme(QStringLiteral("dialog-error")));
+        m_coreBanner->setCloseButtonVisible(false);
+        m_coreBanner->setText(msg);
+        m_coreBanner->animatedShow();
+        statusBar()->showMessage(msg);
+    });
     // A refused send drops something the human composed, so it is said out loud
     // through the same banner the connection uses — the log line is for us, not
     // for them. Transient by nature: the connection is fine, so it fades on its
@@ -1988,6 +2153,14 @@ void MainWindow::setupCore()
         HarnessRegistry::self()->discoverAll(m_core);
         pushOpenFilesToCore();
         reloadExtensionServers();
+    });
+    // Re-check which engine CLIs exist whenever the registry's engine LIST can
+    // have changed (the capability fetch above, and any later refresh): a core
+    // that registers a third harness must not leave the banner claiming the
+    // two we knew about are all there is (audit F37).
+    connect(HarnessRegistry::self(), &HarnessRegistry::changed, this, [this] {
+        EngineAvailability::invalidate();
+        updateEngineAvailabilityBanner();
     });
 
     const QString corePath =

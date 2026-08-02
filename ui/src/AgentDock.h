@@ -74,6 +74,10 @@ public:
     bool activeAgentHasWorktree() const; // git lifecycle ops are meaningful
 
     void newAgentInActiveProject();
+    // The guided New Agent dialog for one named project. Every visible "new
+    // agent" control routes here (audit F45) — the bare panel with five
+    // unlabeled combos is not a first-run experience.
+    void newAgentGuided(const QString &projectPath);
     // Apply an ensemble (plan 16 P4): the core starts its controller, already
     // briefed, and the dock adopts that thread into a roster panel. task is the
     // human's first instruction, appended to the controller's briefing.
@@ -145,6 +149,9 @@ Q_SIGNALS:
     // A desktop notification was clicked: the window must un-minimise, raise and
     // take focus. The dock has already selected the agent it was about.
     void raiseWindowRequested();
+    // How many agents are blocked on the user, forwarded from the roster so the
+    // window can put it in the task bar (audit F50).
+    void attentionCountChanged(int count);
 
 private:
     struct Entry {

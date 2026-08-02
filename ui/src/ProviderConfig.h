@@ -55,6 +55,18 @@ bool setKey(const QString &id, const QString &key);
 QString key(const ProviderProfile &p);
 bool hasStoredKey(const QString &id);
 
+// Can this profile actually start an agent right now? True for Claude-direct
+// (it needs no key of ours) and for a routed profile whose key resolves from
+// KWallet or its environment variable. The two seeded presets ship with no key,
+// so on a fresh profile they were offered as engine choices that could only
+// ever abort (audit F46) — every picker that lists routed providers must gate
+// or annotate on this.
+bool keyResolvable(const ProviderProfile &p);
+
+// The name to show in an engine picker: the profile's own name, suffixed when
+// no key resolves, so the choice is visibly dead before it is made.
+QString pickerLabel(const ProviderProfile &p);
+
 // Build the agent.start/agent.resume "provider" JSON for a profile, resolving
 // the key. Returns an empty object for Claude-direct (the caller omits the field).
 QJsonObject toJson(const ProviderProfile &p);

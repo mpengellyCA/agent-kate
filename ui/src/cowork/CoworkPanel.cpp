@@ -1,6 +1,7 @@
 #include "CoworkPanel.h"
 
 #include "BrowserLaunch.h"
+#include "CapabilityText.h"
 #include "CapabilityTile.h"
 #include "ConsentDialog.h"
 #include "ControlConsentDialog.h"
@@ -14,6 +15,7 @@
 #include <KMessageBox>
 #include <KMessageWidget>
 #include <KSharedConfig>
+#include <KStandardGuiItem>
 
 #include <QAction>
 #include <QComboBox>
@@ -72,7 +74,9 @@ QString targetSummary(const QJsonObject &t)
         return i18n("the whole screen");
     }
     if (kind == QLatin1String("vdesktop") || kind == QLatin1String("sandbox")) {
-        return i18n("the sandbox desktop");
+        // Honesty (audit F32): organizational boundary, not containment — see
+        // CapabilityText.h. Never "sandbox" in the UI.
+        return i18n("a separate desktop");
     }
     if (kind == QLatin1String("any")) {
         return i18n("the whole desktop");
@@ -80,50 +84,18 @@ QString targetSummary(const QJsonObject &t)
     return kind.isEmpty() ? i18n("your desktop") : kind;
 }
 
-// Human, one-word-verb phrasing for a capability, used inside the grant sentence
-// ("Agent X can <verb> on …"). Kept lower-case so it flows in the sentence.
-QString capVerb(const QString &key)
-{
-    if (key == QLatin1String("window_list")) return i18n("see open windows");
-    if (key == QLatin1String("screenshot")) return i18n("take screenshots");
-    if (key == QLatin1String("a11y_read")) return i18n("read app contents");
-    if (key == QLatin1String("screencast")) return i18n("watch the screen");
-    if (key == QLatin1String("launch_browser")) return i18n("open a browser");
-    if (key == QLatin1String("vd_sandbox")) return i18n("use a sandbox desktop");
-    if (key == QLatin1String("a11y_action")) return i18n("click buttons and controls as you");
-    if (key == QLatin1String("input_inject")) return i18n("type and press keys as you");
-    if (key == QLatin1String("pointer_control")) return i18n("move and click the mouse as you");
-    return key;
-}
+// The capability vocabulary (verb / title / description) now lives in
+// CapabilityText.h so this panel and the consent prompt cannot drift apart — the
+// prompt's copy used to be missing half the keys and rendered them raw (audit F50).
 
-// Tile title (Title-ish case) for the control-centre grid.
-QString capTitle(const QString &key)
+// The activity log's capability column. It printed the raw internal key straight from
+// the core's audit entry, which is the same leak in the one surface a non-technical
+// user actually opens to check what agents did (audit F35). Entries with no capability
+// (kill / rearm / rotate) keep the column empty rather than being described as an
+// unrecognised permission.
+QString auditCapabilityText(const QString &key)
 {
-    if (key == QLatin1String("window_list")) return i18n("See open windows");
-    if (key == QLatin1String("screenshot")) return i18n("Take screenshots");
-    if (key == QLatin1String("a11y_read")) return i18n("Read app contents");
-    if (key == QLatin1String("screencast")) return i18n("Watch the screen");
-    if (key == QLatin1String("launch_browser")) return i18n("Open a browser");
-    if (key == QLatin1String("vd_sandbox")) return i18n("Sandbox desktop");
-    if (key == QLatin1String("a11y_action")) return i18n("Click controls");
-    if (key == QLatin1String("input_inject")) return i18n("Type as you");
-    if (key == QLatin1String("pointer_control")) return i18n("Move the mouse");
-    return key;
-}
-
-// One-line, plain-language description shown under the tile title.
-QString capDesc(const QString &key)
-{
-    if (key == QLatin1String("window_list")) return i18n("List the windows you have open");
-    if (key == QLatin1String("screenshot")) return i18n("Capture what's on your screen");
-    if (key == QLatin1String("a11y_read")) return i18n("Read the text and controls in apps");
-    if (key == QLatin1String("screencast")) return i18n("Watch your screen live as it changes");
-    if (key == QLatin1String("launch_browser")) return i18n("Open a browser it can read and use");
-    if (key == QLatin1String("vd_sandbox")) return i18n("Work on a separate virtual desktop");
-    if (key == QLatin1String("a11y_action")) return i18n("Click buttons and controls as you");
-    if (key == QLatin1String("input_inject")) return i18n("Type text and press keys as you");
-    if (key == QLatin1String("pointer_control")) return i18n("Move the pointer and click as you");
-    return QString();
+    return key.isEmpty() ? QString() : CoworkCaps::title(key);
 }
 
 // A recognisable theme icon per capability. Falls back gracefully if a name is
@@ -373,12 +345,14 @@ void CoworkPanel::refreshPolicy()
             const bool dangerous = c.value(QStringLiteral("tier")).toString() == QLatin1String("R2");
             CapabilityTile *tile = m_tiles.value(key, nullptr);
             if (!tile) {
-                tile = new CapabilityTile(key, capTitle(key), capDesc(key), capIcon(key), dangerous, this);
+                tile = new CapabilityTile(key, CoworkCaps::title(key),
+                                          CoworkCaps::description(key), capIcon(key),
+                                          dangerous, this);
                 if (dangerous) {
                     tile->setToolTip(i18n("High-risk: lets the agent act as you (type, click). "
                                           "The kill-switch and activity log are your safety net."));
                 } else {
-                    tile->setToolTip(capDesc(key));
+                    tile->setToolTip(CoworkCaps::description(key));
                 }
                 connect(tile, &CapabilityTile::toggled, this, [this, self](const QString &k, bool on) {
                     if (!self) {
@@ -514,7 +488,7 @@ void CoworkPanel::refreshGrants()
             sentence->setTextFormat(Qt::RichText);
             sentence->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
             sentence->setText(i18n("<b>%1</b> can <i>%2</i> on <i>%3</i> until <b>%4</b>.",
-                                   threadId.toHtmlEscaped(), capVerb(cap).toHtmlEscaped(),
+                                   threadId.toHtmlEscaped(), CoworkCaps::verb(cap).toHtmlEscaped(),
                                    target.toHtmlEscaped(), until.toHtmlEscaped()));
             rowLay->addWidget(sentence, 1);
 
@@ -552,7 +526,7 @@ void CoworkPanel::renderAudit()
         lines << QStringLiteral("%1  %2  %3  %4  %5")
                      .arg(ts,
                           e.value(QStringLiteral("kind")).toString(),
-                          e.value(QStringLiteral("capability")).toString(),
+                          auditCapabilityText(e.value(QStringLiteral("capability")).toString()),
                           e.value(QStringLiteral("threadId")).toString(),
                           e.value(QStringLiteral("detail")).toString());
     }
@@ -617,6 +591,24 @@ void CoworkPanel::revokeGrant(const QString &id)
 void CoworkPanel::toggleKill()
 {
     if (m_killed) {
+        // SECURITY (audit F50): turning the panic button back OFF is the one direction
+        // that widens authority, and it used to be a single unconfirmed click on the
+        // same button the user just hit in a hurry. Confirm it, defaulting to Cancel
+        // (Dangerous), and say plainly what does and does not come back — the kill
+        // cleared every toggle and grant core-side, so nothing is restored by this.
+        const auto ans = KMessageBox::warningContinueCancel(
+            this,
+            i18n("Allow agents to ask for desktop access again?\n\n"
+                 "The kill-switch cleared every standing permission and every live grant, "
+                 "and this does not bring any of them back — agents start from nothing and "
+                 "must ask you."),
+            i18n("Re-enable desktop access"),
+            KGuiItem(i18n("Allow asking again"), QStringLiteral("dialog-ok-apply")),
+            KStandardGuiItem::cancel(), QString(),
+            KMessageBox::Options(KMessageBox::Notify | KMessageBox::Dangerous));
+        if (ans != KMessageBox::Continue) {
+            return;
+        }
         m_core->call(QStringLiteral("cowork.killSwitch"), {{QStringLiteral("on"), false}}, nullptr, this);
         return;
     }
@@ -639,7 +631,11 @@ bool CoworkPanel::confirmDesktopAccessibilityFlip(const QString &what)
     if (!m_portal || m_portal->desktopAccessibilityFlipped()) {
         return true;
     }
-    const auto answer = KMessageBox::questionTwoActions(
+    // SECURITY (audit F31): warningTwoActions, not questionTwoActions — its default
+    // button is the SECONDARY one (Cancel), per the KF6 header contract. This dialog is
+    // long and is raised by a click the user already made, which is exactly the shape
+    // where Enter gets pressed through; the risky side must never be the default.
+    const auto answer = KMessageBox::warningTwoActions(
         this,
         i18n("<p>To do this, Agent Kate switches your session's accessibility service on "
              "(<tt>org.a11y.Status</tt>) so applications expose their windows and controls.</p>"
@@ -741,7 +737,7 @@ void CoworkPanel::handleEnableRequested(const QJsonObject &params)
                 continue;
             }
             const QString key = c.value(QStringLiteral("key")).toString();
-            standing << capVerb(key).toHtmlEscaped();
+            standing << CoworkCaps::verb(key).toHtmlEscaped();
             if (c.value(QStringLiteral("tier")).toString() == QLatin1String("R2")) {
                 anyR2 = true;
             }
@@ -793,7 +789,12 @@ void CoworkPanel::showEnableRequestDialog(const QJsonObject &params, const QStri
                               "the last agent's desktop access is switched off, when you hit the "
                               "kill-switch, and when Agent Kate exits.</p>");
 
-    const auto answer = KMessageBox::questionTwoActions(
+    // SECURITY (audit F31): warningTwoActions defaults to the SECONDARY action ("Keep
+    // it off") — Enter can no longer hand an agent screen-read plus type/click-as-you.
+    // This prompt is AGENT-initiated and long (reason + standing-grant disclosure +
+    // a11y disclosure): the tired-user default has to be the safe one. Matches
+    // ControlConsentDialog's Deny default.
+    const auto answer = KMessageBox::warningTwoActions(
         this,
         i18n("<p>%1</p><p>Its reason: <i>%2</i></p><p>If you allow this, that agent can see "
              "your screen, read window contents, and move the pointer, type and click as you.</p>"

@@ -10,8 +10,10 @@
 #include "TagEditorDialog.h"
 #include "ipc/CoreClient.h"
 #include "ProviderConfig.h"
+#include "state/EngineAvailability.h"
 #include "state/EnsembleCatalog.h"
 #include "state/HarnessTraits.h"
+#include "state/SessionProjects.h"
 #include "notify/AgentNotifier.h"
 
 #include <QDir>
@@ -51,15 +53,23 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
                 Q_EMIT raiseWindowRequested();
             });
 
+    connect(m_roster, &AgentRoster::attentionCountChanged, this,
+            &AgentDock::attentionCountChanged); // → the window's task-bar signal
     connect(m_roster, &AgentRoster::openProjectRequested, this, &AgentDock::openProjectDialog);
     connect(m_roster, &AgentRoster::newAgentRequested, this, [this](const QString &project) {
         QString p = project;
         if (p.isEmpty() && !m_projects.isEmpty()) {
             p = m_projects.constLast();
         }
-        if (!p.isEmpty()) {
-            addAgent(p);
+        if (p.isEmpty()) {
+            return;
         }
+        // The most prominent creation control in the app used to make a blank
+        // agent and drop the user into a panel of five unlabeled combos, while
+        // the guided dialog ("What should this agent do?") hid behind a menu
+        // (audit F45). Plain click = guided; the dropdown still pre-picks an
+        // engine/model for people who know what they want.
+        newAgentGuided(p);
     });
     connect(m_roster, &AgentRoster::newAgentWithEngineRequested, this,
             [this](const QString &project, const QString &backend,
@@ -286,12 +296,14 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
                 "This agent runs in the workspace — it has no branch to merge"));
             return;
         }
+        // "your local main branch" was simply false: agent.land merges into the
+        // workspace's CURRENT branch, whatever it happens to be (audit F50).
         if (QMessageBox::question(
-                m_dialogParent, i18n("Merge into local main"),
+                m_dialogParent, i18n("Merge the Agent's Changes"),
                 i18n(
-                    "Merge this agent's branch into your local main branch?\n\n"
-                    "Its commits are merged into the workspace locally — nothing "
-                    "is pushed to GitHub."))
+                    "Bring this agent's work out of its private copy and merge "
+                    "it into your project's current branch?\n\n"
+                    "The merge happens locally — nothing is pushed to GitHub."))
             != QMessageBox::Yes) {
             return;
         }
@@ -305,7 +317,7 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
                                  error.value(QStringLiteral("message")).toString();
                              emit statusMessage(i18n("Merge failed: %1", msg));
                              QMessageBox::warning(m_dialogParent,
-                                 i18n("Merge into local main failed"), msg);
+                                 i18n("Merge failed"), msg);
                          } else {
                              const QString branch =
                                  result.value(QStringLiteral("branch")).toString();
@@ -313,7 +325,7 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
                                  result.value(QStringLiteral("into")).toString();
                              emit statusMessage(i18n("Merged %1 into %2", branch, into));
                              QMessageBox::information(m_dialogParent,
-                                 i18n("Merge into local main"),
+                                 i18n("Merge complete"),
                                  i18n("Merged %1 into %2.", branch, into));
                          }
                      },
@@ -438,7 +450,11 @@ void AgentDock::newAgentInActiveProject()
 
 void AgentDock::newAgentInActiveProjectGuided()
 {
-    const QString project = activeProjectPath();
+    newAgentGuided(activeProjectPath());
+}
+
+void AgentDock::newAgentGuided(const QString &project)
+{
     if (project.isEmpty()) {
         return;
     }
@@ -678,6 +694,9 @@ void AgentDock::ensureProject(const QString &path)
     }
     m_roster->addProject(path, name);
     RecentProjects::remember(path); // welcome screen reads this on next launch
+    // And remember the whole SET, not just the newest: the next launch offers
+    // to reopen every project of this session (audit F47).
+    SessionProjects::save(m_projects);
 }
 
 // focusExistingProject selects the agent that best stands for an already-open
@@ -851,12 +870,21 @@ void AgentDock::seedEngineChoices()
     choices.append(
         {QString(), QString(), i18n("Manage ensembles…"), false, QString(), true});
     for (const HarnessTraits &t : HarnessRegistry::self()->all()) {
-        choices.append({QString(), QString(), t.displayName, true}); // section
+        // An engine whose CLI is not installed still appears — hiding it would
+        // make the product look like it supports one engine — but every row
+        // under it is dead, and the section title says why (audit F37).
+        const bool present = EngineAvailability::isPresent(t.id);
+        EngineAvailability::Engine e;
+        e.id = t.id;
+        e.displayName = t.displayName;
+        e.present = present;
+        choices.append({QString(), QString(), EngineAvailability::pickerLabel(e),
+                        true, QString(), false, present}); // section
         // The engine's own default model, then its live catalogue (Claude-direct
         // here — the roster quick menu has no provider selection): the recommended
         // group first, then the full list. Empty until the first probe lands.
-        choices.append(
-            {t.id, QString(), i18n("%1 (default model)", t.displayName), false});
+        choices.append({t.id, QString(), i18n("%1 (default model)", t.displayName),
+                        false, QString(), false, present});
         const auto models =
             HarnessRegistry::self()->modelChoices(t.id, ProviderStore::directId());
         QSet<QString> seen;
@@ -866,7 +894,8 @@ void AgentDock::seedEngineChoices()
                 const QString name = entry.section(QLatin1Char('|'), 1);
                 if (!value.isEmpty() && !seen.contains(value)) {
                     seen.insert(value);
-                    choices.append({t.id, value, name.isEmpty() ? value : name, false});
+                    choices.append({t.id, value, name.isEmpty() ? value : name,
+                                    false, QString(), false, present});
                 }
             }
         };
@@ -1384,6 +1413,7 @@ void AgentDock::closeProject(const QString &path)
         removeAgentEntry(id);
     }
     m_projects.removeAll(path);
+    SessionProjects::save(m_projects); // a closed project must not come back
     m_roster->removeProject(path);
     // The project is gone for good — tell consumers (e.g. its terminal tabs) to
     // release any per-project resources. This is the one place destroying a

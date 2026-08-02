@@ -2,7 +2,10 @@
 
 #include "ipc/SocketPath.h"
 
+#include <KLocalizedString>
+
 #include <QCoreApplication>
+#include <QDebug>
 #include <QDir>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -207,30 +210,72 @@ void CoreClient::onSocketConnected()
         m_handshakeWatchdog = true;
         m_reconnectTimer->start(kHandshakeTimeoutMs);
     }
-    call(QStringLiteral("handshake"), {}, [this](const QJsonObject &, const QJsonObject &) {
-        // However the reply lands — answered, errored, or drained by a drop —
-        // the handshake is settled, so the watchdog must not outlive it.
-        if (m_handshakeWatchdog) {
-            m_handshakeWatchdog = false;
-            m_reconnectTimer->stop();
-        }
-        // Except when the "error" is the drop drain: a socket that died with the
-        // handshake still in flight must not announce a connection that is gone —
-        // it would fire ahead of the recovery banner and contradict it. (The drain
-        // runs before beginReconnect, so stopping the timer above hands that path
-        // an idle timer to re-arm rather than one it would decline to touch.)
-        if (!isConnected()) {
-            return;
-        }
-        emit connected();
-        if (m_reconnecting) {
-            m_reconnecting = false;
-            m_reconnectAttempts = 0;
-            const bool respawned = m_coreRespawned;
-            m_coreRespawned = false;
-            emit reconnected(respawned);
-        }
-    });
+    call(QStringLiteral("handshake"), {},
+         [this](const QJsonObject &, const QJsonObject &error) {
+             // However the reply lands — answered, errored, or drained by a drop —
+             // the handshake is settled, so the watchdog must not outlive it.
+             if (m_handshakeWatchdog) {
+                 m_handshakeWatchdog = false;
+                 m_reconnectTimer->stop();
+             }
+             // Except when the "error" is the drop drain: a socket that died with the
+             // handshake still in flight must not announce a connection that is gone —
+             // it would fire ahead of the recovery banner and contradict it. (The drain
+             // runs before beginReconnect, so stopping the timer above hands that path
+             // an idle timer to re-arm rather than one it would decline to touch.)
+             if (!isConnected()) {
+                 return;
+             }
+             // A REFUSED role is not a connection (audit F13 pass 3). This
+             // callback used to ignore its error argument entirely and emit
+             // connected() regardless, which was survivable when the "ui" role
+             // bought a handful of Cowork features: the app came up, most of it
+             // worked, and the Cowork switchboard was blank. It is not
+             // survivable now — twenty-six-plus handlers gate on the role, so a
+             // client that lost the race (a stale connection from a core that
+             // outlived its window, a second Agent Kate, a same-uid squatter
+             // that connected first) would come up looking perfectly connected
+             // and then refuse every commit, stop, rename, search and shutdown
+             // with a message about the "Agent Kate window" that the user IS
+             // looking at. Announcing a connection we were told we do not have
+             // is the one outcome worse than announcing nothing.
+             if (!error.isEmpty()) {
+                 const QString reason =
+                     error.value(QStringLiteral("message")).toString();
+                 const QString message =
+                     i18n("Agent Kate could not take control of its core: %1\n\n"
+                          "Another Agent Kate instance (or a leftover connection "
+                          "from one) holds it. Close the other window, or quit "
+                          "and restart Agent Kate.",
+                          reason.isEmpty() ? i18n("the handshake was refused")
+                                           : reason);
+                 qCritical().noquote() << "[core] handshake refused:" << reason;
+                 // failed() for the log, handshakeRefused() for whoever puts it
+                 // in front of the human. NOT connected(): every consumer of
+                 // that signal goes on to make UI-only calls.
+                 emit failed(message);
+                 emit handshakeRefused(message);
+                 // A recovery round must still END, or the banner hangs forever
+                 // waiting for a reconnected() that this connection can never
+                 // produce. Retrying would not help — the role is held, not
+                 // missing — so it resolves to the dead state directly.
+                 if (m_reconnecting) {
+                     m_reconnecting = false;
+                     m_reconnectAttempts = 0;
+                     m_coreRespawned = false;
+                     emit reconnectFailed();
+                 }
+                 return;
+             }
+             emit connected();
+             if (m_reconnecting) {
+                 m_reconnecting = false;
+                 m_reconnectAttempts = 0;
+                 const bool respawned = m_coreRespawned;
+                 m_coreRespawned = false;
+                 emit reconnected(respawned);
+             }
+         });
 }
 
 void CoreClient::deliverLocalEvent(const QString &threadId, const QJsonObject &event)
