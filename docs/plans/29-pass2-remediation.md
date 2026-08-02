@@ -145,3 +145,89 @@ consumer of the tray's aggregate state (plan 27 §2) and belongs beside it.
   `default`, so the label promised supervision the mechanism never delivered. Any
   label claiming containment, isolation, supervision or a one-off decision is
   checked against what the code actually does.
+
+---
+
+## Outcome
+
+Four rounds ran between 2026-08-01 and 2026-08-02: three remediation rounds and
+one convergence pass, 35 agents, each round ending in a build gate and
+adversarial verification with CLOSED / MOVED / PARTIAL / UNFIXED / REGRESSED
+verdicts. Committed in seven slices on `kimi-code-backend`. Final gate: build
+clean, `go vet` and `gofmt` silent, `go test -race` clean, **25/25 ctest** (up
+from 13 at the start of the programme — nine new test targets).
+
+**What the rounds cost, and why they were worth it.** Every round after the
+first existed because the previous round's verifier rated a fix **MOVED** — the
+named path closed, an equivalent one left open. That verdict fired eleven times
+across the programme. The pattern was consistent enough to be a rule about this
+codebase: *a fix lands at the site the finding named and not at its siblings.*
+The gate caught two defects that compiled clean and passed every test — two
+agents independently claiming the same JSON-RPC error number, and a `connected()`
+signal removed with nothing wired to its replacement, which would have shipped an
+app that came up inert and silent.
+
+**Vacuous tests were the other systemic finding.** Verifiers mutation-tested by
+deleting a fix and re-running; six tests passed anyway, including one guarding
+the default button on the highest-authority dialog in the product. The recurring
+idiom was a test that counts string literals in the source file it is testing —
+which passes over any rewrite that keeps the text and inverts the logic. Round 1b
+onward made mutation testing mandatory and required the mutation output in the
+report.
+
+**Three files had no test binary at all.** `MainWindow.cpp`, `AgentDock.cpp` and
+`AgentRoster.cpp` are compiled only by the application target, so a verifier
+deleted every enablement guard in them with the suite still green. That is why
+guards there kept evaporating between rounds. The convergence pass extracted the
+decision into `AgentActions::compute` with a test target that can see it; the
+rest of those files remain unpinned.
+
+### Backlog — ranked, for whoever picks this up next
+
+Nothing below is a regression; these are the residues the verifiers judged worth
+recording rather than blocking on.
+
+1. **Give the three untested UI files a test binary.** `WorktreeDashboard.cpp`,
+   `WorktreeDiffDialog.cpp`, `MainWindow.cpp` and `AgentDock.cpp` are compiled by
+   one target only. Every guard and every string wired into them this programme
+   is unpinned, and the `DraftDisposition` behaviour — Close keeps a draft,
+   `agent.discarded` forgets it — is guarded by nothing but code inspection.
+2. **Make the handler inventory's caller-bound basis prove itself.** `checkBasis`
+   now runs the pin for some bases; `basisCallerBound` still needs a cross-thread
+   probe that drives the method from a bridge bound elsewhere and requires a
+   refusal. Until then the inventory — this codebase's main defence against
+   ungated handlers accruing again — is partly declarative.
+3. **Extend the Cowork handler-drive harness** to `playInput`,
+   `pointerClickElement`, `activateElement`, `setElementText`, `listElements`,
+   `readText` and `screenshot`. The fixture and fake UI exist; the a11y paths
+   need a stub `ElementInfo`/`ElementBounds`, which is the only new work.
+4. **Replace the two remaining source-scanning Go tests**
+   (`cowork_focuswatch_test.go:224`, `cowork_cursorsection_test.go:399`). They
+   count literals and pass over a fail-open rewrite.
+5. **Per-card rate-limit state.** `AgentCardDelegate::AgentStatus` has no
+   rate-limited value, so a parked agent still shows the green "Working" arc on
+   its roster card. The expiry-aware `RateLimitState` it needs already exists.
+6. **Detect the residue instead of only disclosing it.** The diff surfaces now
+   say honestly what they cannot show (ignored paths, absolute-path writes
+   outside the tree). Surfacing those writes in transcript tool cards is the only
+   thing that would turn "we cannot show you this" into "here it is" — and it is
+   the direct answer to the owner's original "agents escape the worktree"
+   complaint. **This belongs to [plan 23](23-contained-worktrees-and-checkpoints.md);
+   containment is what makes it tractable.**
+7. **An `enable_cowork` digest branch** in `AgentChatHelpers.cpp`. The core now
+   supplies a description the generic key scan prints verbatim, so the bar is
+   honest today, but a real digest beats a core-authored sentence.
+8. **A bare `send_agent`/`wait_agent` still looks one-off to the human.** The
+   composite prompt now states its standing grant; the single-action prompt has
+   nowhere to say it. Pre-existing, and the same finding class as F27.
+9. Smaller: fold `AgentPanel::draftKey()` onto `DraftStore::threadKey` (two
+   byte-identical derivations, one pinned); ensemble *worker* engine availability;
+   `WorktreeDiffDialog`'s disclosure label still uses `QPalette::Disabled`, which
+   reads as *inapplicable*.
+
+### For plan 27 §1 (the KActionCollection refactor)
+
+The raw-`QShortcut` inventory the fixers produced is accurate and worth keeping —
+it turns that refactor's first step from a search into a checklist. When it
+lands, `MainWindow::refreshPanelTooltips()` and `PanelInfo::help` can be deleted
+wholesale; the method comment already says so.
