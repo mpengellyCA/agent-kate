@@ -33,8 +33,9 @@ step "Checking build tools"
 require_cmd cmake "$(pkg_install_hint cmake)"
 require_cmd ninja "$(pkg_install_hint ninja)"
 require_cmd go    "$(pkg_install_hint go)"
+require_cmd npm   "Node.js/npm is needed to compile the embedded Remote Access web UI. $(pkg_install_hint nodejs)"
 require_cmd git
-ok "cmake, ninja, go, git present"
+ok "cmake, ninja, go, npm, git present"
 
 if [[ "$CLEAN" == 1 && -d "$BUILD_DIR" ]]; then
     step "Cleaning $BUILD_DIR"

@@ -9,6 +9,7 @@ URL:            https://github.com/mpengelly/AgentKate
 Source0:        %{name}-%{version}.tar.gz
 
 BuildRequires:  cmake >= 3.20
+BuildRequires:  nodejs
 BuildRequires:  ninja-build
 BuildRequires:  gcc-c++
 BuildRequires:  golang >= 1.22

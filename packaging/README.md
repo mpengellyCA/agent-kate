@@ -25,6 +25,7 @@ network access for `go mod vendor`).
 | CMake ≥ 3.20, Ninja       | Build system                           |
 | GCC/Clang with C++20      | UI is C++20                            |
 | Go ≥ 1.22                 | Builds the `akcore` orchestration core |
+| Node.js/npm                | Build-time only: compiles the embedded Remote Access WebUI |
 | Qt 6 ≥ 6.6                | Core, Gui, Widgets, Network            |
 | KDE Frameworks 6 ≥ 6.0    | TextEditor, SyntaxHighlighting, XmlGui, ConfigWidgets, Config, CoreAddons, I18n, Parts, WidgetsAddons |
 | Konsole                   | Runtime — embedded terminal panel      |
@@ -37,7 +38,7 @@ The quickest path is the helper script, which vendors Go deps, builds the RPM
 with `rpmbuild`, and installs/upgrades it via `dnf` in one step:
 
 ```sh
-sudo dnf install rpm-build cmake ninja-build golang \
+sudo dnf install rpm-build cmake ninja-build golang nodejs \
     extra-cmake-modules qt6-qtbase-devel \
     kf6-ktexteditor-devel kf6-syntax-highlighting-devel kf6-kxmlgui-devel \
     kf6-kconfigwidgets-devel kf6-kconfig-devel kf6-kcoreaddons-devel \
@@ -50,7 +51,7 @@ To build the RPM by hand instead:
 
 ```sh
 # Install build deps
-sudo dnf install rpm-build rpmdevtools cmake ninja-build golang \
+sudo dnf install rpm-build rpmdevtools cmake ninja-build golang nodejs \
     extra-cmake-modules qt6-qtbase-devel \
     kf6-ktexteditor-devel kf6-syntax-highlighting-devel kf6-kxmlgui-devel \
     kf6-kconfigwidgets-devel kf6-kconfig-devel kf6-kcoreaddons-devel \
@@ -70,7 +71,7 @@ The resulting RPM lands in `~/rpmbuild/RPMS/<arch>/`.
 
 ```sh
 sudo apt install build-essential debhelper dh-make cmake ninja-build \
-    golang-go pkg-config extra-cmake-modules qt6-base-dev qt6-tools-dev \
+    golang-go nodejs npm pkg-config extra-cmake-modules qt6-base-dev qt6-tools-dev \
     libkf6texteditor-dev libkf6syntaxhighlighting-dev libkf6xmlgui-dev \
     libkf6configwidgets-dev libkf6config-dev libkf6coreaddons-dev \
     libkf6i18n-dev libkf6parts-dev libkf6widgetsaddons-dev

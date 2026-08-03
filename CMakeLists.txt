@@ -51,6 +51,21 @@ message(STATUS "Agent Kate version: ${AGENTKATE_VERSION}")
 # survives VERBATIM.)
 find_program(GO_EXECUTABLE go REQUIRED)
 
+# --- Embedded Remote Access web UI -----------------------------------------
+# The Go server serves static bytes embedded with //go:embed; it never launches
+# Node at runtime. Build those bytes before compiling akcore. The helper is
+# intentionally a target rather than a configure-time command, so a source edit
+# is noticed by every normal `cmake --build` (including scripts/build.sh and a
+# rebuild install). A release source tarball already contains dist/index.html,
+# and the helper reuses that bundle without requiring npm on the package host.
+add_custom_target(webui
+    COMMAND ${CMAKE_SOURCE_DIR}/scripts/build-webui.sh
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    COMMENT "Building embedded Remote Access web UI"
+    VERBATIM
+    USES_TERMINAL
+)
+
 add_custom_target(akcore ALL
     COMMAND ${GO_EXECUTABLE} build "-ldflags=-X main.version=${AGENTKATE_VERSION}"
             -o ${CMAKE_BINARY_DIR}/akcore ./cmd/akcore
@@ -59,6 +74,7 @@ add_custom_target(akcore ALL
     VERBATIM
     USES_TERMINAL
 )
+add_dependencies(akcore webui)
 
 # Enable CTest at the top level so `ctest` in the build root aggregates the
 # tests registered in subdirectories (e.g. ui/tests). Must precede the
@@ -69,6 +85,9 @@ enable_testing()
 # The UI subdirectory pulls in ECM/KDEInstallDirs, which must be the first
 # install-dirs module to load so KDE_INSTALL_* aren't seeded from CMAKE_INSTALL_*.
 add_subdirectory(ui)
+# A direct `cmake --build ... --target agentkate` must produce the complete
+# runnable pair, not merely the Qt executable beside a stale/missing akcore.
+add_dependencies(agentkate akcore)
 
 # akcore install goes here (after ui/) so KDE_INSTALL_BINDIR is defined.
 install(PROGRAMS ${CMAKE_BINARY_DIR}/akcore

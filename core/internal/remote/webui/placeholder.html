@@ -16,7 +16,7 @@
     <main>
       <h1>The web UI was not built into this binary</h1>
       <p>This development build contains the committed Remote Access stub. The HTTPS API is available, but this binary does not embed the mobile web application.</p>
-      <p>Build the pinned web bundle explicitly with <code>scripts/build-webui.sh</code>, then rebuild the core. Release packaging performs that opt-in build; ordinary Go and CMake development does not require Node.</p>
+      <p>Run the standard CMake build (for example <code>scripts/build.sh</code>) to compile the pinned web bundle, then rebuild the core. Node is only needed while building; the finished executable serves the bundle itself.</p>
     </main>
   </body>
 </html>

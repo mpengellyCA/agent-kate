@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Explicitly build the pinned Remote Access web bundle. Ordinary Go and CMake
-# work deliberately do not call this script and therefore do not need Node.
+# Build the pinned Remote Access web bundle. Standard CMake builds call this
+# before Go embeds the result; Node is a build-time tool, never a runtime one.
+# A raw `go build` may still embed the committed stub for narrow core-only work.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -30,8 +31,13 @@ if [[ "$check" == 1 ]]; then
     exit 0
 fi
 
+if [[ "$force" == 0 && -f "${dist}/index.html" && -z "$(find "${webui}/src" "${webui}/index.html" "${webui}/vite.config.js" "${webui}/package.json" -newer "${dist}/index.html" -print -quit 2>/dev/null)" ]]; then
+    echo "webui: already current"
+    exit 0
+fi
+
 command -v npm >/dev/null 2>&1 || {
-    echo "webui: npm is required for this explicit web build" >&2
+    echo "webui: npm is required to build a missing or stale embedded web bundle" >&2
     exit 1
 }
 [[ -f "${webui}/package-lock.json" ]] || {
@@ -42,11 +48,6 @@ command -v npm >/dev/null 2>&1 || {
 if [[ ! -d "${webui}/node_modules" || "${webui}/package-lock.json" -nt "${webui}/node_modules/.package-lock.json" ]]; then
     echo "webui: installing pinned dependencies…"
     (cd "${webui}" && npm ci --no-audit --no-fund --silent)
-fi
-
-if [[ "$force" == 0 && -f "${dist}/index.html" && -z "$(find "${webui}/src" "${webui}/index.html" "${webui}/vite.config.js" "${webui}/package.json" -newer "${dist}/index.html" -print -quit 2>/dev/null)" ]]; then
-    echo "webui: already current"
-    exit 0
 fi
 
 echo "webui: building the mobile bundle…"

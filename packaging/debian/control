@@ -4,6 +4,8 @@ Priority: optional
 Maintainer: Mike Pengelly <mike@leadrix.io>
 Build-Depends: debhelper-compat (= 13),
                cmake (>= 3.20),
+               nodejs,
+               npm,
                ninja-build,
                golang-go (>= 2:1.22~) | golang-1.22-go | golang-1.23-go,
                pkg-config,

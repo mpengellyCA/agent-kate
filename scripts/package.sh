@@ -29,6 +29,7 @@ done
 cd "$ROOT"
 require_cmd git
 require_cmd go "Needed to vendor Go modules. $(pkg_install_hint go)"
+require_cmd npm "Needed to compile the embedded Remote Access web UI. $(pkg_install_hint nodejs)"
 
 VERSION="$(project_version)"
 [[ -n "$VERSION" ]] || die "could not detect version from CMakeLists.txt"
@@ -94,7 +95,7 @@ depends=(
     'kxmlgui' 'kparts' 'kwidgetsaddons' 'ktexteditor'
     'syntax-highlighting' 'konsole'
 )
-makedepends=('cmake' 'ninja' 'extra-cmake-modules' 'go' 'git')
+makedepends=('cmake' 'ninja' 'extra-cmake-modules' 'go' 'nodejs' 'git')
 optdepends=(
     'git: source control integration'
     'okular: view PDF/ePub/DjVu/comic-book and ODF/Office documents in editor tabs'

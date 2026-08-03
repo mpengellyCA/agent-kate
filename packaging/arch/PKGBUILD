@@ -24,6 +24,7 @@ makedepends=(
     'ninja'
     'extra-cmake-modules'
     'go'
+    'nodejs'
     'git'
 )
 optdepends=(

@@ -52,7 +52,8 @@ Project tree, editor, git log, and diff view together:
 ## Build
 
 Prerequisites (Arch): `qt6-base`, `ktexteditor`, `syntax-highlighting`,
-`extra-cmake-modules`, `cmake`, `ninja`, `go`, plus the `claude` CLI and/or the
+`extra-cmake-modules`, `cmake`, `ninja`, `go`, `nodejs`/`npm` (to compile the
+embedded Remote Access WebUI), plus the `claude` CLI and/or the
 `kimi`, and/or `codex` CLI (only the backend(s) you actually use are needed at
 runtime).
 

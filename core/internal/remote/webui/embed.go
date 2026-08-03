@@ -1,6 +1,7 @@
-// Package webui embeds either an explicitly built mobile bundle or the
-// committed development stub. Node is never needed for an ordinary Go or CMake
-// build: dist contains only .gitkeep in a fresh checkout.
+// Package webui embeds either the CMake-built mobile bundle or the committed
+// development stub. Node is never a runtime dependency: its output is bytes in
+// akcore. Standard CMake builds create dist/index.html first; a raw Go-only
+// build can still compile the stub for narrow core development.
 package webui
 
 import (
@@ -17,9 +18,9 @@ var distFS embed.FS
 //go:embed placeholder.html
 var placeholder []byte
 
-// Handler serves a history-mode single-page app. With no explicit web build it
-// serves the committed placeholder, rather than returning a blank page or
-// making a developer install Node just to compile the core.
+// Handler serves a history-mode single-page app. With no web build (for a raw
+// Go-only core build), it serves the committed placeholder rather than a blank
+// page.
 func Handler() http.Handler {
 	sub, err := fs.Sub(distFS, "dist")
 	if err != nil {
