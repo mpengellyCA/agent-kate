@@ -68,6 +68,20 @@ constexpr qint64 kAttStatTtlMs = 1000;
 // hold the transcript: full means "drop them all", they rebuild lazily.
 constexpr int kHighlightCacheCap = 64;
 
+// User messages may use up to 82% of the usable transcript width, but should
+// never overtake the assistant's reading column. Preserve the full-width
+// narrow layout, where the two configured maxima are equal.
+int messageBubbleWidth(const TranscriptMetrics &metrics, TranscriptModel::Speaker speaker)
+{
+    if (speaker != TranscriptModel::Speaker::User) {
+        return qMax(1, metrics.assistantMaxWidth);
+    }
+    if (metrics.userMaxWidth > metrics.assistantMaxWidth) {
+        return qMax(1, metrics.assistantMaxWidth - 1);
+    }
+    return qMax(1, metrics.userMaxWidth);
+}
+
 // chipThumbnail returns an attachment's preview icon, decoded AT icon size and
 // kept in QPixmapCache.
 //
@@ -823,8 +837,7 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
             idx.data(TranscriptModel::MessageRunPositionRole).toInt());
         const bool showHeader = position == TranscriptModel::MessageRunPosition::Single
             || position == TranscriptModel::MessageRunPosition::First;
-        const int bubbleW = qMax(1, speaker == TranscriptModel::Speaker::User
-            ? metrics.userMaxWidth : metrics.assistantMaxWidth);
+        const int bubbleW = messageBubbleWidth(metrics, speaker);
         const int innerW = qMax(1, bubbleW - 2 * metrics.messagePaddingX);
         QTextDocument *doc = self->bodyDoc(idx, qMax(1, innerW), opt);
         const int bodyH = int(doc->size().height());
@@ -1273,6 +1286,7 @@ QSize TranscriptDelegate::sizeHint(const QStyleOptionViewItem &opt,
 int TranscriptDelegate::measureExact(const QModelIndex &idx, int width,
                                      const QStyleOptionViewItem &opt) const
 {
+    ++m_exactMeasureCount;
     const int h = layoutRow(idx, width, opt, nullptr, QRect(), this);
     const quintptr id = idx.data(TranscriptModel::StableIdRole).value<quintptr>();
     if (m_heightCache.size() >= kHeightCacheCap) {
@@ -1280,6 +1294,13 @@ int TranscriptDelegate::measureExact(const QModelIndex &idx, int width,
     }
     m_heightCache.insert(id, CacheEntry{width, h, ChatAppearance::instance()->generation()});
     return h;
+}
+
+TranscriptDelegate::CacheStats TranscriptDelegate::cacheStats() const
+{
+    return {m_heightCache.size(), m_docCache.size(), m_detailCache.size(),
+            m_resultCache.size(), m_highlightCache.size(), m_attCache.size(),
+            m_exactMeasureCount};
 }
 
 void TranscriptDelegate::paint(QPainter *painter, const QStyleOptionViewItem &opt,
@@ -1350,8 +1371,7 @@ QRect TranscriptDelegate::messageBubbleRect(const QRect &row,
     const int gap = position == TranscriptModel::MessageRunPosition::First
             || position == TranscriptModel::MessageRunPosition::Middle
         ? metrics.groupedMessageGap : metrics.messageGap;
-    const int bubbleW = qMax(1, speaker == TranscriptModel::Speaker::User
-        ? metrics.userMaxWidth : metrics.assistantMaxWidth);
+    const int bubbleW = messageBubbleWidth(metrics, speaker);
     const int left = speaker == TranscriptModel::Speaker::User
         ? row.right() - metrics.outerInsetX - bubbleW + 1 : row.left() + metrics.outerInsetX;
     return QRect(left, row.top(), bubbleW, qMax(0, row.height() - gap));
