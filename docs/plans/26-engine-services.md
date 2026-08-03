@@ -1,6 +1,8 @@
 # 26 — Engine services: the Kimi provider registry, and preflight health for both engines
 
-**Status: PLANNED.** Covers IDEAS #9 (Kimi-native provider routing via
+**Status: IN PROGRESS.** Core health and provider-registry plumbing plus the
+initial UI are implemented and security-gated; terminal remedy execution,
+roster health surfacing, and dedicated UI coverage remain. Covers IDEAS #9 (Kimi-native provider routing via
 `kimi provider`) and #11 (engine preflight health check built on `kimi doctor`).
 Program context: [20-approved-features-program.md](20-approved-features-program.md).
 

@@ -16,9 +16,11 @@ import (
 	"time"
 
 	"agentkate/internal/agent"
+	"agentkate/internal/codex"
 	"agentkate/internal/compact"
 	"agentkate/internal/coop"
 	"agentkate/internal/cowork"
+	extcatalog "agentkate/internal/extensions"
 	"agentkate/internal/gitstatus"
 	"agentkate/internal/harness"
 	"agentkate/internal/ipc"
@@ -188,6 +190,7 @@ func runCore() {
 		os.Exit(1)
 	}
 	attachSide := session.NewAttachmentStore(session.DefaultAttachmentDir())
+	questionSide := session.NewQuestionStore(session.DefaultQuestionDir())
 
 	summaries, err := compact.NewStore(compact.DefaultDir())
 	if err != nil {
@@ -301,6 +304,14 @@ func runCore() {
 			if probe.Type == "rate_limit_event" {
 				noteRateLimit(deps, rateWakes, threadID, probe.RateLimitInfo)
 			}
+			// A permission request (including AskUserQuestion) parks a bridge
+			// frame.  Once its turn was aborted or process exited, there is no
+			// longer a live interaction to answer: deny it immediately instead of
+			// retaining the frame until the eight-minute timeout.  Broker
+			// cancellation delivers a zero decision, which is fail-closed.
+			if probe.Type == "_lifecycle" && (probe.Phase == "turn_aborted" || probe.Phase == "exited" || probe.Phase == "interrupted") {
+				broker.CancelThread(threadID)
+			}
 			// Persist a changed session id (rare — only on an in-session compaction)
 			// so resume follows it. UpdateQuiet: bookkeeping, not user activity.
 			if probe.SessionID != "" {
@@ -374,7 +385,7 @@ func runCore() {
 	// identical across backends.
 	ksup := kimi.NewSupervisor("", log, relayEvents,
 		func(threadID, toolName string, input json.RawMessage) (bool, json.RawMessage) {
-			dec, ok := askHumanPermission(srv, broker, threadID, toolName, input)
+			dec, ok := askHumanPermission(srv, broker, threadID, toolName, input, questionSide)
 			if !ok {
 				// Denied, and worth logging WHY: the human let the window
 				// lapse, or there was no window connected to ask at all — in
@@ -389,6 +400,20 @@ func runCore() {
 			// channel), so it must survive to the supervisor.
 			return dec.Allow, dec.UpdatedInput
 		}, "")
+	// Codex exposes its long-lived, resumable thread protocol through
+	// `codex app-server --stdio`. Like Kimi, the supervisor translates that
+	// protocol into the shared event vocabulary before the adapter exposes it
+	// through the registry.
+	csup := codex.NewSupervisor("", log, relayEvents)
+	csup.SetPermissionFunc(func(threadID, toolName string, input json.RawMessage) bool {
+		dec, ok := askHumanPermission(srv, broker, threadID, toolName, input, questionSide)
+		if !ok {
+			log.Warn("codex tool permission denied without a human answer",
+				"thread", threadID, "tool", toolName, "uiConnected", srv.HasUI())
+			return false
+		}
+		return dec.Allow
+	})
 
 	// The harness registry: each supervisor wrapped in its adapter, in the
 	// order pickers list engines. "claude" is the default — persisted records
@@ -397,6 +422,7 @@ func runCore() {
 	harnesses = harness.NewRegistry("claude")
 	harnesses.Register(newClaudeHarness(sup, exePath, *socket))
 	harnesses.Register(newKimiHarness(ksup, exePath, *socket))
+	harnesses.Register(newCodexHarness(csup))
 	// The cold-exit tracker is created above (the relay closes over it) but can
 	// only route through the registry once it exists — a compaction can't fire
 	// before a thread has run, which is well after this point.
@@ -461,9 +487,11 @@ func runCore() {
 		extensions:    extensions,
 		sessions:      sessions,
 		attachSide:    attachSide,
+		questionSide:  questionSide,
 		summaries:     summaries,
 		modes:         ensembles,
 		skills:        skillCatalog,
+		claudePlugins: extcatalog.NewClaudePlugins("claude"),
 		gitCache:      gitCache,
 		cowork:        coworkSvc,
 		socketPath:    *socket,

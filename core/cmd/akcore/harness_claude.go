@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"agentkate/internal/agent"
@@ -305,6 +306,65 @@ func (h *claudeHarness) ReadTranscript(threadID, sessionID string) ([]json.RawMe
 		return nil, nil // no session yet — nothing to replay
 	}
 	return session.ReadTranscript(sessionID)
+}
+
+// claudeBin is the binary the health probes run — the same PATH-resolved
+// "claude" the supervisor spawns (run.go constructs it with the empty
+// default), so the card diagnoses the CLI the threads will actually use.
+const claudeBin = "claude"
+
+// Health preflights the engine with no project in hand; the handler layer
+// routes a project through HealthIn (the projectHealther side-interface) so
+// `claude doctor` reads the right directory's settings.
+func (h *claudeHarness) Health(ctx context.Context) (harness.Health, error) {
+	return h.HealthIn(ctx, "")
+}
+
+// HealthIn is claude's preflight: `claude --version` (binary), `claude
+// doctor` run in the project directory ("Reads settings files in the current
+// directory without a trust prompt" — its own --help), and the discovered
+// model catalogue's size. Every probe is best-effort under the shared
+// per-check timeout; a hung doctor is an Unknown check, never an error.
+func (h *claudeHarness) HealthIn(ctx context.Context, project string) (harness.Health, error) {
+	var (
+		binaryCheck, doctor harness.Check
+		version             string
+		models              int
+		wg                  sync.WaitGroup
+	)
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		binaryCheck, version = versionCheck(ctx, claudeBin)
+	}()
+	go func() {
+		defer wg.Done()
+		doctor = doctorCheck(ctx, "doctor", project, claudeBin, "doctor")
+	}()
+	go func() {
+		defer wg.Done()
+		// Direct catalogue only: a preflight card describes the ENGINE, and a
+		// routed provider's reachability is the provider picker's business.
+		found, _ := h.DiscoverModels(&agent.Provider{}) // never errors; empty on failure
+		models = len(found)
+	}()
+	wg.Wait()
+	modelsCheck := harness.Check{Name: "models", State: harness.HealthOK,
+		Detail: fmt.Sprintf("%d models discovered", models)}
+	if models == 0 {
+		// No catalogue is not a refusal to start — discovery is best-effort
+		// and an offline box still launches — so it reads Unknown, not bad.
+		modelsCheck = harness.Check{Name: "models", State: harness.HealthUnknown,
+			Detail: "no model catalogue discovered"}
+	}
+	checks := []harness.Check{binaryCheck, doctor, modelsCheck}
+	return harness.Health{
+		EngineID: h.Capabilities().ID,
+		State:    harness.WorstState(checks),
+		Version:  version,
+		Checks:   checks,
+		Models:   models,
+	}, nil
 }
 
 // DiscoverOptions: Claude's mode/effort vocabularies are static (see

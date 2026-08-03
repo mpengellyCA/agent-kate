@@ -1,9 +1,19 @@
 #include "ProvidersDialog.h"
 
+#include "ipc/CoreClient.h"
+#include "state/HarnessTraits.h"
+
+#include <KLocalizedString>
+
+#include <QComboBox>
 #include <QDialogButtonBox>
 #include <QFormLayout>
 #include <QFrame>
+#include <QGroupBox>
 #include <QHBoxLayout>
+#include <QInputDialog>
+#include <QJsonArray>
+#include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
@@ -17,19 +27,19 @@ namespace {
 QString slotLabel(const QString &slot)
 {
     if (slot == QLatin1String("main")) {
-        return ProvidersDialog::tr("Main model");
+        return i18n("Main model");
     }
     if (slot == QLatin1String("opus")) {
-        return ProvidersDialog::tr("Opus slot");
+        return i18n("Opus slot");
     }
     if (slot == QLatin1String("sonnet")) {
-        return ProvidersDialog::tr("Sonnet slot");
+        return i18n("Sonnet slot");
     }
     if (slot == QLatin1String("haiku")) {
-        return ProvidersDialog::tr("Haiku slot");
+        return i18n("Haiku slot");
     }
     if (slot == QLatin1String("subagent")) {
-        return ProvidersDialog::tr("Subagent / small-fast");
+        return i18n("Subagent / small-fast");
     }
     return slot;
 }
@@ -42,36 +52,45 @@ bool baseUrlLooksValid(const QString &url)
            u.startsWith(QLatin1String("http://127.0.0.1"));
 }
 
+// The marker session.EnvNotStored writes in place of a redacted env VALUE.
+// KIMI_CODE_HOME is a path and never redacted in practice, but a marker that
+// did land here must not be offered as a directory.
+const QLatin1String kEnvNotStored("__agentkate_not_stored__");
+
 } // namespace
 
-ProvidersDialog::ProvidersDialog(QWidget *parent)
+ProvidersDialog::ProvidersDialog(QWidget *parent, CoreClient *core)
     : QDialog(parent)
+    , m_core(core)
 {
-    setWindowTitle(tr("API Providers"));
-    resize(680, 520);
+    setWindowTitle(i18nc("@title:window", "API Providers"));
+    resize(680, 620);
 
     m_profiles = ProviderStore::load();
 
     auto *outer = new QVBoxLayout(this);
 
+    auto *claudeSection = new QGroupBox(i18n("API providers (Claude Code)"), this);
+    auto *claudeLayout = new QVBoxLayout(claudeSection);
+
     auto *intro = new QLabel(
-        tr("Route an agent's Claude Code harness at a third-party, "
-           "Anthropic-compatible API. Pick a provider per agent when you start it; "
-           "<b>Claude (direct)</b> is the default and changes nothing."),
-        this);
+        i18n("Route an agent's Claude Code harness at a third-party, "
+             "Anthropic-compatible API. Pick a provider per agent when you start it; "
+             "<b>Claude (direct)</b> is the default and changes nothing."),
+        claudeSection);
     intro->setWordWrap(true);
-    outer->addWidget(intro);
+    claudeLayout->addWidget(intro);
 
     auto *body = new QHBoxLayout;
-    outer->addLayout(body, 1);
+    claudeLayout->addLayout(body, 1);
 
     // --- Left: profile list + add/remove ---
     auto *leftCol = new QVBoxLayout;
-    m_list = new QListWidget(this);
+    m_list = new QListWidget(claudeSection);
     leftCol->addWidget(m_list, 1);
     auto *listBtns = new QHBoxLayout;
-    auto *addBtn = new QPushButton(tr("Add"), this);
-    m_removeBtn = new QPushButton(tr("Remove"), this);
+    auto *addBtn = new QPushButton(i18nc("@action:button", "Add"), claudeSection);
+    m_removeBtn = new QPushButton(i18nc("@action:button", "Remove"), claudeSection);
     listBtns->addWidget(addBtn);
     listBtns->addWidget(m_removeBtn);
     listBtns->addStretch(1);
@@ -80,45 +99,49 @@ ProvidersDialog::ProvidersDialog(QWidget *parent)
 
     // --- Right: edit form ---
     auto *form = new QFormLayout;
-    m_name = new QLineEdit(this);
-    m_baseUrl = new QLineEdit(this);
+    m_name = new QLineEdit(claudeSection);
+    m_baseUrl = new QLineEdit(claudeSection);
     m_baseUrl->setPlaceholderText(QStringLiteral("https://api.fireworks.ai/inference"));
-    m_envVar = new QLineEdit(this);
+    m_envVar = new QLineEdit(claudeSection);
     m_envVar->setPlaceholderText(QStringLiteral("FIREWORKS_API_KEY"));
-    m_key = new QLineEdit(this);
+    m_key = new QLineEdit(claudeSection);
     m_key->setEchoMode(QLineEdit::Password);
-    m_key->setPlaceholderText(tr("enter to set / replace"));
-    m_keyStatus = new QLabel(this);
+    m_key->setPlaceholderText(i18n("enter to set / replace"));
+    m_keyStatus = new QLabel(claudeSection);
     m_keyStatus->setTextFormat(Qt::PlainText);
 
-    form->addRow(tr("Name"), m_name);
-    form->addRow(tr("Base URL"), m_baseUrl);
-    form->addRow(tr("API key"), m_key);
+    form->addRow(i18n("Name"), m_name);
+    form->addRow(i18n("Base URL"), m_baseUrl);
+    form->addRow(i18n("API key"), m_key);
     form->addRow(QString(), m_keyStatus);
-    form->addRow(tr("Key env var"), m_envVar);
+    form->addRow(i18n("Key env var"), m_envVar);
 
-    auto *sep = new QFrame(this);
+    auto *sep = new QFrame(claudeSection);
     sep->setFrameShape(QFrame::HLine);
     form->addRow(sep);
 
     auto *modelsHint = new QLabel(
-        tr("Model ids are provider-specific (see your provider's model list). "
-           "The Main model is used when an agent leaves Model on “Provider default”."),
-        this);
+        i18n("Model ids are provider-specific (see your provider's model list). "
+             "The Main model is used when an agent leaves Model on “Provider default”."),
+        claudeSection);
     modelsHint->setWordWrap(true);
     form->addRow(modelsHint);
 
     for (const QString &slot : ProviderStore::modelSlots()) {
-        auto *edit = new QLineEdit(this);
+        auto *edit = new QLineEdit(claudeSection);
         m_modelEdits.insert(slot, edit);
         form->addRow(slotLabel(slot), edit);
     }
 
-    m_walletNote = new QLabel(this);
+    m_walletNote = new QLabel(claudeSection);
     m_walletNote->setWordWrap(true);
     form->addRow(m_walletNote);
 
     body->addLayout(form, 1);
+    outer->addWidget(claudeSection, 1);
+
+    // --- The kimi provider registry (plan 26) ---
+    buildKimiSection(outer);
 
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel,
                                          this);
@@ -127,8 +150,8 @@ ProvidersDialog::ProvidersDialog(QWidget *parent)
     if (!ProviderStore::walletAvailable()) {
         m_key->setEnabled(false);
         m_walletNote->setText(
-            tr("⚠ KWallet is unavailable, so API keys can't be stored securely. "
-               "Supply the key through the environment variable named above instead."));
+            i18n("⚠ KWallet is unavailable, so API keys can't be stored securely. "
+                 "Supply the key through the environment variable named above instead."));
     } else {
         m_walletNote->clear();
     }
@@ -190,11 +213,11 @@ void ProvidersDialog::loadIntoForm(int row)
         const bool fromEnv = !p.envVar.isEmpty() &&
                              !qEnvironmentVariableIsEmpty(p.envVar.toLocal8Bit().constData());
         if (stored) {
-            m_keyStatus->setText(tr("A key is stored in KWallet."));
+            m_keyStatus->setText(i18n("A key is stored in KWallet."));
         } else if (fromEnv) {
-            m_keyStatus->setText(tr("Resolved from %1 in the environment.").arg(p.envVar));
+            m_keyStatus->setText(i18n("Resolved from %1 in the environment.", p.envVar));
         } else {
-            m_keyStatus->setText(tr("No key set."));
+            m_keyStatus->setText(i18n("No key set."));
         }
     } else {
         m_keyStatus->clear();
@@ -259,7 +282,7 @@ void ProvidersDialog::addProfile()
 
     ProviderProfile p;
     p.id = id;
-    p.name = tr("New provider");
+    p.name = i18n("New provider");
     m_profiles.append(p);
     rebuildList(m_profiles.size() - 1);
 }
@@ -289,10 +312,10 @@ void ProvidersDialog::saveAndAccept()
         }
         if (p.routed() && !baseUrlLooksValid(p.baseUrl)) {
             QMessageBox::warning(
-                this, tr("Invalid base URL"),
-                tr("Provider “%1” has an invalid base URL.\n\n"
-                   "Use an https:// URL (http:// is allowed only for localhost).")
-                    .arg(p.name.isEmpty() ? p.id : p.name));
+                this, i18nc("@title:window", "Invalid base URL"),
+                i18n("Provider “%1” has an invalid base URL.\n\n"
+                     "Use an https:// URL (http:// is allowed only for localhost).",
+                     p.name.isEmpty() ? p.id : p.name));
             return;
         }
     }
@@ -305,4 +328,298 @@ void ProvidersDialog::saveAndAccept()
         ProviderStore::setKey(it.key(), it.value());
     }
     accept();
+}
+
+// --- the kimi provider registry section (plan 26 phase 4) -------------------
+
+void ProvidersDialog::buildKimiSection(QVBoxLayout *outer)
+{
+    m_kimiSection = new QGroupBox(i18n("Kimi provider registry"), this);
+    auto *layout = new QVBoxLayout(m_kimiSection);
+
+    auto *note = new QLabel(
+        i18n("Kimi Code keeps its own provider registry inside the engine's "
+             "home directory. Keys are held by kimi's credential store — "
+             "Agent Kate never sees or stores them."),
+        m_kimiSection);
+    note->setWordWrap(true);
+    layout->addWidget(note);
+
+    auto *homeRow = new QHBoxLayout;
+    homeRow->addWidget(new QLabel(i18n("Registry:"), m_kimiSection));
+    m_kimiHome = new QComboBox(m_kimiSection);
+    m_kimiHome->setToolTip(
+        i18n("Which registry to edit: the user's default kimi home, or a "
+             "specific agent's private home (KIMI_CODE_HOME). Two kimi agents "
+             "in one project can target different provider sets."));
+    homeRow->addWidget(m_kimiHome, 1);
+    layout->addLayout(homeRow);
+
+    m_kimiList = new QListWidget(m_kimiSection);
+    m_kimiList->setSelectionMode(QAbstractItemView::SingleSelection);
+    layout->addWidget(m_kimiList, 1);
+
+    m_kimiStatus = new QLabel(m_kimiSection);
+    m_kimiStatus->setWordWrap(true);
+    layout->addWidget(m_kimiStatus);
+
+    auto *btns = new QHBoxLayout;
+    m_kimiRefresh = new QPushButton(i18nc("@action:button", "Refresh"), m_kimiSection);
+    m_kimiImport = new QPushButton(
+        i18nc("@action:button", "Import from models.dev"), m_kimiSection);
+    m_kimiImport->setToolTip(
+        i18n("Discover and import providers from the public models.dev catalog "
+             "(runs “kimi provider catalog”)."));
+    m_kimiAdd = new QPushButton(i18nc("@action:button", "Add from URL…"), m_kimiSection);
+    m_kimiAdd->setToolTip(
+        i18n("Import every provider listed in a custom registry (api.json) URL "
+             "(runs “kimi provider add”)."));
+    m_kimiRemove = new QPushButton(i18nc("@action:button", "Remove"), m_kimiSection);
+    btns->addWidget(m_kimiRefresh);
+    btns->addWidget(m_kimiImport);
+    btns->addWidget(m_kimiAdd);
+    btns->addWidget(m_kimiRemove);
+    btns->addStretch(1);
+    layout->addLayout(btns);
+
+    outer->addWidget(m_kimiSection, 1);
+
+    connect(m_kimiRefresh, &QPushButton::clicked, this,
+            &ProvidersDialog::refreshKimiProviders);
+    connect(m_kimiImport, &QPushButton::clicked, this,
+            &ProvidersDialog::kimiImportCatalog);
+    connect(m_kimiAdd, &QPushButton::clicked, this, &ProvidersDialog::kimiAddFromUrl);
+    connect(m_kimiRemove, &QPushButton::clicked, this,
+            &ProvidersDialog::kimiRemoveSelected);
+    connect(m_kimiHome, &QComboBox::currentIndexChanged, this,
+            [this] { refreshKimiProviders(); });
+    connect(m_kimiList, &QListWidget::currentRowChanged, this, [this](int row) {
+        m_kimiRemove->setEnabled(row >= 0);
+    });
+
+    // The section exists only where an engine keeps a registry at all —
+    // driven by the trait, never by a backend name compare.
+    const auto anyRegistry = [] {
+        const QList<HarnessTraits> all = HarnessRegistry::self()->all();
+        for (const HarnessTraits &t : all) {
+            if (t.providerRegistry) {
+                return true;
+            }
+        }
+        return false;
+    };
+    m_kimiSection->setVisible(anyRegistry());
+    connect(HarnessRegistry::self(), &HarnessRegistry::changed, m_kimiSection,
+            [this, anyRegistry] { m_kimiSection->setVisible(anyRegistry()); });
+
+    if (!m_core || !m_core->isConnected()) {
+        setKimiBusy(true, i18n("Not connected to the Agent Kate core — the "
+                               "registry cannot be read right now."));
+        return;
+    }
+    refreshKimiHomes();
+    refreshKimiProviders();
+}
+
+QString ProvidersDialog::kimiHomeThreadId() const
+{
+    return m_kimiHome ? m_kimiHome->currentData().toString() : QString();
+}
+
+void ProvidersDialog::setKimiBusy(bool busy, const QString &status)
+{
+    m_kimiRefresh->setEnabled(!busy);
+    m_kimiImport->setEnabled(!busy);
+    m_kimiAdd->setEnabled(!busy);
+    m_kimiRemove->setEnabled(!busy && m_kimiList->currentRow() >= 0);
+    m_kimiHome->setEnabled(!busy);
+    m_kimiStatus->setText(status);
+}
+
+// refreshKimiHomes lists the selectable registries: the user's default home,
+// plus every persisted thread whose Env carries a KIMI_CODE_HOME overlay —
+// read from session.listThreads, the record surface the UI already holds
+// (the RPC is UI-only; the Env values it returns are exactly what the home
+// selector exists to show).
+void ProvidersDialog::refreshKimiHomes()
+{
+    m_kimiHome->clear();
+    m_kimiHome->addItem(i18n("User default"), QString());
+    if (!m_core || !m_core->isConnected()) {
+        return;
+    }
+    m_core->call(
+        QStringLiteral("session.listThreads"), QJsonObject{},
+        [this](const QJsonObject &result, const QJsonObject &error) {
+            if (!error.isEmpty()) {
+                return; // the default entry alone is still a working selector
+            }
+            const QJsonArray threads = result.value(QStringLiteral("threads")).toArray();
+            for (const QJsonValue &v : threads) {
+                const QJsonObject rec = v.toObject();
+                const QString home = rec.value(QStringLiteral("env"))
+                                         .toObject()
+                                         .value(QStringLiteral("KIMI_CODE_HOME"))
+                                         .toString();
+                if (home.isEmpty() || home == kEnvNotStored) {
+                    continue;
+                }
+                const QString threadId = rec.value(QStringLiteral("threadId")).toString();
+                QString title = rec.value(QStringLiteral("title")).toString();
+                if (title.isEmpty()) {
+                    title = threadId;
+                }
+                m_kimiHome->addItem(
+                    i18nc("agent title and its private kimi home path", "%1 — %2",
+                          title, home),
+                    threadId);
+            }
+        },
+        this);
+}
+
+void ProvidersDialog::renderKimiProviders(const QJsonArray &providers)
+{
+    m_kimiList->clear();
+    for (const QJsonValue &v : providers) {
+        const QJsonObject p = v.toObject();
+        const QString id = p.value(QStringLiteral("id")).toString();
+        const int models = p.value(QStringLiteral("models")).toArray().size();
+        QStringList bits;
+        bits << p.value(QStringLiteral("type")).toString();
+        bits << p.value(QStringLiteral("baseUrl")).toString();
+        bits << i18np("%1 model", "%1 models", models);
+        bits << (p.value(QStringLiteral("hasApiKey")).toBool()
+                     ? i18n("credential held by kimi")
+                     : i18n("no credential"));
+        const QString status = p.value(QStringLiteral("status")).toString();
+        if (!status.isEmpty()) {
+            bits << status;
+        }
+        auto *item = new QListWidgetItem(
+            i18nc("provider id and its facts", "%1   (%2)", id,
+                  bits.join(i18nc("list separator", ", "))),
+            m_kimiList);
+        item->setData(Qt::UserRole, id);
+    }
+    m_kimiRemove->setEnabled(m_kimiList->currentRow() >= 0);
+    if (providers.isEmpty()) {
+        m_kimiStatus->setText(
+            i18n("This registry has no providers yet. Import from models.dev, "
+                 "or add a custom registry URL."));
+    } else {
+        m_kimiStatus->clear();
+    }
+}
+
+void ProvidersDialog::refreshKimiProviders()
+{
+    if (!m_core || !m_core->isConnected()) {
+        return;
+    }
+    setKimiBusy(true, i18n("Reading the registry…"));
+    m_core->call(
+        QStringLiteral("kimiProvider.list"),
+        QJsonObject{{QStringLiteral("threadId"), kimiHomeThreadId()}},
+        [this](const QJsonObject &result, const QJsonObject &error) {
+            setKimiBusy(false);
+            if (!error.isEmpty()) {
+                m_kimiStatus->setText(
+                    error.value(QStringLiteral("message")).toString());
+                return;
+            }
+            renderKimiProviders(result.value(QStringLiteral("providers")).toArray());
+        },
+        this);
+}
+
+void ProvidersDialog::kimiImportCatalog()
+{
+    if (!m_core || !m_core->isConnected()) {
+        return;
+    }
+    setKimiBusy(true, i18n("Importing providers from models.dev…"));
+    m_core->call(
+        QStringLiteral("kimiProvider.catalog"),
+        QJsonObject{{QStringLiteral("threadId"), kimiHomeThreadId()}},
+        [this](const QJsonObject &result, const QJsonObject &error) {
+            setKimiBusy(false);
+            if (!error.isEmpty()) {
+                m_kimiStatus->setText(
+                    error.value(QStringLiteral("message")).toString());
+                return;
+            }
+            renderKimiProviders(result.value(QStringLiteral("providers")).toArray());
+        },
+        this);
+}
+
+void ProvidersDialog::kimiAddFromUrl()
+{
+    if (!m_core || !m_core->isConnected()) {
+        return;
+    }
+    bool ok = false;
+    const QString url = QInputDialog::getText(
+        this, i18nc("@title:window", "Add Providers from a Registry URL"),
+        i18n("URL of a custom provider registry (api.json). Every provider it "
+             "lists is imported."),
+        QLineEdit::Normal, QString(), &ok);
+    if (!ok || url.trimmed().isEmpty()) {
+        return;
+    }
+    setKimiBusy(true, i18n("Importing providers from %1…", url.trimmed()));
+    m_core->call(
+        QStringLiteral("kimiProvider.add"),
+        QJsonObject{{QStringLiteral("threadId"), kimiHomeThreadId()},
+                    {QStringLiteral("url"), url.trimmed()}},
+        [this](const QJsonObject &result, const QJsonObject &error) {
+            setKimiBusy(false);
+            if (!error.isEmpty()) {
+                m_kimiStatus->setText(
+                    error.value(QStringLiteral("message")).toString());
+                return;
+            }
+            renderKimiProviders(result.value(QStringLiteral("providers")).toArray());
+        },
+        this);
+}
+
+void ProvidersDialog::kimiRemoveSelected()
+{
+    if (!m_core || !m_core->isConnected()) {
+        return;
+    }
+    QListWidgetItem *item = m_kimiList->currentItem();
+    if (!item) {
+        return;
+    }
+    const QString id = item->data(Qt::UserRole).toString();
+    // The CLI's own consequence, stated before the click: `kimi provider
+    // remove` removes the provider AND every model alias that referenced it.
+    const auto answer = QMessageBox::warning(
+        this, i18nc("@title:window", "Remove Provider"),
+        i18n("Remove “%1” from this registry?\n\nThis also removes every "
+             "model alias that referenced it — agents whose model pointed at "
+             "one of those aliases will need a different model.",
+             id),
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+    if (answer != QMessageBox::Yes) {
+        return;
+    }
+    setKimiBusy(true, i18n("Removing %1…", id));
+    m_core->call(
+        QStringLiteral("kimiProvider.remove"),
+        QJsonObject{{QStringLiteral("threadId"), kimiHomeThreadId()},
+                    {QStringLiteral("id"), id}},
+        [this](const QJsonObject &result, const QJsonObject &error) {
+            setKimiBusy(false);
+            if (!error.isEmpty()) {
+                m_kimiStatus->setText(
+                    error.value(QStringLiteral("message")).toString());
+                return;
+            }
+            renderKimiProviders(result.value(QStringLiteral("providers")).toArray());
+        },
+        this);
 }

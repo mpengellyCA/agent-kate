@@ -1,9 +1,10 @@
 # Adding an agent harness
 
 A **harness** is one way of running an agent: a CLI binary spoken to over some
-protocol. Agent Kate ships two — Claude Code (`claude -p`, stream-json) and
-Kimi Code (`kimi acp`, ACP) — and is built so a third slots in by writing an
-adapter and declaring its capabilities. No `backend == "…"` string compare may
+protocol. Agent Kate ships three — Claude Code (`claude -p`, stream-json),
+Kimi Code (`kimi acp`, ACP), and Codex (`codex app-server`, JSON-RPC) — and is
+built so another slots in by writing an adapter and declaring its capabilities.
+No `backend == "…"` string compare may
 appear outside the adapter and its supervisor package; the registry and the
 capability set carry every difference.
 

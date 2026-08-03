@@ -1,6 +1,6 @@
 # 20 — Approved features program (the 2026-08 capability-drift round)
 
-**Status: PLANNED.** This is the program doc for the twelve features the user
+**Status: IN PROGRESS.** This is the program doc for the twelve features the user
 approved in [`docs/IDEAS.md`](../IDEAS.md). It clusters them into eight
 workstreams, sequences them by dependency and risk, and records how each of the
 user's inline design notes shapes the design. Every cluster has its own plan

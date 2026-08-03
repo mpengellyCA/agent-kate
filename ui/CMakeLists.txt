@@ -31,6 +31,8 @@ find_package(KF6 6.0 REQUIRED COMPONENTS
     WidgetsAddons       # KMultiTabBar — Kate-style collapsible side/bottom strip
     ColorScheme         # KColorScheme — native Breeze status-badge colours
     Notifications       # KNotification — desktop alerts for background agents
+    StatusNotifierItem  # KStatusNotifierItem — the Plasma tray presence (plan 27 §2)
+    GlobalAccel         # KGlobalAccel — the three desktop-wide shortcuts (plan 27 §3)
     DBusAddons          # KDBusService — single-instance, raise-on-relaunch
     WindowSystem        # activation token handling when a relaunch raises us
     KIO                 # KIO::copy/move/trash, KPropertiesDialog, highlightInFileManager
@@ -87,6 +89,8 @@ add_executable(agentkate
     src/shell/FlowLayout.cpp
     src/shell/ElidingLabel.cpp
     src/shell/ChipPainter.cpp
+    src/shell/TrayPresence.cpp
+    src/QuickAskDialog.cpp
     src/cowork/CoworkPanel.cpp
     src/cowork/CapabilityTile.cpp
     src/cowork/CoworkPortal.cpp
@@ -167,6 +171,8 @@ target_link_libraries(agentkate PRIVATE
     KF6::WidgetsAddons
     KF6::ColorScheme
     KF6::Notifications
+    KF6::StatusNotifierItem
+    KF6::GlobalAccel
     KF6::DBusAddons
     KF6::WindowSystem
     KF6::KIOCore
@@ -493,6 +499,21 @@ if(Qt6Test_FOUND)
     set_tests_properties(AiInspectorPanelTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
+    # Plan 27 §2: the tray's decision layer — status from counts, the tooltip,
+    # the AgentNotifier state fold it copies, and the close-to-tray gate whose
+    # false cases are the traps (no host, genuine quit, session logout). No
+    # D-Bus: embed() is never called, exactly the evaluate*/emitAlert split
+    # AgentNotifierTest relies on. KF6::StatusNotifierItem still links because
+    # TrayPresence.cpp compiles the SNI half too.
+    add_executable(TrayPresenceTest tests/TrayPresenceTest.cpp
+        src/shell/TrayPresence.cpp)
+    target_include_directories(TrayPresenceTest PRIVATE src)
+    target_link_libraries(TrayPresenceTest PRIVATE Qt6::Widgets Qt6::DBus
+        Qt6::Test KF6::I18n KF6::StatusNotifierItem)
+    add_test(NAME TrayPresenceTest COMMAND TrayPresenceTest)
+    set_tests_properties(TrayPresenceTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
     # Desktop alerts: which agent transitions are worth interrupting the user
     # for. Covers the finish/fail rules, the status+attention dedup (one popup
     # per prompt, arriving in either order), the on-screen suppression rule and
@@ -567,10 +588,12 @@ if(Qt6Test_FOUND)
     add_executable(NewAgentDialogTest tests/NewAgentDialogTest.cpp
         src/NewAgentDialog.cpp src/ProviderConfig.cpp src/state/EnsembleCatalog.cpp
         src/state/EngineAvailability.cpp
-        src/state/HarnessTraits.cpp src/ipc/CoreClient.cpp)
+        src/state/HarnessTraits.cpp src/state/Reactive.cpp src/ipc/CoreClient.cpp
+        src/shell/ChipPainter.cpp src/shell/ElidingLabel.cpp)
     target_include_directories(NewAgentDialogTest PRIVATE src)
     target_link_libraries(NewAgentDialogTest PRIVATE Qt6::Widgets Qt6::Test
-        Qt6::Network KF6::ConfigCore KF6::I18n KF6::WidgetsAddons)
+        Qt6::Network KF6::ColorScheme KF6::ConfigCore KF6::I18n
+        KF6::WidgetsAddons)
     add_test(NAME NewAgentDialogTest COMMAND NewAgentDialogTest)
     set_tests_properties(NewAgentDialogTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
@@ -654,6 +677,25 @@ if(Qt6Test_FOUND)
     set_tests_properties(WelcomeDialogTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 endif()
+
+# Plan 27 §4: the desktop-integration metadata stays valid, enforced by ctest.
+# Both run through run-validator.sh, which exits 77 — SKIP_RETURN_CODE — when
+# the validator is not installed, so a box without the tools reports SKIP
+# instead of failing (or silently having no test at all). appstreamcli gets
+# --no-net: homepage reachability is a property of the network, not the file,
+# and a flaky mirror must not redden the suite.
+add_test(NAME AppStreamMetainfoValidate
+    COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/run-validator.sh
+            appstreamcli validate --no-net
+            ${CMAKE_CURRENT_SOURCE_DIR}/org.kde.agentkate.metainfo.xml)
+set_tests_properties(AppStreamMetainfoValidate PROPERTIES SKIP_RETURN_CODE 77)
+
+# Validates the CONFIGURED .desktop (Exec is filled in at configure time).
+add_test(NAME DesktopFileValidate
+    COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/run-validator.sh
+            desktop-file-validate
+            ${CMAKE_CURRENT_BINARY_DIR}/org.kde.agentkate.desktop)
+set_tests_properties(DesktopFileValidate PROPERTIES SKIP_RETURN_CODE 77)
 
 # Dev-only visual harness for the new Appearance dialog + Command Palette. Not a
 # ctest and not installed — it shows the widgets under a chosen Agent Kate theme

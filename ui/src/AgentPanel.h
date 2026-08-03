@@ -186,6 +186,16 @@ public:
     void promptAttach() { onAttachClicked(); }
     void showChanges() { onChangesClicked(); }
 
+    // The quick-ask surface (plan 27 §3) drives the composer's OWN send path —
+    // never a parallel one, so queueing, dormant-resume and frame-cap rules all
+    // apply to a quick-ask exactly as they do to a typed message. In particular,
+    // it preserves a dormant agent's existing composer draft while the resume
+    // completes; quick ask must not be a second way to eat typed words.
+    bool quickAsk(const QString &text);
+    QString composerText() const;
+    void sendComposer() { onSendClicked(); }
+    void focusComposer();
+
     // Jobs-panel entry points. That panel mirrors what this one publishes, so
     // acting on a job routes back here, where the state actually lives.
     void forgetFinishedJobs();
@@ -250,6 +260,9 @@ Q_SIGNALS:
     // Roster card affordance: attention = a turn is waiting on the user's input
     // (a permission prompt). The roster paints this as a card marker.
     void attentionChanged(bool attention);
+    // A semantic refinement of attention: this prompt is an agent question,
+    // so the desktop notifier can use a separately configurable alert.
+    void questionAsked();
     // This agent's complete background-work set, re-published as a snapshot on
     // every change (a job starting, finishing, or gaining an output path). The
     // Jobs panel keys on threadId and replaces that agent's rows wholesale, so
@@ -433,6 +446,9 @@ private:
     // Issue the actual agent.resume call. Called by resume() after any
     // pre-resume compaction has run (or been declined).
     void doResume();
+    // Return a quick ask that was waiting on a failed resume to the composer,
+    // without overwriting its existing draft.
+    void restorePendingQuickAskToComposer();
     // Rebuild the model combo to match the selected provider: Claude tiers for
     // Claude-direct, or the provider's own model ids otherwise.
     void rebuildModelCombo();
@@ -597,6 +613,10 @@ private:
     bool m_promoting = false; // a promote-to-worktree is in flight
     bool m_replaying = false; // inside loadTranscript() — don't double-count cost
     bool m_errored = false;   // the last start/turn failed — card shows Error
+    // A quick ask issued while this thread is dormant. The normal resumed
+    // lifecycle path sends it through the ordinary composer and then restores
+    // whatever the human had already typed (including whitespace-only drafts).
+    QString m_pendingQuickAsk;
     // During replay we accumulate the final preview line + its event timestamp
     // and emit a single previewChanged at the end, so a dormant agent's card
     // isn't repainted N times nor re-stamped "just now" for historical lines.

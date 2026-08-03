@@ -17,8 +17,9 @@ namespace {
 // struct, so the LOCKSTEP rule does not apply. What it does mirror is the
 // *binary name* the core defaults to when it is given none:
 // agent.NewSupervisor("") → "claude" (core/internal/agent/agent.go) and
-// kimi.NewSupervisor("") → "kimi" (core/internal/kimi/thread.go), both from
-// run.go. An engine this table does not know falls back to its harness id,
+// kimi.NewSupervisor("") → "kimi" (core/internal/kimi/thread.go), and Codex
+// defaults to "codex" (core/internal/codex), all from run.go. An engine this
+// table does not know falls back to its harness id,
 // which is what a third adapter would name its binary anyway (docs/HARNESSES.md).
 struct EngineFacts {
     const char *executable;
@@ -34,6 +35,7 @@ const QHash<QString, EngineFacts> &knownEngines()
         // still exists, and a dead link at the moment someone is stuck is
         // worse than naming the command and letting them search for it.
         {QStringLiteral("kimi"), {"kimi", ""}},
+        {QStringLiteral("codex"), {"codex", "https://developers.openai.com/codex/cli/"}},
     };
     return facts;
 }

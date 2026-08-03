@@ -58,7 +58,17 @@ type Capabilities struct {
 	ColdCompact     bool `json:"coldCompact"`
 	Promote         bool `json:"promote"`         // agent.promote (move session into an isolated worktree)
 	ProviderRouting bool `json:"providerRouting"` // third-party Anthropic-compatible endpoints
-	Cowork          bool `json:"cowork"`          // the KDE Cowork desktop MCP server
+	// ProviderRegistry: the ENGINE keeps its own persistent provider registry
+	// in its home directory (kimi's `kimi provider add/catalog/list/remove`
+	// family), managed by shelling out to the CLI — providers/list is not
+	// implemented over ACP (probed, -32601). Deliberately a SECOND flag, not a
+	// change to ProviderRouting: routing is per-launch env injection whose
+	// keys Agent Kate brokers (claude, plan 11); the registry is per-home
+	// state whose credentials the engine holds itself and Agent Kate never
+	// sees (plan 26). Claude false, kimi true. LOCKSTEP with
+	// ui/src/state/HarnessTraits.h/.cpp (fromJson AND the defaults).
+	ProviderRegistry bool `json:"providerRegistry"`
+	Cowork           bool `json:"cowork"` // the KDE Cowork desktop MCP server
 	// LiveToolReveal: the CLI honours the MCP notifications/tools/list_changed
 	// notification, so a server that starts advertising new tools mid-session
 	// is picked up without a relaunch. True for claude 2.1.220 (probed: the
@@ -127,6 +137,66 @@ type Capabilities struct {
 	// discovered per session from the CLI's configOptions instead.
 	PermissionModes []string `json:"permissionModes"`
 	Efforts         []string `json:"efforts"`
+}
+
+// HealthState is a traffic light, deliberately coarse — the detail lives in
+// Checks. Unknown is a real state: a probe that timed out has not said "bad".
+const (
+	HealthOK      = "ok"
+	HealthWarn    = "warn"    // usable, something is off
+	HealthBad     = "bad"     // will not start
+	HealthUnknown = "unknown" // the probe could not answer
+)
+
+// healthRank orders the states for the worst-of roll-up. A warn outranks an
+// unknown: "something IS off" beats "one probe did not answer", and an engine
+// whose only blemish is a hung doctor must not paint itself amber.
+var healthRank = map[string]int{
+	HealthOK:      0,
+	HealthUnknown: 1,
+	HealthWarn:    2,
+	HealthBad:     3,
+}
+
+// WorstState rolls a check list up into the engine's overall state — THE
+// roll-up, shared by every adapter so no engine can rank the lights its own
+// way. No checks at all is Unknown (an empty card must not claim health), and
+// an unrecognised state string is treated as Unknown rather than trusted.
+func WorstState(checks []Check) string {
+	worst := HealthUnknown
+	for i, c := range checks {
+		state := c.State
+		if _, known := healthRank[state]; !known {
+			state = HealthUnknown
+		}
+		if i == 0 || healthRank[state] > healthRank[worst] {
+			worst = state
+		}
+	}
+	return worst
+}
+
+// Check is one named health assertion, with a remedy the UI can act on.
+type Check struct {
+	Name   string `json:"name"` // "binary", "config", "auth", "models", …
+	State  string `json:"state"`
+	Detail string `json:"detail"`
+	// Remedy is a command the user can run, verbatim, e.g. "kimi login".
+	// Taken from the engine where it advertises one (kimi's authMethods
+	// _meta.terminal-auth) — never invented by us.
+	Remedy string `json:"remedy,omitempty"`
+}
+
+// Health is one engine's preflight verdict — the answer to "will an agent
+// started on this engine actually come up?", asked before any thread exists.
+type Health struct {
+	EngineID string  `json:"engineId"`
+	State    string  `json:"state"` // worst of Checks (WorstState)
+	Version  string  `json:"version"`
+	Checks   []Check `json:"checks"`
+	// Models is the discovered catalogue size, so the card can say
+	// "4 models" without a second round trip.
+	Models int `json:"models"`
 }
 
 // DiscoveredOption mirrors one CLI config-option enumeration (the shape the
@@ -389,6 +459,16 @@ type Harness interface {
 	// caller persists reality. An unsupported option returns an error naming
 	// the harness.
 	SetOption(threadID, option, value string) (applied string, err error)
+
+	// Health answers the engine-level (thread-less) preflight question: is
+	// this engine's CLI present, configured, authenticated, and does it have
+	// a model catalogue? Deliberately NOT capability-gated — every harness
+	// can answer, even if the answer is all-Unknown; a flag would let an
+	// adapter opt out of being diagnosable, which is the opposite of the
+	// point. Implementations are BEST-EFFORT with per-check timeouts: a hung
+	// doctor yields an Unknown check, never an error that blanks the card.
+	// The error return is for genuinely unexpected failure only.
+	Health(ctx context.Context) (Health, error)
 
 	// DiscoverOptions probes the harness's live configuration vocabulary
 	// (model / effort / mode enumerations, with display names) without

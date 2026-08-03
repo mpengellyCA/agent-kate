@@ -152,6 +152,7 @@ QStringList frozenIds()
         QStringLiteral("options_experience_simple"),
         QStringLiteral("options_experience_advanced"),
         QStringLiteral("options_language_extensions"),
+        QStringLiteral("options_close_to_tray"),
         QStringLiteral("options_show_menubar"),
         QStringLiteral("options_configure_keybinding"),
 
@@ -171,6 +172,10 @@ QStringList frozenIds()
         QStringLiteral("view_centre_chat"),
         QStringLiteral("view_focus_editor"),
         QStringLiteral("view_focus_agent"),
+
+        QStringLiteral("global_show_hide"),
+        QStringLiteral("global_quick_ask"),
+        QStringLiteral("global_answer_attention"),
 
         QStringLiteral("layout_converse"),
         QStringLiteral("layout_build"),

@@ -12,6 +12,7 @@
 #include "ProblemsPanel.h"
 #include "ProjectTree.h"
 #include "ProvidersDialog.h"
+#include "QuickAskDialog.h"
 #include "ReferencesPanel.h"
 #include "ShutdownDialog.h"
 #include "SearchPanel.h"
@@ -28,6 +29,7 @@
 #include "shell/ActionIds.h"
 #include "shell/ShellLayout.h"
 #include "shell/SideBar.h"
+#include "shell/TrayPresence.h"
 #include "git/BlameController.h"
 #include "git/GutterController.h"
 #include "git/LogViewer.h"
@@ -49,10 +51,12 @@
 #include <KActionCollection>
 #include <KMultiTabBar>
 #include <KConfigGroup>
+#include <KGlobalAccel>
 #include <KHamburgerMenu>
 #include <KHelpMenu>
 #include <KLocalizedString>
 #include <KMessageWidget>
+#include <KNotification>
 #include <KSharedConfig>
 #include <KShortcutsDialog>
 #include <KStandardAction>
@@ -127,6 +131,11 @@ MainWindow::MainWindow(const QString &openPath, QWidget *parent)
     setupShellShortcuts();
     setupCore();
     setupExperience();
+    // Tray presence + the three global shortcuts (plan 27 §2/§3). After
+    // setupActions (the tray menu reuses collection actions) and before
+    // openLaunchPath (the first project's agents must already be wired into
+    // the tray's decision layer).
+    setupPresence();
     // Every action exists now. Lay the user's customised bindings from
     // [Shortcuts] over the declared defaults — this is the read half of what
     // KShortcutsDialog writes, and without it a rebind survives only until the
@@ -211,6 +220,9 @@ void MainWindow::raiseAndActivate(const QString &xdgActivationToken)
     show();
     raise();
     KWindowSystem::activateWindow(windowHandle());
+    // Visible again means the normal quit-on-last-window rule applies again —
+    // hideToTray() switches it off for exactly the hidden stretch (plan 27 §2).
+    qApp->setQuitOnLastWindowClosed(true);
 }
 
 MainWindow::~MainWindow()
@@ -225,6 +237,9 @@ MainWindow::~MainWindow()
         m_core->setParent(nullptr);
         m_core->setParent(this);
     }
+    // Parentless on purpose (see showQuickAsk); reap it here.
+    delete m_quickAsk;
+    m_quickAsk = nullptr;
 }
 
 void MainWindow::setupUi()
@@ -831,6 +846,247 @@ void MainWindow::configureShortcuts()
     refreshPanelTooltips();
 }
 
+// --- KDE presence: tray + global shortcuts (plan 27 §2/§3) ------------------
+
+void MainWindow::setupPresence()
+{
+    using agentkate::TrayPresence;
+
+    // The decision layer always exists — the answer-attention shortcut reads
+    // firstAttentionAgent() even in a session with no tray host. It is fed the
+    // per-agent forwards of exactly the wires AgentNotifier consumes, so the
+    // tray can never claim a state the roster card does not show.
+    m_tray = new TrayPresence(this);
+    connect(m_agent, &AgentDock::agentTitleChanged, m_tray,
+            &TrayPresence::setAgentTitle);
+    connect(m_agent, &AgentDock::agentStatusChanged, m_tray,
+            &TrayPresence::reportStatus);
+    connect(m_agent, &AgentDock::agentAttentionChanged, m_tray,
+            &TrayPresence::reportAttention);
+    connect(m_agent, &AgentDock::agentRemoved, m_tray, &TrayPresence::forgetAgent);
+    connect(m_tray, &TrayPresence::agentActivationRequested, this,
+            [this](int agentId) {
+                raiseAndActivate();
+                if (m_agent) {
+                    m_agent->selectAgent(agentId);
+                }
+            });
+    connect(m_tray, &TrayPresence::quitRequested, this, &MainWindow::requestQuit);
+
+    // The three global shortcuts. Three is a budget, not a starting point —
+    // every one is taken from the user's entire desktop. Registering through
+    // KGlobalAccel is what lists them under System Settings ▸ Shortcuts ▸
+    // Agent Kate, which is where KDE users discover what an app can do.
+    auto *showHideAct =
+        new QAction(QIcon::fromTheme(QStringLiteral("window")),
+                    i18n("Show/Hide Agent Kate"), this);
+    registerAction(QLatin1String(ActionIds::GlobalShowHide), showHideAct);
+    connect(showHideAct, &QAction::triggered, this,
+            &MainWindow::toggleWindowPresence);
+    KGlobalAccel::setGlobalShortcut(
+        showHideAct, QList<QKeySequence>{QKeySequence(Qt::META | Qt::Key_A)});
+
+    auto *quickAskAct =
+        new QAction(QIcon::fromTheme(QStringLiteral("mail-message-new")),
+                    i18n("Quick-Ask the Active Agent"), this);
+    registerAction(QLatin1String(ActionIds::GlobalQuickAsk), quickAskAct);
+    connect(quickAskAct, &QAction::triggered, this, &MainWindow::showQuickAsk);
+    KGlobalAccel::setGlobalShortcut(
+        quickAskAct,
+        QList<QKeySequence>{QKeySequence(Qt::META | Qt::SHIFT | Qt::Key_A)});
+
+    // Registered UNBOUND (recorded decision): the least frequent of the three
+    // and the most likely to collide. It appears in System Settings all the
+    // same, which is where a user who wants it assigns it.
+    auto *answerAct =
+        new QAction(QIcon::fromTheme(QStringLiteral("dialog-warning")),
+                    i18n("Answer Pending Attention"), this);
+    registerAction(QLatin1String(ActionIds::GlobalAnswerAttention), answerAct);
+    connect(answerAct, &QAction::triggered, this,
+            &MainWindow::answerPendingAttention);
+    KGlobalAccel::setGlobalShortcut(answerAct, QList<QKeySequence>{});
+    // This is also the tray's "Answer pending permission" entry until plan
+    // 24 adds questions. It is the same action as the global shortcut, so the
+    // enabled state cannot drift between the two entry points.
+    answerAct->setEnabled(false);
+    connect(m_tray, &TrayPresence::presenceChanged, answerAct,
+            [this, answerAct] {
+                answerAct->setEnabled(m_tray && m_tray->firstAttentionAgent() >= 0);
+            });
+
+    // The tray item itself, only when this session can actually show one. The
+    // context menu is built FROM the collection — the same QActions the menus
+    // hold, so enablement and retitling stay one story. TrayPresence inserts
+    // its per-agent submenu at the front.
+    if (TrayPresence::hostAvailable()) {
+        auto *trayMenu = new QMenu(this);
+        if (QAction *newAgent =
+                m_actions->action(QLatin1String(ActionIds::AgentNew))) {
+            trayMenu->addAction(newAgent);
+        }
+        trayMenu->addAction(showHideAct);
+        trayMenu->addAction(answerAct);
+        trayMenu->addSeparator();
+        if (QAction *quitAct =
+                m_actions->action(QLatin1String(ActionIds::FileQuit))) {
+            trayMenu->addAction(quitAct);
+        }
+        // Force the native window into existence so the item can associate
+        // with it before the first show().
+        winId();
+        m_tray->embed(windowHandle(), trayMenu);
+    }
+    // Close-to-tray enabled in a host-less session? Say once, at startup, that
+    // the close button will keep quitting here.
+    maybeExplainNoTrayHost();
+}
+
+void MainWindow::requestQuit()
+{
+    m_quitRequested = true;
+    // A quit from the tray can arrive while the window is hidden; the
+    // ShutdownDialog and any unsaved-file prompts need a visible home.
+    if (!isVisible()) {
+        raiseAndActivate();
+    }
+    close();
+}
+
+bool MainWindow::closeToTrayEnabled() const
+{
+    return KSharedConfig::openConfig()
+        ->group(QStringLiteral("Behaviour"))
+        .readEntry("closeToTray", false);
+}
+
+void MainWindow::hideToTray()
+{
+    // Only while hidden to the tray: with the main window gone, Qt would
+    // otherwise end the process as soon as the last other window (a floating
+    // panel, a dialog) closed. Flipped back in raiseAndActivate and on the
+    // genuine-quit path, so a session can never get stuck unquittable.
+    qApp->setQuitOnLastWindowClosed(false);
+    hide();
+
+    // One-shot, first time ever: a window that vanishes with work still
+    // running and no sign of where it went is a support ticket.
+    KConfigGroup grp =
+        KSharedConfig::openConfig()->group(QStringLiteral("Behaviour"));
+    if (grp.readEntry("hideToTrayNoticeShown", false)) {
+        return;
+    }
+    grp.writeEntry("hideToTrayNoticeShown", true);
+    grp.sync();
+    const int running = m_agent ? m_agent->runningAgentCount() : 0;
+    auto *n = new KNotification(QStringLiteral("hiddenToTray"));
+    n->setComponentName(QStringLiteral("agentkate"));
+    n->setTitle(i18n("Agent Kate is still running"));
+    n->setText(running > 0
+                   ? i18np("%1 agent keeps working in the background. Find "
+                           "Agent Kate in the system tray.",
+                           "%1 agents keep working in the background. Find "
+                           "Agent Kate in the system tray.",
+                           running)
+                   : i18n("Find Agent Kate in the system tray."));
+    n->setIconName(QStringLiteral("agentkate"));
+    n->setAutoDelete(true);
+    n->sendEvent();
+}
+
+void MainWindow::toggleWindowPresence()
+{
+    if (isVisible() && isActiveWindow()) {
+        // Toggle away. With a live tray the window can vanish entirely;
+        // without one it only minimises — a bare-WM session must always keep
+        // a way back on screen.
+        if (m_tray && m_tray->active()) {
+            qApp->setQuitOnLastWindowClosed(false);
+            hide();
+        } else {
+            showMinimized();
+        }
+        return;
+    }
+    raiseFromGlobalShortcut();
+    if (m_agent) {
+        m_agent->focusActiveComposer();
+    }
+}
+
+void MainWindow::showQuickAsk()
+{
+    if (!m_agent || !m_agent->hasActiveAgent()) {
+        // No target agent: the useful reading of "ask an agent" is "make one".
+        raiseFromGlobalShortcut();
+        if (m_agent) {
+            m_agent->newAgentInActiveProjectGuided();
+        }
+        return;
+    }
+    if (!m_quickAsk) {
+        // Deliberately parentless: a transient child of a HIDDEN main window
+        // is exactly what a Wayland compositor may refuse to map, and hidden
+        // is quick-ask's home case. Deleted in the destructor.
+        m_quickAsk = new QuickAskDialog(nullptr);
+        connect(m_quickAsk, &QuickAskDialog::submitted, this,
+                [this](const QString &text) {
+                    if (m_agent && m_agent->quickAskActiveAgent(text)) {
+                        m_quickAsk->acceptSent();
+                    } else {
+                        m_quickAsk->showError(
+                            i18n("Could not send — open Agent Kate to see why."));
+                    }
+                });
+    }
+    m_quickAsk->setTargetName(m_agent->activeAgentTitle());
+    m_quickAsk->popUp();
+}
+
+void MainWindow::answerPendingAttention()
+{
+    raiseFromGlobalShortcut();
+    const int agentId = m_tray ? m_tray->firstAttentionAgent() : -1;
+    if (agentId >= 0 && m_agent) {
+        m_agent->selectAgent(agentId);
+    }
+}
+
+void MainWindow::raiseFromGlobalShortcut()
+{
+    // KGlobalAccel parks an XDG activation token in the environment for the
+    // duration of the triggered action — the same convention KDBusService
+    // uses for a relaunch. Spend it through the ONE raise path; a second
+    // hand-rolled raise is how Wayland activation silently stops working.
+    const QString token = qEnvironmentVariable("XDG_ACTIVATION_TOKEN");
+    qunsetenv("XDG_ACTIVATION_TOKEN");
+    raiseAndActivate(token);
+}
+
+void MainWindow::maybeExplainNoTrayHost()
+{
+    KConfigGroup grp =
+        KSharedConfig::openConfig()->group(QStringLiteral("Behaviour"));
+    if (!agentkate::TrayPresence::shouldExplainNoHost(
+            closeToTrayEnabled(), m_tray && m_tray->active(),
+            grp.readEntry("closeToTrayNoHostExplained", false))) {
+        return;
+    }
+    grp.writeEntry("closeToTrayNoHostExplained", true);
+    grp.sync();
+    auto *banner = new KMessageWidget(
+        i18n("Close to System Tray is enabled, but this session has no system "
+             "tray. The close button will keep quitting Agent Kate — hiding "
+             "the window here would leave no way to bring it back."),
+        this);
+    banner->setMessageType(KMessageWidget::Information);
+    banner->setWordWrap(true);
+    banner->setCloseButtonVisible(true);
+    if (auto *layout = qobject_cast<QVBoxLayout *>(centralWidget()->layout())) {
+        layout->insertWidget(0, banner);
+        banner->animatedShow();
+    }
+}
+
 void MainWindow::setupActions()
 {
     QMenu *fileMenu = menuBar()->addMenu(i18n("&File"));
@@ -895,8 +1151,10 @@ void MainWindow::setupActions()
     fileMenu->addAction(saveAllAct);
 
     fileMenu->addSeparator();
+    // requestQuit, not close: File ▸ Quit is a GENUINE quit even while
+    // close-to-tray is on — the hide is reserved for the window's close button.
     fileMenu->addAction(registerAction(QLatin1String(ActionIds::FileQuit),
-                                       KStandardAction::quit(this, &QWidget::close, this)));
+                                       KStandardAction::quit(this, &MainWindow::requestQuit, this)));
 
     // The Agent menu sits right after File — agents are the primary thing this
     // app is about, and its actions were previously buried in roster right-clicks.
@@ -970,15 +1228,38 @@ void MainWindow::setupActions()
         m_editor->setAutosaveEnabled(autosaveOn);
     }
 
+    // Close-to-tray (plan 27 §2). DEFAULT OFF — a recorded decision: changing
+    // what the close button does without asking is hostile. With it on (and a
+    // StatusNotifier host present) closing hides the window while agents keep
+    // working; File ▸ Quit and the tray's Quit still run the real shutdown.
+    auto *closeTrayAct = registerAction(
+        QLatin1String(ActionIds::OptionsCloseToTray),
+        optionsMenu->addAction(i18n("Close to System &Tray")));
+    closeTrayAct->setCheckable(true);
+    closeTrayAct->setChecked(closeToTrayEnabled());
+    closeTrayAct->setToolTip(
+        i18n("Closing the window hides Agent Kate in the system tray while "
+             "agents keep working. Quit from the File menu or the tray to "
+             "really stop."));
+    connect(closeTrayAct, &QAction::toggled, this, [this](bool on) {
+        KConfigGroup grp =
+            KSharedConfig::openConfig()->group(QStringLiteral("Behaviour"));
+        grp.writeEntry("closeToTray", on);
+        grp.sync();
+        // Turning it on in a session with no tray earns the one-time
+        // explanation that the close button will keep quitting here.
+        maybeExplainNoTrayHost();
+    });
+
     optionsMenu->addSeparator();
     auto *providersAct = registerAction(
         QLatin1String(ActionIds::OptionsConfigureProviders),
-        optionsMenu->addAction(i18n("Configure API &Providers…")));
+        optionsMenu->addAction(i18n("Configure &Providers…")));
     providersAct->setToolTip(i18n(
-        "Configure third-party, Anthropic-compatible API providers (Fireworks, "
-        "OpenRouter, …) that an agent can use in place of Anthropic."));
+        "Configure third-party API providers for Claude Code and the Kimi "
+        "Code provider registry."));
     connect(providersAct, &QAction::triggered, this, [this] {
-        ProvidersDialog dlg(this);
+        ProvidersDialog dlg(this, m_core);
         if (dlg.exec() == QDialog::Accepted) {
             m_agent->reloadProviders();
         }
@@ -2814,8 +3095,33 @@ void MainWindow::closeEvent(QCloseEvent *event)
     // Snapshot the open tabs before any save-prompt closes them, so the session
     // restores the full working set next run.
     persistEditorSession();
-    // Prompt to save any modified documents; a cancel aborts the close.
+    // Close-to-tray (plan 27 §2), decided BEFORE the unsaved-file prompt:
+    // hiding is not closing, so no document is closed and nothing needs
+    // asking. Every persist that the quit path runs still runs here — a crash
+    // while hidden must not lose the session state this code is otherwise
+    // careful to snapshot early. shouldHideToTray's clauses are the feature's
+    // traps spelled out: preference off, no live tray item (the unquittable-
+    // app fallback), a genuine quit (File ▸ Quit / tray Quit), session logout.
+    if (!m_shutdownComplete
+        && agentkate::TrayPresence::shouldHideToTray(
+               closeToTrayEnabled(), m_tray && m_tray->active(),
+               m_quitRequested, qApp->isSavingSession())) {
+        persistShellState();
+        if (m_terminal) {
+            m_terminal->saveSession();
+        }
+        if (m_agent) {
+            m_agent->persistLastActiveSessions();
+        }
+        event->ignore();
+        hideToTray();
+        return;
+    }
+    // Prompt to save any modified documents; a cancel aborts the close — and a
+    // cancelled QUIT must disarm the flag, or the next plain close would quit
+    // instead of hiding.
     if (m_editor && !m_editor->confirmCloseAll()) {
+        m_quitRequested = false;
         event->ignore();
         return;
     }
@@ -2841,6 +3147,9 @@ void MainWindow::closeEvent(QCloseEvent *event)
         QMetaObject::invokeMethod(this, &QWidget::close, Qt::QueuedConnection);
         return;
     }
+    // A genuine close: restore the normal quit rule (hideToTray switches it
+    // off while hidden) so ending this window still ends the app.
+    qApp->setQuitOnLastWindowClosed(true);
     KMainWindow::closeEvent(event);
 }
 

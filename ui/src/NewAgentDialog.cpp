@@ -3,21 +3,30 @@
 
 #include "NewAgentDialog.h"
 #include "ProviderConfig.h"
+#include "ipc/CoreClient.h"
+#include "shell/ChipPainter.h"
+#include "shell/ElidingLabel.h"
 #include "state/EngineAvailability.h"
 #include "state/EnsembleCatalog.h"
 #include "state/HarnessTraits.h"
 
+#include <KColorScheme>
 #include <KConfigGroup>
 #include <KLocalizedString>
 #include <KSharedConfig>
 
 #include <QCheckBox>
+#include <QClipboard>
 #include <QDoubleSpinBox>
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QFormLayout>
+#include <QGuiApplication>
+#include <QJsonArray>
+#include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
+#include <QPainter>
 #include <QPalette>
 #include <QPlainTextEdit>
 #include <QPointer>
@@ -26,6 +35,7 @@
 #include <QSignalBlocker>
 #include <QStandardItemModel>
 #include <QTimer>
+#include <QToolButton>
 #include <QVBoxLayout>
 
 namespace IsolationCopy {
@@ -150,10 +160,236 @@ void selectFirstEnabled(QComboBox *combo)
 
 } // namespace
 
+// --- the preflight card (plan 26 phase 2) -----------------------------------
+
+EngineHealth EngineHealth::fromJson(const QJsonObject &o)
+{
+    EngineHealth h;
+    h.engineId = o.value(QStringLiteral("engineId")).toString();
+    h.state = o.value(QStringLiteral("state")).toString();
+    h.version = o.value(QStringLiteral("version")).toString();
+    h.models = o.value(QStringLiteral("models")).toInt();
+    const QJsonArray checks = o.value(QStringLiteral("checks")).toArray();
+    for (const QJsonValue &v : checks) {
+        const QJsonObject c = v.toObject();
+        h.checks.append(EngineCheck{
+            c.value(QStringLiteral("name")).toString(),
+            c.value(QStringLiteral("state")).toString(),
+            c.value(QStringLiteral("detail")).toString(),
+            c.value(QStringLiteral("remedy")).toString(),
+        });
+    }
+    return h;
+}
+
+namespace {
+
+// The traffic light's palette, from KColorScheme's status roles — never a
+// hardcoded green/amber/red, so it stays legible under every colour scheme.
+void healthColors(const QString &state, QColor *fill, QColor *text)
+{
+    const KColorScheme scheme(QPalette::Active, KColorScheme::View);
+    if (state == QLatin1String("ok")) {
+        *fill = scheme.background(KColorScheme::PositiveBackground).color();
+        *text = scheme.foreground(KColorScheme::PositiveText).color();
+    } else if (state == QLatin1String("warn")) {
+        *fill = scheme.background(KColorScheme::NeutralBackground).color();
+        *text = scheme.foreground(KColorScheme::NeutralText).color();
+    } else if (state == QLatin1String("bad")) {
+        *fill = scheme.background(KColorScheme::NegativeBackground).color();
+        *text = scheme.foreground(KColorScheme::NegativeText).color();
+    } else { // unknown / pending: quiet, promises nothing
+        *fill = scheme.background(KColorScheme::AlternateBackground).color();
+        *text = scheme.foreground(KColorScheme::InactiveText).color();
+    }
+}
+
+// The chip's one-word verdict. Human words, not the wire tokens.
+QString healthChipText(const QString &state)
+{
+    if (state == QLatin1String("ok")) {
+        return i18nc("engine health chip", "Ready");
+    }
+    if (state == QLatin1String("warn")) {
+        return i18nc("engine health chip", "Attention");
+    }
+    if (state == QLatin1String("bad")) {
+        return i18nc("engine health chip", "Not ready");
+    }
+    return i18nc("engine health chip", "Unchecked");
+}
+
+} // namespace
+
+HealthChip::HealthChip(QWidget *parent)
+    : QWidget(parent)
+{
+    setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+}
+
+void HealthChip::setVerdict(const QString &state, const QString &text)
+{
+    if (state == m_state && text == m_text) {
+        return; // same verdict, no repaint (the card's Reactive already
+                // guards this path, but the chip stays safe on its own too)
+    }
+    m_state = state;
+    m_text = text;
+    updateGeometry();
+    update();
+}
+
+QSize HealthChip::sizeHint() const
+{
+    return {ChipPainter::chipWidth(font(), m_text), ChipPainter::chipHeight(font())};
+}
+
+void HealthChip::paintEvent(QPaintEvent *)
+{
+    QColor fill, text;
+    healthColors(m_state, &fill, &text);
+    QPainter p(this);
+    p.setRenderHint(QPainter::Antialiasing);
+    ChipPainter::drawChip(&p, QRect(QPoint(0, 0), sizeHint()), m_text, font(),
+                          fill, text);
+}
+
+PreflightCard::PreflightCard(QWidget *parent)
+    : QWidget(parent)
+{
+    auto *root = new QVBoxLayout(this);
+    root->setContentsMargins(0, 0, 0, 0);
+    root->setSpacing(4);
+
+    auto *header = new QHBoxLayout;
+    header->setContentsMargins(0, 0, 0, 0);
+    m_toggle = new QToolButton(this);
+    m_toggle->setAutoRaise(true);
+    m_toggle->setCheckable(true);
+    m_toggle->setArrowType(Qt::RightArrow);
+    m_toggle->setToolTip(i18n("Show the engine's health checks"));
+    header->addWidget(m_toggle);
+    m_chip = new HealthChip(this);
+    header->addWidget(m_chip);
+    header->addSpacing(ChipPainter::kChipGap);
+    m_summary = new ElidingLabel(this);
+    DisclosureStyle::apply(m_summary);
+    header->addWidget(m_summary, 1);
+    root->addLayout(header);
+
+    m_body = new QWidget(this);
+    m_bodyLayout = new QVBoxLayout(m_body);
+    m_bodyLayout->setContentsMargins(m_toggle->sizeHint().width(), 0, 0, 0);
+    m_bodyLayout->setSpacing(2);
+    m_body->setVisible(false);
+    root->addWidget(m_body);
+
+    connect(m_toggle, &QToolButton::toggled, this, [this](bool on) {
+        m_toggle->setArrowType(on ? Qt::DownArrow : Qt::RightArrow);
+        m_body->setVisible(on && m_bodyLayout->count() > 0);
+    });
+
+    // The verdict repaints ONLY on a real change: Reactive<T>'s full-field
+    // equality is the whole flicker guard, and PreflightCardTest pins it.
+    m_health.subscribe(this, [this](const EngineHealth &h) { rebuild(h); });
+
+    setPending(QString());
+}
+
+void PreflightCard::setPending(const QString &engineId)
+{
+    const EngineHealth &held = m_health.get();
+    if (!held.state.isEmpty() && held.engineId == engineId) {
+        return; // the verdict on show already answers for this engine
+    }
+    m_chip->setVerdict(QStringLiteral("pending"),
+                       i18nc("engine health chip", "Checking…"));
+    m_summary->setText(QString());
+    m_body->setVisible(false);
+    m_toggle->setEnabled(false);
+}
+
+void PreflightCard::setHealth(const EngineHealth &health)
+{
+    m_health.set(health); // equal verdicts stop right here — no rebuild
+}
+
+void PreflightCard::rebuild(const EngineHealth &health)
+{
+    ++m_rebuilds;
+    m_chip->setVerdict(health.state, healthChipText(health.state));
+
+    QStringList summaryBits;
+    if (!health.version.isEmpty()) {
+        summaryBits << health.version;
+    }
+    if (health.models > 0) {
+        summaryBits << i18np("%1 model", "%1 models", health.models);
+    }
+    m_summary->setText(summaryBits.join(i18nc("summary separator", " · ")));
+
+    // One line per non-OK check; an all-green engine keeps the card to its
+    // single header line.
+    while (QLayoutItem *item = m_bodyLayout->takeAt(0)) {
+        delete item->widget();
+        delete item;
+    }
+    for (const EngineCheck &check : health.checks) {
+        if (check.state == QLatin1String("ok")) {
+            continue;
+        }
+        auto *line = new ElidingLabel(
+            i18nc("health check line: name, state, detail", "%1: %2 — %3",
+                  check.name, check.state, check.detail),
+            m_body);
+        line->setToolTip(check.detail);
+        DisclosureStyle::apply(line);
+        m_bodyLayout->addWidget(line);
+        if (check.remedy.isEmpty()) {
+            continue;
+        }
+        // The engine's own remedy, copyable. Running it in a terminal is
+        // deferred (the terminal lives on MainWindow); Copy loses nothing.
+        auto *remedyRow = new QWidget(m_body);
+        auto *remedyLayout = new QHBoxLayout(remedyRow);
+        remedyLayout->setContentsMargins(0, 0, 0, 0);
+        auto *command = new QLabel(remedyRow);
+        QFont mono = command->font();
+        mono.setFamilies({QStringLiteral("monospace")});
+        command->setFont(mono);
+        command->setText(check.remedy);
+        command->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        remedyLayout->addWidget(command);
+        auto *copy = new QToolButton(remedyRow);
+        copy->setIcon(QIcon::fromTheme(QStringLiteral("edit-copy")));
+        copy->setText(i18nc("@action:button copy the remedy command", "Copy"));
+        copy->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+        copy->setAutoRaise(true);
+        const QString remedy = check.remedy;
+        connect(copy, &QToolButton::clicked, remedyRow, [remedy] {
+            QGuiApplication::clipboard()->setText(remedy);
+        });
+        remedyLayout->addWidget(copy);
+        remedyLayout->addStretch(1);
+        m_bodyLayout->addWidget(remedyRow);
+    }
+
+    const bool hasLines = m_bodyLayout->count() > 0;
+    m_toggle->setEnabled(hasLines);
+    if (hasLines && !m_autoExpanded) {
+        // Open once, on the first verdict worth reading — and never again,
+        // so a user who collapsed the card stays collapsed.
+        m_autoExpanded = true;
+        m_toggle->setChecked(true);
+    }
+    m_body->setVisible(m_toggle->isChecked() && hasLines);
+}
+
 NewAgentDialog::NewAgentDialog(const QString &projectName, CoreClient *core,
                                QWidget *parent, const QString &projectPath)
     : QDialog(parent)
     , m_core(core)
+    , m_projectPath(projectPath)
 {
     setWindowTitle(i18nc("@title:window", "New Agent"));
 
@@ -244,6 +480,10 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, CoreClient *core,
     // Never leave the picker resting on an entry it has just refused.
     selectFirstEnabled(m_engine);
     form->addRow(i18n("Which agent?"), m_engine);
+    // The preflight card (plan 26): the selected engine's health, refreshed
+    // with the combo. It WARNS only — Create is never blocked on a verdict.
+    m_preflight = new PreflightCard(this);
+    form->addRow(m_preflight);
     m_model = new QComboBox(this);
     m_model->setToolTip(i18n("Which model powers this agent. Smarter is more capable; faster is cheaper."));
     form->addRow(i18n("How clever?"), m_model);
@@ -367,10 +607,11 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, CoreClient *core,
         HarnessRegistry::self()->ensureDiscovered(
             m_core, m_engine->currentData().toString().section(QLatin1Char('|'), 0, 0));
     };
-    connect(m_engine, &QComboBox::currentIndexChanged, this, [rebuildBackendChoices,
-                                                              probeEngine] {
+    connect(m_engine, &QComboBox::currentIndexChanged, this,
+            [this, rebuildBackendChoices, probeEngine] {
         probeEngine();
         rebuildBackendChoices();
+        refreshPreflight();
     });
     connect(HarnessRegistry::self(), &HarnessRegistry::changed, this,
             rebuildBackendChoices);
@@ -466,6 +707,7 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, CoreClient *core,
     // backend selection, and probe that engine's option lists if discovered.
     probeEngine();
     rebuildBackendChoices();
+    refreshPreflight();
     connect(m_ensemble, &QComboBox::currentIndexChanged, this,
             &NewAgentDialog::applyEnsembleMode);
     applyEnsembleMode();
@@ -539,6 +781,61 @@ void NewAgentDialog::updateIsolationState()
     m_isolationNote->setText(
         IsolationCopy::isolationNote(m_isolationAvailability,
                                      m_sandbox->isChecked()));
+}
+
+// refreshPreflight asks the core for the selected engine's health and
+// publishes the verdict into the card. Fire-and-forget: the core caches the
+// answer for 30 s, the card's Reactive guard swallows identical repeats, and
+// nothing here can gate the Create button (warn, never block).
+void NewAgentDialog::refreshPreflight()
+{
+    if (!m_preflight) {
+        return;
+    }
+    const QString engineId =
+        m_engine->currentData().toString().section(QLatin1Char('|'), 0, 0);
+    m_preflight->setPending(engineId);
+    if (engineId.isEmpty() || !m_core || !m_core->isConnected()) {
+        return; // the card stays on its quiet "checking…"/held verdict
+    }
+    QJsonObject params{{QStringLiteral("engineId"), engineId}};
+    if (!m_projectPath.isEmpty()) {
+        // claude's doctor reads the project directory's settings.
+        params.insert(QStringLiteral("project"), m_projectPath);
+    }
+    m_core->call(
+        QStringLiteral("engine.health"), params,
+        // The context argument (below) QPointer-guards this continuation:
+        // a reply landing after the dialog closed is dropped, never a UAF.
+        [this, engineId](const QJsonObject &result, const QJsonObject &error) {
+            const QString current =
+                m_engine->currentData().toString().section(QLatin1Char('|'), 0, 0);
+            if (current != engineId) {
+                return; // the user moved on; a stale verdict must not land
+            }
+            if (!error.isEmpty()) {
+                // Best-effort to the end: an unreachable probe is an UNKNOWN
+                // verdict on the card, never a blank or a scary red.
+                EngineHealth h;
+                h.engineId = engineId;
+                h.state = QStringLiteral("unknown");
+                h.checks.append(EngineCheck{
+                    QStringLiteral("health"), QStringLiteral("unknown"),
+                    error.value(QStringLiteral("message")).toString(), QString()});
+                m_preflight->setHealth(h);
+                return;
+            }
+            const QJsonArray engines =
+                result.value(QStringLiteral("engines")).toArray();
+            for (const QJsonValue &v : engines) {
+                const EngineHealth h = EngineHealth::fromJson(v.toObject());
+                if (h.engineId == engineId) {
+                    m_preflight->setHealth(h);
+                    return;
+                }
+            }
+        },
+        this);
 }
 
 NewAgentChoices NewAgentDialog::choices() const

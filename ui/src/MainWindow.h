@@ -39,6 +39,10 @@ class QLabel;
 class QLineEdit;
 class QTimer;
 class QToolButton;
+class QuickAskDialog;
+namespace agentkate {
+class TrayPresence;
+}
 
 // MainWindow is the Agent Kate arena shell — a project-aware, agent-centric KDE
 // main window. The agent roster (left) holds projects and their agents; the
@@ -100,6 +104,37 @@ private:
     // collection AND the embedded editor part's, so a conflict between the two
     // is visible and resolvable instead of being worked around in code.
     void configureShortcuts();
+
+    // --- KDE presence (plan 27 §2/§3) ---------------------------------------
+    // Tray item + close-to-tray + the three KGlobalAccel actions.
+    void setupPresence();
+    // A GENUINE quit — File ▸ Quit, the tray's Quit. Sets the flag closeEvent
+    // reads so close-to-tray cannot swallow it, then closes.
+    void requestQuit();
+    // Hide the window to the tray (closeEvent's close-to-tray path): the
+    // persist calls have already run; this flips quitOnLastWindowClosed off
+    // for exactly as long as the window is hidden, and fires the one-shot
+    // "still running" notification the first time ever.
+    void hideToTray();
+    // [Behaviour] closeToTray — default OFF (recorded decision: changing what
+    // the close button does without asking is hostile).
+    bool closeToTrayEnabled() const;
+    // Global Show/Hide (Meta+A): raise + activate + focus the active agent's
+    // composer; toggle-hide when the window is already focused.
+    void toggleWindowPresence();
+    // Global Quick-ask (Meta+Shift+A): the QuickAskDialog against the
+    // last-focused agent; the New Agent dialog when there is none.
+    void showQuickAsk();
+    // Global Answer-pending-attention (unbound by default): raise and jump to
+    // the first blocked agent.
+    void answerPendingAttention();
+    // Consume the XDG activation token KGlobalAccel parks in the environment
+    // for the duration of a triggered global action, then raise.
+    void raiseFromGlobalShortcut();
+    // One-time banner when close-to-tray is on in a session with no
+    // StatusNotifier host: the close button will keep quitting, and saying so
+    // once is what keeps the fallback from reading as a broken preference.
+    void maybeExplainNoTrayHost();
 
     // Agent Kate contains no model: every agent is an external CLI akcore
     // spawns off $PATH. If NOT ONE of them is installed the app is inert, and
@@ -219,6 +254,16 @@ private:
     // Set once the graceful stop-and-compact shutdown has run, so the re-entered
     // closeEvent takes the normal teardown path instead of re-showing the dialog.
     bool m_shutdownComplete = false;
+    // Set by requestQuit (File ▸ Quit, tray Quit) so closeEvent can tell a
+    // genuine quit from the close button while close-to-tray is on. Cleared
+    // when a quit is cancelled (unsaved-file prompt), so the NEXT plain close
+    // hides again.
+    bool m_quitRequested = false;
+    // The Plasma tray presence. The object always exists (its decision layer
+    // feeds the answer-attention shortcut); the actual StatusNotifierItem is
+    // only embedded when a host is present.
+    agentkate::TrayPresence *m_tray = nullptr;
+    QuickAskDialog *m_quickAsk = nullptr; // lazily created on first use
     EditorArea *m_editor = nullptr;
     ProjectTree *m_tree = nullptr;
     AgentDock *m_agent = nullptr;

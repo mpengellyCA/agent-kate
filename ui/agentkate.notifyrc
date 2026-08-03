@@ -25,6 +25,12 @@ Comment=An agent has stopped and is waiting for you before it can continue
 Action=Popup
 Urgency=High
 
+[Event/agentAsksQuestion]
+Name=Agent asks a question
+Comment=An agent needs your answer before it can continue
+Action=Popup
+Urgency=High
+
 [Event/agentFinished]
 Name=Agent finished its turn
 Comment=An agent stopped working and is waiting for your next instruction
@@ -42,3 +48,9 @@ Name=Agents paused by a usage limit
 Comment=One or more agents cannot continue until the account's usage window resets
 Action=Popup
 Urgency=Normal
+
+[Event/hiddenToTray]
+Name=Hidden to the system tray
+Comment=The window was closed to the tray while agents keep working (shown once, the first time)
+Action=Popup
+Urgency=Low

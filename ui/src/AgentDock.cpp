@@ -1103,10 +1103,12 @@ void AgentDock::wireAgentPanel(int agentId, AgentPanel *panel)
             [this, agentId](const QString &title) {
                 m_roster->setAgentTitle(agentId, title);
                 m_notifier->setAgentTitle(agentId, title);
+                Q_EMIT agentTitleChanged(agentId, title);
             });
     connect(panel, &AgentPanel::statusChanged, this, [this, agentId](int status) {
         m_roster->setAgentStatus(agentId, status);
         m_notifier->reportStatus(agentId, status);
+        Q_EMIT agentStatusChanged(agentId, status);
     });
     connect(panel, &AgentPanel::subtitleChanged, this,
             [this, agentId](const QString &text) { m_roster->setAgentSubtitle(agentId, text); });
@@ -1119,6 +1121,10 @@ void AgentDock::wireAgentPanel(int agentId, AgentPanel *panel)
     connect(panel, &AgentPanel::attentionChanged, this, [this, agentId](bool on) {
         m_roster->setAgentAttention(agentId, on);
         m_notifier->reportAttention(agentId, on);
+        Q_EMIT agentAttentionChanged(agentId, on);
+    });
+    connect(panel, &AgentPanel::questionAsked, this, [this, agentId] {
+        m_notifier->reportQuestion(agentId);
     });
     connect(panel, &AgentPanel::threadIdChanged, this, [this, panel](const QString &threadId) {
         if (m_stack->currentWidget() == panel) {
@@ -1198,6 +1204,44 @@ void AgentDock::selectAgentByThread(const QString &threadId)
             return;
         }
     }
+}
+
+// selectAgent focuses one agent by id — the tray submenu and the
+// answer-pending-attention shortcut already hold the id, no thread required.
+void AgentDock::selectAgent(int agentId)
+{
+    if (entryById(agentId)) {
+        m_roster->setCurrentAgent(agentId);
+    }
+}
+
+QString AgentDock::activeAgentTitle() const
+{
+    const int id = activeAgentId();
+    return id >= 0 ? m_roster->agentTitle(id) : QString();
+}
+
+void AgentDock::focusActiveComposer()
+{
+    if (AgentPanel *panel = activeAgentPanel()) {
+        panel->focusComposer();
+    }
+}
+
+// quickAskActiveAgent delivers one quick-ask line through the active panel's
+// own composer send path (plan 27 §3 — "no new protocol" is load-bearing: the
+// send queue, the dormant-resume deferral and the frame cap all keep applying).
+// AgentPanel owns the swap because a dormant session resumes asynchronously:
+// the existing draft must stay intact until the resumed lifecycle event can
+// send the ask and restore it.
+bool AgentDock::quickAskActiveAgent(const QString &text)
+{
+    AgentPanel *panel = activeAgentPanel();
+    const QString ask = text.trimmed();
+    if (!panel || ask.isEmpty()) {
+        return false;
+    }
+    return panel->quickAsk(ask);
 }
 
 bool AgentDock::hasThread(const QString &threadId) const
@@ -1460,6 +1504,7 @@ void AgentDock::removeAgentEntry(int agentId, DraftDisposition drafts)
                 Q_EMIT jobsChanged(goneThread, {});
             }
             m_notifier->forgetAgent(agentId);
+            Q_EMIT agentRemoved(agentId);
             const QString goneProject = m_agents.at(i).project;
             m_agents.removeAt(i);
             // Forget this agent's persisted composer draft — but ONLY when the

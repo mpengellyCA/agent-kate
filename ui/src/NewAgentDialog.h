@@ -3,10 +3,13 @@
 
 #pragma once
 
+#include "state/Reactive.h"
+
 #include <KLocalizedString>
 
 #include <QColor>
 #include <QDialog>
+#include <QList>
 #include <QPalette>
 #include <QString>
 #include <QStringList>
@@ -55,12 +58,103 @@ inline void apply(QWidget *label)
 class QPlainTextEdit;
 class QComboBox;
 class QCheckBox;
+class QJsonObject;
 class QLabel;
 class QLineEdit;
 class QDoubleSpinBox;
 class QFormLayout;
+class QToolButton;
+class QVBoxLayout;
 class QWidget;
 class CoreClient;
+class ElidingLabel;
+
+// EngineCheck / EngineHealth mirror one engine's verdict from the core's
+// engine.health RPC (plan 26; core/internal/harness Health/Check). Value
+// types with full-field equality, because the preflight card publishes them
+// through a Reactive<EngineHealth>: an identical verdict — the common case,
+// with the core caching health for 30 s — repaints nothing.
+struct EngineCheck {
+    QString name;   // "binary", "config", "auth", "models", …
+    QString state;  // "ok" | "warn" | "bad" | "unknown"
+    QString detail;
+    // A command the user can run, verbatim (e.g. "kimi login") — the engine's
+    // own advertised remedy, never one the UI invents.
+    QString remedy;
+    bool operator==(const EngineCheck &) const = default;
+};
+
+struct EngineHealth {
+    QString engineId;
+    QString state; // worst of checks, rolled up core-side
+    QString version;
+    int models = 0;
+    QList<EngineCheck> checks;
+    bool operator==(const EngineHealth &) const = default;
+    static EngineHealth fromJson(const QJsonObject &o);
+};
+
+// HealthChip — the traffic light: one ChipPainter pill whose colours come
+// from KColorScheme's status roles (Positive/Neutral/Negative), so it stays
+// native under every colour scheme.
+class HealthChip : public QWidget
+{
+    Q_OBJECT
+public:
+    explicit HealthChip(QWidget *parent = nullptr);
+    void setVerdict(const QString &state, const QString &text);
+    QSize sizeHint() const override;
+
+protected:
+    void paintEvent(QPaintEvent *event) override;
+
+private:
+    QString m_state;
+    QString m_text;
+};
+
+// PreflightCard — the collapsible engine-health card under the New Agent
+// dialog's engine combo (plan 26 phase 2). Header: a traffic-light chip plus
+// a disclosure toggle; body: one line per non-OK check, and a copyable
+// command for any check that carries a remedy.
+//
+// It WARNS ONLY. Start is never blocked on a bad verdict — a health check
+// that is wrong must never be the thing that stops work — so nothing here
+// gates the dialog's buttons. (Offering to RUN the remedy in a terminal is
+// deferred: the terminal lives on MainWindow, which this change does not
+// touch; the command is copyable instead.)
+//
+// Flicker rule: the verdict lives in a Reactive<EngineHealth> with
+// full-field equality, so publishing the same health twice rebuilds and
+// repaints nothing — PreflightCardTest pins that, via rebuilds().
+class PreflightCard : public QWidget
+{
+    Q_OBJECT
+public:
+    explicit PreflightCard(QWidget *parent = nullptr);
+
+    // The engine combo moved and the probe is in flight: show a quiet
+    // "checking…" chip for that engine. A verdict already held for the SAME
+    // engine stays put — the cache will answer with it anyway.
+    void setPending(const QString &engineId);
+    // Publish a verdict. Identical health is silently ignored (Reactive).
+    void setHealth(const EngineHealth &health);
+
+    // How many times the card actually rebuilt — the test's observable.
+    int rebuilds() const { return m_rebuilds; }
+
+private:
+    void rebuild(const EngineHealth &health);
+
+    Reactive<EngineHealth> m_health;
+    int m_rebuilds = 0;
+    HealthChip *m_chip = nullptr;
+    QToolButton *m_toggle = nullptr;
+    ElidingLabel *m_summary = nullptr;
+    QWidget *m_body = nullptr;
+    QVBoxLayout *m_bodyLayout = nullptr;
+    bool m_autoExpanded = false; // expand once on the first non-OK verdict
+};
 
 // The choices a guided New Agent dialog collects. Empty strings mean "leave the
 // agent's sticky default" (the data values match AgentPanel's combos).
@@ -292,12 +386,19 @@ private:
     // ensemble picker and the isolation probe) and neither may clobber the
     // other.
     void updateIsolationState();
+    // Ask the core for the selected engine's preflight health (engine.health,
+    // 30 s cache core-side) and publish it into the card. Fired from the
+    // engine combo's currentIndexChanged handler; never blocks, never gates
+    // the Create button.
+    void refreshPreflight();
 
     CoreClient *m_core = nullptr; // for the lazy discovered-option probe
+    QString m_projectPath;        // so claude's doctor reads the right directory
     QPlainTextEdit *m_task = nullptr;
     QComboBox *m_ensemble = nullptr; // "Single agent" or one ensemble
     QLabel *m_ensembleHint = nullptr;
     QComboBox *m_engine = nullptr; // harness + optional provider overlay
+    PreflightCard *m_preflight = nullptr; // engine health, under the engine combo
     QComboBox *m_model = nullptr;
     QCheckBox *m_sandbox = nullptr;
     QLabel *m_isolationNote = nullptr;

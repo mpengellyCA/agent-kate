@@ -111,6 +111,20 @@ public:
     void forgetFinishedJobsEverywhere();
     void showWorkflowMonitorFor(const QString &threadId);
     void selectAgentByThread(const QString &threadId);
+    // Focus one agent by id — the tray's per-agent submenu and the
+    // answer-pending-attention shortcut land here (plan 27 §2/§3).
+    void selectAgent(int agentId);
+
+    // The active agent's roster title (for the quick-ask header); empty if none.
+    QString activeAgentTitle() const;
+    // Put the composer caret in the active agent's panel (global Show/Hide).
+    void focusActiveComposer();
+    // Quick-ask (plan 27 §3): deliver `text` through the active panel's OWN
+    // composer send path — queueing, dormant-resume and frame-cap rules all
+    // apply — while preserving any unsent draft. Returns false when there is
+    // no active panel or the send was refused before any side effect (the
+    // caller keeps the text; nothing was lost anywhere).
+    bool quickAskActiveAgent(const QString &text);
 
 Q_SIGNALS:
     void statusMessage(const QString &text);
@@ -158,6 +172,15 @@ Q_SIGNALS:
     // How many agents are blocked on the user, forwarded from the roster so the
     // window can put it in the task bar (audit F50).
     void attentionCountChanged(int count);
+    // Per-agent forwards of exactly the three wires AgentNotifier consumes
+    // (title / status / attention), plus the teardown. TrayPresence folds these
+    // with AgentNotifier's own rules, so the tray, the popup and the roster
+    // card can never tell three different stories (plan 27 §2). Emitted from
+    // the SAME lambdas that feed m_notifier — that co-location is the contract.
+    void agentTitleChanged(int agentId, const QString &title);
+    void agentStatusChanged(int agentId, int status);
+    void agentAttentionChanged(int agentId, bool attention);
+    void agentRemoved(int agentId);
 
 private:
     struct Entry {

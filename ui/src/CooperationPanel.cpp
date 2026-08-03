@@ -32,7 +32,10 @@ QTreeWidget *makeSection(const QString &title, const QStringList &headers, QWidg
     tree->setRootIsDecorated(false);
     tree->setUniformRowHeights(true);
     tree->setSelectionMode(QAbstractItemView::NoSelection);
-    tree->setFocusPolicy(Qt::NoFocus);
+    // StrongFocus with NoSelection retained (plan 27 §4): NoFocus made these
+    // read-only sections unreachable by Tab and unreadable by a screen reader;
+    // focus enables keyboard scrolling without adding selection semantics.
+    tree->setFocusPolicy(Qt::StrongFocus);
     tree->header()->setStretchLastSection(true);
     tree->setSizeAdjustPolicy(QAbstractScrollArea::AdjustToContents);
     boxLayout->addWidget(tree);

@@ -182,6 +182,52 @@ func TestHarnessCapabilities(t *testing.T) {
 	if len(kimi.PermissionModes) != 0 || len(kimi.Efforts) != 0 {
 		t.Error("kimi vocabularies must be empty (discovered per session from configOptions)")
 	}
+
+	codex := newCodexHarness(nil).Capabilities()
+	if codex.ID != "codex" || codex.DisplayName != "Codex CLI" || codex.Badge != "Codex" {
+		t.Errorf("codex identity = %q/%q/%q", codex.ID, codex.DisplayName, codex.Badge)
+	}
+	if !codex.Fork {
+		t.Error("codex Fork = false; app-server exposes thread/fork")
+	}
+	if codex.MintsSessionID {
+		t.Error("codex MintsSessionID = true; app-server assigns the persistent thread id")
+	}
+	if codex.ModelPicker != harness.ModelPickerDiscovered {
+		t.Errorf("codex ModelPicker = %q, want discovered", codex.ModelPicker)
+	}
+	// Keep the first adapter deliberately narrow. The app-server protocol has
+	// endpoints that resemble several of these features, but none may appear in
+	// Agent Kate before its end-to-end semantic mapping is tested.
+	for name, got := range map[string]bool{
+		"Compaction":          codex.Compaction,
+		"ColdCompact":         codex.ColdCompact,
+		"Promote":             codex.Promote,
+		"ProviderRouting":     codex.ProviderRouting,
+		"ProviderRegistry":    codex.ProviderRegistry,
+		"Cowork":              codex.Cowork,
+		"LiveToolReveal":      codex.LiveToolReveal,
+		"EffortLive":          codex.EffortLive,
+		"UsageReporting":      codex.UsageReporting,
+		"SessionBrowse":       codex.SessionBrowse,
+		"TranscriptPreview":   codex.TranscriptPreview,
+		"SystemPrompt":        codex.SystemPrompt,
+		"CustomSubagents":     codex.CustomSubagents,
+		"FallbackModels":      codex.FallbackModels,
+		"DisallowedTools":     codex.DisallowedTools,
+		"AddDirs":             codex.AddDirs,
+		"StrictMCPConfig":     codex.StrictMCPConfig,
+		"CostBudget":          codex.CostBudget,
+		"SubagentTranscripts": codex.SubagentTranscripts,
+		"SkillReload":         codex.SkillReload,
+	} {
+		if got {
+			t.Errorf("codex capability %s = true, want false until its complete lifecycle is wired", name)
+		}
+	}
+	if len(codex.PermissionModes) != 0 || len(codex.Efforts) != 0 {
+		t.Error("codex vocabularies must remain discovered until app-server option mapping is verified")
+	}
 }
 
 // TestHarnessRegistryWiring mirrors runCore's registration: the default id
@@ -190,6 +236,7 @@ func TestHarnessRegistryWiring(t *testing.T) {
 	r := harness.NewRegistry("claude")
 	r.Register(newClaudeHarness(nil, "", ""))
 	r.Register(newKimiHarness(nil, "", ""))
+	r.Register(newCodexHarness(nil))
 
 	if h, ok := r.Get(""); !ok || h.Capabilities().ID != "claude" {
 		t.Fatal(`legacy empty Backend must resolve to the claude harness`)
@@ -197,8 +244,11 @@ func TestHarnessRegistryWiring(t *testing.T) {
 	if h, ok := r.Get("kimi"); !ok || h.Capabilities().ID != "kimi" {
 		t.Fatal(`Get("kimi") must resolve to the kimi harness`)
 	}
+	if h, ok := r.Get("codex"); !ok || h.Capabilities().ID != "codex" {
+		t.Fatal(`Get("codex") must resolve to the codex harness`)
+	}
 	all := r.All()
-	if len(all) != 2 || all[0].Capabilities().ID != "claude" {
+	if len(all) != 3 || all[0].Capabilities().ID != "claude" || all[2].Capabilities().ID != "codex" {
 		t.Fatalf("engine order wrong: %d entries, first %q",
 			len(all), all[0].Capabilities().ID)
 	}

@@ -120,6 +120,11 @@ void AgentNotifier::reportAttention(int agentId, bool attention)
     emitAlert(agentId, evaluateAttention(agentId, attention));
 }
 
+void AgentNotifier::reportQuestion(int agentId)
+{
+    emitAlert(agentId, evaluateQuestion(agentId));
+}
+
 AgentNotifier::Alert AgentNotifier::evaluateStatus(int agentId, int status)
 {
     if (m_forgotten.contains(agentId)) {
@@ -168,6 +173,21 @@ AgentNotifier::Alert AgentNotifier::evaluateAttention(int agentId, bool attentio
     // the second half of the status/attention pair must not announce it again.
     st.attentionRaised = true;
     return shouldNotify(agentId) ? Alert::NeedsAttention : Alert::None;
+}
+
+AgentNotifier::Alert AgentNotifier::evaluateQuestion(int agentId)
+{
+    if (m_forgotten.contains(agentId)) {
+        return Alert::None;
+    }
+    State &st = m_state[agentId];
+    if (st.attentionRaised) {
+        return Alert::None;
+    }
+    // Use the ordinary attention latch.  A question still blocks the agent,
+    // but it gets its own notifyrc event rather than a second generic prompt.
+    st.attentionRaised = true;
+    return shouldNotify(agentId) ? Alert::Question : Alert::None;
 }
 
 bool AgentNotifier::noteInWindow(QList<int> &pending, bool &open, int agentId)
@@ -288,6 +308,14 @@ void AgentNotifier::emitAlert(int agentId, Alert alert)
             notify(agentId, QStringLiteral("agentNeedsAttention"),
                    i18n("%1 needs your attention", displayName(agentId)),
                    i18n("The agent is waiting on you before it can continue."), true);
+        return;
+    case Alert::Question:
+        // Same persistent lifetime as a permission prompt: close it once the
+        // interaction resolves, never leave a stale question in the tray.
+        m_state[agentId].attention =
+            notify(agentId, QStringLiteral("agentAsksQuestion"),
+                   i18n("%1 asks a question", displayName(agentId)),
+                   i18n("The agent needs your answer before it can continue."), true);
         return;
     }
 }

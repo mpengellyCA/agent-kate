@@ -16,6 +16,7 @@ import (
 	"agentkate/internal/compact"
 	"agentkate/internal/coop"
 	"agentkate/internal/cowork"
+	"agentkate/internal/extensions"
 	"agentkate/internal/gitstatus"
 	"agentkate/internal/harness"
 	"agentkate/internal/ipc"
@@ -159,9 +160,14 @@ type handlerDeps struct {
 	extensions    *vsix.Manager
 	sessions      *session.Store
 	attachSide    *session.AttachmentStore // per-thread attachment metadata sidecars
+	questionSide  *session.QuestionStore   // completed AskUserQuestion history for replay
 	summaries     *compact.Store
 	modes         *modes.Store // user-editable ensembles (plan 16 P4)
 	skills        *skills.Catalog
+	// claudePlugins is a CLI boundary for the extension catalogue. Keeping it
+	// separate from VSIX extensions prevents two unrelated extension systems
+	// from sharing an install path or authority boundary.
+	claudePlugins *extensions.ClaudePlugins
 	gitCache      *gitstatus.Cache
 	cowork        *cowork.Service // nil if KDE/consent init failed; handlers guard
 	socketPath    string
@@ -370,6 +376,12 @@ func registerHandlers(d handlerDeps) {
 	// Ensembles: the user-editable controller/worker recipes and the one-thread
 	// apply that briefs a controller (plan 16 P4).
 	registerModeHandlers(d)
+
+	// Engine-level services: preflight health + the kimi provider registry (plan 26).
+	registerEngineServiceHandlers(d)
+
+	// Extension catalogue (plan 22): plugins widen, but do not replace, Skills.
+	registerExtensionHandlers(d)
 
 	// Per-subagent transcripts, discovered by the thread's own harness (P6).
 	registerSubagentHandlers(d)
@@ -642,6 +654,19 @@ func registerHandlers(d handlerDeps) {
 		// hundreds of MB to build on the way to failing. The tail is what the UI
 		// keeps anyway (its row ring), and CapTranscript prepends a visible
 		// notice when it drops anything, so a shortened history is never silent.
+		// CLI transcripts do not reliably retain the completed answer to an
+		// AskUserQuestion (and Kimi's ACP bridge has no native transcript for
+		// it).  Append our private, completed-history sidecar only on this
+		// UI-authorised pull path; no bridge ever receives another thread's
+		// question text or answer.
+		if d.questionSide != nil {
+			questions, qerr := d.questionSide.Events(p.ThreadID)
+			if qerr != nil {
+				d.log.Warn("could not load question history", "thread", p.ThreadID, "err", qerr)
+			} else {
+				events = append(events, questions...)
+			}
+		}
 		events = harness.CapTranscript(events)
 		return map[string]any{"events": events, "attachments": attachTurns}, nil
 	})
@@ -1149,6 +1174,14 @@ func registerHandlers(d handlerDeps) {
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
+		// Resolve a parked question/permission frame before sending the
+		// harness interrupt.  The latter may need a child acknowledgement (or a
+		// signal backstop); the human pressed Escape now, so its answer must be
+		// a prompt refusal now as well.  CancelThread only delivers zero
+		// decisions, preserving the broker's human-only, fail-closed authority.
+		if d.broker != nil {
+			d.broker.CancelThread(p.ThreadID)
+		}
 		if err := d.agentInterrupt(p.ThreadID); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
@@ -1520,6 +1553,9 @@ func registerHandlers(d handlerDeps) {
 		_ = d.summaries.Remove(p.ThreadID)
 		if d.attachSide != nil {
 			_ = d.attachSide.Remove(p.ThreadID)
+		}
+		if d.questionSide != nil {
+			_ = d.questionSide.Remove(p.ThreadID)
 		}
 		d.gitCache.Forget(p.ThreadID)
 		d.turns.Forget(p.ThreadID)
@@ -2574,6 +2610,9 @@ func registerHandlers(d handlerDeps) {
 		if d.attachSide != nil {
 			_ = d.attachSide.Remove(p.ThreadID)
 		}
+		if d.questionSide != nil {
+			_ = d.questionSide.Remove(p.ThreadID)
+		}
 		d.gitCache.Forget(p.ThreadID)
 		d.srv.Notify("agent.discarded", map[string]any{"threadId": p.ThreadID})
 		d.srv.Notify("git.invalidated", map[string]any{"threadIds": []string{p.ThreadID}})
@@ -3165,6 +3204,9 @@ func registerHandlers(d handlerDeps) {
 		if d.attachSide != nil {
 			_ = d.attachSide.Remove(p.ThreadID)
 		}
+		if d.questionSide != nil {
+			_ = d.questionSide.Remove(p.ThreadID)
+		}
 		d.gitCache.Forget(p.ThreadID)
 		d.threads.remove(p.ThreadID)
 		d.srv.Notify("agent.discarded", map[string]any{"threadId": p.ThreadID})
@@ -3446,8 +3488,29 @@ const permissionTimeout = 8 * time.Minute
 // separate HasUI() check: taken from the same snapshot as the send, it cannot
 // race a UI that disconnects in between. Still FAIL CLOSED — no window means no
 // approval — only promptly.
-func askHumanPermission(srv *ipc.Server, broker *permission.Broker, threadID, toolName string, input json.RawMessage) (permission.Decision, bool) {
-	id, ch := broker.Open()
+func askHumanPermission(srv *ipc.Server, broker *permission.Broker, threadID, toolName string, input json.RawMessage, questionStores ...*session.QuestionStore) (permission.Decision, bool) {
+	var questions *session.QuestionStore
+	if len(questionStores) != 0 {
+		questions = questionStores[0]
+	}
+	// Persist every terminal outcome of an actual question.  "answered" is
+	// deliberately strict: a permission allow without a usable question answer
+	// remains a dismissal, never a guessed first option.
+	recordQuestion := func(dec permission.Decision) {
+		if questions == nil || toolName != "AskUserQuestion" {
+			return
+		}
+		answered := dec.Allow && len(dec.UpdatedInput) != 0 && json.Valid(dec.UpdatedInput)
+		if err := questions.Append(threadID, session.QuestionTurn{
+			Input: input, Answer: dec.UpdatedInput, Answered: answered,
+		}); err != nil {
+			// The interactive answer already happened on the engine wire.  Do
+			// not turn a history-write failure into a different decision, and
+			// never invent an approval to recover it.
+			slog.Warn("could not persist question history", "thread", threadID, "err", err)
+		}
+	}
+	id, ch := broker.OpenForThread(threadID)
 	if srv.NotifyUI("permission.requested", map[string]any{
 		"threadId":       threadID,
 		"requestId":      id,
@@ -3456,13 +3519,16 @@ func askHumanPermission(srv *ipc.Server, broker *permission.Broker, threadID, to
 		"timeoutSeconds": int(permissionTimeout / time.Second),
 	}) == 0 {
 		broker.Close(id)
+		recordQuestion(permission.Decision{})
 		return permission.Decision{}, false
 	}
 	select {
 	case dec := <-ch:
+		recordQuestion(dec)
 		return dec, true
 	case <-time.After(permissionTimeout):
 		broker.Close(id)
+		recordQuestion(permission.Decision{})
 		return permission.Decision{}, false
 	}
 }

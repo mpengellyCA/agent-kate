@@ -45,7 +45,7 @@ A single uniform supervisor for every child process. Independently runnable
 headless, which keeps the harness scriptable.
 
 - **Agent supervisor** — one agent thread per child process, events relayed to
-  the UI. Two backends, selectable per thread:
+  the UI. Three backends, selectable per thread:
   - *Claude Code* — spawns `claude -p --output-format stream-json
     --input-format stream-json --mcp-config <coop.json>`; relays the stream-json
     events verbatim.
@@ -53,6 +53,10 @@ headless, which keeps the harness scriptable.
     translates ACP session updates into the same Claude-shaped stream-json
     events, so the UI renderer is backend-agnostic. Permissions, interrupts,
     follow-ups, and session resume all map onto ACP methods.
+  - *Codex* — spawns `codex app-server --stdio` and translates its JSON-RPC
+    thread/turn protocol into the same Claude-shaped stream-json events. Its
+    persistent threads support follow-ups, interrupts, resume, and fork without
+    falling back to one-shot `codex exec` processes.
   Every per-thread action — send, stop, compaction, subagent-transcript
   discovery — goes through the harness registry, never a supervisor handle: the
   orchestration layer asks the thread's own backend and consults its

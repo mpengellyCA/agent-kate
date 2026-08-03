@@ -465,6 +465,41 @@ QVariant TranscriptModel::data(const QModelIndex &idx, int role) const
         return it.checklist;
     case StableIdRole:
         return QVariant::fromValue<quintptr>(it.stableId);
+    case Qt::AccessibleTextRole: {
+        // What a screen reader speaks for the row (plan 27 §4). Served from
+        // the SAME plain text the copy path assembles — it.plain is the cached
+        // form built once at append, never a fresh HTML parse here. A Tool row
+        // speaks its SHOWN result, not toolFullResult: the full result retains
+        // up to 128 KB and is exactly what must not be re-joined per query.
+        switch (it.kind) {
+        case Message:
+            return it.role.isEmpty()
+                ? it.plain
+                : it.role + QStringLiteral(": ") + it.plain;
+        case Note:
+            return it.plain;
+        case Thinking:
+            return it.toolSummary.isEmpty()
+                ? it.plain
+                : it.toolSummary + QLatin1Char('\n') + it.plain;
+        case Tool: {
+            QStringList parts{it.toolName, it.toolSummary, it.toolResult};
+            parts.removeAll(QString());
+            return parts.join(QLatin1Char('\n'));
+        }
+        case Checklist: {
+            QStringList parts;
+            for (const QJsonValue &v : it.checklist) {
+                const QJsonObject item = v.toObject();
+                parts << QStringLiteral("%1 (%2)").arg(
+                    item.value(QStringLiteral("content")).toString(),
+                    item.value(QStringLiteral("status")).toString());
+            }
+            return parts.join(QLatin1Char('\n'));
+        }
+        }
+        return {};
+    }
     default:
         return {};
     }

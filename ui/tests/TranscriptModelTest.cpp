@@ -51,6 +51,7 @@ private Q_SLOTS:
     void runningToolShowsItsPartialOutput();
     void failedToolLooksDifferentFromASuccessfulOne();
     void findScansNotesToolsAndThinking();
+    void accessibleTextSpeaksEveryRowKind();
     void searchTextIsCachedUntilTheRowChanges();
     void findKeystrokeTouchesOnlyRowsWhoseMatchChanged();
     void findHighlightHtmlIsCachedPerRowAndNeedle();
@@ -320,6 +321,53 @@ void TranscriptModelTest::findScansNotesToolsAndThinking()
         sawNote = sawNote || args.at(0).value<quintptr>() == noteId;
     }
     QVERIFY2(sawNote, "a note that starts matching must be re-measured, not repainted stale");
+}
+
+// Plan 27 §4: the transcript view is now focusable, and what a screen reader
+// speaks for each row is served from Qt::AccessibleTextRole — built from the
+// SAME cached plain text the copy path uses, never a fresh HTML parse. A Tool
+// row speaks its SHOWN result, not the up-to-128KB retained full result.
+void TranscriptModelTest::accessibleTextSpeaksEveryRowKind()
+{
+    TranscriptModel m;
+    const int msg = m.appendMessage(QStringLiteral("Agent Kate"), QStringLiteral("#888"),
+                                    QStringLiteral("<p>the fix is in</p>"),
+                                    QStringLiteral("the fix is in"), false, QString());
+    const int note = m.appendNote(
+        QStringLiteral("&#128274; rate limit reached &mdash; resets at 15:04"),
+        QStringLiteral("err"));
+    const int tool = m.appendTool(QStringLiteral("Bash"), QStringLiteral("pytest tests/"),
+                                  QStringLiteral("{\"command\":\"pytest tests/\"}"), true);
+    m.setToolResult(tool, QStringLiteral("2 passed"),
+                    QString(100000, QLatin1Char('X')), true);
+    const int think = m.appendThinking(QStringLiteral("<p>maybe the venv</p>"),
+                                       QStringLiteral("maybe the venv is stale"),
+                                       QStringLiteral("maybe the venv"));
+    const int list = m.appendChecklist(QJsonArray{
+        QJsonObject{{QStringLiteral("content"), QStringLiteral("write the test")},
+                    {QStringLiteral("status"), QStringLiteral("in_progress")}}});
+
+    const auto spoken = [&m](int row) {
+        return m.data(m.index(row), Qt::AccessibleTextRole).toString();
+    };
+    // A message row names its speaker — the visual layout carries that in the
+    // role chip, which a screen reader cannot see.
+    QVERIFY(spoken(msg).contains(QStringLiteral("Agent Kate")));
+    QVERIFY(spoken(msg).contains(QStringLiteral("the fix is in")));
+    QVERIFY(!spoken(msg).contains(QStringLiteral("<p>")));
+    // A note speaks its recovered plain words, entities unescaped.
+    QVERIFY(spoken(note).contains(QStringLiteral("resets at 15:04")));
+    QVERIFY(spoken(note).contains(QStringLiteral("—")));
+    // A tool row speaks name, summary and the SHOWN result — and must not drag
+    // the retained full result through the accessibility layer.
+    QVERIFY(spoken(tool).contains(QStringLiteral("Bash")));
+    QVERIFY(spoken(tool).contains(QStringLiteral("pytest tests/")));
+    QVERIFY(spoken(tool).contains(QStringLiteral("2 passed")));
+    QVERIFY(spoken(tool).size() < 1000);
+    // Thinking speaks its preview plus body; a checklist speaks its items.
+    QVERIFY(spoken(think).contains(QStringLiteral("venv is stale")));
+    QVERIFY(spoken(list).contains(QStringLiteral("write the test")));
+    QVERIFY(spoken(list).contains(QStringLiteral("in_progress")));
 }
 
 // Audit F58. Find used to call searchText(row) for every row on every

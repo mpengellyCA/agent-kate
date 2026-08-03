@@ -13,10 +13,20 @@
       with integrated git, LSP, terminal, and worktree management.
     </p>
   </description>
-  <url type="homepage">https://github.com/mpengelly/AgentKate</url>
+  <!-- The actual repository (the old mpengelly/AgentKate URL never existed,
+       which is what appstreamcli's url-not-reachable warning was about). -->
+  <url type="homepage">https://github.com/mpengellyCA/agent-kate</url>
+  <url type="vcs-browser">https://github.com/mpengellyCA/agent-kate</url>
+  <url type="bugtracker">https://github.com/mpengellyCA/agent-kate/issues</url>
   <developer id="io.leadrix">
     <name>Mike Pengelly</name>
   </developer>
+  <screenshots>
+    <screenshot type="default">
+      <caption>Agent roster and conversation beside the Kate editor and git panels</caption>
+      <image>https://raw.githubusercontent.com/mpengellyCA/agent-kate/main/assets/screenshots/Screenshot_20260524_232021.png</image>
+    </screenshot>
+  </screenshots>
   <categories>
     <category>Development</category>
     <category>IDE</category>

@@ -38,13 +38,25 @@ func initializeParams() map[string]any {
 const probeDirPrefix = "akcore-kimi-probe-"
 
 // withProbe spawns a throwaway `kimi acp` child in a temp directory, runs the
-// ACP initialize handshake and hands the connected client to fn. No prompt is
-// ever sent, so no model inference (or token spend) occurs. Teardown closes
-// stdin and kills the whole process group — the same -pgid signalling the
-// interrupt backstop uses — so nothing the CLI spawned can linger. Do NOT use
-// this for real threads: there is no translator, no event log, no supervisor
-// registration.
-func (s *Supervisor) withProbe(fn func(ctx context.Context, client *acpClient, tmpDir string) error) error {
+// ACP initialize handshake and hands the connected client to fn — along with
+// the RAW initialize result, which used to be discarded (plan 26): it carries
+// the authMethods whose _meta.terminal-auth names the exact login command the
+// engine health card offers verbatim. No prompt is ever sent, so no model
+// inference (or token spend) occurs. Teardown closes stdin and kills the whole
+// process group — the same -pgid signalling the interrupt backstop uses — so
+// nothing the CLI spawned can linger. Do NOT use this for real threads: there
+// is no translator, no event log, no supervisor registration.
+func (s *Supervisor) withProbe(fn func(ctx context.Context, client *acpClient, tmpDir string, initRaw json.RawMessage) error) error {
+	return s.withProbeContext(context.Background(), fn)
+}
+
+// withProbeContext is withProbe with a caller-owned cancellation boundary. A
+// health card's per-check deadline must be able to reap this child too; using
+// Background here made a wedged auth probe outlive the health timeout.
+func (s *Supervisor) withProbeContext(parent context.Context, fn func(ctx context.Context, client *acpClient, tmpDir string, initRaw json.RawMessage) error) error {
+	if parent == nil {
+		parent = context.Background()
+	}
 	tmp, err := os.MkdirTemp("", probeDirPrefix)
 	if err != nil {
 		return fmt.Errorf("probe dir: %w", err)
@@ -89,12 +101,118 @@ func (s *Supervisor) withProbe(fn func(ctx context.Context, client *acpClient, t
 		_ = cmd.Wait()
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 20*time.Second)
 	defer cancel()
-	if err := client.call(ctx, "initialize", initializeParams(), nil); err != nil {
+	var initRaw json.RawMessage
+	if err := client.call(ctx, "initialize", initializeParams(), &initRaw); err != nil {
 		return fmt.Errorf("acp initialize: %w", err)
 	}
-	return fn(ctx, client, tmp)
+	return fn(ctx, client, tmp, initRaw)
+}
+
+// Bin is the kimi binary this supervisor spawns ("kimi" unless overridden at
+// construction) — exported so the engine-health checks run the SAME binary the
+// threads will, never a different one that happens to be on PATH first.
+func (s *Supervisor) Bin() string { return s.kimiBin }
+
+// terminalAuthRemedy extracts the login command an ACP initialize result
+// advertises (_meta.terminal-auth on an authMethod), rendered as the verbatim
+// command line, e.g. "kimi login". Empty when the engine advertises none —
+// the health card then offers NO remedy rather than inventing one.
+func terminalAuthRemedy(initRaw json.RawMessage) string {
+	var res struct {
+		AuthMethods []struct {
+			Meta struct {
+				TerminalAuth struct {
+					Command string   `json:"command"`
+					Args    []string `json:"args"`
+				} `json:"terminal-auth"`
+			} `json:"_meta"`
+		} `json:"authMethods"`
+	}
+	if json.Unmarshal(initRaw, &res) != nil {
+		return ""
+	}
+	for _, m := range res.AuthMethods {
+		if cmd := m.Meta.TerminalAuth.Command; cmd != "" {
+			return strings.Join(append([]string{cmd}, m.Meta.TerminalAuth.Args...), " ")
+		}
+	}
+	return ""
+}
+
+// EngineAuth is the engine-level auth verdict ProbeEngineAuth reaches — the
+// answer to "would a session start right now?", asked with no thread. States
+// are the harness health vocabulary ("ok" / "bad" / "unknown"), kept as plain
+// strings so this package does not import the harness contract it serves.
+type EngineAuth struct {
+	State  string
+	Detail string
+	// Remedy is the engine's own advertised login command (see
+	// terminalAuthRemedy) — never invented here.
+	Remedy string
+	// Models is the model-catalogue size the probe's session/new reported;
+	// 0 when the session never opened.
+	Models int
+}
+
+// ProbeEngineAuth runs initialize + session/new in a throwaway home-respecting
+// probe. session/new succeeding IS the auth check — an unauthenticated kimi
+// answers it with "Authentication required" (verified live on 0.31.1), while
+// initialize succeeds either way and merely advertises the login command. A
+// successful probe also seeds the DiscoverOptions cache, since session/new
+// carries the same configOptions a discovery probe would spawn a second
+// process to fetch.
+func (s *Supervisor) ProbeEngineAuth(ctx context.Context) (EngineAuth, error) {
+	out := EngineAuth{State: "unknown"}
+	err := s.withProbeContext(ctx, func(ctx context.Context, client *acpClient, tmp string,
+		initRaw json.RawMessage) error {
+		out.Remedy = terminalAuthRemedy(initRaw)
+		var res struct {
+			ConfigOptions []ConfigOption `json:"configOptions"`
+		}
+		err := client.call(ctx, "session/new", map[string]any{
+			"cwd":        tmp,
+			"mcpServers": []MCPServer{}, // kimi rejects a null mcpServers (-32602)
+		}, &res)
+		if err == nil {
+			out.State = "ok"
+			out.Detail = "signed in"
+			for _, o := range res.ConfigOptions {
+				if o.ID == "model" {
+					out.Models = len(o.Options)
+				}
+			}
+			s.discoverMu.Lock()
+			if !s.discovered && len(res.ConfigOptions) > 0 {
+				s.discovered = true
+				s.discoveredOpts = res.ConfigOptions
+			}
+			s.discoverMu.Unlock()
+			return nil
+		}
+		if strings.Contains(err.Error(), "Authentication required") {
+			out.State = "bad"
+			out.Detail = "not signed in (the engine answered: Authentication required)"
+			return nil
+		}
+		// The session failed for some OTHER reason — that is not an auth
+		// verdict, and claiming "bad" here would tell the user to log in when
+		// login would fix nothing.
+		out.Detail = "session probe failed: " + err.Error()
+		return nil
+	})
+	if err != nil {
+		// The CLI never came up or never finished initialize: an unknown, with
+		// whatever the probe could say. Best-effort by contract — the caller
+		// renders the state, never an error.
+		out.State = "unknown"
+		if out.Detail == "" {
+			out.Detail = err.Error()
+		}
+		return out, nil
+	}
+	return out, nil
 }
 
 // DiscoverOptions returns kimi's live config-option vocabulary (the model /
@@ -111,7 +229,8 @@ func (s *Supervisor) DiscoverOptions() ([]ConfigOption, error) {
 		return s.discoveredOpts, nil
 	}
 	var opts []ConfigOption
-	err := s.withProbe(func(ctx context.Context, client *acpClient, tmp string) error {
+	err := s.withProbe(func(ctx context.Context, client *acpClient, tmp string,
+		_ json.RawMessage) error {
 		var res struct {
 			ConfigOptions []ConfigOption `json:"configOptions"`
 		}
@@ -146,7 +265,8 @@ type SessionInfo struct {
 // DiscoverOptions probes leave behind are filtered out.
 func (s *Supervisor) ListSessions(cwd string) ([]SessionInfo, error) {
 	var out []SessionInfo
-	err := s.withProbe(func(ctx context.Context, client *acpClient, _ string) error {
+	err := s.withProbe(func(ctx context.Context, client *acpClient, _ string,
+		_ json.RawMessage) error {
 		params := map[string]any{}
 		if cwd != "" {
 			params["cwd"] = cwd

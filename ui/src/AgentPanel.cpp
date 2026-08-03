@@ -88,6 +88,8 @@
 #include <QToolButton>
 #include <QVariant>
 #include <QVBoxLayout>
+
+#include <utility>
 #include <QWidgetAction>
 
 #include <functional>
@@ -594,7 +596,12 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     m_view->setWordWrap(true);
     m_view->setSelectionMode(QAbstractItemView::NoSelection);
     m_view->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    m_view->setFocusPolicy(Qt::NoFocus);
+    // StrongFocus with NoSelection retained (plan 27 §4): the transcript is the
+    // core content of the app, and NoFocus made it unreachable by Tab, dead to
+    // PgUp/PgDn/arrows and silent under Orca. Focus enables keyboard scrolling
+    // and lets the accessibility layer walk the rows (the model serves
+    // Qt::AccessibleTextRole) without changing the read-only interaction model.
+    m_view->setFocusPolicy(Qt::StrongFocus);
     m_view->setFrameShape(QFrame::NoFrame);
     m_view->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     m_view->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
@@ -1573,6 +1580,83 @@ void AgentPanel::setComposerText(const QString &text)
     m_input->setFocus();
 }
 
+QString AgentPanel::composerText() const
+{
+    return m_input ? m_input->toPlainText() : QString();
+}
+
+bool AgentPanel::quickAsk(const QString &text)
+{
+    const QString ask = text.trimmed();
+    if (ask.isEmpty() || !m_input) {
+        return false;
+    }
+
+    if (m_dormant) {
+        // There is no resume/send path while the core is offline. Refuse
+        // before touching either the dialog's ask or the dormant draft.
+        if (!m_core || !m_core->isConnected()) {
+            return false;
+        }
+        // Do NOT replace the dormant composer's draft with the ask. The
+        // resumed lifecycle handler sends m_pendingQuickAsk once the process
+        // is genuinely live, then puts this exact composer text back. Keeping
+        // the draft in place also means a failed resume cannot lose it.
+        if (m_pendingQuickAsk.isEmpty()) {
+            m_pendingQuickAsk = ask;
+        } else {
+            // Two quick-asks before the resume event are still two distinct
+            // human messages. Preserve both in their arrival order.
+            m_pendingQuickAsk += QStringLiteral("\n\n") + ask;
+        }
+        resume();
+        return true;
+    }
+
+    // A live agent can use the normal send path immediately. Swap only long
+    // enough for it to capture/queue the ask, then restore the exact draft —
+    // whitespace is user text too, so never use trimmed() as the restoration
+    // predicate.
+    const QString draft = m_input->toPlainText();
+    m_input->setPlainText(ask);
+    onSendClicked();
+    const QString after = m_input->toPlainText();
+    if (after.trimmed().isEmpty()) {
+        m_input->setPlainText(draft);
+        return true;
+    }
+    if (after != ask) {
+        // The established send path rewrote the composer itself. It owns that
+        // result; do not clobber it with an older snapshot.
+        return true;
+    }
+    // Refused before a side effect. Put the original draft back exactly as it
+    // was and let the quick-ask dialog retain its text for a retry.
+    m_input->setPlainText(draft);
+    return false;
+}
+
+void AgentPanel::restorePendingQuickAskToComposer()
+{
+    if (m_pendingQuickAsk.isEmpty() || !m_input) {
+        return;
+    }
+    const QString ask = std::exchange(m_pendingQuickAsk, QString());
+    const QString draft = m_input->toPlainText();
+    m_input->setPlainText(draft.isEmpty()
+                              ? ask
+                              : ask + QStringLiteral("\n\n") + draft);
+    addNote(i18n("Quick ask could not resume — it and your draft are in the "
+                 "composer."), QStringLiteral("err"));
+}
+
+void AgentPanel::focusComposer()
+{
+    if (m_input) {
+        m_input->setFocus();
+    }
+}
+
 void AgentPanel::updateSlashPopup()
 {
     if (!m_slashPopup || !m_input) {
@@ -2486,6 +2570,7 @@ void AgentPanel::doResume()
                                               .toString()
                                               .toHtmlEscaped()),
                                  QStringLiteral("err"));
+                         restorePendingQuickAskToComposer();
                      }
                  },
                  this);
@@ -5060,6 +5145,10 @@ void AgentPanel::onPermissionRequested(const QJsonObject &params)
     if (tool == QLatin1String("AskUserQuestion")) {
         addNote(QStringLiteral("&#10067; the agent is asking a question"),
                 QStringLiteral("sys"));
+        // Emit before refresh() publishes generic attention.  AgentNotifier
+        // latches it so this earns the distinct question alert, not a second
+        // generic permission popup.
+        emit questionAsked();
     } else {
         addNote(QStringLiteral("&#128274; permission requested: %1").arg(tool.toHtmlEscaped()),
                 QStringLiteral("sys"));
@@ -6093,6 +6182,52 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
         return;
     }
 
+    // Completed AskUserQuestion interactions live in Agent Kate's private
+    // replay sidecar: neither engine's transcript reliably retains both the
+    // prompt and the human's chosen answer.  It is a history row, not a live
+    // form — answers always travel through permission.respond while the turn
+    // is active.  Escape every field because questions are agent-authored.
+    if (type == QLatin1String("_question")) {
+        const QJsonObject input = ev.value(QStringLiteral("input")).toObject();
+        const QJsonObject answers = ev.value(QStringLiteral("answer"))
+                                        .toObject()
+                                        .value(QStringLiteral("answers"))
+                                        .toObject();
+        const bool answered = ev.value(QStringLiteral("answered")).toBool();
+        QStringList lines;
+        for (const QJsonValue &qv : input.value(QStringLiteral("questions")).toArray()) {
+            const QJsonObject question = qv.toObject();
+            const QString text = question.value(QStringLiteral("question")).toString();
+            if (text.isEmpty()) {
+                continue;
+            }
+            const QJsonValue choice = answers.value(text);
+            QString answer;
+            if (choice.isArray()) {
+                QStringList selected;
+                for (const QJsonValue &v : choice.toArray()) {
+                    selected << v.toString();
+                }
+                answer = selected.join(QStringLiteral(", "));
+            } else {
+                answer = choice.toString();
+            }
+            lines << QStringLiteral("&#10067; <b>%1</b> &rarr; %2")
+                         .arg(text.toHtmlEscaped(),
+                              (answered && !answer.isEmpty()
+                                   ? answer
+                                   : i18n("dismissed")).toHtmlEscaped());
+        }
+        if (lines.isEmpty()) {
+            lines << QStringLiteral("&#10067; %1").arg(
+                answered ? i18n("answered the agent's question").toHtmlEscaped()
+                         : i18n("the agent's question was dismissed").toHtmlEscaped());
+        }
+        addNote(lines.join(QStringLiteral("<br>")), answered ? QStringLiteral("ok")
+                                                              : QStringLiteral("dim"));
+        return;
+    }
+
     if (type == QLatin1String("system")) {
         const QString subtype = ev.value(QStringLiteral("subtype")).toString();
         // The CLI's background-task lifecycle (run_in_background shells and
@@ -6671,6 +6806,30 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
                     QStringLiteral("sys"));
             emit dormantChanged(false);
             refresh();
+            // A quick ask requested while this agent was dormant waits here
+            // rather than overwriting the human's dormant composer draft.
+            // Send through the ordinary composer (so all queue/frame rules
+            // still apply) and restore the exact draft afterwards. If sending
+            // is refused, keep BOTH texts visible instead of silently losing
+            // either one.
+            if (!m_pendingQuickAsk.isEmpty()) {
+                const QString ask = std::exchange(m_pendingQuickAsk, QString());
+                const QString draft = m_input->toPlainText();
+                m_input->setPlainText(ask);
+                onSendClicked();
+                const QString after = m_input->toPlainText();
+                if (after.trimmed().isEmpty()) {
+                    m_input->setPlainText(draft);
+                } else {
+                    const QString combined = draft.isEmpty()
+                        ? after : after + QStringLiteral("\n\n") + draft;
+                    m_input->setPlainText(combined);
+                    addNote(i18n("Quick ask could not be sent — it and your draft are "
+                                 "in the composer."), QStringLiteral("err"));
+                }
+                refresh();
+                return;
+            }
             // Deliver any message the human typed before pressing Resume.
             if (!m_input->toPlainText().trimmed().isEmpty() || !m_attachments.isEmpty()) {
                 onSendClicked();

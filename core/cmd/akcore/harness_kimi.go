@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"agentkate/internal/agent"
@@ -73,6 +74,14 @@ func (h *kimiHarness) Capabilities() harness.Capabilities {
 		// therefore re-attaches the thread — session/resume keeps the
 		// conversation and accepts a fresh mcpServers list (also probed).
 		LiveToolReveal: false,
+		// ProviderRegistry: `kimi provider add/catalog/list/remove` manage a
+		// persistent registry in the engine's home (plan 26) — a genuinely
+		// different mechanism from claude's per-launch env routing, which is
+		// why it is a SECOND flag and ProviderRouting stays false here. The
+		// registry is edited by shelling out (providers/list is not
+		// implemented over ACP — probed, -32601). LOCKSTEP with
+		// ui/src/state/HarnessTraits.cpp kimiDefaults().
+		ProviderRegistry: true,
 		// UsageReporting stays false (the zero value, stated here because it is
 		// load-bearing): the ACP protocol reports no per-turn token accounting,
 		// and kimi's only token figure is `/usage`, a CUMULATIVE context
@@ -230,6 +239,75 @@ func (h *kimiHarness) ReadTranscript(threadID, _ string) ([]json.RawMessage, err
 func (h *kimiHarness) DeleteTranscript(threadID string) error {
 	return h.ksup.DeleteTranscript(threadID)
 }
+
+// Health is kimi's preflight: `kimi --version` (binary), `kimi doctor
+// config` (non-interactive config validation), the engine-level auth probe
+// (initialize + session/new in a throwaway home-respecting probe — an
+// unauthenticated kimi answers "Authentication required", and the remedy is
+// taken VERBATIM from the authMethods' _meta.terminal-auth, never invented),
+// and the discovered model catalogue's size. Best-effort throughout: a hung
+// probe yields an Unknown check, never an error.
+func (h *kimiHarness) Health(ctx context.Context) (harness.Health, error) {
+	bin := h.ksup.Bin()
+	var (
+		binaryCheck, config harness.Check
+		version             string
+		auth                kimi.EngineAuth
+		wg                  sync.WaitGroup
+	)
+	// The auth ACP handshake is one health CHECK, so it receives the same
+	// deadline as --version and doctor. ProbeEngineAuth propagates this into
+	// its child instead of retaining a private Background/20s timeout.
+	authCtx, cancelAuth := context.WithTimeout(ctx, healthProbeTimeout)
+	defer cancelAuth()
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		binaryCheck, version = versionCheck(ctx, bin)
+	}()
+	go func() {
+		defer wg.Done()
+		config = doctorCheck(ctx, "config", "", bin, "doctor", "config")
+	}()
+	go func() {
+		defer wg.Done()
+		// ProbeEngineAuth is best-effort by contract (state Unknown on any
+		// probe failure) and honors the per-check deadline above.
+		auth, _ = h.ksup.ProbeEngineAuth(authCtx)
+	}()
+	wg.Wait()
+	authCheck := harness.Check{Name: "auth", State: auth.State, Detail: auth.Detail}
+	if auth.State == "bad" {
+		// The remedy travels only with a verdict it would fix.
+		authCheck.Remedy = auth.Remedy
+	}
+	modelsCheck := harness.Check{Name: "models", State: harness.HealthOK,
+		Detail: fmt.Sprintf("%d models discovered", auth.Models)}
+	if auth.Models == 0 {
+		modelsCheck = harness.Check{Name: "models", State: harness.HealthUnknown,
+			Detail: "no model catalogue discovered"}
+	}
+	checks := []harness.Check{binaryCheck, config, authCheck, modelsCheck}
+	return harness.Health{
+		EngineID: h.Capabilities().ID,
+		State:    harness.WorstState(checks),
+		Version:  version,
+		Checks:   checks,
+		Models:   auth.Models,
+	}, nil
+}
+
+// The provider-registry side-interface (engineservices.go providerRegistrar):
+// thin delegation to internal/kimi, so the handlers reach the registry
+// through the capability + type assertion and never a backend string compare.
+func (h *kimiHarness) ListProviders(home string) ([]kimi.Provider, error) {
+	return kimi.ListProviders(home)
+}
+func (h *kimiHarness) AddProvider(home, url string) error { return kimi.AddProvider(home, url) }
+func (h *kimiHarness) ImportCatalog(home string) ([]kimi.Provider, error) {
+	return kimi.ImportCatalog(home)
+}
+func (h *kimiHarness) RemoveProvider(home, id string) error { return kimi.RemoveProvider(home, id) }
 
 // DiscoverOptions probes the CLI's live config-option vocabulary (model /
 // thinking / mode enumerations) via a one-shot `kimi acp` handshake, cached by

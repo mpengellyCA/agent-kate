@@ -134,6 +134,7 @@ private Q_SLOTS:
     void rebindingTheThreadWithdrawsItsUsageLimitClaim();
     void closingInsideTheAutosaveWindowKeepsTheDraft();
     void aDestroyedThreadsDraftIsNotWrittenBackByThePendingTimer();
+    void dormantQuickAskPreservesWhitespaceDraftWhenSendFails();
 };
 
 void AgentPanelTest::initTestCase()
@@ -379,6 +380,29 @@ void AgentPanelTest::aDestroyedThreadsDraftIsNotWrittenBackByThePendingTimer()
                  .readEntry(key, QString())
                  .isEmpty(),
              "a pending autosave resurrected the draft of a destroyed thread");
+}
+
+// Plan 27 §3: Quick Ask must not turn a dormant agent's automatic-resume
+// behaviour into a draft shredder. A disconnected core is refused BEFORE it
+// starts resuming, leaving the quick ask in its dialog for retry and preserving
+// the exact whitespace-bearing dormant draft in the composer.
+void AgentPanelTest::dormantQuickAskPreservesWhitespaceDraftWhenSendFails()
+{
+    CoreClient core;
+    AgentPanel panel(&core);
+    panel.setWorkspace(QStringLiteral("/tmp/agentkate-quick-ask-test"));
+    panel.setDormant(QStringLiteral("t-one"), QStringLiteral("one"), false,
+                     // Kimi is hot-only, so resume() goes straight to its
+                     // asynchronous request rather than opening Claude's
+                     // cold-summary recovery chooser in this headless test.
+                     QStringLiteral("kimi"));
+
+    QPlainTextEdit *composer = panel.findChild<QPlainTextEdit *>();
+    QVERIFY(composer != nullptr);
+    const QString draft = QStringLiteral("  keep these spaces  ");
+    composer->setPlainText(draft);
+    QVERIFY(!panel.quickAsk(QStringLiteral("please check the tests")));
+    QCOMPARE(composer->toPlainText(), draft);
 }
 
 QTEST_MAIN(AgentPanelTest)

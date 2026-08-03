@@ -4,10 +4,10 @@
 
 A **native multi-agent coding arena**. Agent Kate is a fast, non-webview desktop
 application that embeds the **Kate editor engine** (`KTextEditor`) and
-orchestrates multiple **Claude Code** and **Kimi Code** instances working across
-one or many projects at once — with agents and the human cooperating through a
-shared MCP server. The backend (Claude Code or Kimi Code) is chosen per agent
-thread; both can run side by side in the same workspace.
+orchestrates multiple **Claude Code**, **Kimi Code**, and **Codex** instances
+working across one or many projects at once — with agents and the human
+cooperating through a shared MCP server. The backend is chosen per agent thread;
+all three can run side by side in the same workspace.
 
 It is our own *harness and arena* for coding agents. Where others wrap a web
 GUI and put each agent thread on a bare git branch, Agent Kate renders natively
@@ -53,7 +53,8 @@ Project tree, editor, git log, and diff view together:
 
 Prerequisites (Arch): `qt6-base`, `ktexteditor`, `syntax-highlighting`,
 `extra-cmake-modules`, `cmake`, `ninja`, `go`, plus the `claude` CLI and/or the
-`kimi` CLI (only the backend(s) you actually use are needed at runtime).
+`kimi`, and/or `codex` CLI (only the backend(s) you actually use are needed at
+runtime).
 
 The `scripts/ak` helper is the single entry point for everyday tasks (run any
 subcommand with `--help` for options):
@@ -82,9 +83,8 @@ a more interactive, developer-friendly multi-agent environment.
 
 I am building Agent Kate as a KDE Plasma user tired of slow Chromium- and
 Java-based IDEs, and I wanted something tailored to agentic development on
-Linux. Claude Code and Kimi Code are supported as agent backends; other
-harnesses like Codex and OpenCode could be added — I have no personal need for
-them, so PRs are welcome.
+Linux. Claude Code, Kimi Code, and Codex are supported as agent backends;
+additional harnesses such as OpenCode can follow the same adapter boundary.
 
 This project was, by and large, coded directly by Claude Opus 4.7.
 

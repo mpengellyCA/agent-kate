@@ -40,6 +40,7 @@ private Q_SLOTS:
     void errorAlwaysFails();
     void attentionIsDeduped_data();
     void attentionIsDeduped();
+    void questionGetsDistinctAlertAndConsumesAttentionLatch();
     void visibleAgentInActiveWindowIsSilent();
     void forgottenAgentSaysNothing();
     void closingAllAlertsRetractsOutstandingPrompts();
@@ -110,6 +111,23 @@ void AgentNotifierTest::attentionIsDeduped()
     // So does moving on via the status channel.
     QCOMPARE(n.evaluateStatus(1, kWorking), Alert::None);
     QCOMPARE(n.evaluateStatus(1, kNeedsInput), Alert::NeedsAttention);
+}
+
+// A question is still a blocking prompt, but it must be individually
+// configurable in KDE's notification settings.  Its shared latch also proves
+// the question event cannot be followed by a second generic permission popup.
+void AgentNotifierTest::questionGetsDistinctAlertAndConsumesAttentionLatch()
+{
+    QWidget window;
+    TestNotifier n(&window);
+
+    QCOMPARE(n.evaluateQuestion(1), Alert::Question);
+    QCOMPARE(n.evaluateAttention(1, true), Alert::None);
+    QCOMPARE(n.evaluateStatus(1, kNeedsInput), Alert::None);
+
+    // Resolving the prompt re-arms a later, separate question.
+    QCOMPARE(n.evaluateAttention(1, false), Alert::None);
+    QCOMPARE(n.evaluateQuestion(1), Alert::Question);
 }
 
 void AgentNotifierTest::visibleAgentInActiveWindowIsSilent()

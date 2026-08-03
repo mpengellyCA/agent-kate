@@ -37,6 +37,13 @@ struct HarnessTraits {
     bool coldCompact = false;
     bool promote = false;
     bool providerRouting = false;
+    // providerRegistry: the ENGINE keeps its own persistent provider registry
+    // in its home directory (kimi's `kimi provider` family, plan 26), whose
+    // credentials the engine holds itself — a different mechanism from
+    // providerRouting's per-launch env injection, hence a second flag. Gates
+    // the "Kimi provider registry" section of ProvidersDialog. LOCKSTEP with
+    // harness.Capabilities.ProviderRegistry (core/internal/harness/harness.go).
+    bool providerRegistry = false;
     bool cowork = false;
     bool effortLive = false; // thinking effort adjustable mid-session
     bool usageReporting = false;

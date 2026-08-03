@@ -77,6 +77,7 @@ inline constexpr char OptionsAppearance[] = "options_appearance";
 inline constexpr char OptionsExperienceSimple[] = "options_experience_simple";
 inline constexpr char OptionsExperienceAdvanced[] = "options_experience_advanced";
 inline constexpr char OptionsLanguageExtensions[] = "options_language_extensions";
+inline constexpr char OptionsCloseToTray[] = "options_close_to_tray";
 inline constexpr char OptionsShowMenubar[] = "options_show_menubar";       // KStandardAction
 inline constexpr char OptionsConfigureKeyBinding[] = "options_configure_keybinding"; // KStandardAction
 
@@ -97,6 +98,17 @@ inline constexpr char ViewCentreSplit[] = "view_centre_split";
 inline constexpr char ViewCentreChat[] = "view_centre_chat";
 inline constexpr char ViewFocusEditor[] = "view_focus_editor";
 inline constexpr char ViewFocusAgent[] = "view_focus_agent";
+
+// --- Global (KGlobalAccel) -----------------------------------------------
+// The three desktop-wide shortcuts (plan 27 §3). Their ids are ALSO the keys
+// kglobalacceld stores the user's bindings under, so the freeze rule applies
+// doubly. Three is a budget, not a starting point: every global shortcut is
+// taken from the user's whole desktop. Show/Hide and Quick-ask ship bound
+// (Meta+A / Meta+Shift+A); Answer-attention ships UNBOUND — least frequent,
+// most likely to collide — and is assignable in System Settings ▸ Shortcuts.
+inline constexpr char GlobalShowHide[] = "global_show_hide";
+inline constexpr char GlobalQuickAsk[] = "global_quick_ask";
+inline constexpr char GlobalAnswerAttention[] = "global_answer_attention";
 
 // --- Layout presets ----------------------------------------------------
 inline constexpr char LayoutConverse[] = "layout_converse";
@@ -180,6 +192,7 @@ inline QStringList all()
         QLatin1String(OptionsExperienceSimple),
         QLatin1String(OptionsExperienceAdvanced),
         QLatin1String(OptionsLanguageExtensions),
+        QLatin1String(OptionsCloseToTray),
         QLatin1String(OptionsShowMenubar),
         QLatin1String(OptionsConfigureKeyBinding),
 
@@ -199,6 +212,10 @@ inline QStringList all()
         QLatin1String(ViewCentreChat),
         QLatin1String(ViewFocusEditor),
         QLatin1String(ViewFocusAgent),
+
+        QLatin1String(GlobalShowHide),
+        QLatin1String(GlobalQuickAsk),
+        QLatin1String(GlobalAnswerAttention),
 
         QLatin1String(LayoutConverse),
         QLatin1String(LayoutBuild),

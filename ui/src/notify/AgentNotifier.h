@@ -39,13 +39,17 @@ public:
 
     // What a report should announce, once suppression and dedup have had their
     // say. Alert::None means "nothing to show".
-    enum class Alert { None, Finished, Failed, NeedsAttention };
+    enum class Alert { None, Finished, Failed, NeedsAttention, Question };
 
     void setAgentTitle(int agentId, const QString &title);
     // status is an AgentRoles::AgentStatus value as int (AgentCardDelegate.h) —
     // the same int AgentPanel::statusChanged carries.
     void reportStatus(int agentId, int status);
     void reportAttention(int agentId, bool attention);
+    // A question is attention with a more useful notification category.  It
+    // shares the same latch as ordinary permissions so one prompt cannot earn
+    // both alerts when status and attention signals arrive afterwards.
+    void reportQuestion(int agentId);
     // The agent whose panel is currently on top of the stack; -1 for none.
     void setVisibleAgent(int agentId);
     void forgetAgent(int agentId);
@@ -61,6 +65,7 @@ public:
     // remembered state exactly as the report path does.
     Alert evaluateStatus(int agentId, int status);
     Alert evaluateAttention(int agentId, bool attention);
+    Alert evaluateQuestion(int agentId);
 
     // --- finish aggregation ------------------------------------------------
     // A fleet running a multi-turn workflow earns one Finished alert per agent

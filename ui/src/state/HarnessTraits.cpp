@@ -66,6 +66,9 @@ HarnessTraits claudeDefaults()
     // session.ReadTranscript reads its on-disk transcript, so the cold path is
     // real here. LOCKSTEP with harness_claude.go Capabilities().ColdCompact.
     t.coldCompact = true;
+    // providerRegistry stays false for claude: its third-party story is plan
+    // 11's per-launch env routing (providerRouting below), not a persistent
+    // engine-home registry. LOCKSTEP with harness_claude.go.
     t.providerRouting = t.cowork = true;
     t.usageReporting = t.sessionBrowse = true;
     t.transcriptPreview = true; // claude keeps the on-disk session store
@@ -125,6 +128,12 @@ HarnessTraits kimiDefaults()
     t.compaction = true;
     // One wire log per subagent under <session-dir>/agents/<id>/ (probed on 0.30.0).
     t.subagentTranscripts = true;
+    // `kimi provider add/catalog/list/remove` manage a persistent registry in
+    // the engine's home (plan 26): the ProvidersDialog registry section shows
+    // for kimi. providerRouting stays false — the mechanisms are genuinely
+    // different and each engine has exactly one of them. LOCKSTEP with
+    // core/cmd/akcore/harness_kimi.go Capabilities().ProviderRegistry.
+    t.providerRegistry = true;
     // skillReload stays false: ACP has no reload-skills request and `kimi acp`
     // resolves its skill directories once, at session/new — so a skill the
     // human installs while a kimi thread runs needs a restart to take effect.
@@ -140,6 +149,21 @@ HarnessTraits kimiDefaults()
     return t;
 }
 
+// Codex speaks its persistent app-server JSON-RPC protocol. Keep this
+// conservative fallback in lockstep with harness_codex.go: its thread ids and
+// live model catalogue are wired, while the first adapter deliberately keeps
+// optional surfaces behind their capability gates.
+HarnessTraits codexDefaults()
+{
+    HarnessTraits t;
+    t.id = QStringLiteral("codex");
+    t.displayName = QStringLiteral("Codex CLI");
+    t.badge = QStringLiteral("Codex");
+    t.fork = true;
+    t.modelPicker = QStringLiteral("discovered");
+    return t;
+}
+
 HarnessTraits fromJson(const QJsonObject &o)
 {
     HarnessTraits t;
@@ -151,6 +175,7 @@ HarnessTraits fromJson(const QJsonObject &o)
     t.coldCompact = o.value(QStringLiteral("coldCompact")).toBool();
     t.promote = o.value(QStringLiteral("promote")).toBool();
     t.providerRouting = o.value(QStringLiteral("providerRouting")).toBool();
+    t.providerRegistry = o.value(QStringLiteral("providerRegistry")).toBool();
     t.cowork = o.value(QStringLiteral("cowork")).toBool();
     t.effortLive = o.value(QStringLiteral("effortLive")).toBool();
     t.usageReporting = o.value(QStringLiteral("usageReporting")).toBool();
@@ -234,9 +259,11 @@ HarnessRegistry::HarnessRegistry()
 {
     const HarnessTraits claude = claudeDefaults();
     const HarnessTraits kimi = kimiDefaults();
+    const HarnessTraits codex = codexDefaults();
     m_traits.insert(claude.id, claude);
     m_traits.insert(kimi.id, kimi);
-    m_order = {claude.id, kimi.id};
+    m_traits.insert(codex.id, codex);
+    m_order = {claude.id, kimi.id, codex.id};
 }
 
 void HarnessRegistry::fetch(CoreClient *core)

@@ -170,11 +170,17 @@ func serveIPC(t *testing.T, srv *ipc.Server, sock string) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	go func() { _ = srv.Serve(ctx) }()
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(ctx) }()
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		if _, err := os.Stat(sock); err == nil {
 			return
+		}
+		select {
+		case err := <-serveErr:
+			t.Fatalf("server failed before its socket appeared: %v", err)
+		default:
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("server socket never appeared")

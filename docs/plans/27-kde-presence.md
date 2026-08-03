@@ -1,6 +1,6 @@
 # 27 — KDE presence: one action model, a tray item, and global shortcuts
 
-**Status: PHASE 1 LANDED; PHASES 2–4 PLANNED.** Covers IDEAS #12 (system tray +
+**Status: PHASE 1 LANDED; PHASES 2–4 IMPLEMENTED, AWAITING FULL UI GATE.** Covers IDEAS #12 (system tray +
 close-to-tray) and #13 (global shortcuts), plus the KActionCollection / KXmlGui
 refactor #13 depends on and the whole program benefits from. Program context:
 [20-approved-features-program.md](20-approved-features-program.md).

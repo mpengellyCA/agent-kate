@@ -114,6 +114,16 @@ var uiOnlyHandlers = map[string]map[string]any{
 	"skills.install":           {"name": "", "target": ""},
 	"skills.uninstall":         {"name": "", "target": ""},
 	"skills.create":            {"name": "", "description": ""},
+	// Plugin metadata and all plugin mutations expose or change the user's
+	// Claude configuration, so the extension catalogue is UI-only too.
+	"extensions.list":           {},
+	"extensions.components":     {"name": ""},
+	"extensions.install":        {"name": ""},
+	"extensions.uninstall":      {"name": ""},
+	"extensions.enable":         {"name": ""},
+	"extensions.disable":        {"name": ""},
+	"extensions.marketplaces":   {},
+	"extensions.addMarketplace": {"source": ""},
 	// Pass 3 — the equivalents F34/F36 gated one verb of and left open in
 	// another. Each is UI-only by grep and by data class; see the SECURITY
 	// comments at their registrations.
