@@ -20,11 +20,13 @@
 #include "AgentPanel.h"
 #include "AgentCardDelegate.h"
 #include "AgentChatHelpers.h"
+#include "TranscriptDelegate.h"
 #include "TranscriptModel.h"
 #include "NewAgentDialog.h" // IsolationCopy — the shared isolation wording
 #include "ipc/CoreClient.h"
 #include "state/DraftStore.h"
 #include "state/RateLimitState.h"
+#include "state/ChatAppearance.h"
 
 #include <QAbstractItemModel>
 #include <QComboBox>
@@ -32,10 +34,13 @@
 #include <QJsonArray>
 #include <QLabel>
 #include <QListView>
+#include <QListWidget>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QScrollBar>
 #include <QStandardPaths>
+#include <QTextBrowser>
+#include <QToolButton>
 #include <QtTest>
 
 #include <KConfigGroup>
@@ -93,6 +98,26 @@ QAbstractItemModel *feedModel(QWidget *panel)
     return nullptr;
 }
 
+QListView *feedView(QWidget *panel)
+{
+    const auto views = panel->findChildren<QListView *>();
+    for (QListView *view : views) {
+        if (view->model()) {
+            return view;
+        }
+    }
+    return nullptr;
+}
+
+QJsonObject assistantTextEvent(const QString &text)
+{
+    const QJsonObject block{{QStringLiteral("type"), QStringLiteral("text")},
+                            {QStringLiteral("text"), text}};
+    return QJsonObject{{QStringLiteral("type"), QStringLiteral("assistant")},
+                       {QStringLiteral("message"),
+                        QJsonObject{{QStringLiteral("content"), QJsonArray{block}}}}};
+}
+
 int feedRowCount(QWidget *panel)
 {
     QAbstractItemModel *m = feedModel(panel);
@@ -140,6 +165,9 @@ private Q_SLOTS:
     void dormantQuickAskPreservesWhitespaceDraftWhenSendFails();
     void toolRouterDiagnosticsNameTheirSourceAndTool();
     void composerGrowsToItsCapInsideTheComposerSurface();
+    void slashPopupTracksComposerHeight();
+    void detachedTranscriptMarksUnreadAndJumpsToLatest();
+    void selectionOverlayUsesFreshGeometryAfterAppearanceChange();
 };
 
 void AgentPanelTest::initTestCase()
@@ -445,6 +473,152 @@ void AgentPanelTest::composerGrowsToItsCapInsideTheComposerSurface()
              qPrintable(QStringLiteral("composer exceeded its seven-line cap: %1 > %2")
                             .arg(composer->height()).arg(cap)));
     QVERIFY(composer->verticalScrollBar()->maximum() > 0);
+}
+
+void AgentPanelTest::slashPopupTracksComposerHeight()
+{
+    CoreClient core;
+    AgentPanel panel(&core);
+    panel.setWorkspace(QStringLiteral("/tmp/agentkate-slash-placement-test"));
+    panel.setDormant(QStringLiteral("t-one"), QStringLiteral("one"), false,
+                     QStringLiteral("kimi"));
+    panel.resize(250, 520);
+    panel.show();
+    QCoreApplication::processEvents();
+
+    const QString command(50, QLatin1Char('a'));
+    panel.onNotification(QStringLiteral("agent.event"), threadEvent(QJsonObject{
+        {QStringLiteral("type"), QStringLiteral("_commands")},
+        {QStringLiteral("commands"), QJsonArray{QJsonObject{
+            {QStringLiteral("name"), command},
+            {QStringLiteral("description"), QStringLiteral("Long command")}}}},
+    }));
+    auto *composer = panel.findChild<QPlainTextEdit *>(QStringLiteral("composerInput"));
+    auto *popup = panel.findChild<QListWidget *>();
+    QVERIFY(composer != nullptr);
+    QVERIFY(popup != nullptr);
+    const int initialHeight = composer->height();
+
+    composer->setPlainText(QStringLiteral("/") + command);
+    QTRY_VERIFY(popup->isVisible());
+    // The auto-grow cap itself is exercised above with real multi-line prose.
+    // Slash completion permits no spaces or newlines, and QPlainTextEdit does
+    // not wrap a single unbroken command token on every platform. Change the
+    // input's real geometry here, then re-trigger popup placement through the
+    // normal text-changed path.
+    composer->setFixedHeight(initialHeight + composer->fontMetrics().lineSpacing());
+    composer->setPlainText(QStringLiteral("/") + command.left(command.size() - 1));
+    composer->setPlainText(QStringLiteral("/") + command);
+    QTRY_COMPARE(composer->height(), initialHeight + composer->fontMetrics().lineSpacing());
+    const QPoint composerTop = composer->mapTo(&panel, QPoint(0, 0));
+    QCOMPARE(popup->width(), composer->width());
+    QVERIFY2(popup->geometry().bottom() < composerTop.y(),
+             "slash popup must stay above the composer after it grows");
+}
+
+void AgentPanelTest::detachedTranscriptMarksUnreadAndJumpsToLatest()
+{
+    CoreClient core;
+    AgentPanel panel(&core);
+    panel.setWorkspace(QStringLiteral("/tmp/agentkate-unread-test"));
+    panel.setDormant(QStringLiteral("t-one"), QStringLiteral("one"), false,
+                     QStringLiteral("claude"));
+    panel.resize(560, 420);
+    panel.show();
+
+    // Enough short real events to make the virtual feed scrollable.
+    QJsonArray events;
+    for (int i = 0; i < 40; ++i) {
+        events.append(assistantTextEvent(QStringLiteral("A useful transcript line %1.").arg(i)));
+    }
+    panel.onNotification(QStringLiteral("agent.event"), QJsonObject{
+        {QStringLiteral("threadId"), QStringLiteral("t-one")},
+        {QStringLiteral("events"), events},
+    });
+    QCoreApplication::processEvents();
+
+    auto *view = feedView(&panel);
+    QVERIFY(view != nullptr);
+    QScrollBar *bar = view->verticalScrollBar();
+    QVERIFY(bar->maximum() > 48);
+    bar->setValue(0);
+    QCoreApplication::processEvents();
+
+    panel.onNotification(QStringLiteral("agent.event"),
+                         threadEvent(assistantTextEvent(QStringLiteral("Unread reply."))));
+    QToolButton *jump = nullptr;
+    for (QToolButton *candidate : panel.findChildren<QToolButton *>()) {
+        if (candidate->accessibleName().startsWith(QStringLiteral("Jump to latest"))) {
+            jump = candidate;
+            break;
+        }
+    }
+    QVERIFY(jump != nullptr);
+    QTRY_VERIFY(jump->isVisible());
+    QVERIFY(jump->accessibleName().contains(QStringLiteral("new messages")));
+    QCOMPARE(jump->text(), QStringLiteral("•"));
+
+    QTest::mouseClick(jump, Qt::LeftButton);
+    QTRY_COMPARE(bar->value(), bar->maximum());
+    QCOMPARE(jump->accessibleName(), QStringLiteral("Jump to latest"));
+}
+
+void AgentPanelTest::selectionOverlayUsesFreshGeometryAfterAppearanceChange()
+{
+    CoreClient core;
+    AgentPanel panel(&core);
+    panel.setWorkspace(QStringLiteral("/tmp/agentkate-overlay-appearance-test"));
+    panel.setDormant(QStringLiteral("t-one"), QStringLiteral("one"), false,
+                     QStringLiteral("claude"));
+    panel.resize(620, 460);
+    panel.show();
+    panel.onNotification(QStringLiteral("agent.event"),
+                         threadEvent(assistantTextEvent(QStringLiteral(
+                             "A selectable reply with enough prose to read."))));
+    QCoreApplication::processEvents();
+
+    auto *view = feedView(&panel);
+    QVERIFY(view != nullptr);
+    auto *delegate = qobject_cast<TranscriptDelegate *>(view->itemDelegate());
+    QVERIFY(delegate != nullptr);
+    QModelIndex index;
+    for (int row = 0; row < view->model()->rowCount(); ++row) {
+        const QModelIndex candidate = view->model()->index(row, 0);
+        if (candidate.data(TranscriptModel::KindRole).toInt() == TranscriptModel::Message) {
+            index = candidate;
+            break;
+        }
+    }
+    QVERIFY(index.isValid());
+    QTRY_VERIFY(view->visualRect(index).isValid());
+    QStyleOptionViewItem opt;
+    opt.initFrom(view);
+    opt.font = view->font();
+    opt.rect = view->visualRect(index);
+    const QRect body = delegate->messageBodyRect(opt.rect, opt, index);
+    QVERIFY(body.isValid());
+    QTest::mouseClick(view->viewport(), Qt::LeftButton, Qt::NoModifier, body.center());
+    QTRY_VERIFY(!panel.findChildren<QTextBrowser *>().isEmpty());
+
+    auto *appearance = ChatAppearance::instance();
+    const auto oldDensity = appearance->density();
+    const int oldScale = appearance->textScale();
+    appearance->set(oldDensity == ChatAppearance::Density::Spacious
+                        ? ChatAppearance::Density::Comfortable
+                        : ChatAppearance::Density::Spacious,
+                    oldScale == 1 ? 0 : 1, false);
+    QTRY_VERIFY(panel.findChildren<QTextBrowser *>().isEmpty());
+
+    opt.initFrom(view);
+    opt.font = view->font();
+    opt.rect = view->visualRect(index);
+    const QRect freshBody = delegate->messageBodyRect(opt.rect, opt, index);
+    QTest::mouseClick(view->viewport(), Qt::LeftButton, Qt::NoModifier, freshBody.center());
+    QTRY_VERIFY(!panel.findChildren<QTextBrowser *>().isEmpty());
+    const auto overlays = panel.findChildren<QTextBrowser *>();
+    QCOMPARE(overlays.constFirst()->geometry(), freshBody);
+
+    appearance->set(oldDensity, oldScale, false);
 }
 
 // Codex reports client-tool failures on its stderr tracing channel. This is a

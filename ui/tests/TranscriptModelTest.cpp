@@ -21,6 +21,7 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QListView>
+#include <QMouseEvent>
 #include <QPainter>
 #include <QSignalSpy>
 #include <QStyleOptionViewItem>
@@ -29,6 +30,19 @@
 #include <QtTest>
 
 #include <KSharedConfig>
+
+namespace {
+
+// editorEvent is the delegate's real mouse-routing seam. Exposing it only to
+// this offscreen fixture proves an attachment tile uses the same geometry for
+// painting and activation without adding a production-only test hook.
+class TestTranscriptDelegate : public TranscriptDelegate
+{
+public:
+    using TranscriptDelegate::editorEvent;
+};
+
+} // namespace
 
 class TranscriptModelTest : public QObject
 {
@@ -39,6 +53,7 @@ private Q_SLOTS:
     void messageRunsAreSemanticAndBoundedByEvents();
     void semanticMessagesUseChatNativeGeometry();
     void transcriptDocumentUsesConfiguredTypography();
+    void attachmentTilesUseTheirPaintGeometryForHitTesting();
     void toolResultMutatesInPlace();
     void terminalControlsAreRemovedFromHarnessDiagnostics();
     void toolsVisibilityToggles();
@@ -50,6 +65,7 @@ private Q_SLOTS:
     void heightCacheInvalidatesOnMutation();
     void stableIdSurvivesInPlaceUpdates();
     void evictionBoundsRamAndKeysResolve();
+    void longMixedTranscriptKeepsCachesBoundedAndResizeLazy();
     void attachmentsRoleRoundTrips();
     void thinkingRowExpands();
     void checklistUpdatesInPlace();
@@ -361,13 +377,18 @@ void TranscriptModelTest::accessibleTextSpeaksEveryRowKind()
     const int msg = m.appendMessage(TranscriptModel::Speaker::Agent,
                                     QStringLiteral("<p>the fix is in</p>"),
                                     QStringLiteral("the fix is in"), false, QString());
+    const int user = m.appendMessage(
+        TranscriptModel::Speaker::User, QStringLiteral("<p>here is the file</p>"),
+        QStringLiteral("here is the file"), false, QString(),
+        QJsonArray{QJsonObject{{QStringLiteral("name"), QStringLiteral("report.pdf")},
+                               {QStringLiteral("kind"), QStringLiteral("file")}}});
     const int note = m.appendNote(
         QStringLiteral("&#128274; rate limit reached &mdash; resets at 15:04"),
         QStringLiteral("err"));
     const int tool = m.appendTool(QStringLiteral("Bash"), QStringLiteral("pytest tests/"),
                                   QStringLiteral("{\"command\":\"pytest tests/\"}"), true);
     m.setToolResult(tool, QStringLiteral("2 passed"),
-                    QString(100000, QLatin1Char('X')), true);
+                    QString(100000, QLatin1Char('X')), true, true);
     const int think = m.appendThinking(QStringLiteral("<p>maybe the venv</p>"),
                                        QStringLiteral("maybe the venv is stale"),
                                        QStringLiteral("maybe the venv"));
@@ -383,19 +404,24 @@ void TranscriptModelTest::accessibleTextSpeaksEveryRowKind()
     QVERIFY(spoken(msg).contains(QStringLiteral("Agent Kate")));
     QVERIFY(spoken(msg).contains(QStringLiteral("the fix is in")));
     QVERIFY(!spoken(msg).contains(QStringLiteral("<p>")));
+    QVERIFY(spoken(user).contains(QStringLiteral("You")));
+    QVERIFY(spoken(user).contains(QStringLiteral("report.pdf")));
     // A note speaks its recovered plain words, entities unescaped.
     QVERIFY(spoken(note).contains(QStringLiteral("resets at 15:04")));
     QVERIFY(spoken(note).contains(QStringLiteral("—")));
+    QVERIFY(spoken(note).startsWith(QStringLiteral("Error:")));
     // A tool row speaks name, summary and the SHOWN result — and must not drag
     // the retained full result through the accessibility layer.
     QVERIFY(spoken(tool).contains(QStringLiteral("Bash")));
     QVERIFY(spoken(tool).contains(QStringLiteral("pytest tests/")));
     QVERIFY(spoken(tool).contains(QStringLiteral("2 passed")));
+    QVERIFY(spoken(tool).contains(QStringLiteral("Failed")));
     QVERIFY(spoken(tool).size() < 1000);
     // Thinking speaks its preview plus body; a checklist speaks its items.
     QVERIFY(spoken(think).contains(QStringLiteral("venv is stale")));
     QVERIFY(spoken(list).contains(QStringLiteral("write the test")));
     QVERIFY(spoken(list).contains(QStringLiteral("in_progress")));
+    QVERIFY(spoken(list).contains(QStringLiteral("Plan: 0 of 1 complete")));
 }
 
 // Audit F58. Find used to call searchText(row) for every row on every
@@ -762,6 +788,46 @@ void TranscriptModelTest::transcriptDocumentUsesConfiguredTypography()
     QVERIFY(css.contains(QStringLiteral("table")));
 }
 
+// A typed attachment is a direct object in the conversation, not decoration:
+// its painted rectangle must be the click target. This deliberately routes a
+// real mouse release through editorEvent rather than checking a duplicate
+// layout calculation in the test.
+void TranscriptModelTest::attachmentTilesUseTheirPaintGeometryForHitTesting()
+{
+    TranscriptModel m;
+    const QJsonArray attachments{
+        QJsonObject{{QStringLiteral("name"), QStringLiteral("screen.png")},
+                    {QStringLiteral("kind"), QStringLiteral("image")},
+                    {QStringLiteral("mediaType"), QStringLiteral("image/png")}},
+        QJsonObject{{QStringLiteral("name"), QStringLiteral("notes.md")},
+                    {QStringLiteral("kind"), QStringLiteral("text")},
+                    {QStringLiteral("mediaType"), QStringLiteral("text/markdown")}},
+    };
+    m.appendMessage(TranscriptModel::Speaker::User, QStringLiteral("Files attached"),
+                    QStringLiteral("Files attached"), false, QStringLiteral("10:00"),
+                    attachments);
+
+    TestTranscriptDelegate d;
+    QStyleOptionViewItem opt;
+    opt.font = QFont();
+    opt.palette = QPalette();
+    opt.rect = QRect(0, 0, 620, d.sizeHint(opt, m.index(0)).height());
+    const QList<QRect> tiles = d.attachmentRects(opt.rect, opt, m.index(0));
+    QCOMPARE(tiles.size(), 2);
+    QVERIFY(!tiles.at(0).intersects(tiles.at(1)));
+
+    QSignalSpy activated(&d, &TranscriptDelegate::attachmentActivated);
+    const QPoint clickAt = tiles.at(1).center();
+    const QPointF point(clickAt);
+    QMouseEvent release(QEvent::MouseButtonRelease, point, point, point, Qt::LeftButton,
+                        Qt::LeftButton, Qt::NoModifier);
+    QVERIFY(d.editorEvent(&release, &m, opt, m.index(0)));
+    QCOMPARE(activated.count(), 1);
+    QCOMPARE(activated.takeFirst().at(0).toJsonObject().value(QStringLiteral("name"))
+                 .toString(),
+             QStringLiteral("notes.md"));
+}
+
 void TranscriptModelTest::toolResultMutatesInPlace()
 {
     TranscriptModel m;
@@ -1059,6 +1125,94 @@ void TranscriptModelTest::evictionBoundsRamAndKeysResolve()
     QCOMPARE(m.data(m.index(liveRow), TranscriptModel::ToolResultRole).toString(),
              QStringLiteral("done"));
     QVERIFY(m.data(m.index(liveRow), TranscriptModel::ToolDoneRole).toBool());
+}
+
+// Phase 5's deterministic offscreen long-chat fixture. It is intentionally a
+// mixed transcript so all three document caches are exercised. Timing is not a
+// CI assertion: the durable contract is bounded storage and resize returning
+// old cached estimates until the caller measures only its visible overscan.
+void TranscriptModelTest::longMixedTranscriptKeepsCachesBoundedAndResizeLazy()
+{
+    TranscriptModel m;
+    constexpr int kRows = 5000;
+    for (int i = 0; i < kRows; ++i) {
+        switch (i % 5) {
+        case 0:
+            m.appendMessage(TranscriptModel::Speaker::Agent,
+                            QStringLiteral("Agent reply %1 with readable prose.").arg(i),
+                            QStringLiteral("Agent reply %1 with readable prose.").arg(i),
+                            false, QString());
+            break;
+        case 1:
+            m.appendMessage(TranscriptModel::Speaker::User,
+                            QStringLiteral("User reply %1.").arg(i),
+                            QStringLiteral("User reply %1.").arg(i), false, QString());
+            break;
+        case 2: {
+            const int tool = m.appendTool(QStringLiteral("Read"),
+                                          QStringLiteral("source-%1.cpp").arg(i),
+                                          QStringLiteral("{\"path\":\"source-%1.cpp\"}").arg(i),
+                                          true);
+            m.setToolResult(tool, QStringLiteral("read %1 lines").arg(i),
+                            QStringLiteral("read %1 lines").arg(i), false);
+            m.setExpanded(tool, true);
+            break;
+        }
+        case 3: {
+            const int thinking = m.appendThinking(QStringLiteral("<p>Checking %1</p>").arg(i),
+                                                  QStringLiteral("Checking %1").arg(i),
+                                                  QStringLiteral("Checking %1").arg(i));
+            m.setExpanded(thinking, true);
+            break;
+        }
+        default:
+            m.appendNote(QStringLiteral("Lifecycle note %1").arg(i), QStringLiteral("dim"));
+            break;
+        }
+    }
+    QCOMPARE(m.rowCount(), kRows);
+
+    TranscriptDelegate d;
+    QStyleOptionViewItem opt;
+    opt.font = QFont();
+    opt.palette = QPalette();
+    opt.rect = QRect(0, 0, 720, 0);
+    for (int row = 0; row < m.rowCount(); ++row) {
+        QVERIFY(d.sizeHint(opt, m.index(row)).height() > 0);
+    }
+    const auto filled = d.cacheStats();
+    QCOMPARE(filled.heights, kRows);
+    QVERIFY2(filled.bodyDocuments <= 32, "body document cache must remain bounded");
+    QVERIFY2(filled.detailDocuments <= 32, "tool detail cache must remain bounded");
+    QVERIFY2(filled.resultDocuments <= 32, "tool result cache must remain bounded");
+
+    // An interactive width change may visit the whole model, but every visit is
+    // an old-height lookup. It must not rebuild a document before the settle
+    // pass selects viewport rows for exact measurement.
+    const int sampleRow = 2500;
+    QTextDocument *sample = d.bodyDoc(m.index(sampleRow), 600, opt);
+    const int sampleRevision = sample->revision();
+    const auto beforeResize = d.cacheStats();
+    opt.rect.setWidth(360);
+    for (int row = 0; row < m.rowCount(); ++row) {
+        QVERIFY(d.sizeHint(opt, m.index(row)).height() > 0);
+    }
+    QVERIFY(d.hasStaleHeights());
+    const auto estimated = d.cacheStats();
+    QCOMPARE(estimated.bodyDocuments, beforeResize.bodyDocuments);
+    QCOMPARE(estimated.detailDocuments, beforeResize.detailDocuments);
+    QCOMPARE(estimated.resultDocuments, beforeResize.resultDocuments);
+    QCOMPARE(d.bodyDoc(m.index(sampleRow), 600, opt)->revision(), sampleRevision);
+
+    // Simulate the viewport plus a small overscan window. Exact work is bounded
+    // by that window, not by the five thousand rows above.
+    const int firstVisible = 2488;
+    constexpr int kVisibleWithOverscan = 28;
+    const int exactBefore = d.cacheStats().exactMeasures;
+    for (int row = firstVisible; row < firstVisible + kVisibleWithOverscan; ++row) {
+        QVERIFY(d.measureExact(m.index(row), opt.rect.width(), opt) > 0);
+    }
+    QCOMPARE(d.cacheStats().exactMeasures - exactBefore, kVisibleWithOverscan);
 }
 
 // A You message can carry compact attachment metadata (plan 13 phase 4). It must

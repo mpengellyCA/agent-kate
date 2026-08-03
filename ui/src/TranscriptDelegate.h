@@ -122,6 +122,26 @@ public:
     QRect messageBodyRect(const QRect &row, const QStyleOptionViewItem &opt,
                           const QModelIndex &idx) const;
 
+    // Typed attachment tiles are painted and hit-tested from these exact
+    // rectangles. Keeping this query public lets the offscreen regression
+    // fixture exercise the actual click targets rather than duplicating their
+    // geometry in a test.
+    QList<QRect> attachmentRects(const QRect &row, const QStyleOptionViewItem &opt,
+                                 const QModelIndex &idx) const;
+
+    // Lightweight cache observations for the deterministic transcript fixture.
+    // These expose counts only: cache ownership and eviction remain private.
+    struct CacheStats {
+        int heights = 0;
+        int bodyDocuments = 0;
+        int detailDocuments = 0;
+        int resultDocuments = 0;
+        int highlights = 0;
+        int attachments = 0;
+        int exactMeasures = 0;
+    };
+    CacheStats cacheStats() const;
+
     // --- in-place selectable overlay (plan 13 phase 1) -------------------
     // A Message row's body can be covered by a frameless read-only QTextBrowser
     // so the user can select and copy an arbitrary substring. The browser reuses
@@ -183,6 +203,7 @@ private:
     // resize settles (measureExact), making steady-state cost O(visible rows).
     mutable QHash<quintptr, CacheEntry> m_heightCache;
     mutable bool m_dirtyResize = false;
+    mutable int m_exactMeasureCount = 0;
 
     // One row's laid-out body document, kept so measure and paint share a single
     // layout. `html` and `width` are what it was laid out for: a mismatch means
@@ -266,9 +287,6 @@ private:
     QRect toolCopyRect(const QRect &row, const QStyleOptionViewItem &opt) const;
     // The "open in inspector" glyph sits immediately left of the copy glyph.
     QRect toolInspectRect(const QRect &row, const QStyleOptionViewItem &opt) const;
-
-    QList<QRect> attachmentRects(const QRect &row, const QStyleOptionViewItem &opt,
-                                 const QModelIndex &idx) const;
 
     // The same durable attachment tile geometry is used below a message and a
     // tool result. Keeping the tool variant private avoids expanding the

@@ -1298,8 +1298,8 @@ int TranscriptDelegate::measureExact(const QModelIndex &idx, int width,
 
 TranscriptDelegate::CacheStats TranscriptDelegate::cacheStats() const
 {
-    return {m_heightCache.size(), m_docCache.size(), m_detailCache.size(),
-            m_resultCache.size(), m_highlightCache.size(), m_attCache.size(),
+    return {int(m_heightCache.size()), int(m_docCache.size()), int(m_detailCache.size()),
+            int(m_resultCache.size()), int(m_highlightCache.size()), int(m_attCache.size()),
             m_exactMeasureCount};
 }
 

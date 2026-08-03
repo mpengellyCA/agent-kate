@@ -517,29 +517,53 @@ QVariant TranscriptModel::data(const QModelIndex &idx, int role) const
         // speaks its SHOWN result, not toolFullResult: the full result retains
         // up to 128 KB and is exactly what must not be re-joined per query.
         switch (it.kind) {
-        case Message:
-            return (it.speaker == Speaker::User ? QStringLiteral("You")
-                                                 : QStringLiteral("Agent Kate"))
+        case Message: {
+            QString spoken = (it.speaker == Speaker::User ? QStringLiteral("You")
+                                                           : QStringLiteral("Agent Kate"))
                 + QStringLiteral(": ") + it.plain;
+            QStringList attachmentNames;
+            for (const QJsonValue &value : it.attachments) {
+                const QString name = value.toObject().value(QStringLiteral("name")).toString();
+                if (!name.isEmpty()) {
+                    attachmentNames << name;
+                }
+            }
+            if (!attachmentNames.isEmpty()) {
+                spoken += QStringLiteral("\nAttachments: ")
+                    + attachmentNames.join(QStringLiteral(", "));
+            }
+            return spoken;
+        }
         case Note:
-            return it.plain;
+            return it.noteKind == QLatin1String("err")
+                ? QStringLiteral("Error: ") + it.plain
+                : it.plain;
         case Thinking:
             return it.toolSummary.isEmpty()
                 ? it.plain
                 : it.toolSummary + QLatin1Char('\n') + it.plain;
         case Tool: {
-            QStringList parts{it.toolName, it.toolSummary, it.toolResult};
+            const QString status = it.toolError ? QStringLiteral("Failed")
+                : (it.toolDone ? QStringLiteral("Done") : QStringLiteral("Running"));
+            QStringList parts{it.toolName, status, it.toolSummary, it.toolResult};
             parts.removeAll(QString());
             return parts.join(QLatin1Char('\n'));
         }
         case Checklist: {
+            int completed = 0;
             QStringList parts;
             for (const QJsonValue &v : it.checklist) {
                 const QJsonObject item = v.toObject();
+                if (item.value(QStringLiteral("status")).toString()
+                    == QLatin1String("completed")) {
+                    ++completed;
+                }
                 parts << QStringLiteral("%1 (%2)").arg(
                     item.value(QStringLiteral("content")).toString(),
                     item.value(QStringLiteral("status")).toString());
             }
+            parts.prepend(QStringLiteral("Plan: %1 of %2 complete")
+                              .arg(completed).arg(it.checklist.size()));
             return parts.join(QLatin1Char('\n'));
         }
         }
