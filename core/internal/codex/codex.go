@@ -779,8 +779,149 @@ func (s *Supervisor) pumpStderr(t *Thread, r io.Reader) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 4096), 256*1024)
 	for sc.Scan() {
-		s.emitEvent(t, event(map[string]any{"type": "_stderr", "text": sc.Text()}))
+		s.emitEvent(t, event(codexStderrEvent(sc.Text())))
 	}
+}
+
+// codexStderrEvent turns Codex's terminal-oriented tracing output into a
+// durable transcript diagnostic. In particular, a tool-router failure is a
+// failed tool call, not Agent Kate or Bash output; retaining that distinction
+// lets the UI label it truthfully. Unknown stderr remains visible as a Codex
+// CLI diagnostic rather than being discarded.
+func codexStderrEvent(line string) map[string]any {
+	text := stripTerminalControls(line)
+	ev := map[string]any{
+		"type":     "_stderr",
+		"source":   "Codex CLI",
+		"severity": "error", // stderr retained its historical error treatment
+		"text":     text,
+	}
+	severity, component, message := parseCodexDiagnostic(text)
+	if severity != "" {
+		ev["severity"] = severity
+	}
+	if component != "" {
+		ev["component"] = component
+	}
+	if message != "" {
+		ev["text"] = message
+	}
+	if tool := toolRouterFailure(component, message); tool != "" {
+		ev["tool"] = tool
+		// The tool is already named in the heading, so leave the useful reason
+		// in the body rather than making people read it twice.
+		ev["text"] = strings.TrimSpace(strings.TrimPrefix(message, tool))
+	}
+	return ev
+}
+
+// stripTerminalControls removes the ANSI CSI/OSC sequences Codex's tracing
+// subscriber puts on stderr. It operates on bytes so ordinary UTF-8 passes
+// through unchanged while the C0 controls that have no meaning in a transcript
+// are dropped.
+func stripTerminalControls(text string) string {
+	var clean strings.Builder
+	clean.Grow(len(text))
+	for i := 0; i < len(text); {
+		if text[i] == 0x1b {
+			i++
+			if i == len(text) {
+				break
+			}
+			switch text[i] {
+			case '[': // CSI: parameter/intermediate bytes, then a final byte
+				i++
+				for i < len(text) {
+					c := text[i]
+					i++
+					if c >= 0x40 && c <= 0x7e {
+						break
+					}
+				}
+			case ']': // OSC, terminated by BEL or ST (ESC backslash)
+				i++
+				for i < len(text) {
+					if text[i] == 0x07 {
+						i++
+						break
+					}
+					if text[i] == 0x1b && i+1 < len(text) && text[i+1] == '\\' {
+						i += 2
+						break
+					}
+					i++
+				}
+			default: // two-byte ESC command
+				i++
+			}
+			continue
+		}
+		if text[i] >= 0x20 || text[i] == '\t' {
+			clean.WriteByte(text[i])
+		}
+		i++
+	}
+	return clean.String()
+}
+
+// parseCodexDiagnostic understands both rust-tracing forms Codex has used:
+// "TIME ERROR component: message" and "TIME ERROR [component] message".
+// It intentionally returns empty values for an unfamiliar line, which remains
+// a plainly labelled harness diagnostic instead of being misclassified.
+func parseCodexDiagnostic(text string) (severity, component, message string) {
+	fields := strings.Fields(text)
+	for i, field := range fields {
+		if i > 2 {
+			break
+		}
+		switch strings.ToLower(field) {
+		case "trace", "debug", "info", "warn", "warning", "error":
+			severity = strings.ToLower(field)
+			if severity == "warning" {
+				severity = "warn"
+			}
+			if i+1 >= len(fields) {
+				return severity, "", ""
+			}
+			component = strings.TrimSuffix(fields[i+1], ":")
+			component = strings.Trim(component, "[]")
+			if component == "" {
+				return severity, "", ""
+			}
+			message = strings.TrimSpace(strings.Join(fields[i+2:], " "))
+			message = strings.TrimPrefix(message, "error=")
+			return severity, component, message
+		}
+	}
+	return "", "", ""
+}
+
+func toolRouterFailure(component, message string) string {
+	if !strings.Contains(component, "tools::router") &&
+		!strings.Contains(component, "tools.router") {
+		return ""
+	}
+	words := strings.Fields(message)
+	if len(words) < 2 {
+		return ""
+	}
+	failed := strings.TrimSuffix(words[1], ":") == "failed" ||
+		(len(words) >= 3 && words[1] == "verification" &&
+			strings.TrimSuffix(words[2], ":") == "failed")
+	if !failed || !isToolName(words[0]) {
+		return ""
+	}
+	return words[0]
+}
+
+func isToolName(name string) bool {
+	for i, c := range name {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '-' || (i > 0 && c >= '0' && c <= '9') {
+			continue
+		}
+		return false
+	}
+	return name != ""
 }
 
 func (s *Supervisor) onNotification(t *Thread, method string, raw json.RawMessage) {

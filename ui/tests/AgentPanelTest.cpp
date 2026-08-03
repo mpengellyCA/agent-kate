@@ -135,6 +135,7 @@ private Q_SLOTS:
     void closingInsideTheAutosaveWindowKeepsTheDraft();
     void aDestroyedThreadsDraftIsNotWrittenBackByThePendingTimer();
     void dormantQuickAskPreservesWhitespaceDraftWhenSendFails();
+    void toolRouterDiagnosticsNameTheirSourceAndTool();
 };
 
 void AgentPanelTest::initTestCase()
@@ -403,6 +404,39 @@ void AgentPanelTest::dormantQuickAskPreservesWhitespaceDraftWhenSendFails()
     composer->setPlainText(draft);
     QVERIFY(!panel.quickAsk(QStringLiteral("please check the tests")));
     QCOMPARE(composer->toPlainText(), draft);
+}
+
+// Codex reports client-tool failures on its stderr tracing channel. This is a
+// useful error, but it used to look like an unowned red note (often beside a
+// Bash card) and leaked its ANSI colour bytes literally into the feed. The UI
+// must preserve the reason while saying it came from the Codex tool router.
+void AgentPanelTest::toolRouterDiagnosticsNameTheirSourceAndTool()
+{
+    CoreClient core;
+    AgentPanel panel(&core);
+    panel.setWorkspace(QStringLiteral("/tmp/agentkate-codex-diagnostic-test"));
+    panel.setDormant(QStringLiteral("t-one"), QStringLiteral("one"), false,
+                     QStringLiteral("codex"));
+
+    const int before = feedRowCount(&panel);
+    panel.onNotification(QStringLiteral("agent.event"), threadEvent(QJsonObject{
+        {QStringLiteral("type"), QStringLiteral("_stderr")},
+        {QStringLiteral("source"), QStringLiteral("Codex CLI")},
+        {QStringLiteral("severity"), QStringLiteral("error")},
+        {QStringLiteral("component"), QStringLiteral("codex_core::tools::router")},
+        {QStringLiteral("tool"), QStringLiteral("apply_patch")},
+        {QStringLiteral("text"), QStringLiteral("\x1b[31mverification failed: expected lines moved\x1b[0m")},
+    }));
+
+    QCOMPARE(feedRowCount(&panel), before + 1);
+    const QString said = lastFeedText(&panel);
+    QVERIFY2(said.contains(QStringLiteral("Tool call failed: apply_patch")),
+             qPrintable(said));
+    QVERIFY2(said.contains(QStringLiteral("Reported by Codex CLI")), qPrintable(said));
+    QVERIFY2(said.contains(QStringLiteral("codex_core::tools::router")), qPrintable(said));
+    QVERIFY2(said.contains(QStringLiteral("verification failed: expected lines moved")),
+             qPrintable(said));
+    QVERIFY2(!said.contains(QChar(0x1b)), qPrintable(said));
 }
 
 QTEST_MAIN(AgentPanelTest)

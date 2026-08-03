@@ -47,6 +47,12 @@ QString permPromptSummary(const QString &toolName, const QJsonObject &input,
 // be a bare string or an array of content blocks.
 QString toolResultText(const QJsonValue &content);
 
+// stripTerminalControlSequences removes ANSI colour/control escapes and other
+// non-printing terminal controls from harness diagnostics before they become
+// transcript text. Harness stderr is not markdown or terminal output here;
+// leaving its controls intact makes an otherwise useful error unreadable.
+QString stripTerminalControlSequences(const QString &text);
+
 // toolResultImages pulls base64 image blocks out of a tool_result content
 // value (e.g. a screenshot tool's result), decoded, as (mediaType, bytes)
 // pairs. Text-only results return an empty list.

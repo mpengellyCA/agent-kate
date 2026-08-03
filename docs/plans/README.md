@@ -38,6 +38,7 @@ daily dogfooding. Each item has its own grounded plan file with the relevant
 | 29 | Pass-2 remediation — consent quality, honest labelling, destructive actions, first-run friction (F25–F50) | Core (Go) + UI (C++) | [29-pass2-remediation.md](29-pass2-remediation.md) | M (3 rounds) |
 | 30 | Pass-3 remediation — lifecycle correctness, bounded reads, hot-path scaling (F51–F67, internal audit of the perf/stability/multi-agent refactor) | Core (Go) + UI (C++) | [30-pass3-remediation.md](30-pass3-remediation.md) | M (4 rounds) |
 | 32 | Harness Linkage DTO cutover — versioned descriptors, catalogues and typed setting application | Core (Go) + UI (C++) | [32-harness-linkage-dto.md](32-harness-linkage-dto.md) | XL |
+| 33 | Chat comfort, rhythm & rich content — chat-native message hierarchy, readable density/typesetting, compact tool activity, rich attachments and a scalable composer | UI (C++) | [33-chat-comfort-and-rich-content.md](33-chat-comfort-and-rich-content.md) | L–XL (approval-gated) |
 
 Size key: **S** ≈ <½ day, **M** ≈ 1–2 days, **L** ≈ 3–5 days, **XL** ≈ a release of its own.
 

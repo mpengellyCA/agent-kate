@@ -265,6 +265,52 @@ QString toolResultText(const QJsonValue &content)
     return parts.join(QLatin1Char('\n'));
 }
 
+QString stripTerminalControlSequences(const QString &text)
+{
+    QString clean;
+    clean.reserve(text.size());
+    for (int i = 0; i < text.size();) {
+        const QChar ch = text.at(i);
+        if (ch == QChar(0x1b)) {
+            ++i;
+            if (i >= text.size()) {
+                break;
+            }
+            const QChar introducer = text.at(i++);
+            if (introducer == QLatin1Char('[')) {
+                // CSI: ESC [ parameters intermediates final-byte
+                while (i < text.size()) {
+                    const ushort code = text.at(i++).unicode();
+                    if (code >= 0x40 && code <= 0x7e) {
+                        break;
+                    }
+                }
+            } else if (introducer == QLatin1Char(']')) {
+                // OSC ends at BEL or ST (ESC backslash).
+                while (i < text.size()) {
+                    const QChar osc = text.at(i++);
+                    if (osc == QChar(0x07)) {
+                        break;
+                    }
+                    if (osc == QChar(0x1b) && i < text.size()
+                        && text.at(i) == QLatin1Char('\\')) {
+                        ++i;
+                        break;
+                    }
+                }
+            }
+            // Two-character ESC commands have no payload to retain.
+            continue;
+        }
+        const ushort code = ch.unicode();
+        if (code >= 0x20 || ch == QLatin1Char('\n') || ch == QLatin1Char('\t')) {
+            clean += ch;
+        }
+        ++i;
+    }
+    return clean;
+}
+
 QList<QPair<QString, QByteArray>> toolResultImages(const QJsonValue &content)
 {
     QList<QPair<QString, QByteArray>> out;

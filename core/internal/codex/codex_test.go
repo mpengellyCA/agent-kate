@@ -279,3 +279,33 @@ func TestDiscoverModelsDoesNotCreateAThread(t *testing.T) {
 		t.Fatalf("model discovery registered %d running thread(s)", n)
 	}
 }
+
+// A failed client tool reaches Codex app-server stderr through its Rust tracing
+// subscriber. It is not Bash output and it is not an Agent Kate failure; freeze
+// the translated provenance so the transcript can say exactly that.
+func TestToolRouterStderrIsStructuredAndTerminalCodesAreRemoved(t *testing.T) {
+	var c collected
+	s := &Supervisor{emit: c.add}
+	thread := &Thread{ID: "ak-stderr"}
+	s.pumpStderr(thread, strings.NewReader(
+		"\x1b[2m2026-08-03T16:44:56.107468Z\x1b[0m \x1b[31mERROR\x1b[0m "+
+			"\x1b[2mcodex_core::tools::router\x1b[0m\x1b[2m:\x1b[0m "+
+			"\x1b[3merror\x1b[0m\x1b[2m=\x1b[0mapply_patch verification failed: "+
+			"Failed to find expected lines\n"))
+
+	if !c.contains(t, func(v map[string]any) bool {
+		return v["type"] == "_stderr" &&
+			v["source"] == "Codex CLI" &&
+			v["severity"] == "error" &&
+			v["component"] == "codex_core::tools::router" &&
+			v["tool"] == "apply_patch" &&
+			v["text"] == "verification failed: Failed to find expected lines"
+	}) {
+		t.Fatalf("tool-router stderr was not translated into the expected diagnostic: %#v", c.values)
+	}
+	for _, raw := range c.values {
+		if strings.Contains(string(raw), "\x1b") {
+			t.Fatalf("terminal control escaped into transcript event: %q", raw)
+		}
+	}
+}

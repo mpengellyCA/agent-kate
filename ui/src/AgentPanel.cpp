@@ -669,6 +669,17 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     // The tool card's "open in inspector" glyph opens the full-size modal.
     connect(m_delegate, &TranscriptDelegate::inspectToolRequested, this,
             &AgentPanel::openToolInspector);
+    connect(m_delegate, &TranscriptDelegate::appearanceChanged, this, [this] {
+        closeSelectionOverlay();
+        // QListView may ask every row for its estimate here, but the delegate
+        // deliberately serves cached old heights until the existing settle pass
+        // walks only the visible rows at the new appearance generation.
+        m_view->doItemsLayout();
+        m_view->viewport()->update();
+        if (m_resizeSettle) {
+            m_resizeSettle->start();
+        }
+    });
     // Close the overlay when its row's data changes (streaming/mutation) or the
     // model resets, so a stale editor never lingers over a re-laid-out row.
     connect(m_model, &QAbstractItemModel::dataChanged, this,
@@ -6652,11 +6663,46 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
         refresh();
 
     } else if (type == QLatin1String("_stderr")) {
-        // The CLI's own error channel, rendered in the error colour rather than
-        // dim (audit F50): this is where a failed prompt, a bad flag or a
-        // provider refusal lands, and dim reads as chatter to skip past.
-        addNote(ev.value(QStringLiteral("text")).toString().toHtmlEscaped(),
-                QStringLiteral("err"));
+        // stderr belongs to the harness, not to an assistant message. Codex
+        // adds structured source/tool fields for its own router logs; older
+        // transcripts and the other harnesses retain the clear generic label.
+        // Strip controls here too: it repairs historical logs and protects the
+        // transcript boundary if a harness misses its own sanitisation.
+        const QString detail = agentkate::stripTerminalControlSequences(
+            ev.value(QStringLiteral("text")).toString()).trimmed();
+        if (detail.isEmpty()) {
+            return;
+        }
+        const QString source = ev.value(QStringLiteral("source")).toString().trimmed();
+        const QString component = ev.value(QStringLiteral("component")).toString().trimmed();
+        const QString tool = ev.value(QStringLiteral("tool")).toString().trimmed();
+        const QString severity = ev.value(QStringLiteral("severity")).toString();
+        // Legacy _stderr events have no severity field and were intentionally
+        // red before structured diagnostics existed; preserve that treatment.
+        const bool isError = severity.isEmpty() || severity == QLatin1String("error");
+
+        QString title;
+        if (!tool.isEmpty() && isError) {
+            title = i18n("Tool call failed: %1", tool.toHtmlEscaped());
+        } else if (!source.isEmpty()) {
+            title = i18n("%1 diagnostic", source.toHtmlEscaped());
+        } else {
+            title = i18n("Agent harness diagnostic");
+        }
+        QString origin;
+        if (!source.isEmpty()) {
+            origin = i18n("Reported by %1", source.toHtmlEscaped());
+        }
+        if (!component.isEmpty()) {
+            origin += (origin.isEmpty() ? QString() : QStringLiteral(" · "))
+                      + component.toHtmlEscaped();
+        }
+        QString html = QStringLiteral("<b>%1</b>").arg(title);
+        if (!origin.isEmpty()) {
+            html += QStringLiteral("<br><small>%1</small>").arg(origin);
+        }
+        html += QStringLiteral("<br>%1").arg(detail.toHtmlEscaped());
+        addNote(html, isError ? QStringLiteral("err") : QStringLiteral("sys"));
 
     } else if (type == QLatin1String("_lifecycle")) {
         const QString phase = ev.value(QStringLiteral("phase")).toString();
