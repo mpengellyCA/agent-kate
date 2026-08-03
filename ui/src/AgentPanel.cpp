@@ -274,7 +274,12 @@ public:
         // draft, and ask it to resize only when a line wraps/un-wraps.
         connect(document()->documentLayout(),
                 &QAbstractTextDocumentLayout::documentSizeChanged, this,
-                [this](const QSizeF &) { updateHeightForContents(); });
+                [this](const QSizeF &) { scheduleHeightUpdate(); });
+        // QPlainTextDocumentLayout can defer its new block geometry until the
+        // event loop returns. Queue a single check after edits as well, rather
+        // than assuming its document-size signal will arrive synchronously.
+        connect(this, &QPlainTextEdit::textChanged, this,
+                [this] { scheduleHeightUpdate(); });
     }
 
     void setImageHandler(std::function<bool(const QMimeData *)> handler)
@@ -308,6 +313,18 @@ protected:
     }
 
 private:
+    void scheduleHeightUpdate()
+    {
+        if (m_heightCheckQueued) {
+            return;
+        }
+        m_heightCheckQueued = true;
+        QTimer::singleShot(0, this, [this] {
+            m_heightCheckQueued = false;
+            updateHeightForContents();
+        });
+    }
+
     void updateHeightForContents()
     {
         if (!m_heightHandler) {
@@ -318,10 +335,16 @@ private:
             + contentsMargins().bottom();
         const int minimum = 2 * line + chrome;
         const int maximum = 7 * line + chrome;
-        const int documentHeight = qCeil(document()->documentLayout()
-                                             ->documentSize()
-                                             .height());
-        const int preferred = qBound(minimum, documentHeight + chrome, maximum);
+        const int layoutHeight = qCeil(document()->documentLayout()
+                                           ->documentSize()
+                                           .height());
+        // QPlainTextDocumentLayout may publish a stale document height until
+        // its next layout pass, but a block count is immediately authoritative
+        // for explicit lines. Wrapped visual lines are still covered by the
+        // settled layout height above.
+        const int contentHeight = qMax(layoutHeight,
+                                       document()->blockCount() * line);
+        const int preferred = qBound(minimum, contentHeight + chrome, maximum);
         if (preferred == m_lastPreferredHeight) {
             return;
         }
@@ -332,6 +355,7 @@ private:
     std::function<bool(const QMimeData *)> m_handler;
     std::function<void(int)> m_heightHandler;
     int m_lastPreferredHeight = -1;
+    bool m_heightCheckQueued = false;
 };
 
 // Role carrying a slash command's argument hint on its popup item.
