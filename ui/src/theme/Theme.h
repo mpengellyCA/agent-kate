@@ -7,6 +7,22 @@
 #include <QPalette>
 #include <QString>
 #include <QVector>
+#include <cmath>
+
+inline double akColorContrastRatio(const QColor &foreground, const QColor &background)
+{
+    const auto luminance = [](const QColor &color) {
+        const auto linear = [](qreal channel) {
+            return channel <= 0.04045 ? channel / 12.92
+                                      : std::pow((channel + 0.055) / 1.055, 2.4);
+        };
+        return 0.2126 * linear(color.redF()) + 0.7152 * linear(color.greenF())
+            + 0.0722 * linear(color.blueF());
+    };
+    const double a = luminance(foreground);
+    const double b = luminance(background);
+    return (qMax(a, b) + 0.05) / (qMin(a, b) + 0.05);
+}
 
 // AkColors — the semantic, app-specific colours that QPalette does not cover.
 //
@@ -32,6 +48,17 @@ struct AkColors {
 
     QColor agentRunning; // roster status dot while a turn is in flight
     QColor agentIdle;    // roster status dot when idle / dormant
+
+    // Transcript surfaces. These are semantic tokens, never fixed colours in
+    // the delegate, so a KDE/system palette keeps its own character.
+    QColor chatAssistantSurface;
+    QColor chatUserSurface;
+    QColor chatActivitySurface;
+    QColor chatCodeSurface;
+    QColor chatBorder;
+    QColor chatRail;
+    QColor chatMetadata;
+    QColor chatAttachmentSurface;
 
     QVector<QColor> lanes; // git-graph lane hues (>= 6, stable across scroll)
 

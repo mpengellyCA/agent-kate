@@ -12,9 +12,11 @@
 #include "AgentChatHelpers.h"
 #include "TranscriptDelegate.h"
 #include "TranscriptModel.h"
+#include "state/ChatAppearance.h"
 #include "state/HarnessTraits.h"
 
 #include <QApplication>
+#include <QDir>
 #include <QImage>
 #include <QJsonArray>
 #include <QJsonObject>
@@ -23,19 +25,28 @@
 #include <QSignalSpy>
 #include <QStyleOptionViewItem>
 #include <QTextDocument>
+#include <QStandardPaths>
 #include <QtTest>
+
+#include <KSharedConfig>
 
 class TranscriptModelTest : public QObject
 {
     Q_OBJECT
 private Q_SLOTS:
+    void initTestCase();
     void appendsGrowRowCount();
+    void messageRunsAreSemanticAndBoundedByEvents();
+    void semanticMessagesUseChatNativeGeometry();
+    void transcriptDocumentUsesConfiguredTypography();
     void toolResultMutatesInPlace();
+    void terminalControlsAreRemovedFromHarnessDiagnostics();
     void toolsVisibilityToggles();
     void findStatePropagates();
     void widthChangeEstimatesThenMeasuresExact();
     void sizeHintMeasuresAtViewportWidth();
     void themeChangeRelaysCachedDocuments();
+    void appearanceChangeRelaysCachedDocuments();
     void heightCacheInvalidatesOnMutation();
     void stableIdSurvivesInPlaceUpdates();
     void evictionBoundsRamAndKeysResolve();
@@ -60,6 +71,22 @@ private Q_SLOTS:
     void disconnectedAdviceFollowsTheLadder();
     void emptyStateNamesTheRealIsolation();
 };
+
+void TranscriptModelTest::initTestCase()
+{
+    QStandardPaths::setTestModeEnabled(true);
+    KSharedConfig::setMainConfigName(QDir::tempPath() + QStringLiteral("/transcriptmodel-testrc"));
+}
+
+void TranscriptModelTest::terminalControlsAreRemovedFromHarnessDiagnostics()
+{
+    const QString raw = QString::fromLatin1(
+        "\x1b[2mCodex CLI\x1b[0m: \x1b[31mtool failed\x1b[0m "
+        "\x1b]8;;https://example.invalid" "\x07" "details"
+        "\x1b]8;;" "\x07" "\x01");
+    QCOMPARE(agentkate::stripTerminalControlSequences(raw),
+             QStringLiteral("Codex CLI: tool failed details"));
+}
 
 // Audit F50, round 3. The advice printed when a send is refused has now been
 // wrong in BOTH directions: round 1 said "restart to recover" while the
@@ -279,7 +306,7 @@ void TranscriptModelTest::failedToolLooksDifferentFromASuccessfulOne()
 void TranscriptModelTest::findScansNotesToolsAndThinking()
 {
     TranscriptModel m;
-    const int msg = m.appendMessage(QStringLiteral("You"), QStringLiteral("#888"),
+    const int msg = m.appendMessage(TranscriptModel::Speaker::User,
                                     QStringLiteral("go on then"),
                                     QStringLiteral("go on then"), false, QString());
     // A note as the panel writes them: glyph entity + escaped text.
@@ -330,7 +357,7 @@ void TranscriptModelTest::findScansNotesToolsAndThinking()
 void TranscriptModelTest::accessibleTextSpeaksEveryRowKind()
 {
     TranscriptModel m;
-    const int msg = m.appendMessage(QStringLiteral("Agent Kate"), QStringLiteral("#888"),
+    const int msg = m.appendMessage(TranscriptModel::Speaker::Agent,
                                     QStringLiteral("<p>the fix is in</p>"),
                                     QStringLiteral("the fix is in"), false, QString());
     const int note = m.appendNote(
@@ -414,7 +441,7 @@ void TranscriptModelTest::findKeystrokeTouchesOnlyRowsWhoseMatchChanged()
 {
     TranscriptModel m;
     const auto msg = [&m](const QString &text) {
-        return m.appendMessage(QStringLiteral("Agent Kate"), QStringLiteral("#1a7f6b"),
+        return m.appendMessage(TranscriptModel::Speaker::Agent,
                                text, text, false, QString());
     };
     const int hitA = msg(QStringLiteral("the needle is here"));
@@ -475,8 +502,7 @@ void TranscriptModelTest::findKeystrokeTouchesOnlyRowsWhoseMatchChanged()
 void TranscriptModelTest::findHighlightHtmlIsCachedPerRowAndNeedle()
 {
     TranscriptModel m;
-    const int row = m.appendMessage(QStringLiteral("Agent Kate"),
-                                    QStringLiteral("#1a7f6b"),
+    const int row = m.appendMessage(TranscriptModel::Speaker::Agent,
                                     QStringLiteral("alpha <b>needle</b> beta"),
                                     QStringLiteral("alpha needle beta"), false,
                                     QString());
@@ -621,7 +647,7 @@ void TranscriptModelTest::appendsGrowRowCount()
     TranscriptModel m;
     QCOMPARE(m.rowCount(), 0);
     m.appendNote(QStringLiteral("session started"), QStringLiteral("sys"));
-    m.appendMessage(QStringLiteral("Agent Kate"), QStringLiteral("#1a7f6b"),
+    m.appendMessage(TranscriptModel::Speaker::Agent,
                     QStringLiteral("hello <b>world</b>"), QStringLiteral("hello world"),
                     false, QStringLiteral("10:00"));
     const int tool = m.appendTool(QStringLiteral("Bash"), QStringLiteral("ls -la"),
@@ -636,6 +662,103 @@ void TranscriptModelTest::appendsGrowRowCount()
              QStringLiteral("Bash"));
     // A fresh tool row is not yet done.
     QVERIFY(!m.data(m.index(2), TranscriptModel::ToolDoneRole).toBool());
+}
+
+void TranscriptModelTest::messageRunsAreSemanticAndBoundedByEvents()
+{
+    TranscriptModel m;
+    const int first = m.appendMessage(TranscriptModel::Speaker::Agent,
+                                      QStringLiteral("one"), QStringLiteral("one"),
+                                      false, QString());
+    QSignalSpy changed(&m, &QAbstractItemModel::dataChanged);
+    const int last = m.appendMessage(TranscriptModel::Speaker::Agent,
+                                     QStringLiteral("two"), QStringLiteral("two"),
+                                     false, QString());
+    QCOMPARE(m.data(m.index(first), TranscriptModel::SpeakerRole).toInt(),
+             int(TranscriptModel::Speaker::Agent));
+    QCOMPARE(m.data(m.index(first), TranscriptModel::MessageRunPositionRole).toInt(),
+             int(TranscriptModel::MessageRunPosition::First));
+    QCOMPARE(m.data(m.index(last), TranscriptModel::MessageRunPositionRole).toInt(),
+             int(TranscriptModel::MessageRunPosition::Last));
+    QCOMPARE(changed.count(), 1);
+    QCOMPARE(changed.first().at(0).toModelIndex().row(), first);
+
+    const int third = m.appendMessage(TranscriptModel::Speaker::Agent,
+                                      QStringLiteral("three"), QStringLiteral("three"),
+                                      false, QString());
+    QCOMPARE(m.data(m.index(last), TranscriptModel::MessageRunPositionRole).toInt(),
+             int(TranscriptModel::MessageRunPosition::Middle));
+    QCOMPARE(m.data(m.index(third), TranscriptModel::MessageRunPositionRole).toInt(),
+             int(TranscriptModel::MessageRunPosition::Last));
+
+    m.appendTool(QStringLiteral("Bash"), QStringLiteral("boundary"),
+                 QStringLiteral("{}"), true);
+    const int afterTool = m.appendMessage(TranscriptModel::Speaker::Agent,
+                                          QStringLiteral("three"), QStringLiteral("three"),
+                                          false, QString());
+    QCOMPARE(m.data(m.index(afterTool), TranscriptModel::MessageRunPositionRole).toInt(),
+             int(TranscriptModel::MessageRunPosition::Single));
+    const int user = m.appendMessage(TranscriptModel::Speaker::User,
+                                     QStringLiteral("four"), QStringLiteral("four"),
+                                     false, QString());
+    QCOMPARE(m.data(m.index(user), TranscriptModel::MessageRunPositionRole).toInt(),
+             int(TranscriptModel::MessageRunPosition::Single));
+}
+
+void TranscriptModelTest::semanticMessagesUseChatNativeGeometry()
+{
+    TranscriptModel m;
+    const int agent = m.appendMessage(TranscriptModel::Speaker::Agent,
+                                      QStringLiteral("agent reply"),
+                                      QStringLiteral("agent reply"), false,
+                                      QStringLiteral("10:00"));
+    const int user = m.appendMessage(TranscriptModel::Speaker::User,
+                                     QStringLiteral("user reply"),
+                                     QStringLiteral("user reply"), false,
+                                     QStringLiteral("10:01"));
+    TranscriptDelegate d;
+    QStyleOptionViewItem opt;
+    opt.font = QFont();
+    opt.palette = QPalette();
+    opt.rect = QRect(0, 0, 1200, d.sizeHint(opt, m.index(agent)).height());
+    const QRect agentBubble = d.messageBubbleRect(opt.rect, opt, m.index(agent));
+    QVERIFY(agentBubble.width() <= 820);
+    QCOMPARE(agentBubble.left(), 12);
+
+    opt.rect.setHeight(d.sizeHint(opt, m.index(user)).height());
+    const QRect userBubble = d.messageBubbleRect(opt.rect, opt, m.index(user));
+    QVERIFY(userBubble.width() < agentBubble.width());
+    QCOMPARE(userBubble.right(), 1200 - 12 - 1);
+
+    opt.rect = QRect(0, 0, 400, d.sizeHint(opt, m.index(agent)).height());
+    const QRect narrowAgent = d.messageBubbleRect(opt.rect, opt, m.index(agent));
+    opt.rect.setHeight(d.sizeHint(opt, m.index(user)).height());
+    const QRect narrowUser = d.messageBubbleRect(opt.rect, opt, m.index(user));
+    QCOMPARE(narrowAgent.width(), narrowUser.width());
+    QCOMPARE(narrowAgent.width(), 400 - 24);
+}
+
+void TranscriptModelTest::transcriptDocumentUsesConfiguredTypography()
+{
+    TranscriptModel m;
+    m.appendMessage(TranscriptModel::Speaker::Agent,
+                    QStringLiteral("<h1>Heading</h1><blockquote>quoted</blockquote>"
+                                   "<pre><code>int x;</code></pre>"),
+                    QStringLiteral("Heading quoted int x;"), false, QString());
+    TranscriptDelegate d;
+    QStyleOptionViewItem opt;
+    opt.font = QApplication::font();
+    opt.palette = QPalette();
+    opt.rect = QRect(0, 0, 640, 0);
+    QTextDocument *doc = d.bodyDoc(m.index(0), 600, opt);
+    QVERIFY(doc);
+    const TranscriptMetrics metrics = ChatAppearance::instance()->metrics(
+        opt.font, opt.palette, 640);
+    QCOMPARE(doc->defaultFont(), metrics.bodyFont);
+    const QString css = doc->defaultStyleSheet();
+    QVERIFY(css.contains(QStringLiteral("blockquote")));
+    QVERIFY(css.contains(QStringLiteral("pre")));
+    QVERIFY(css.contains(QStringLiteral("table")));
 }
 
 void TranscriptModelTest::toolResultMutatesInPlace()
@@ -659,7 +782,7 @@ void TranscriptModelTest::toolResultMutatesInPlace()
 void TranscriptModelTest::toolsVisibilityToggles()
 {
     TranscriptModel m;
-    m.appendMessage(QStringLiteral("You"), QStringLiteral("#888"),
+    m.appendMessage(TranscriptModel::Speaker::User,
                     QStringLiteral("hi"), QStringLiteral("hi"), false, QString());
     const int t = m.appendTool(QStringLiteral("Bash"), QStringLiteral("x"),
                                QStringLiteral("{}"), true);
@@ -672,7 +795,7 @@ void TranscriptModelTest::toolsVisibilityToggles()
 void TranscriptModelTest::findStatePropagates()
 {
     TranscriptModel m;
-    m.appendMessage(QStringLiteral("Agent Kate"), QStringLiteral("#1a7f6b"),
+    m.appendMessage(TranscriptModel::Speaker::Agent,
                     QStringLiteral("find the needle here"),
                     QStringLiteral("find the needle here"), false, QString());
     QSignalSpy spy(&m, &QAbstractItemModel::dataChanged);
@@ -690,7 +813,7 @@ void TranscriptModelTest::widthChangeEstimatesThenMeasuresExact()
     for (int i = 0; i < 40; ++i) {
         body += QStringLiteral("word%1 ").arg(i);
     }
-    m.appendMessage(QStringLiteral("Agent Kate"), QStringLiteral("#1a7f6b"), body, body,
+    m.appendMessage(TranscriptModel::Speaker::Agent, body, body,
                     false, QStringLiteral("10:00"));
 
     TranscriptDelegate d;
@@ -738,7 +861,7 @@ void TranscriptModelTest::sizeHintMeasuresAtViewportWidth()
     for (int i = 0; i < 60; ++i) {
         body += QStringLiteral("word%1 ").arg(i);
     }
-    m.appendMessage(QStringLiteral("Agent Kate"), QStringLiteral("#1a7f6b"), body, body,
+    m.appendMessage(TranscriptModel::Speaker::Agent, body, body,
                     false, QStringLiteral("10:00"));
 
     QListView view;
@@ -780,7 +903,7 @@ void TranscriptModelTest::sizeHintMeasuresAtViewportWidth()
 void TranscriptModelTest::themeChangeRelaysCachedDocuments()
 {
     TranscriptModel m;
-    m.appendMessage(QStringLiteral("Agent Kate"), QStringLiteral("#1a7f6b"),
+    m.appendMessage(TranscriptModel::Speaker::Agent,
                     QStringLiteral("hello <b>world</b>"), QStringLiteral("hello world"),
                     false, QStringLiteral("10:00"));
 
@@ -811,6 +934,46 @@ void TranscriptModelTest::themeChangeRelaysCachedDocuments()
              "a theme change must re-lay the cached body document, not repaint it stale");
 }
 
+// Density/type changes share the palette path's cache contract: old height
+// entries remain estimates until the visible-row settle pass, but a body
+// document may never keep the former appearance generation.
+void TranscriptModelTest::appearanceChangeRelaysCachedDocuments()
+{
+    TranscriptModel m;
+    m.appendMessage(TranscriptModel::Speaker::Agent,
+                    QStringLiteral("a readable reply"), QStringLiteral("a readable reply"),
+                    false, QStringLiteral("10:00"));
+    QListView view;
+    TranscriptDelegate d;
+    view.setModel(&m);
+    view.setItemDelegate(&d);
+    view.resize(600, 400);
+
+    QStyleOptionViewItem opt;
+    opt.widget = &view;
+    opt.font = view.font();
+    opt.palette = view.palette();
+    opt.rect = QRect(0, 0, 400, 0);
+    QTextDocument *doc = d.bodyDoc(m.index(0), 360, opt);
+    QVERIFY(doc);
+    const int rev = doc->revision();
+    const int oldHeight = d.sizeHint(opt, m.index(0)).height();
+
+    auto *appearance = ChatAppearance::instance();
+    const auto oldDensity = appearance->density();
+    const int oldScale = appearance->textScale();
+    appearance->set(oldDensity == ChatAppearance::Density::Spacious
+                        ? ChatAppearance::Density::Comfortable
+                        : ChatAppearance::Density::Spacious,
+                    oldScale == 1 ? 0 : 1, false);
+
+    QCOMPARE(d.sizeHint(opt, m.index(0)).height(), oldHeight);
+    QVERIFY(d.hasStaleHeights());
+    QVERIFY2(d.bodyDoc(m.index(0), 360, opt)->revision() > rev,
+             "a chat appearance update must rebuild cached document metrics");
+    appearance->set(oldDensity, oldScale, false);
+}
+
 void TranscriptModelTest::heightCacheInvalidatesOnMutation()
 {
     TranscriptModel m;
@@ -838,8 +1001,7 @@ void TranscriptModelTest::heightCacheInvalidatesOnMutation()
 void TranscriptModelTest::stableIdSurvivesInPlaceUpdates()
 {
     TranscriptModel m;
-    const int key = m.appendMessage(QStringLiteral("Agent Kate"),
-                                    QStringLiteral("#1a7f6b"), QStringLiteral("a"),
+    const int key = m.appendMessage(TranscriptModel::Speaker::Agent, QStringLiteral("a"),
                                     QStringLiteral("a"), false, QString());
     const quintptr id0 =
         m.data(m.index(key), TranscriptModel::StableIdRole).value<quintptr>();
@@ -857,7 +1019,7 @@ void TranscriptModelTest::stableIdSurvivesInPlaceUpdates()
     QCOMPARE(m.data(m.index(key), TranscriptModel::StableIdRole).value<quintptr>(), id0);
 
     // A NEW row still gets a distinct id.
-    const int other = m.appendMessage(QStringLiteral("You"), QStringLiteral("#888"),
+    const int other = m.appendMessage(TranscriptModel::Speaker::User,
                                       QStringLiteral("b"), QStringLiteral("b"), false,
                                       QString());
     QVERIFY(m.data(m.index(other), TranscriptModel::StableIdRole).value<quintptr>() != id0);
@@ -906,7 +1068,7 @@ void TranscriptModelTest::attachmentsRoleRoundTrips()
 {
     TranscriptModel m;
     // A plain message: no attachments.
-    m.appendMessage(QStringLiteral("You"), QStringLiteral("#1a5fb4"),
+    m.appendMessage(TranscriptModel::Speaker::User,
                     QStringLiteral("plain"), QStringLiteral("plain"), false,
                     QStringLiteral("10:00"));
     QVERIFY(m.data(m.index(0), TranscriptModel::AttachmentsRole).toJsonArray().isEmpty());
@@ -920,7 +1082,7 @@ void TranscriptModelTest::attachmentsRoleRoundTrips()
                     {QStringLiteral("kind"), QStringLiteral("text")},
                     {QStringLiteral("path"), QStringLiteral("/tmp/notes.txt")},
                     {QStringLiteral("outside"), true}}};
-    m.appendMessage(QStringLiteral("You"), QStringLiteral("#1a5fb4"),
+    m.appendMessage(TranscriptModel::Speaker::User,
                     QStringLiteral("with files"), QStringLiteral("with files"), false,
                     QStringLiteral("10:01"), atts);
     const QJsonArray got =

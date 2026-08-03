@@ -38,12 +38,18 @@ public:
         Checklist, // the agent's plan / todo list, updated in place
     };
 
+    // Message presentation is semantic. Labels and colours are resolved by the
+    // delegate/theme instead of callers relying on a display-string convention.
+    enum class Speaker { User, Agent };
+    enum class MessageRunPosition { Single, First, Middle, Last };
+
     // Custom roles the delegate reads. Past UserRole to stay clear of Qt's
     // reserved range.
     enum Role {
         KindRole = Qt::UserRole + 1,
-        RoleTextRole,  // "You" / "Agent Kate"
-        AccentRole,    // hex accent for the role label
+        RoleTextRole,  // display label, derived from Speaker for accessibility
+        SpeakerRole,
+        MessageRunPositionRole,
         HtmlRole,      // pre-rendered body / note HTML
         PlainRole,     // raw source for copy + search
         ReplayedRole,  // bool — suppress the live timestamp
@@ -67,8 +73,8 @@ public:
 
     struct Item {
         Kind kind = Note;
-        QString role;
-        QString accentHex;
+        Speaker speaker = Speaker::Agent;
+        MessageRunPosition runPosition = MessageRunPosition::Single;
         QString html;
         QString plain;
         bool replayed = false;
@@ -123,8 +129,8 @@ public:
     // eviction (unlike a row index); hold it to address the row later, e.g. to
     // deliver a tool_result. Numerically equal to the row index until the first
     // eviction.
-    int appendMessage(const QString &role, const QString &accentHex,
-                      const QString &bodyHtml, const QString &plain, bool replayed,
+    int appendMessage(Speaker speaker, const QString &bodyHtml, const QString &plain,
+                      bool replayed,
                       const QString &timestamp,
                       const QJsonArray &attachments = {});
     // A status note. `html` is the rendered line; a plain-text form is derived
@@ -234,6 +240,7 @@ private:
     // Evict oldest rows once the feed grows past kMaxRows, keeping in-RAM size
     // bounded. Called after every append.
     void enforceCap();
+    void normalizeFirstMessageRun();
 
     QList<Item> m_items;
     quintptr m_nextId = 1;

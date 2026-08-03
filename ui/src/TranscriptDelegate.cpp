@@ -5,6 +5,7 @@
 #include "TranscriptModel.h"
 #include "AttachmentBuilder.h"
 #include "SafeContent.h"
+#include "state/ChatAppearance.h"
 #include "theme/ThemeManager.h"
 
 #include <QAbstractItemView>
@@ -216,15 +217,46 @@ QString highlightedHtml(const QString &plain, const QString &needle, bool curren
     return out.replace(QLatin1Char('\n'), QStringLiteral("<br>"));
 }
 
-// The single source of a body document's metrics — font, zero margin, HTML and
-// wrap width. paint()/measure use it through bodyDoc(); the selection
-// overlay (a QTextBrowser) applies the same setup to its own document so the
-// overlay's glyph positions line up with the painted row exactly.
-void configureBodyDoc(QTextDocument *doc, const QFont &font, int contentWidth,
-                      const QString &html)
+QString cssColor(const QColor &color)
 {
-    doc->setDefaultFont(font);
+    return color.name(QColor::HexRgb);
+}
+
+// The single source of transcript typography. Qt supports this subset on its
+// rich-text engine; installing it before setHtml is important because the safe
+// markdown HTML then inherits it both in paint and in the selection overlay.
+void configureTranscriptDocument(QTextDocument *doc, const TranscriptMetrics &metrics,
+                                 const QPalette &palette, int contentWidth,
+                                 const QString &html)
+{
+    const QString family = metrics.bodyFont.family().replace(QLatin1Char('\''),
+                                                               QStringLiteral("\\'"));
+    const QString mono = metrics.codeFont.family().replace(QLatin1Char('\''),
+                                                            QStringLiteral("\\'"));
+    const qreal bodyPt = metrics.bodyFont.pointSizeF();
+    const qreal codePt = metrics.codeFont.pointSizeF();
+    const AkColors &colors = ThemeManager::palette();
+    doc->setDefaultFont(metrics.bodyFont);
     doc->setDocumentMargin(0);
+    doc->setDefaultStyleSheet(QStringLiteral(
+        "body { font-family: '%1'; font-size: %2pt; color: %3; }"
+        "p { margin-top: 0px; margin-bottom: 8px; }"
+        "h1 { font-size: 1.45em; margin: 10px 0px 6px 0px; }"
+        "h2 { font-size: 1.25em; margin: 10px 0px 6px 0px; }"
+        "h3 { font-size: 1.1em; margin: 8px 0px 4px 0px; }"
+        "ul, ol { margin: 4px 0px 8px 20px; }"
+        "li { margin-bottom: 3px; }"
+        "blockquote { margin: 6px 0px; padding-left: 8px; color: %4; }"
+        "code { font-family: '%5'; font-size: %6pt; background-color: %7; }"
+        "pre { font-family: '%5'; font-size: %6pt; background-color: %7;"
+        " padding: 7px; white-space: pre-wrap; }"
+        "table { border-collapse: collapse; margin: 6px 0px; }"
+        "th, td { border: 1px solid %8; padding: 4px; }"
+        "a { color: %9; text-decoration: underline; }")
+        .arg(family, QString::number(bodyPt), cssColor(palette.color(QPalette::Text)),
+             cssColor(colors.chatMetadata), mono, QString::number(codePt),
+             cssColor(colors.chatCodeSurface), cssColor(colors.chatBorder),
+             cssColor(palette.color(QPalette::Link))));
     doc->setHtml(html);
     doc->setTextWidth(contentWidth);
 }
@@ -316,6 +348,14 @@ TranscriptDelegate::TranscriptDelegate(QObject *parent)
     // a system colour-scheme change that never goes through ThemeManager too.
     // Touching ThemeManager::instance() from a constructor would also drag the
     // singleton (and its KColorScheme/config read) into every delegate.
+    connect(ChatAppearance::instance(), &ChatAppearance::changed, this, [this] {
+        // Do not clear m_heightCache: old heights are exactly the cheap estimate
+        // the virtual view needs during its all-row layout pass. The per-entry
+        // appearance generation below makes them stale, then AgentPanel's
+        // existing settle pass measures only the visible rows exactly.
+        m_dirtyResize = true;
+        Q_EMIT appearanceChanged();
+    });
 }
 
 // Watch the view for palette changes. Installed lazily (like bindModel) from the
@@ -414,20 +454,25 @@ QTextDocument *TranscriptDelegate::bodyDoc(const QModelIndex &idx, int contentWi
 {
     const quintptr id = idx.data(TranscriptModel::StableIdRole).value<quintptr>();
     const QString html = resolveBodyHtml(idx);
+    const int appearanceGen = ChatAppearance::instance()->generation();
+    const qreal dpr = opt.widget ? opt.widget->devicePixelRatioF() : 1.0;
+    const TranscriptMetrics metrics = ChatAppearance::instance()->metrics(
+        opt.font, opt.palette, rowMeasureWidth(opt), dpr);
     watchPalette(opt);
     auto it = m_docCache.find(id);
     if (it != m_docCache.end() && it->doc) {
-        if (it->width == contentWidth && it->html == html && it->font == opt.font
-            && it->paletteGen == m_paletteGen) {
+        if (it->width == contentWidth && it->html == html && it->font == metrics.bodyFont
+            && it->paletteGen == m_paletteGen && it->appearanceGen == appearanceGen) {
             return it->doc; // already laid out for exactly this
         }
         // Same row, new content / width / theme: re-set this document rather than
         // allocating another (QTextDocument reuses its internal structures).
-        configureBodyDoc(it->doc, opt.font, contentWidth, html);
+        configureTranscriptDocument(it->doc, metrics, opt.palette, contentWidth, html);
         it->width = contentWidth;
         it->html = html;
-        it->font = opt.font;
+        it->font = metrics.bodyFont;
         it->paletteGen = m_paletteGen;
+        it->appearanceGen = appearanceGen;
         return it->doc;
     }
     if (m_docCache.size() >= kDocCacheCap) {
@@ -437,8 +482,9 @@ QTextDocument *TranscriptDelegate::bodyDoc(const QModelIndex &idx, int contentWi
         m_docCache.clear();
     }
     auto *doc = new agentkate::GuardedTextDocument;
-    configureBodyDoc(doc, opt.font, contentWidth, html);
-    m_docCache.insert(id, DocEntry{contentWidth, html, opt.font, m_paletteGen, doc});
+    configureTranscriptDocument(doc, metrics, opt.palette, contentWidth, html);
+    m_docCache.insert(id, DocEntry{contentWidth, html, metrics.bodyFont, m_paletteGen,
+                                   appearanceGen, doc});
     return doc;
 }
 
@@ -455,6 +501,7 @@ QTextDocument *TranscriptDelegate::toolDoc(const QModelIndex &idx, ToolSlot slot
     QHash<quintptr, DocEntry> &cache =
         slot == ToolSlot::Detail ? m_detailCache : m_resultCache;
     const quintptr id = idx.data(TranscriptModel::StableIdRole).value<quintptr>();
+    const int appearanceGen = ChatAppearance::instance()->generation();
     const auto configure = [&](QTextDocument *doc) {
         doc->setDefaultFont(mono);
         doc->setDocumentMargin(0);
@@ -463,13 +510,15 @@ QTextDocument *TranscriptDelegate::toolDoc(const QModelIndex &idx, ToolSlot slot
     };
     auto it = cache.find(id);
     if (it != cache.end() && it->doc) {
-        if (it->width == contentWidth && it->html == plain && it->font == mono) {
+        if (it->width == contentWidth && it->html == plain && it->font == mono
+            && it->appearanceGen == appearanceGen) {
             return it->doc; // already laid out for exactly this
         }
         configure(it->doc);
         it->width = contentWidth;
         it->html = plain;
         it->font = mono;
+        it->appearanceGen = appearanceGen;
         return it->doc;
     }
     if (cache.size() >= kDocCacheCap) {
@@ -480,7 +529,7 @@ QTextDocument *TranscriptDelegate::toolDoc(const QModelIndex &idx, ToolSlot slot
     }
     auto *doc = new agentkate::GuardedTextDocument;
     configure(doc);
-    cache.insert(id, DocEntry{contentWidth, plain, mono, 0, doc});
+    cache.insert(id, DocEntry{contentWidth, plain, mono, 0, appearanceGen, doc});
     return doc;
 }
 
@@ -636,7 +685,19 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
     }
 
     if (kind == TranscriptModel::Message) {
-        const int innerW = contentWidth - 2 * kCardPadX;
+        const qreal dpr = painter ? painter->device()->devicePixelRatioF()
+                                  : (opt.widget ? opt.widget->devicePixelRatioF() : 1.0);
+        const TranscriptMetrics metrics = ChatAppearance::instance()->metrics(
+            opt.font, opt.palette, width, dpr);
+        const auto speaker = TranscriptModel::Speaker(
+            idx.data(TranscriptModel::SpeakerRole).toInt());
+        const auto position = TranscriptModel::MessageRunPosition(
+            idx.data(TranscriptModel::MessageRunPositionRole).toInt());
+        const bool showHeader = position == TranscriptModel::MessageRunPosition::Single
+            || position == TranscriptModel::MessageRunPosition::First;
+        const int bubbleW = qMax(1, speaker == TranscriptModel::Speaker::User
+            ? metrics.userMaxWidth : metrics.assistantMaxWidth);
+        const int innerW = qMax(1, bubbleW - 2 * metrics.messagePaddingX);
         QTextDocument *doc = self->bodyDoc(idx, qMax(1, innerW), opt);
         const int bodyH = int(doc->size().height());
         // Attachment chip block under the body (You messages with attachments).
@@ -649,49 +710,56 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
         // F18).
         QList<ChipLayout> chips;
         if (!atts.isEmpty()) {
-            chips = layoutAttachmentChips(atts, opt.font, QPoint(0, 0), qMax(1, innerW),
+            chips = layoutAttachmentChips(atts, metrics.bodyFont, QPoint(0, 0), innerW,
                                           chipsH);
         }
-        const int chipsBlock = chipsH > 0 ? kChipGapTop + chipsH : 0;
-        const int total =
-            kCardPadTop + lineH + kRoleRowGap + bodyH + chipsBlock + kCardPadBottom;
+        const int chipsBlock = chipsH > 0 ? metrics.attachmentGap + chipsH : 0;
+        const int headerH = showHeader ? metrics.messageHeaderHeight
+                                       + metrics.messageHeaderGap : 0;
+        const int bubbleH = metrics.messagePaddingY + headerH + bodyH + chipsBlock
+                            + metrics.messagePaddingY;
+        const int gap = position == TranscriptModel::MessageRunPosition::Middle
+                || position == TranscriptModel::MessageRunPosition::First
+            ? metrics.groupedMessageGap : metrics.messageGap;
+        const int total = bubbleH + gap;
         if (painter) {
-            const QRect card(rowRect.left() + contentLeft, rowRect.top(),
-                             contentWidth, total);
+            const QRect card = self->messageBubbleRect(rowRect, opt, idx);
             painter->save();
             painter->setRenderHint(QPainter::Antialiasing, true);
             painter->setPen(Qt::NoPen);
-            painter->setBrush(opt.palette.color(QPalette::AlternateBase));
-            painter->drawRoundedRect(card, 8, 8);
+            painter->setBrush(speaker == TranscriptModel::Speaker::User
+                                  ? ThemeManager::palette().chatUserSurface
+                                  : ThemeManager::palette().chatAssistantSurface);
+            painter->drawRoundedRect(card, metrics.bubbleRadius, metrics.bubbleRadius);
             painter->restore();
 
-            // Role row: accent label left, dim timestamp right.
-            const int rrTop = rowRect.top() + kCardPadTop;
-            const QString role = idx.data(TranscriptModel::RoleTextRole).toString();
-            QFont bold = opt.font;
-            bold.setBold(true);
-            painter->save();
-            painter->setFont(bold);
-            painter->setPen(QColor(idx.data(TranscriptModel::AccentRole).toString()));
-            painter->drawText(QRect(card.left() + kCardPadX, rrTop, innerW, lineH),
-                              Qt::AlignLeft | Qt::AlignVCenter, role);
-            painter->restore();
-            if (!idx.data(TranscriptModel::ReplayedRole).toBool()) {
+            const QRect bodyRect = self->messageBodyRect(rowRect, opt, idx);
+            if (showHeader) {
+                const QRect header = self->messageHeaderRect(rowRect, opt, idx);
+                painter->save();
+                QFont label = metrics.metadataFont;
+                label.setBold(true);
+                painter->setFont(label);
+                painter->setPen(speaker == TranscriptModel::Speaker::User
+                                    ? opt.palette.color(QPalette::Link)
+                                    : ThemeManager::palette().chatMetadata);
+                painter->drawText(header, Qt::AlignLeft | Qt::AlignVCenter,
+                                  idx.data(TranscriptModel::RoleTextRole).toString());
+                painter->restore();
+            }
+            if (showHeader && !idx.data(TranscriptModel::ReplayedRole).toBool()) {
                 const QString ts = idx.data(TranscriptModel::TimestampRole).toString();
                 painter->save();
-                QFont small = opt.font;
-                small.setPointSizeF(opt.font.pointSizeF() * 0.85);
-                painter->setFont(small);
-                painter->setPen(opt.palette.color(QPalette::Mid));
-                painter->drawText(QRect(card.left() + kCardPadX, rrTop, innerW, lineH),
+                painter->setFont(metrics.metadataFont);
+                painter->setPen(ThemeManager::palette().chatMetadata);
+                painter->drawText(self->messageHeaderRect(rowRect, opt, idx),
                                   Qt::AlignRight | Qt::AlignVCenter, ts);
                 painter->restore();
             }
 
             // Body HTML.
-            const int bodyTop = rrTop + lineH + kRoleRowGap;
             painter->save();
-            painter->translate(card.left() + kCardPadX, bodyTop);
+            painter->translate(bodyRect.left(), bodyRect.top());
             QAbstractTextDocumentLayout::PaintContext ctx;
             ctx.palette = opt.palette;
             doc->documentLayout()->draw(painter, ctx);
@@ -700,11 +768,11 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
             // Attachment chips, laid out in the coordinate space of the card so
             // the chip rects here match the hit-test rects in editorEvent().
             if (chipsH > 0) {
-                const QPoint origin(card.left() + kCardPadX,
-                                    bodyTop + bodyH + kChipGapTop);
+                const QPoint origin(bodyRect.left(), bodyRect.bottom() + 1
+                                                    + metrics.attachmentGap);
                 painter->save();
                 painter->setRenderHint(QPainter::Antialiasing, true);
-                QFont chipFont = opt.font;
+                QFont chipFont = metrics.metadataFont;
                 for (int i = 0; i < chips.size(); ++i) {
                     ChipLayout c = chips.at(i);
                     c.rect.translate(origin);
@@ -1081,9 +1149,10 @@ QSize TranscriptDelegate::sizeHint(const QStyleOptionViewItem &opt,
     // cache honest, and this is the first place we see the model.
     bindModel(idx);
     const quintptr id = idx.data(TranscriptModel::StableIdRole).value<quintptr>();
+    const int appearanceGen = ChatAppearance::instance()->generation();
     auto cit = m_heightCache.constFind(id);
     if (cit != m_heightCache.constEnd()) {
-        if (cit->width == width) {
+        if (cit->width == width && cit->appearanceGen == appearanceGen) {
             return QSize(width, cit->height); // exact — width unchanged
         }
         // Width changed: hand back the cached height as an estimate WITHOUT
@@ -1099,7 +1168,7 @@ QSize TranscriptDelegate::sizeHint(const QStyleOptionViewItem &opt,
     if (m_heightCache.size() >= kHeightCacheCap) {
         m_heightCache.clear();
     }
-    m_heightCache.insert(id, CacheEntry{width, h});
+    m_heightCache.insert(id, CacheEntry{width, h, appearanceGen});
     return QSize(width, h);
 }
 
@@ -1111,7 +1180,7 @@ int TranscriptDelegate::measureExact(const QModelIndex &idx, int width,
     if (m_heightCache.size() >= kHeightCacheCap) {
         m_heightCache.clear();
     }
-    m_heightCache.insert(id, CacheEntry{width, h});
+    m_heightCache.insert(id, CacheEntry{width, h, ChatAppearance::instance()->generation()});
     return h;
 }
 
@@ -1152,23 +1221,92 @@ int TranscriptDelegate::attachmentsBlockHeight(const QModelIndex &idx,
     if (atts.isEmpty()) {
         return 0;
     }
+    const TranscriptMetrics metrics = ChatAppearance::instance()->metrics(
+        opt.font, opt.palette, rowMeasureWidth(opt),
+        opt.widget ? opt.widget->devicePixelRatioF() : 1.0);
     int chipsH = 0;
-    layoutAttachmentChips(atts, opt.font, QPoint(0, 0), qMax(1, innerW), chipsH);
-    return chipsH > 0 ? kChipGapTop + chipsH : 0;
+    layoutAttachmentChips(atts, metrics.bodyFont, QPoint(0, 0), qMax(1, innerW), chipsH);
+    return chipsH > 0 ? metrics.attachmentGap + chipsH : 0;
+}
+
+QRect TranscriptDelegate::messageBubbleRect(const QRect &row,
+                                             const QStyleOptionViewItem &opt,
+                                             const QModelIndex &idx) const
+{
+    const TranscriptMetrics metrics = ChatAppearance::instance()->metrics(
+        opt.font, opt.palette, row.width(), opt.widget ? opt.widget->devicePixelRatioF() : 1.0);
+    const auto speaker = TranscriptModel::Speaker(
+        idx.data(TranscriptModel::SpeakerRole).toInt());
+    const auto position = TranscriptModel::MessageRunPosition(
+        idx.data(TranscriptModel::MessageRunPositionRole).toInt());
+    const int gap = position == TranscriptModel::MessageRunPosition::First
+            || position == TranscriptModel::MessageRunPosition::Middle
+        ? metrics.groupedMessageGap : metrics.messageGap;
+    const int bubbleW = qMax(1, speaker == TranscriptModel::Speaker::User
+        ? metrics.userMaxWidth : metrics.assistantMaxWidth);
+    const int left = speaker == TranscriptModel::Speaker::User
+        ? row.right() - metrics.outerInsetX - bubbleW + 1 : row.left() + metrics.outerInsetX;
+    return QRect(left, row.top(), bubbleW, qMax(0, row.height() - gap));
+}
+
+QRect TranscriptDelegate::messageHeaderRect(const QRect &row,
+                                             const QStyleOptionViewItem &opt,
+                                             const QModelIndex &idx) const
+{
+    const auto position = TranscriptModel::MessageRunPosition(
+        idx.data(TranscriptModel::MessageRunPositionRole).toInt());
+    if (position != TranscriptModel::MessageRunPosition::Single
+        && position != TranscriptModel::MessageRunPosition::First) {
+        return {};
+    }
+    const TranscriptMetrics metrics = ChatAppearance::instance()->metrics(
+        opt.font, opt.palette, row.width(), opt.widget ? opt.widget->devicePixelRatioF() : 1.0);
+    const QRect bubble = messageBubbleRect(row, opt, idx);
+    return QRect(bubble.left() + metrics.messagePaddingX,
+                 bubble.top() + metrics.messagePaddingY,
+                 qMax(1, bubble.width() - 2 * metrics.messagePaddingX),
+                 metrics.messageHeaderHeight);
 }
 
 QRect TranscriptDelegate::messageBodyRect(const QRect &row,
                                           const QStyleOptionViewItem &opt,
                                           const QModelIndex &idx) const
 {
-    const int lineH = QFontMetrics(opt.font).height();
-    const int left = row.left() + kOuterMarginX + kCardPadX;
-    const int top = row.top() + kCardPadTop + lineH + kRoleRowGap;
-    const int innerW = row.width() - 2 * kOuterMarginX - 2 * kCardPadX;
+    const TranscriptMetrics metrics = ChatAppearance::instance()->metrics(
+        opt.font, opt.palette, row.width(), opt.widget ? opt.widget->devicePixelRatioF() : 1.0);
+    const QRect bubble = messageBubbleRect(row, opt, idx);
+    const QRect header = messageHeaderRect(row, opt, idx);
+    const int innerW = bubble.width() - 2 * metrics.messagePaddingX;
     const int chipsBlock = attachmentsBlockHeight(idx, opt, innerW);
-    const int bodyH = row.height() - kCardPadTop - lineH - kRoleRowGap
-                      - chipsBlock - kCardPadBottom;
-    return QRect(left, top, qMax(1, innerW), qMax(0, bodyH));
+    const int headerH = header.isEmpty() ? 0 : metrics.messageHeaderHeight
+                                             + metrics.messageHeaderGap;
+    const int bodyH = bubble.height() - 2 * metrics.messagePaddingY - headerH - chipsBlock;
+    return QRect(bubble.left() + metrics.messagePaddingX,
+                 bubble.top() + metrics.messagePaddingY + headerH,
+                 qMax(1, innerW), qMax(0, bodyH));
+}
+
+QList<QRect> TranscriptDelegate::attachmentRects(const QRect &row,
+                                                  const QStyleOptionViewItem &opt,
+                                                  const QModelIndex &idx) const
+{
+    const QJsonArray atts = idx.data(TranscriptModel::AttachmentsRole).toJsonArray();
+    if (atts.isEmpty()) {
+        return {};
+    }
+    const TranscriptMetrics metrics = ChatAppearance::instance()->metrics(
+        opt.font, opt.palette, row.width(), opt.widget ? opt.widget->devicePixelRatioF() : 1.0);
+    const QRect body = messageBodyRect(row, opt, idx);
+    int ignored = 0;
+    const QList<ChipLayout> chips = layoutAttachmentChips(
+        atts, metrics.bodyFont, QPoint(body.left(), body.bottom() + 1 + metrics.attachmentGap),
+        body.width(), ignored);
+    QList<QRect> rects;
+    rects.reserve(chips.size());
+    for (const ChipLayout &chip : chips) {
+        rects.append(chip.rect);
+    }
+    return rects;
 }
 
 // The chip a point falls in, or -1. Recomputes the chip layout in the card's
@@ -1181,19 +1319,9 @@ int TranscriptDelegate::attachmentChipAt(const QRect &row,
     if (atts.isEmpty()) {
         return -1;
     }
-    const int lineH = QFontMetrics(opt.font).height();
-    const int innerW = row.width() - 2 * kOuterMarginX - 2 * kCardPadX;
-    const int bodyTop = row.top() + kCardPadTop + lineH + kRoleRowGap;
-    const int chipsBlock = attachmentsBlockHeight(idx, opt, innerW);
-    const int bodyH = row.height() - kCardPadTop - lineH - kRoleRowGap
-                      - chipsBlock - kCardPadBottom;
-    const QPoint origin(row.left() + kOuterMarginX + kCardPadX,
-                        bodyTop + bodyH + kChipGapTop);
-    int dummy = 0;
-    const QList<ChipLayout> laid =
-        layoutAttachmentChips(atts, opt.font, origin, qMax(1, innerW), dummy);
+    const QList<QRect> laid = attachmentRects(row, opt, idx);
     for (int i = 0; i < laid.size(); ++i) {
-        if (laid.at(i).rect.contains(pos)) {
+        if (laid.at(i).contains(pos)) {
             return i;
         }
     }
@@ -1255,12 +1383,15 @@ void TranscriptDelegate::setEditorData(QWidget *editor, const QModelIndex &idx) 
     if (!browser) {
         return;
     }
-    // Match paint()'s document setup exactly (see configureBodyDoc). The browser
+    // Match paint()'s document setup exactly (see configureTranscriptDocument).
     // is a child of the view's viewport, so it inherits the same font paint()
     // draws with (opt.font). The wrap width is re-applied by updateEditorGeometry
     // once the geometry is known.
-    configureBodyDoc(browser->document(), browser->font(),
-                     browser->viewport()->width(), resolveBodyHtml(idx));
+    const QPalette palette = browser->palette();
+    const TranscriptMetrics metrics = ChatAppearance::instance()->metrics(
+        browser->font(), palette, browser->viewport()->width(), browser->devicePixelRatioF());
+    configureTranscriptDocument(browser->document(), metrics, palette,
+                                browser->viewport()->width(), resolveBodyHtml(idx));
 }
 
 void TranscriptDelegate::updateEditorGeometry(QWidget *editor,
@@ -1274,8 +1405,14 @@ void TranscriptDelegate::updateEditorGeometry(QWidget *editor,
     const QRect body = messageBodyRect(opt.rect, opt, idx);
     editor->setGeometry(body);
     if (auto *browser = qobject_cast<QTextBrowser *>(editor)) {
-        // Re-wrap the document to the body width now the geometry is known.
-        browser->document()->setTextWidth(body.width());
+        // Reapply the same appearance-aware setup paint uses. This covers an
+        // overlay opened immediately after a density/theme update as well as a
+        // width change, without ever letting its document retain stale glyph
+        // metrics behind the painted row.
+        const TranscriptMetrics metrics = ChatAppearance::instance()->metrics(
+            opt.font, opt.palette, opt.rect.width(), browser->devicePixelRatioF());
+        configureTranscriptDocument(browser->document(), metrics, opt.palette,
+                                    body.width(), resolveBodyHtml(idx));
     }
 }
 
@@ -1378,12 +1515,9 @@ bool TranscriptDelegate::editorEvent(QEvent *event, QAbstractItemModel *model,
             // A click on a link opens it directly (the overlay isn't up on the
             // first click). Otherwise a click on the body asks the panel to open
             // the persistent selection overlay so the text becomes selectable.
-            const int innerW = opt.rect.width() - 2 * kOuterMarginX - 2 * kCardPadX;
-            QTextDocument *doc = bodyDoc(idx, qMax(1, innerW), opt);
-            const QFontMetrics fm(opt.font);
-            const QPointF rel(pos.x() - (opt.rect.left() + kOuterMarginX + kCardPadX),
-                              pos.y() - (opt.rect.top() + kCardPadTop + fm.height()
-                                         + kRoleRowGap));
+            const QRect body = messageBodyRect(opt.rect, opt, idx);
+            QTextDocument *doc = bodyDoc(idx, qMax(1, body.width()), opt);
+            const QPointF rel(pos.x() - body.left(), pos.y() - body.top());
             const QString anchor = doc->documentLayout()->anchorAt(rel);
             if (!anchor.isEmpty()) {
                 // A link in an assistant message is model-authored: its text

@@ -3,9 +3,12 @@
 
 #pragma once
 
+#include "state/ChatAppearance.h"
+
 #include <QFont>
 #include <QHash>
 #include <QJsonObject>
+#include <QList>
 #include <QModelIndex>
 #include <QPixmap>
 #include <QPointer>
@@ -110,6 +113,15 @@ public:
     QTextDocument *toolDoc(const QModelIndex &idx, ToolSlot slot, const QString &plain,
                            const QFont &mono, int contentWidth) const;
 
+    // Shared message geometry. Public because the row painter is deliberately a
+    // free function, keeping measure and paint in one routine.
+    QRect messageBubbleRect(const QRect &row, const QStyleOptionViewItem &opt,
+                            const QModelIndex &idx) const;
+    QRect messageHeaderRect(const QRect &row, const QStyleOptionViewItem &opt,
+                            const QModelIndex &idx) const;
+    QRect messageBodyRect(const QRect &row, const QStyleOptionViewItem &opt,
+                          const QModelIndex &idx) const;
+
     // --- in-place selectable overlay (plan 13 phase 1) -------------------
     // A Message row's body can be covered by a frameless read-only QTextBrowser
     // so the user can select and copy an arbitrary substring. The browser reuses
@@ -122,6 +134,10 @@ public:
                               const QModelIndex &idx) const override;
 
 Q_SIGNALS:
+    // A density/text-scale update invalidated document metrics. AgentPanel uses
+    // its existing resize-settle path: cached old heights remain cheap estimates
+    // while only visible rows are synchronously remeasured.
+    void appearanceChanged() const;
     // A left click landed inside a Message row's body (and not on a link) — the
     // panel opens a persistent selection overlay for this row.
     void messageBodyClicked(const QModelIndex &idx) const;
@@ -157,6 +173,7 @@ private:
     struct CacheEntry {
         int width = -1;  // width the height was last measured at
         int height = 0;  // measured height
+        int appearanceGen = 0;
     };
     // Keyed by the model's per-row stableId. On a width change sizeHint returns
     // the cached height *as an estimate* without rebuilding the QTextDocument —
@@ -183,6 +200,7 @@ private:
         // Comparing the generation is what forces the re-lay. (AgentKate ships a
         // signature Midnight theme alongside Breeze, so this is user-visible.)
         int paletteGen = 0;
+        int appearanceGen = 0;
         QTextDocument *doc = nullptr;
     };
     mutable QHash<quintptr, DocEntry> m_docCache;
@@ -249,13 +267,8 @@ private:
     // The "open in inspector" glyph sits immediately left of the copy glyph.
     QRect toolInspectRect(const QRect &row) const;
 
-    // The body-text sub-rect of a Message row (excludes the card padding, the
-    // role/timestamp line, and any attachment chip block) — the exact area the
-    // selection overlay covers. `row` is the full row rect; `opt` supplies the
-    // font; `idx` supplies the attachments so the chip block below the body is
-    // excluded. Matches the translate the body draw uses in layoutRow().
-    QRect messageBodyRect(const QRect &row, const QStyleOptionViewItem &opt,
-                          const QModelIndex &idx) const;
+    QList<QRect> attachmentRects(const QRect &row, const QStyleOptionViewItem &opt,
+                                 const QModelIndex &idx) const;
 
     // Height of the attachment chip block for a Message row (0 if none),
     // including the gap above it — used by messageBodyRect and layoutRow so the

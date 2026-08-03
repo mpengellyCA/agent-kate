@@ -51,17 +51,33 @@ void TranscriptModel::enforceCap()
     m_items.remove(0, over);
     endRemoveRows();
     m_base += over;
+    normalizeFirstMessageRun();
 }
 
-int TranscriptModel::appendMessage(const QString &role, const QString &accentHex,
-                                   const QString &bodyHtml, const QString &plain,
-                                   bool replayed, const QString &timestamp,
+void TranscriptModel::normalizeFirstMessageRun()
+{
+    if (m_items.isEmpty() || m_items.first().kind != Message) {
+        return;
+    }
+    Item &first = m_items.first();
+    const bool continues = m_items.size() > 1 && m_items.at(1).kind == Message
+        && m_items.at(1).speaker == first.speaker;
+    const MessageRunPosition position = continues ? MessageRunPosition::First
+                                                   : MessageRunPosition::Single;
+    if (first.runPosition != position) {
+        first.runPosition = position;
+        touched(0);
+    }
+}
+
+int TranscriptModel::appendMessage(Speaker speaker, const QString &bodyHtml,
+                                   const QString &plain, bool replayed,
+                                   const QString &timestamp,
                                    const QJsonArray &attachments)
 {
     Item it;
     it.kind = Message;
-    it.role = role;
-    it.accentHex = accentHex;
+    it.speaker = speaker;
     it.html = bodyHtml;
     it.plain = plain;
     it.replayed = replayed;
@@ -73,6 +89,16 @@ int TranscriptModel::appendMessage(const QString &role, const QString &accentHex
     beginInsertRows({}, row, row);
     m_items.append(it);
     endInsertRows();
+    // A run can only extend the immediately preceding row. Any non-message is
+    // a hard boundary, so append/replay work without scanning the transcript.
+    if (row > 0 && m_items.at(row - 1).kind == Message
+        && m_items.at(row - 1).speaker == speaker) {
+        Item &previous = m_items[row - 1];
+        previous.runPosition = previous.runPosition == MessageRunPosition::Single
+            ? MessageRunPosition::First : MessageRunPosition::Middle;
+        m_items[row].runPosition = MessageRunPosition::Last;
+        touched(row - 1);
+    }
     // A row appended while find is active (streaming under an open find bar)
     // must highlight without waiting for the next keystroke.
     if (!m_findNeedleLower.isEmpty()) {
@@ -426,9 +452,12 @@ QVariant TranscriptModel::data(const QModelIndex &idx, int role) const
     case KindRole:
         return int(it.kind);
     case RoleTextRole:
-        return it.role;
-    case AccentRole:
-        return it.accentHex;
+        return it.speaker == Speaker::User ? QStringLiteral("You")
+                                           : QStringLiteral("Agent Kate");
+    case SpeakerRole:
+        return int(it.speaker);
+    case MessageRunPositionRole:
+        return int(it.runPosition);
     case HtmlRole:
         return it.html;
     case PlainRole:
@@ -473,9 +502,9 @@ QVariant TranscriptModel::data(const QModelIndex &idx, int role) const
         // up to 128 KB and is exactly what must not be re-joined per query.
         switch (it.kind) {
         case Message:
-            return it.role.isEmpty()
-                ? it.plain
-                : it.role + QStringLiteral(": ") + it.plain;
+            return (it.speaker == Speaker::User ? QStringLiteral("You")
+                                                 : QStringLiteral("Agent Kate"))
+                + QStringLiteral(": ") + it.plain;
         case Note:
             return it.plain;
         case Thinking:

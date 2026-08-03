@@ -3,6 +3,7 @@
 
 #include "AppearanceDialog.h"
 
+#include "state/ChatAppearance.h"
 #include "theme/ThemeManager.h"
 
 #include <KLocalizedString>
@@ -109,6 +110,8 @@ AppearanceDialog::AppearanceDialog(QWidget *parent)
     m_originalId = ThemeManager::instance()->currentId();
     m_originalEditorThemeId = ThemeManager::instance()->editorThemeId();
     m_originalTerminalProfile = ThemeManager::instance()->terminalProfileId();
+    m_originalChatDensity = ChatAppearance::instance()->density();
+    m_originalChatTextScale = ChatAppearance::instance()->textScale();
 
     auto *outer = new QVBoxLayout(this);
 
@@ -209,6 +212,8 @@ AppearanceDialog::AppearanceDialog(QWidget *parent)
     terminalRow->addWidget(m_terminalProfileCombo, 1);
     outer->addLayout(terminalRow);
 
+    buildChatAppearanceControls(outer);
+
     // --- Buttons ---
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel |
                                              QDialogButtonBox::Apply,
@@ -220,6 +225,8 @@ AppearanceDialog::AppearanceDialog(QWidget *parent)
         ThemeManager::instance()->applyTheme(selectedId(), /*persist=*/true);
         ThemeManager::instance()->setEditorTheme(selectedEditorThemeId(), /*persist=*/true);
         ThemeManager::instance()->setTerminalProfile(selectedTerminalProfileId(), /*persist=*/true);
+        ChatAppearance::instance()->set(selectedChatDensity(), selectedChatTextScale(),
+                                        /*persist=*/true);
         accept();
     });
     connect(buttons, &QDialogButtonBox::rejected, this, &AppearanceDialog::reject);
@@ -228,6 +235,8 @@ AppearanceDialog::AppearanceDialog(QWidget *parent)
         ThemeManager::instance()->applyTheme(selectedId(), /*persist=*/true);
         ThemeManager::instance()->setEditorTheme(selectedEditorThemeId(), /*persist=*/true);
         ThemeManager::instance()->setTerminalProfile(selectedTerminalProfileId(), /*persist=*/true);
+        ChatAppearance::instance()->set(selectedChatDensity(), selectedChatTextScale(),
+                                        /*persist=*/true);
     });
 
     connect(m_list, &QListWidget::currentRowChanged, this,
@@ -240,6 +249,68 @@ AppearanceDialog::AppearanceDialog(QWidget *parent)
     buildThemeList();
     buildEditorThemeCombo();
     buildTerminalProfileCombo();
+}
+
+void AppearanceDialog::buildChatAppearanceControls(QVBoxLayout *outer)
+{
+    auto *section = new QFrame(this);
+    section->setFrameShape(QFrame::StyledPanel);
+    auto *layout = new QGridLayout(section);
+    layout->setContentsMargins(10, 8, 10, 8);
+
+    auto *title = new QLabel(i18n("Chat readability"), section);
+    QFont titleFont = title->font();
+    titleFont.setBold(true);
+    title->setFont(titleFont);
+    layout->addWidget(title, 0, 0, 1, 2);
+
+    auto *densityLabel = new QLabel(i18n("Density:"), section);
+    m_chatDensityCombo = new QComboBox(section);
+    m_chatDensityCombo->addItem(i18n("Compact — fit more conversation"),
+                                int(ChatAppearance::Density::Compact));
+    m_chatDensityCombo->addItem(i18n("Comfortable — balanced reading"),
+                                int(ChatAppearance::Density::Comfortable));
+    m_chatDensityCombo->addItem(i18n("Spacious — extra breathing room"),
+                                int(ChatAppearance::Density::Spacious));
+    densityLabel->setBuddy(m_chatDensityCombo);
+    layout->addWidget(densityLabel, 1, 0);
+    layout->addWidget(m_chatDensityCombo, 1, 1);
+
+    auto *textLabel = new QLabel(i18n("Transcript text:"), section);
+    m_chatTextScaleCombo = new QComboBox(section);
+    m_chatTextScaleCombo->addItem(i18n("Smaller"), -1);
+    m_chatTextScaleCombo->addItem(i18n("Default"), 0);
+    m_chatTextScaleCombo->addItem(i18n("Larger"), 1);
+    textLabel->setBuddy(m_chatTextScaleCombo);
+    layout->addWidget(textLabel, 2, 0);
+    layout->addWidget(m_chatTextScaleCombo, 2, 1);
+
+    const auto *appearance = ChatAppearance::instance();
+    m_chatDensityCombo->setCurrentIndex(m_chatDensityCombo->findData(int(appearance->density())));
+    m_chatTextScaleCombo->setCurrentIndex(m_chatTextScaleCombo->findData(appearance->textScale()));
+    connect(m_chatDensityCombo, &QComboBox::currentIndexChanged, this, [this](int) {
+        ChatAppearance::instance()->set(selectedChatDensity(), selectedChatTextScale(),
+                                        /*persist=*/false);
+    });
+    connect(m_chatTextScaleCombo, &QComboBox::currentIndexChanged, this, [this](int) {
+        ChatAppearance::instance()->set(selectedChatDensity(), selectedChatTextScale(),
+                                        /*persist=*/false);
+    });
+
+    outer->addWidget(section);
+}
+
+ChatAppearance::Density AppearanceDialog::selectedChatDensity() const
+{
+    if (!m_chatDensityCombo)
+        return m_originalChatDensity;
+    return ChatAppearance::Density(m_chatDensityCombo->currentData().toInt());
+}
+
+int AppearanceDialog::selectedChatTextScale() const
+{
+    return m_chatTextScaleCombo ? m_chatTextScaleCombo->currentData().toInt()
+                                : m_originalChatTextScale;
 }
 
 void AppearanceDialog::buildThemeList()
@@ -454,6 +525,11 @@ void AppearanceDialog::revertToOriginal()
     }
     if (ThemeManager::instance()->terminalProfileId() != m_originalTerminalProfile) {
         ThemeManager::instance()->setTerminalProfile(m_originalTerminalProfile, /*persist=*/true);
+    }
+    if (ChatAppearance::instance()->density() != m_originalChatDensity
+        || ChatAppearance::instance()->textScale() != m_originalChatTextScale) {
+        ChatAppearance::instance()->set(m_originalChatDensity, m_originalChatTextScale,
+                                        /*persist=*/true);
     }
 }
 

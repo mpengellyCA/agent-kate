@@ -160,6 +160,14 @@ AkThemeDef midnightTheme()
     c.hunkBg = QColor("#1b1f47");        // navy-purple
     c.agentRunning = QColor("#34d399");
     c.agentIdle = QColor("#6b6f99");
+    c.chatAssistantSurface = QColor("#1a1e3f");
+    c.chatUserSurface = QColor("#392044");
+    c.chatActivitySurface = QColor("#141833");
+    c.chatCodeSurface = QColor("#0b0e24");
+    c.chatBorder = QColor("#747bb8");
+    c.chatRail = QColor("#8589bd");
+    c.chatMetadata = QColor("#b8bbdc");
+    c.chatAttachmentSurface = QColor("#252a59");
     c.lanes = {QColor("#ff2d8e"), QColor("#a855f7"), QColor("#34d399"),
                QColor("#38bdf8"), QColor("#fbbf24"), QColor("#c4b5fd")};
     d.colors = c;
@@ -217,6 +225,14 @@ AkThemeDef daylightTheme()
     c.hunkBg = QColor("#efeafb");
     c.agentRunning = QColor("#137a52");
     c.agentIdle = QColor("#9a98ba");
+    c.chatAssistantSurface = QColor("#ffffff");
+    c.chatUserSurface = QColor("#f6e9f1");
+    c.chatActivitySurface = QColor("#f3f2fb");
+    c.chatCodeSurface = QColor("#f7f5fc");
+    c.chatBorder = QColor("#8b86ac");
+    c.chatRail = QColor("#6b6a8c");
+    c.chatMetadata = QColor("#5c5a7c");
+    c.chatAttachmentSurface = QColor("#eceaf8");
     c.lanes = {QColor("#d6256f"), QColor("#7c3aed"), QColor("#137a52"),
                QColor("#1f6feb"), QColor("#b7791f"), QColor("#8b5cf6")};
     d.colors = c;
@@ -245,6 +261,16 @@ AkColors systemColors(const QPalette &pal)
     c.hunkBg = blend(base, c.accent, 0.12);
     c.agentRunning = c.positive;
     c.agentIdle = pal.color(QPalette::Disabled, QPalette::Text);
+    const QColor text = pal.color(QPalette::Text);
+    const QColor window = pal.color(QPalette::Window);
+    c.chatAssistantSurface = blend(base, window, 0.55);
+    c.chatUserSurface = blend(base, c.accent, 0.10);
+    c.chatActivitySurface = blend(base, window, 0.30);
+    c.chatCodeSurface = blend(base, text, 0.035);
+    c.chatBorder = blend(base, text, 0.30);
+    c.chatRail = blend(base, text, 0.52);
+    c.chatMetadata = blend(base, text, 0.72);
+    c.chatAttachmentSurface = blend(base, c.accent, 0.06);
     // Stable, theme-independent lane hues (graph identity must not shift).
     c.lanes = {QColor(0x35, 0x8c, 0xe6), QColor(0xe6, 0x7e, 0x22),
                QColor(0x2e, 0xc4, 0x71), QColor(0xe7, 0x4c, 0x3c),

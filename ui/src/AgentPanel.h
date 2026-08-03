@@ -2,6 +2,7 @@
 
 #include "state/AgentJob.h"
 #include "state/HarnessTraits.h"
+#include "TranscriptModel.h"
 
 #include <QDateTime>
 #include <QHash>
@@ -16,7 +17,6 @@
 #include <QWidget>
 
 class CoreClient;
-class TranscriptModel;
 class TranscriptDelegate;
 class WorkflowMonitor;
 class WorkingIndicator;
@@ -465,11 +465,11 @@ private:
     void refresh();
 
     // The conversation feed — a virtualized model/view (plan 10 phase 2).
-    // addMessageCard appends one role-tagged message row. `plainText` is the raw
+    // addMessageCard appends one semantic message row. `plainText` is the raw
     // (Markdown / plain) source kept for copy + search; pass empty when none.
     // `replayed` cards (transcript restore) carry no live timestamp.
-    void addMessageCard(const QString &role, const QString &accentHex,
-                        const QString &bodyHtml, const QString &plainText = QString(),
+    void addMessageCard(TranscriptModel::Speaker speaker, const QString &bodyHtml,
+                        const QString &plainText = QString(),
                         bool replayed = false, const QJsonArray &attachments = {});
     // Strip the heavy body (dataB64 / text) from a live attachment array, leaving
     // the compact chip metadata (name/kind/path/mediaType/outside) the feed row

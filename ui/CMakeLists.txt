@@ -49,6 +49,7 @@ add_executable(agentkate
     src/main.cpp
     src/state/HarnessTraits.cpp
     src/state/DraftStore.cpp
+    src/state/ChatAppearance.cpp
     src/state/EngineAvailability.cpp
     src/state/EnsembleCatalog.cpp
     src/state/RateLimitState.cpp
@@ -251,6 +252,18 @@ install(TARGETS agentkate RUNTIME DESTINATION ${KDE_INSTALL_BINDIR})
 find_package(Qt6 6.6 QUIET COMPONENTS Test)
 if(Qt6Test_FOUND)
     enable_testing()
+
+    # Plan 33 phase 1: persisted transcript readability choices and the
+    # semantic chat surfaces are deliberately independent of any live session.
+    add_executable(ChatAppearanceTest tests/ChatAppearanceTest.cpp
+        src/state/ChatAppearance.cpp src/theme/ThemeManager.cpp)
+    target_include_directories(ChatAppearanceTest PRIVATE src)
+    target_link_libraries(ChatAppearanceTest PRIVATE Qt6::Widgets Qt6::Test
+        KF6::ColorScheme KF6::ConfigCore KF6::SyntaxHighlighting)
+    add_test(NAME ChatAppearanceTest COMMAND ChatAppearanceTest)
+    set_tests_properties(ChatAppearanceTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
     add_executable(PanelStackTest tests/PanelStackTest.cpp src/shell/PanelStack.cpp)
     target_include_directories(PanelStackTest PRIVATE src)
     target_link_libraries(PanelStackTest PRIVATE Qt6::Widgets Qt6::Test)
@@ -264,6 +277,7 @@ if(Qt6Test_FOUND)
     # for its model-availability helpers — hence the extra sources.
     add_executable(TranscriptModelTest tests/TranscriptModelTest.cpp
         src/TranscriptModel.cpp src/TranscriptDelegate.cpp
+        src/state/ChatAppearance.cpp
         src/AgentChatHelpers.cpp src/MarkdownUtil.cpp src/AttachmentBuilder.cpp
         src/SafeContent.cpp
         src/state/HarnessTraits.cpp src/ProviderConfig.cpp src/ipc/CoreClient.cpp
@@ -468,6 +482,7 @@ if(Qt6Test_FOUND)
         src/MarkdownUtil.cpp src/ProviderConfig.cpp
         src/SubAgentTranscriptDialog.cpp src/ToolInspectorDialog.cpp
         src/TranscriptDelegate.cpp src/TranscriptModel.cpp
+        src/state/ChatAppearance.cpp
         src/WorkflowMonitor.cpp src/WorkflowMonitorDialog.cpp
         src/WorkflowMonitorView.cpp src/DiffView.cpp src/ipc/CoreClient.cpp
         src/shell/ChipPainter.cpp src/shell/ElidingLabel.cpp
@@ -702,10 +717,10 @@ set_tests_properties(DesktopFileValidate PROPERTIES SKIP_RETURN_CODE 77)
 # so they can be eyeballed/screenshotted in isolation. Build tree only.
 add_executable(akwidgets-preview EXCLUDE_FROM_ALL
     tests/WidgetsPreview.cpp
+    src/state/ChatAppearance.cpp
     src/theme/ThemeManager.cpp
     src/AppearanceDialog.cpp
     src/CommandPalette.cpp
-    src/NewAgentDialog.cpp
     src/DiffView.cpp
     src/shell/FlowLayout.cpp
     themes/aktheme.qrc)

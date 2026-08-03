@@ -330,6 +330,58 @@ func requireUIWindow(srv *ipc.Server, ctx context.Context) error {
 	return ipc.Errorf(codeUIOnly, uiOnlyRefusal)
 }
 
+// sessionRecordWire is the compatibility boundary for the UI-facing session
+// roster. The persistence refactor moved identity and requested/effective
+// settings into the neutral linkage DTOs, which is the correct on-disk shape.
+// Existing UI consumers still read the small, flat roster fields, though, and
+// returning the raw Record makes every restored thread look like it has no id.
+// Keep the linkage DTOs in the reply while projecting the old display fields;
+// this is a wire compatibility shim, not a second persisted representation.
+func sessionRecordWire(r session.Record) map[string]any {
+	b, err := json.Marshal(r)
+	if err != nil {
+		// Record contains only JSON-compatible fields; keep a useful minimal
+		// response even if a future field makes the full marshal fail.
+		return map[string]any{
+			"threadId": r.ThreadID,
+			"project":  r.Project,
+			"title":    r.Title,
+			"status":   r.Status,
+		}
+	}
+	var out map[string]any
+	if err := json.Unmarshal(b, &out); err != nil {
+		return map[string]any{
+			"threadId": r.ThreadID,
+			"project":  r.Project,
+			"title":    r.Title,
+			"status":   r.Status,
+		}
+	}
+	// These are display/control identifiers, not the persisted schema. Keep
+	// them top-level for clients released before the linkage cutover.
+	out["threadId"] = r.ThreadID
+	out["sessionId"] = r.SessionID
+	out["backend"] = r.Backend
+	out["providerId"] = r.ProviderID
+	out["model"] = r.Model
+	out["effort"] = r.Effort
+	out["permissionMode"] = r.PermissionMode
+	// Cleanup's existing table also reads these worktree display fields.
+	out["branch"] = r.Worktree.Branch
+	out["path"] = r.Worktree.Path
+	out["isolated"] = r.Worktree.Isolated
+	out["number"] = r.Worktree.Number
+	return out
+}
+
+func archiveRecordWire(r session.ArchiveRecord) map[string]any {
+	out := sessionRecordWire(r.Record)
+	out["archivedAt"] = r.ArchivedAt
+	out["reason"] = r.Reason
+	return out
+}
+
 // registerHandlers wires the JSON-RPC methods the core serves.
 func registerHandlers(d handlerDeps) {
 	d.srv.Handle("handshake", func(ctx context.Context, _ json.RawMessage) (any, error) {
@@ -750,10 +802,11 @@ func registerHandlers(d handlerDeps) {
 		}
 		_ = json.Unmarshal(raw, &p) // project is optional
 		records := d.sessions.List(p.Project)
-		if records == nil {
-			records = []session.Record{}
+		out := make([]map[string]any, 0, len(records))
+		for _, record := range records {
+			out = append(out, sessionRecordWire(record))
 		}
-		return map[string]any{"threads": records}, nil
+		return map[string]any{"threads": out}, nil
 	})
 
 	// session.browse merges every browse-capable harness's discoverable past
@@ -3200,10 +3253,11 @@ func registerHandlers(d handlerDeps) {
 			return nil, err
 		}
 		arch := d.sessions.ListArchived()
-		if arch == nil {
-			arch = []session.ArchiveRecord{}
+		out := make([]map[string]any, 0, len(arch))
+		for _, record := range arch {
+			out = append(out, archiveRecordWire(record))
 		}
-		return map[string]any{"archived": arch}, nil
+		return map[string]any{"archived": out}, nil
 	})
 
 	// cleanup.restore moves an archived record back as a dormant, non-isolated

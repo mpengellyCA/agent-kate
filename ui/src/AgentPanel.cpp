@@ -2934,15 +2934,14 @@ void AgentPanel::scrollFeedToBottom()
     });
 }
 
-void AgentPanel::addMessageCard(const QString &role, const QString &accentHex,
+void AgentPanel::addMessageCard(TranscriptModel::Speaker speaker,
                                 const QString &bodyHtml, const QString &plainText,
                                 bool replayed, const QJsonArray &attachments)
 {
     const QString ts = replayed
         ? QString()
         : QLocale().toString(QTime::currentTime(), QLocale::ShortFormat);
-    m_model->appendMessage(role, accentHex, bodyHtml, plainText, replayed, ts,
-                           attachments);
+    m_model->appendMessage(speaker, bodyHtml, plainText, replayed, ts, attachments);
 
     // Feed the roster card its two-line preview: the latest message line, with a
     // "You: " prefix on the user's own messages. plainText is the raw Markdown
@@ -2951,7 +2950,7 @@ void AgentPanel::addMessageCard(const QString &role, const QString &accentHex,
     // times and stamp its "last activity" as now for every historical line.
     // Instead we retain the final line and emit once at replay end.
     if (!plainText.isEmpty()) {
-        const bool fromUser = role == QLatin1String("You");
+        const bool fromUser = speaker == TranscriptModel::Speaker::User;
         const QString flat = plainText.simplified();
         const QString preview =
             fromUser ? i18nc("@item roster preview, user message", "You: %1", flat)
@@ -3748,9 +3747,8 @@ void AgentPanel::addYouCard(const QString &text, const QJsonArray &attachments)
 {
     const QString youLine =
         text.toHtmlEscaped().replace(QLatin1Char('\n'), QLatin1String("<br>"));
-    addMessageCard(QStringLiteral("You"),
-                   isDark(this) ? QStringLiteral("#7cb7ff") : QStringLiteral("#1a5fb4"),
-                   youLine, text, m_replaying, compactAttachments(attachments));
+    addMessageCard(TranscriptModel::Speaker::User, youLine, text, m_replaying,
+                   compactAttachments(attachments));
 }
 
 // openAttachment opens a clicked attachment chip. An image is previewed in a
@@ -5949,9 +5947,7 @@ void AgentPanel::renderStreamEvent(const QJsonObject &inner)
         if (blockType == QLatin1String("text")) {
             // Open the provisional row empty; deltas fill it in place.
             block.key = m_model->appendMessage(
-                QStringLiteral("Agent Kate"),
-                isDark(this) ? QStringLiteral("#5fd3bf") : QStringLiteral("#1a7f6b"),
-                QString(), QString(), false,
+                TranscriptModel::Speaker::Agent, QString(), QString(), false,
                 QLocale().toString(QTime::currentTime(), QLocale::ShortFormat));
             m_streamTextKeys.append(block.key);
             // Same unread bookkeeping addMessageCard does: a message arriving
@@ -6244,9 +6240,7 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
                     if (streamedKey < 0
                         || !m_model->setMessageBody(streamedKey,
                                                     agentkate::markdownToHtml(t), t)) {
-                        addMessageCard(QStringLiteral("Agent Kate"),
-                                       isDark(this) ? QStringLiteral("#5fd3bf")
-                                                    : QStringLiteral("#1a7f6b"),
+                        addMessageCard(TranscriptModel::Speaker::Agent,
                                        agentkate::markdownToHtml(t), t, m_replaying);
                     } else if (!m_replaying) {
                         // addMessageCard's roster side-effect, which the

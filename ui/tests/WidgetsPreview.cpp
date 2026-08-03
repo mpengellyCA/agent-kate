@@ -12,7 +12,6 @@
 #include "AppearanceDialog.h"
 #include "CommandPalette.h"
 #include "DiffView.h"
-#include "NewAgentDialog.h"
 #include "theme/ThemeManager.h"
 
 #include <QAction>
@@ -53,6 +52,15 @@ static QList<QAction *> sampleActions(QObject *parent)
     return out;
 }
 
+static QList<CommandPalette::Entry> sampleEntries(QObject *parent)
+{
+    QList<CommandPalette::Entry> entries;
+    for (QAction *action : sampleActions(parent)) {
+        entries << CommandPalette::Entry{action, QStringLiteral("Preview"), false, true};
+    }
+    return entries;
+}
+
 int main(int argc, char **argv)
 {
     QApplication app(argc, argv);
@@ -90,12 +98,6 @@ int main(int argc, char **argv)
         return app.exec();
     }
 
-    if (mode == QLatin1String("newagent")) {
-        auto *dlg = new NewAgentDialog(QStringLiteral("ak-theme-preview"));
-        dlg->show();
-        return app.exec();
-    }
-
     if (mode == QLatin1String("palette")) {
         auto *backdrop = new QMainWindow;
         backdrop->setWindowTitle(QStringLiteral("Command Palette preview"));
@@ -105,7 +107,7 @@ int main(int argc, char **argv)
         backdrop->setCentralWidget(label);
         backdrop->show();
         auto *pal = new CommandPalette(backdrop);
-        pal->setActions(sampleActions(&app));
+        pal->setActions(sampleEntries(&app));
         pal->showPalette();
     } else {
         auto *dlg = new AppearanceDialog;

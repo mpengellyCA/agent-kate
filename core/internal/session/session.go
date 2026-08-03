@@ -251,7 +251,13 @@ func (s *Store) load() error {
 	// the field existed. Assign sequentially in Created order so older
 	// agents keep the lower numbers a user would expect.
 	if s.backfillNumbers() || migratedAny {
-		_ = s.flush()
+		// A migration is not complete until its replacement file is durable.
+		// Previously this error was discarded, leaving the daemon running with
+		// an in-memory migration that would be retried (and could be lost) on
+		// the next restart.
+		if err := s.flush(); err != nil {
+			return fmt.Errorf("thread store %s: migrate: %w", s.path, err)
+		}
 	}
 	return nil
 }

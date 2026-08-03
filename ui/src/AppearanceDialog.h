@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "state/ChatAppearance.h"
+
 #include <QDialog>
 #include <QString>
 
@@ -11,6 +13,7 @@ class QGridLayout;
 class QLabel;
 class QListWidget;
 class QPushButton;
+class QVBoxLayout;
 
 // AppearanceDialog — pick the look Agent Kate wears.
 //
@@ -41,6 +44,7 @@ private:
     void buildThemeList();
     void buildEditorThemeCombo();
     void buildTerminalProfileCombo();
+    void buildChatAppearanceControls(QVBoxLayout *outer);
     void onSelectionChanged();
     void onEditorThemeChanged();
     void onTerminalProfileChanged();
@@ -48,15 +52,21 @@ private:
     QString selectedId() const;
     QString selectedEditorThemeId() const;
     QString selectedTerminalProfileId() const;
+    ChatAppearance::Density selectedChatDensity() const;
+    int selectedChatTextScale() const;
     void revertToOriginal();
 
     QString m_originalId;              // interface theme active when opened (revert)
     QString m_originalEditorThemeId;   // editor theme active when opened (revert)
     QString m_originalTerminalProfile; // terminal profile active when opened (revert)
+    ChatAppearance::Density m_originalChatDensity;
+    int m_originalChatTextScale = 0;
 
     QListWidget *m_list = nullptr;
     QComboBox *m_editorThemeCombo = nullptr;
     QComboBox *m_terminalProfileCombo = nullptr;
+    QComboBox *m_chatDensityCombo = nullptr;
+    QComboBox *m_chatTextScaleCombo = nullptr;
 
     QLabel *m_previewName = nullptr;
     QLabel *m_previewDesc = nullptr;
