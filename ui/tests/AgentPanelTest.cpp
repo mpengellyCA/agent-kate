@@ -28,10 +28,13 @@
 
 #include <QAbstractItemModel>
 #include <QComboBox>
+#include <QFrame>
 #include <QJsonArray>
 #include <QLabel>
 #include <QListView>
 #include <QPlainTextEdit>
+#include <QPushButton>
+#include <QScrollBar>
 #include <QStandardPaths>
 #include <QtTest>
 
@@ -136,6 +139,7 @@ private Q_SLOTS:
     void aDestroyedThreadsDraftIsNotWrittenBackByThePendingTimer();
     void dormantQuickAskPreservesWhitespaceDraftWhenSendFails();
     void toolRouterDiagnosticsNameTheirSourceAndTool();
+    void composerGrowsToItsCapInsideTheComposerSurface();
 };
 
 void AgentPanelTest::initTestCase()
@@ -404,6 +408,43 @@ void AgentPanelTest::dormantQuickAskPreservesWhitespaceDraftWhenSendFails()
     composer->setPlainText(draft);
     QVERIFY(!panel.quickAsk(QStringLiteral("please check the tests")));
     QCOMPARE(composer->toPlainText(), draft);
+}
+
+// Phase 4: the input is allowed to grow with a real multi-line draft, but it
+// has a hard seven-line cap so a long thought cannot collapse the transcript.
+// This drives the actual QPlainTextEdit rather than a height helper: wrapping,
+// the layout and the input's own scrollbar must agree.
+void AgentPanelTest::composerGrowsToItsCapInsideTheComposerSurface()
+{
+    CoreClient core;
+    AgentPanel panel(&core);
+    panel.resize(640, 520);
+    panel.show();
+    QCoreApplication::processEvents();
+
+    auto *composer = panel.findChild<QPlainTextEdit *>(QStringLiteral("composerInput"));
+    auto *surface = panel.findChild<QFrame *>(QStringLiteral("composerContainer"));
+    QVERIFY(composer != nullptr);
+    QVERIFY(surface != nullptr);
+    QCOMPARE(composer->parentWidget(), surface);
+    QVERIFY(surface->findChild<QPushButton *>(QStringLiteral("composerSend")) != nullptr);
+
+    const int initialHeight = composer->height();
+    QStringList lines;
+    for (int i = 0; i < 20; ++i) {
+        lines << QStringLiteral("A readable line in a deliberately long draft.");
+    }
+    composer->setPlainText(lines.join(QLatin1Char('\n')));
+    QCoreApplication::processEvents();
+    QVERIFY(composer->height() > initialHeight);
+
+    const int chrome = 2 * composer->frameWidth() + composer->contentsMargins().top()
+        + composer->contentsMargins().bottom();
+    const int cap = 7 * composer->fontMetrics().lineSpacing() + chrome;
+    QVERIFY2(composer->height() <= cap,
+             qPrintable(QStringLiteral("composer exceeded its seven-line cap: %1 > %2")
+                            .arg(composer->height()).arg(cap)));
+    QVERIFY(composer->verticalScrollBar()->maximum() > 0);
 }
 
 // Codex reports client-tool failures on its stderr tracing channel. This is a

@@ -28,6 +28,7 @@
 #include <KSharedConfig>
 
 #include <QAbstractButton>
+#include <QAbstractTextDocumentLayout>
 #include <QClipboard>
 #include <QCryptographicHash>
 #include <QGuiApplication>
@@ -265,11 +266,30 @@ bool rawImageBeatsText(const QMimeData *mime)
 class ComposerEdit : public QPlainTextEdit
 {
 public:
-    using QPlainTextEdit::QPlainTextEdit;
+    explicit ComposerEdit(QWidget *parent = nullptr)
+        : QPlainTextEdit(parent)
+    {
+        // A content-size change is much less frequent than cursor movement.
+        // Keep the outer panel still while a person is simply navigating their
+        // draft, and ask it to resize only when a line wraps/un-wraps.
+        connect(document()->documentLayout(),
+                &QAbstractTextDocumentLayout::documentSizeChanged, this,
+                [this](const QSizeF &) { updateHeightForContents(); });
+    }
 
     void setImageHandler(std::function<bool(const QMimeData *)> handler)
     {
         m_handler = std::move(handler);
+    }
+
+    // The panel owns layout policy; this small editor only reports its
+    // preferred height. Keeping the callback here lets paste, restore, history
+    // and programmatic edits share precisely the same sizing behaviour.
+    void setHeightChangedHandler(std::function<void(int)> handler)
+    {
+        m_heightHandler = std::move(handler);
+        m_lastPreferredHeight = -1;
+        updateHeightForContents();
     }
 
 protected:
@@ -288,7 +308,30 @@ protected:
     }
 
 private:
+    void updateHeightForContents()
+    {
+        if (!m_heightHandler) {
+            return;
+        }
+        const int line = fontMetrics().lineSpacing();
+        const int chrome = 2 * frameWidth() + contentsMargins().top()
+            + contentsMargins().bottom();
+        const int minimum = 2 * line + chrome;
+        const int maximum = 7 * line + chrome;
+        const int documentHeight = qCeil(document()->documentLayout()
+                                             ->documentSize()
+                                             .height());
+        const int preferred = qBound(minimum, documentHeight + chrome, maximum);
+        if (preferred == m_lastPreferredHeight) {
+            return;
+        }
+        m_lastPreferredHeight = preferred;
+        m_heightHandler(preferred);
+    }
+
     std::function<bool(const QMimeData *)> m_handler;
+    std::function<void(int)> m_heightHandler;
+    int m_lastPreferredHeight = -1;
 };
 
 // Role carrying a slash command's argument hint on its popup item.
@@ -716,6 +759,8 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     m_jumpBtn = new QToolButton(m_view->viewport());
     m_jumpBtn->setIcon(QIcon::fromTheme(QStringLiteral("go-down")));
     m_jumpBtn->setToolTip(i18n("Jump to latest"));
+    m_jumpBtn->setAccessibleName(i18n("Jump to latest"));
+    m_jumpBtn->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
     m_jumpBtn->setCursor(Qt::PointingHandCursor);
     m_jumpBtn->setAutoRaise(false);
     m_jumpBtn->setVisible(false);
@@ -798,7 +843,11 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     composer->setImageHandler(
         [this](const QMimeData *source) { return handleComposerPaste(source); });
     m_input = composer;
-    m_input->setFixedHeight(94);
+    m_input->setObjectName(QStringLiteral("composerInput"));
+    // Start at two readable lines and grow only as actual content wraps, up to
+    // seven. Beyond that QPlainTextEdit owns scrolling so a long draft cannot
+    // steadily steal the transcript viewport.
+    m_input->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
     m_input->installEventFilter(this); // for the configurable send key
     // QPlainTextEdit delivers drops to its viewport and would otherwise insert
     // a dropped file's path as text; filter the viewport so file/attachment
@@ -1145,12 +1194,14 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     // Attachment chip bar — hidden until files are attached. A FlowLayout so the
     // chips wrap onto further rows when the panel is dragged narrow.
     m_attachBar = new QWidget(this);
+    m_attachBar->setObjectName(QStringLiteral("composerAttachments"));
     m_attachLayout = new FlowLayout(m_attachBar, 0, 6, 6);
     m_attachBar->setVisible(false);
 
     // Inline banner explaining why a dropped/attached file was rejected. More
     // visible and persistent than a status-bar toast, and dismissable.
     m_attachNotice = new KMessageWidget(this);
+    m_attachNotice->setObjectName(QStringLiteral("composerAttachmentNotice"));
     m_attachNotice->setMessageType(KMessageWidget::Information);
     m_attachNotice->setIcon(QIcon::fromTheme(QStringLiteral("dialog-information")));
     m_attachNotice->setCloseButtonVisible(true);
@@ -1222,8 +1273,10 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     m_interruptBtn->setToolTip(QStringLiteral(
         "Cancel the in-flight response now (Esc), keeping the session — then type "
         "a new message to redirect the agent."));
+    m_interruptBtn->setObjectName(QStringLiteral("composerInterrupt"));
     m_interruptBtn->hide();
     m_sendBtn = new QPushButton(this);
+    m_sendBtn->setObjectName(QStringLiteral("composerSend"));
     m_sendBtn->setIcon(QIcon::fromTheme(QStringLiteral("document-send")));
     m_sendBtn->setCursor(Qt::PointingHandCursor);
 
@@ -1324,7 +1377,6 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     auto *buttons = new FlowLayout(0, 6, 6);
     buttons->addWidget(setupBtn);
     buttons->addWidget(compactionBtn);
-    buttons->addWidget(m_attachBtn);
     buttons->addWidget(m_diffBtn);
     buttons->addWidget(m_subagentsBtn);
     buttons->addWidget(m_forkBtn);
@@ -1332,8 +1384,42 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     // less-frequent end-this-agent action. Interrupt is the prominent in-flight
     // control, grouped next to Send.
     buttons->addWidget(m_stopBtn);
-    buttons->addWidget(m_interruptBtn);
-    buttons->addWidget(m_sendBtn);
+
+    // The composer is deliberately one visual endpoint: draft first, then any
+    // attachment/rejection state, then the actions that affect that draft. A
+    // small local palette stylesheet is used only for this surface; application
+    // chrome remains entirely palette-driven.
+    m_composerContainer = new QFrame(this);
+    m_composerContainer->setObjectName(QStringLiteral("composerContainer"));
+    m_composerContainer->setStyleSheet(QStringLiteral(
+        "QFrame#composerContainer { background-color: palette(base); "
+        "border: 1px solid palette(mid); border-radius: 10px; } "
+        "QPlainTextEdit#composerInput { background: transparent; border: 0; }"));
+    auto *composerLayout = new QVBoxLayout(m_composerContainer);
+    composerLayout->setContentsMargins(10, 8, 10, 8);
+    composerLayout->setSpacing(6);
+    composerLayout->addWidget(m_input);
+    composerLayout->addWidget(m_attachNotice);
+    composerLayout->addWidget(m_attachBar);
+    auto *composerActions = new QHBoxLayout;
+    composerActions->setContentsMargins(0, 0, 0, 0);
+    composerActions->setSpacing(6);
+    composerActions->addWidget(m_attachBtn);
+    composerActions->addStretch(1);
+    composerActions->addWidget(m_interruptBtn);
+    composerActions->addWidget(m_sendBtn);
+    composerLayout->addLayout(composerActions);
+    composer->setHeightChangedHandler([this](int height) {
+        if (!m_input || m_input->height() == height) {
+            return;
+        }
+        m_input->setFixedHeight(height);
+        // The slash completion is positioned from the input itself, so a wrap
+        // that grows the composer must move an already-open popup with it.
+        if (m_slashPopup && m_slashPopup->isVisible()) {
+            updateSlashPopup();
+        }
+    });
 
     auto *body = new QVBoxLayout;
     body->setContentsMargins(12, 12, 12, 12);
@@ -1347,9 +1433,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     body->addWidget(m_queueBar);
     body->addWidget(m_workflowBar);
     body->addWidget(m_jobsBar);
-    body->addWidget(m_attachNotice);
-    body->addWidget(m_attachBar);
-    body->addWidget(m_input);
+    body->addWidget(m_composerContainer);
     body->addLayout(buttons);
 
     auto *layout = new QVBoxLayout(this);
@@ -3264,12 +3348,21 @@ void AgentPanel::updateJumpButton()
     }
     const bool show = !m_stickBottom;
     if (show) {
-        m_jumpBtn->setToolTip(m_jumpUnread ? i18n("Jump to latest — new messages")
-                                           : i18n("Jump to latest"));
+        const QString label = m_jumpUnread ? i18n("Jump to latest — new messages")
+                                            : i18n("Jump to latest");
+        // A quiet dot makes the control read as an unread affordance rather
+        // than merely a scroll convenience. Its accessible name carries the
+        // same state for keyboard and screen-reader users.
+        m_jumpBtn->setText(m_jumpUnread ? QStringLiteral("•") : QString());
+        m_jumpBtn->setToolTip(label);
+        m_jumpBtn->setAccessibleName(label);
         positionJumpButton();
         m_jumpBtn->raise();
     } else {
         m_jumpUnread = false;
+        m_jumpBtn->setText(QString());
+        m_jumpBtn->setToolTip(i18n("Jump to latest"));
+        m_jumpBtn->setAccessibleName(i18n("Jump to latest"));
     }
     m_jumpBtn->setVisible(show);
 }

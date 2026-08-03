@@ -840,6 +840,9 @@ private:
     QList<int> m_findHits; // model rows that currently match the needle
     int m_findIndex = -1;
     WorkingIndicator *m_working = nullptr;
+    // Rounded surface that keeps the draft, its pending attachments and the
+    // primary send/interrupt actions together as one conversation endpoint.
+    QFrame *m_composerContainer = nullptr;
     QPlainTextEdit *m_input = nullptr;
     QComboBox *m_modeCombo = nullptr;
     QComboBox *m_isolationCombo = nullptr;
