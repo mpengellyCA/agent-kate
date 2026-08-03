@@ -1,11 +1,13 @@
 import { defineConfig } from 'vitest/config'
 import vue from '@vitejs/plugin-vue'
+import tailwindcss from '@tailwindcss/vite'
 
-// This is an explicit, release-only asset build. Go and CMake never invoke it:
-// a fresh checkout embeds placeholder.html until scripts/build-webui.sh runs.
+// CMake invokes the pinned asset build before compiling the Go embed package.
+// Node is therefore a build-time tool only: production runs serve the bundled
+// immutable files directly from the Go HTTPS listener.
 export default defineConfig({
   base: '/',
-  plugins: [vue()],
+  plugins: [vue(), tailwindcss()],
   build: {
     outDir: 'dist',
     emptyOutDir: true,

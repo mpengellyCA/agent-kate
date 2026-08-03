@@ -537,6 +537,7 @@ void AgentDock::newAgentGuided(const QString &project)
     panel->preselectModel(c.modelId);
     panel->preselectIsolation(c.isolation);
     panel->preselectPermission(c.permissionMode);
+    panel->preselectSandboxMode(c.sandboxMode);
     panel->preselectEffort(c.effort);
     // The P6 sweep rides on the first start; the dialog only offered the
     // options this engine declares, so nothing here can be silently dropped.

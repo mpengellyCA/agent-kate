@@ -67,6 +67,11 @@ func (h *codexHarness) Catalogue(ctx context.Context, scope harness.CatalogueSco
 			{Key: harness.SettingReasoningEffort, DisplayName: "Reasoning effort", Timing: harness.TimingNextTurn},
 			{Key: harness.SettingPermissionMode, DisplayName: "Approval policy",
 				Choices: choices("untrusted", "on-request", "never"), Timing: harness.TimingNextTurn},
+			{Key: harness.SettingSandboxMode, DisplayName: "Sandbox mode",
+				Choices: []harness.SettingChoice{
+					{Value: "workspace-write", DisplayName: "Workspace write"},
+					{Value: "danger-full-access", DisplayName: "Full access (dangerous)"},
+				}, DefaultValue: "workspace-write", Timing: harness.TimingNextTurn},
 		}}
 	snapshot.Revision = harness.CatalogueRevision(snapshot)
 	return snapshot, nil
@@ -124,7 +129,7 @@ func (h *codexHarness) Launch(launch harness.AgentLaunch, runtime harness.StartS
 		Model:          spec.Model,
 		Effort:         spec.Effort,
 		ApprovalPolicy: spec.PermissionMode,
-		Sandbox:        "workspace-write",
+		Sandbox:        firstNonEmpty(spec.SandboxMode, "workspace-write"),
 		Env:            spec.Env,
 	})
 	if err != nil {
@@ -168,6 +173,7 @@ func (h *codexHarness) UpdateSettings(_ context.Context, ref harness.AgentRef, r
 		{"model", requested.Model},
 		{"effort", requested.ReasoningEffort},
 		{"permissionMode", requested.PermissionMode},
+		{"sandboxMode", requested.SandboxMode},
 	} {
 		if update.value == "" {
 			continue

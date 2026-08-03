@@ -23,6 +23,8 @@ type fakeBackend struct {
 	agents     []Agent
 	transcript Transcript
 	sendResult SendResult
+	lastSend   SendRequest
+	lastSender Principal
 	diff       Diff
 	gitStatus  any
 	gitLog     any
@@ -63,10 +65,12 @@ func (f *fakeBackend) Transcript(context.Context, TranscriptRequest) (Transcript
 	return f.transcript, nil
 }
 
-func (f *fakeBackend) Send(context.Context, Principal, SendRequest) (SendResult, error) {
+func (f *fakeBackend) Send(_ context.Context, principal Principal, req SendRequest) (SendResult, error) {
 	f.record("Send")
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.lastSender = principal
+	f.lastSend = req
 	return f.sendResult, f.sendErr
 }
 

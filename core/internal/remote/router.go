@@ -22,6 +22,11 @@ const contentSecurityPolicy = "default-src 'self'; script-src 'self'; object-src
 // updatedInput and stops an authenticated device from making us buffer a gigabyte.
 const maxRequestBytes = 64 * 1024
 
+// Remote uploads are bounded independently from ordinary API JSON. The limit
+// includes base64 expansion and JSON framing; it is intentionally much smaller
+// than the desktop IPC frame and does not create a general-purpose file API.
+const maxSendRequestBytes = 8 * 1024 * 1024
+
 // route is one entry in the frozen route table.
 type route struct {
 	// Pattern is a Go 1.22 ServeMux pattern, including the method where one
@@ -51,6 +56,7 @@ func (s *Server) routes() []route {
 		{Pattern: "GET /api/v1/agents", Auth: true, Handler: s.handleAgents},
 		{Pattern: "GET /api/v1/agents/{threadId}", Auth: true, Handler: s.handleAgent},
 		{Pattern: "GET /api/v1/agents/{threadId}/transcript", Auth: true, Handler: s.handleTranscript},
+		{Pattern: "POST /api/v1/agents/{threadId}/send", Auth: true, Handler: s.handleSend},
 		{Pattern: "POST /api/v1/agents/{threadId}/interrupt", Auth: true, Handler: s.handleInterrupt},
 		{Pattern: "POST /api/v1/agents/{threadId}/stop", Auth: true, Handler: s.handleStop},
 		{Pattern: "GET /api/v1/agents/{threadId}/diff", Auth: true, Handler: s.handleDiff},
@@ -115,7 +121,11 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 		// Deliberately no HSTS. The certificate is self-signed and trusted on
 		// first use; pinning the origin to HTTPS-only via HSTS would turn a
 		// certificate change into a lockout the user cannot click through.
-		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+		bodyLimit := int64(maxRequestBytes)
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/send") {
+			bodyLimit = maxSendRequestBytes
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, bodyLimit)
 
 		// The kill switch answers before the auth gate, and answers 503.
 		//

@@ -65,6 +65,20 @@ func TestProjectRemoteTranscriptCapsOnlyTheRemoteDTO(t *testing.T) {
 	}
 }
 
+func TestProjectRemoteTranscriptLabelsAttachmentOnlyUserTurn(t *testing.T) {
+	secret := "attachment-body-must-not-leave-the-desktop"
+	raw := []json.RawMessage{json.RawMessage(fmt.Sprintf(`{"type":"user","message":{"content":[{"type":"text","text":%q}]}}`,
+		"Attached file `private.md`:\n```\n"+secret+"\n```"))}
+	got, truncated := projectRemoteTranscript(raw, 20, 4096)
+	if truncated || len(got) != 1 || got[0].Kind != "user" || got[0].Text != "Attached 1 file(s)" {
+		t.Fatalf("attachment-only projection = %#v, truncated=%v", got, truncated)
+	}
+	encoded, _ := json.Marshal(got)
+	if strings.Contains(string(encoded), secret) || strings.Contains(string(encoded), "private.md") {
+		t.Fatalf("attachment-only projection leaked file details: %s", encoded)
+	}
+}
+
 func TestRemoteBackendUsesHarnessDescriptorAndLinkage(t *testing.T) {
 	store, err := session.NewStore(filepath.Join(t.TempDir(), "threads.json"))
 	if err != nil {

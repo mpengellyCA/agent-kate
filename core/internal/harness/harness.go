@@ -112,6 +112,7 @@ const (
 	SettingModel           SettingKey = "model"
 	SettingReasoningEffort SettingKey = "reasoningEffort"
 	SettingPermissionMode  SettingKey = "permissionMode"
+	SettingSandboxMode     SettingKey = "sandboxMode"
 )
 
 type SettingChoice struct {
@@ -223,6 +224,7 @@ type AgentSettings struct {
 	Model           string `json:"model,omitempty"`
 	ReasoningEffort string `json:"reasoningEffort,omitempty"`
 	PermissionMode  string `json:"permissionMode,omitempty"`
+	SandboxMode     string `json:"sandboxMode,omitempty"`
 }
 
 type AgentRef struct {
@@ -335,6 +337,7 @@ type StartSpec struct {
 	Model          string // harness vocabulary (tier token or CLI model id)
 	Effort         string // harness vocabulary (claude --effort / kimi thinking)
 	PermissionMode string // harness vocabulary (claude mode / kimi mode)
+	SandboxMode    string // harness vocabulary; currently Codex only
 
 	SessionID   string // pre-minted (MintsSessionID) or the session to resume
 	Resume      bool   // re-attach SessionID instead of starting fresh

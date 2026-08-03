@@ -7,11 +7,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	"agentkate/internal/agent"
 	"agentkate/internal/gitstatus"
 	"agentkate/internal/permission"
 	"agentkate/internal/remote"
@@ -150,14 +152,34 @@ func (b *remoteBackend) Transcript(ctx context.Context, req remote.TranscriptReq
 		return remote.Transcript{}, err
 	}
 	projected, truncated := projectRemoteTranscript(events, req.Limit, req.MaxBytes)
+	if b.d.remote != nil {
+		projected = b.d.remote.mergeHumanEchoes(req.ThreadID, projected)
+	}
 	return remote.Transcript{Events: projected, Truncated: truncated}, nil
 }
 
-// Send remains intentionally unavailable. The route is absent too: until a
-// human message has one canonical desktop + remote transcript echo, accepting
-// an HTTPS send would create a split conversation history.
-func (b *remoteBackend) Send(context.Context, remote.Principal, remote.SendRequest) (remote.SendResult, error) {
-	return remote.SendResult{}, remote.ErrUnsupported
+// Send reaches the canonical human-surface operation after HTTPS authentication
+// has constructed an immutable remote principal. It never calls a harness
+// directly, so remote queueing and cross-surface echo cannot drift from the
+// desktop path.
+func (b *remoteBackend) Send(ctx context.Context, principal remote.Principal, req remote.SendRequest) (remote.SendResult, error) {
+	if err := ctx.Err(); err != nil {
+		return remote.SendResult{}, err
+	}
+	if err := b.requireThread(req.ThreadID); err != nil {
+		return remote.SendResult{}, err
+	}
+	atts := make([]agent.Attachment, 0, len(req.Attachments))
+	for _, att := range req.Attachments {
+		atts = append(atts, agent.Attachment{
+			Kind: att.Kind, Name: att.Name, MediaType: att.MediaType, Text: att.Text, DataB64: att.DataB64,
+		})
+	}
+	result, err := b.d.humanSend(humanPrincipal{Surface: remoteSurface, Device: principal.DeviceName}, req.ThreadID, req.Text, atts)
+	if err != nil {
+		return remote.SendResult{}, fmt.Errorf("remote send: %w", err)
+	}
+	return remote.SendResult{Queued: result.Queued, Position: result.Position, Resuming: result.Resuming}, nil
 }
 
 func (b *remoteBackend) PermissionDetail(ctx context.Context, requestID string) (remote.PermissionDetail, error) {
@@ -409,13 +431,29 @@ func remoteUserText(content json.RawMessage) string {
 		return text
 	}
 	var blocks []remoteWireBlock
-	if json.Unmarshal(content, &blocks) != nil || len(blocks) == 0 || blocks[0].Type != "text" {
+	if json.Unmarshal(content, &blocks) != nil || len(blocks) == 0 {
 		return ""
 	}
 	// buildUserContent always puts the human's text first and attachment bodies
 	// after it. Deliberately read one block only: later text blocks can contain
 	// a full attached file and must never reach a paired device.
-	return blocks[0].Text
+	if blocks[0].Type == "text" && !strings.HasPrefix(blocks[0].Text, "Attached file `") {
+		return blocks[0].Text
+	}
+	// An attachment-only prompt has no safe prose block at all. Preserve the
+	// conversation shape with the same bounded label the canonical acceptance
+	// echo uses, but never project the file body (or image data) from a harness
+	// transcript back to a paired device.
+	attachments := 0
+	for _, block := range blocks {
+		if block.Type == "image" || (block.Type == "text" && strings.HasPrefix(block.Text, "Attached file `")) {
+			attachments++
+		}
+	}
+	if attachments == 0 {
+		return ""
+	}
+	return fmt.Sprintf("Attached %d file(s)", attachments)
 }
 
 func remoteLifecyclePhase(phase string) bool {

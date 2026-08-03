@@ -201,9 +201,25 @@ type Transcript struct {
 type SendRequest struct {
 	ThreadID string
 	Text     string
+	// Attachments are a deliberately narrow upload DTO. They have no path,
+	// provenance, URL, or arbitrary metadata field: a paired browser can offer
+	// bytes to an agent, never name a desktop file for the core to read.
+	Attachments []Attachment
 	// Mode is M0.3's core-side semantics: "queue" | "reject". The HTTP layer
 	// never passes "now" — see sendModeNow in handlers.go for why.
 	Mode string
+}
+
+// Attachment is one browser-uploaded text or image file. Validation happens at
+// the HTTP boundary before it reaches this DTO; keeping it separate from the
+// desktop's agent.Attachment prevents path/cache metadata from becoming part of
+// the remote contract by accident.
+type Attachment struct {
+	Kind      string `json:"kind"`
+	Name      string `json:"name"`
+	MediaType string `json:"mediaType"`
+	Text      string `json:"text"`
+	DataB64   string `json:"dataB64"`
 }
 
 // SendResult is what the core did with the prompt.

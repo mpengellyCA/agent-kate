@@ -170,6 +170,7 @@ struct NewAgentChoices {
     QString modelId;        // tier token / discovered model id; "" = default
     QString isolation;      // auto | isolated | workspace
     QString permissionMode; // the harness's own mode vocabulary; "" = default
+    QString sandboxMode;    // Codex: workspace-write | danger-full-access
     QString effort;         // the harness's own effort vocabulary; "" = default
     // The launch-option sweep (plan 16 P6), each offered only when the chosen
     // engine declares the capability. Empty lists mean "not requested".
@@ -419,6 +420,7 @@ private:
         IsolationCopy::Availability::Unknown;
     QWidget *m_advanced = nullptr;
     QComboBox *m_permission = nullptr;
+    QComboBox *m_sandboxMode = nullptr;
     QComboBox *m_effort = nullptr;
     // Sweep fields + their form rows, so a row can be hidden entirely for an
     // engine that cannot express it (offering it would be a lie).

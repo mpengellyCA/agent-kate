@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"agentkate/internal/permission"
 	"agentkate/internal/remote"
@@ -30,6 +32,7 @@ type remoteControl struct {
 	dataDir  string // test override; production uses the private XDG location.
 	bind     string
 	allowAll bool
+	echoes   humanEchoStore
 }
 
 func newRemoteControl(ctx context.Context, log *slog.Logger) *remoteControl {
@@ -179,7 +182,172 @@ func (c *remoteControl) publishRawEvents(threadID string, raw []json.RawMessage)
 		return
 	}
 	events, _ := projectRemoteTranscript(raw, 200, 256*1024)
+	events = c.echoes.consumeObserved(threadID, events)
 	srv.PublishTranscript(threadID, events)
+}
+
+// publishAcceptedHumanSend is separate from publishRawEvents because the core
+// created this user turn itself. It is already a remote-safe typed DTO; routing
+// it through the raw projector would couple the remote surface to a desktop
+// event shape and invite attachment data to drift across the boundary.
+func (c *remoteControl) publishAcceptedHumanSend(threadID, text string, at time.Time) {
+	c.echoes.add(threadID, remote.TranscriptEvent{Kind: "user", Text: text, At: at})
+	if srv := c.server(); srv != nil {
+		srv.PublishTranscript(threadID, []remote.TranscriptEvent{{Kind: "user", Text: text, At: at}})
+	}
+}
+
+// mergeHumanEchoes makes an accepted user turn visible to a reconnecting phone
+// before a harness has flushed its own transcript record. Once the harness
+// produces the equivalent typed user event, consumeObserved removes the
+// synthetic copy so remote clients never see a duplicate. The store holds only
+// the already-redacted user text, is process-local, and is bounded: it is an
+// ordering bridge, not a second transcript store.
+func (c *remoteControl) mergeHumanEchoes(threadID string, events []remote.TranscriptEvent) []remote.TranscriptEvent {
+	if c == nil {
+		return events
+	}
+	return c.echoes.merge(threadID, events)
+}
+
+const (
+	maxHumanEchoesPerThread = 64
+	maxHumanEchoTextBytes   = 256 * 1024
+	humanEchoMaxAge         = 24 * time.Hour
+)
+
+type humanEchoStore struct {
+	mu       sync.Mutex
+	byThread map[string][]remote.TranscriptEvent
+}
+
+func (s *humanEchoStore) add(threadID string, event remote.TranscriptEvent) {
+	if s == nil || threadID == "" || event.Kind != "user" || event.Text == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.byThread == nil {
+		s.byThread = make(map[string][]remote.TranscriptEvent)
+	}
+	now := time.Now().UTC()
+	items := pruneHumanEchoes(s.byThread[threadID], now)
+	items = append(items, event)
+	for len(items) > maxHumanEchoesPerThread || humanEchoTextBytes(items) > maxHumanEchoTextBytes {
+		items = items[1:]
+	}
+	s.byThread[threadID] = items
+}
+
+// consumeObserved returns only new harness events. Matching is one-to-one and
+// ordered, so two identical follow-ups remain two messages rather than
+// accidentally coalescing. A harness record may arrive long after acceptance
+// when a remote follow-up waits behind a slow turn; an event from before the
+// acceptance timestamp is the only one that must not consume the new echo.
+func (s *humanEchoStore) consumeObserved(threadID string, events []remote.TranscriptEvent) []remote.TranscriptEvent {
+	if s == nil || len(events) == 0 {
+		return events
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	items := pruneHumanEchoes(s.byThread[threadID], time.Now().UTC())
+	if len(items) == 0 {
+		return events
+	}
+	out := make([]remote.TranscriptEvent, 0, len(events))
+	for _, event := range events {
+		if i := matchingHumanEcho(items, event); i >= 0 {
+			items = append(items[:i], items[i+1:]...)
+			continue
+		}
+		out = append(out, event)
+	}
+	if len(items) == 0 {
+		delete(s.byThread, threadID)
+	} else {
+		s.byThread[threadID] = items
+	}
+	return out
+}
+
+func (s *humanEchoStore) merge(threadID string, events []remote.TranscriptEvent) []remote.TranscriptEvent {
+	if s == nil {
+		return events
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	items := pruneHumanEchoes(s.byThread[threadID], time.Now().UTC())
+	if len(items) == 0 {
+		return events
+	}
+	// A read can beat the live relay. Consume any harness event in this page
+	// before adding the not-yet-persisted typed echo.
+	remaining := make([]remote.TranscriptEvent, 0, len(items))
+	observed := append([]remote.TranscriptEvent(nil), events...)
+	for _, echo := range items {
+		if i := matchingObservedHumanEcho(echo, observed); i >= 0 {
+			observed = append(observed[:i], observed[i+1:]...)
+		} else {
+			remaining = append(remaining, echo)
+		}
+	}
+	if len(remaining) == 0 {
+		delete(s.byThread, threadID)
+	} else {
+		s.byThread[threadID] = remaining
+	}
+	out := append([]remote.TranscriptEvent(nil), events...)
+	out = append(out, remaining...)
+	sort.SliceStable(out, func(i, j int) bool { return out[i].At.Before(out[j].At) })
+	return out
+}
+
+func pruneHumanEchoes(items []remote.TranscriptEvent, now time.Time) []remote.TranscriptEvent {
+	cutoff := now.Add(-humanEchoMaxAge)
+	first := 0
+	for first < len(items) && items[first].At.Before(cutoff) {
+		first++
+	}
+	return append([]remote.TranscriptEvent(nil), items[first:]...)
+}
+
+func humanEchoTextBytes(items []remote.TranscriptEvent) int {
+	total := 0
+	for _, item := range items {
+		total += len(item.Text)
+	}
+	return total
+}
+
+func matchingHumanEcho(items []remote.TranscriptEvent, event remote.TranscriptEvent) int {
+	for i, echo := range items {
+		if humanEchoMatches(echo, event) {
+			return i
+		}
+	}
+	return -1
+}
+
+func matchingObservedHumanEcho(echo remote.TranscriptEvent, events []remote.TranscriptEvent) int {
+	for i, event := range events {
+		if humanEchoMatches(echo, event) {
+			return i
+		}
+	}
+	return -1
+}
+
+func humanEchoMatches(echo, event remote.TranscriptEvent) bool {
+	if echo.Kind != "user" || event.Kind != "user" || echo.Text != event.Text {
+		return false
+	}
+	if echo.At.IsZero() || event.At.IsZero() {
+		return false
+	}
+	// A transcript timestamp slightly before acceptance can result from a small
+	// clock/flush skew, but an older historical user turn must never consume a
+	// fresh identical prompt during a reconnect merge.
+	return !event.At.Before(echo.At.Add(-time.Minute))
 }
 
 func (c *remoteControl) publishTurnState(threadID string, busy bool) {

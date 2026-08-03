@@ -78,6 +78,7 @@ type Thread struct {
 	model          string
 	effort         string
 	approvalPolicy string
+	sandbox        string
 	alive          bool
 	stopping       bool
 	activeTurnID   string
@@ -297,6 +298,7 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 	// previous default effort.
 	t.effort = first(opts.Effort, response.ReasoningEffort)
 	t.approvalPolicy = first(response.ApprovalPolicy, opts.ApprovalPolicy)
+	t.sandbox = first(opts.Sandbox, "workspace-write")
 	t.mu.Unlock()
 	if err := s.openLog(t, opts.Resume); err != nil {
 		s.logf("codex event log unavailable", "thread", id, "err", err)
@@ -360,8 +362,8 @@ func (s *Supervisor) Send(id, text string, atts []agent.Attachment) error {
 	}
 	t.mu.Lock()
 	stopping := t.stopping
-	sessionID, model, effort, approvalPolicy :=
-		t.sessionID, t.model, t.effort, t.approvalPolicy
+	sessionID, model, effort, approvalPolicy, sandbox :=
+		t.sessionID, t.model, t.effort, t.approvalPolicy, t.sandbox
 	t.mu.Unlock()
 	if stopping {
 		return fmt.Errorf("codex thread %q is stopping", id)
@@ -400,6 +402,9 @@ func (s *Supervisor) Send(id, text string, atts []agent.Attachment) error {
 	}
 	if approvalPolicy != "" {
 		params["approvalPolicy"] = approvalPolicy
+	}
+	if sandbox != "" {
+		params["sandbox"] = sandbox
 	}
 	if err := t.rpc.call(ctx, "turn/start", params, &out); err != nil {
 		return fmt.Errorf("codex turn/start: %w", err)
@@ -562,6 +567,12 @@ func (s *Supervisor) SetOption(id, option, value string) (string, error) {
 		t.effort = value
 	case "permissionMode":
 		t.approvalPolicy = value
+	case "sandboxMode":
+		if value != "read-only" && value != "workspace-write" && value != "danger-full-access" {
+			t.mu.Unlock()
+			return "", fmt.Errorf("unknown Codex sandbox mode %q", value)
+		}
+		t.sandbox = value
 	default:
 		t.mu.Unlock()
 		return "", fmt.Errorf("unknown codex option %q", option)

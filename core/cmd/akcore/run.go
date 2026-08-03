@@ -264,6 +264,7 @@ func runCore() {
 	// The handlers mark turns queued; the relay below feeds every event back in
 	// (results end turns, terminal lifecycles end threads).
 	turns := agent.NewTurnTracker()
+	humanQueue := newHumanSendQueue()
 
 	// Rate-window auto-resume (plan 28 §Phase 2). Built below, once deps exist
 	// — the relay only needs the handle, and no event can reach it before
@@ -504,6 +505,7 @@ func runCore() {
 		gitCache:      gitCache,
 		cowork:        coworkSvc,
 		remote:        remoteCtl,
+		humanQueue:    humanQueue,
 		socketPath:    *socket,
 		exePath:       exePath,
 		log:           log,
@@ -511,6 +513,12 @@ func runCore() {
 	remoteCtl.attach(deps)
 	broker.SetObserver(remoteCtl)
 	turns.SetOnChange(func(threadID string, busy bool) {
+		// A queued remote follow-up becomes the next turn before we publish an
+		// idle edge. This makes the state transition truthful to both desktop
+		// and paired devices: there is no visible idle gap while work is queued.
+		if !busy && humanQueue.drainOne(deps, threadID) {
+			return
+		}
 		remoteCtl.publishTurnState(threadID, busy)
 	})
 	registerHandlers(deps)

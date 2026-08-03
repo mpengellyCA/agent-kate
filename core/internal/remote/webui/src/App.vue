@@ -1,11 +1,16 @@
 <script setup>
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import MarkdownBlock from './components/MarkdownBlock.vue'
 import { bootstrapAuth } from './api/auth.js'
 import {
   API_VERSION, eventsUrl, getAgents, getMeta, getPermission, getTranscript,
-  interruptAgent, logout, respondPermission, stopAgent,
+  interruptAgent, logout, respondPermission, sendPrompt, stopAgent,
 } from './api/client.js'
+
+const MAX_ATTACHMENTS = 4
+const MAX_ATTACHMENT_BYTES = 4 * 1024 * 1024
+const MAX_ATTACHMENT_TOTAL = 6 * 1024 * 1024
+const imageTypes = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp'])
 
 const phase = ref('booting')
 const message = ref('')
@@ -17,12 +22,23 @@ const transcriptTruncated = ref(false)
 const lastEventID = ref(0)
 const detail = ref(null)
 const actionError = ref('')
+const sendFeedback = ref('')
 const answers = ref({})
+const drawerOpen = ref(false)
+const composer = ref('')
+const attachments = ref([])
+const attachmentPicker = ref(null)
+const sending = ref(false)
+const conversation = ref(null)
 let stream = null
 
-const selected = computed(() => agents.value.find((a) => a.threadId === selectedID.value) ?? null)
+const selected = computed(() => agents.value.find((agent) => agent.threadId === selectedID.value) ?? null)
 const prompt = computed(() => selected.value?.awaitingPermission ?? null)
 const versionSkew = computed(() => Number(meta.value?.apiVersion) !== API_VERSION)
+const activeAgents = computed(() => agents.value.filter((agent) => agent.status !== 'archived'))
+const canSend = computed(() => !!selected.value && !sending.value &&
+  (!!composer.value.trim() || attachments.value.length > 0) && selected.value.status !== 'archived')
+const attachmentBytes = computed(() => attachments.value.reduce((total, attachment) => total + attachment.bytes, 0))
 
 boot()
 onBeforeUnmount(closeStream)
@@ -32,17 +48,22 @@ watch(() => prompt.value?.requestId, async (requestID) => {
   if (!requestID) return
   try {
     const next = await getPermission(requestID)
-    // The server has already reduced this to a plan or a typed question list;
-    // normal tool prompts never have renderable input here.
+    // The server has already reduced this to a plan or typed questions. A raw
+    // tool input has no field anywhere in this rendering path.
     detail.value = next
-    for (const q of next.questions ?? []) answers.value[q?.question] = q?.multiSelect ? [] : ''
+    for (const question of next.questions ?? []) answers.value[question?.question] = question?.multiSelect ? [] : ''
   } catch (err) { actionError.value = err?.message || 'Could not load that permission request.' }
 })
+watch(() => transcript.value.length, () => scrollConversation())
 
 async function boot() {
   phase.value = 'booting'; message.value = ''
   const auth = await bootstrapAuth()
-  if (auth.error) { phase.value = auth.error.isAuth ? 'bad-token' : 'offline'; message.value = auth.error.message; return }
+  if (auth.error) {
+    phase.value = auth.error.isAuth ? 'bad-token' : 'offline'
+    message.value = auth.error.message
+    return
+  }
   try {
     meta.value = await getMeta()
     await refresh()
@@ -65,25 +86,36 @@ function connectThread(threadId) { connect({ scope: 'thread', threadId, lastEven
 function connect(scope) {
   closeStream()
   stream = new EventSource(eventsUrl(scope))
-  stream.addEventListener('roster', event => applyRoster(event))
-  stream.addEventListener('turnState', event => applyTurnState(event))
-  stream.addEventListener('permissionRequested', event => refresh().catch(() => {}))
-  stream.addEventListener('permissionResolved', event => refresh().catch(() => {}))
-  stream.addEventListener('agentGone', event => {
-    const body = parse(event); agents.value = agents.value.filter(a => a.threadId !== body?.threadId)
+  stream.addEventListener('roster', (event) => applyRoster(event))
+  stream.addEventListener('turnState', (event) => applyTurnState(event))
+  stream.addEventListener('permissionRequested', () => refresh().catch(() => {}))
+  stream.addEventListener('permissionResolved', () => refresh().catch(() => {}))
+  stream.addEventListener('agentGone', (event) => {
+    const body = parse(event)
+    agents.value = agents.value.filter((agent) => agent.threadId !== body?.threadId)
     if (body?.threadId === selectedID.value) back()
   })
-  stream.addEventListener('agentEvent', event => {
+  stream.addEventListener('agentEvent', (event) => {
     const body = parse(event)
+    rememberEventID(event)
     if (body?.threadId === selectedID.value && Array.isArray(body.events)) transcript.value.push(...body.events)
   })
   stream.addEventListener('gap', () => { if (selectedID.value) open(selectedID.value); else refresh().catch(() => {}) })
-  stream.addEventListener('revoked', event => { message.value = parse(event)?.reason || 'This device was unpaired.'; phase.value = 'revoked'; closeStream() })
+  stream.addEventListener('revoked', (event) => {
+    message.value = parse(event)?.reason || 'This device has been unpaired.'
+    phase.value = 'revoked'
+    closeStream()
+  })
 }
 function parse(event) { try { return JSON.parse(event.data) } catch { return null } }
+function rememberEventID(event) {
+  const id = Number(event?.lastEventId)
+  if (Number.isFinite(id) && id > lastEventID.value) lastEventID.value = id
+}
 function applyRoster(event) { const body = parse(event); if (Array.isArray(body?.agents)) agents.value = body.agents }
 function applyTurnState(event) {
-  const state = parse(event); const row = agents.value.find(a => a.threadId === state?.threadId)
+  const state = parse(event)
+  const row = agents.value.find((agent) => agent.threadId === state?.threadId)
   if (!row) return
   if (typeof state.busy === 'boolean') row.busy = state.busy
   if (typeof state.attention === 'boolean') row.attention = state.attention
@@ -91,27 +123,126 @@ function applyTurnState(event) {
 }
 
 async function open(threadId) {
-  selectedID.value = threadId; actionError.value = ''
+  selectedID.value = threadId
+  actionError.value = ''
+  sendFeedback.value = ''
+  drawerOpen.value = false
   try {
     const body = await getTranscript(threadId, { limit: 500, maxBytes: 262144 })
     transcript.value = Array.isArray(body?.events) ? body.events : []
     transcriptTruncated.value = !!body?.truncated
     lastEventID.value = Number(body?.lastEventId) || 0
     connectThread(threadId)
+    scrollConversation()
   } catch (err) { actionError.value = err?.message || 'Could not load this conversation.' }
 }
-function back() { selectedID.value = ''; transcript.value = []; detail.value = null; connectRoster() }
+function back() {
+  selectedID.value = ''
+  transcript.value = []
+  detail.value = null
+  composer.value = ''
+  attachments.value = []
+  connectRoster()
+}
+function scrollConversation() {
+  nextTick(() => {
+    const pane = conversation.value
+    if (pane) pane.scrollTop = pane.scrollHeight
+  })
+}
+
 async function control(op) {
   if (!selected.value) return
   actionError.value = ''
-  try { await (op === 'interrupt' ? interruptAgent(selected.value.threadId) : stopAgent(selected.value.threadId)); await refresh() }
-  catch (err) { actionError.value = err?.message || `Could not ${op} this agent.` }
+  try {
+    await (op === 'interrupt' ? interruptAgent(selected.value.threadId) : stopAgent(selected.value.threadId))
+    await refresh()
+  } catch (err) { actionError.value = err?.message || `Could not ${op} this agent.` }
 }
+
+function openAttachmentPicker() { attachmentPicker.value?.click() }
+async function addAttachments(event) {
+  const files = Array.from(event.target?.files ?? [])
+  if (attachmentPicker.value) attachmentPicker.value.value = ''
+  actionError.value = ''
+  for (const file of files) {
+    if (attachments.value.length >= MAX_ATTACHMENTS) {
+      actionError.value = `A remote message can have at most ${MAX_ATTACHMENTS} attachments.`
+      break
+    }
+    try {
+      const attachment = await encodeAttachment(file)
+      if (attachmentBytes.value + attachment.bytes > MAX_ATTACHMENT_TOTAL) {
+        actionError.value = 'Attachments together must be 6 MiB or smaller.'
+        break
+      }
+      attachments.value.push(attachment)
+    } catch (err) { actionError.value = err?.message || `Could not add ${file.name || 'that file'}.` }
+  }
+}
+async function encodeAttachment(file) {
+  const name = String(file?.name || '').trim()
+  if (!name || name.length > 160 || /[\\/\0]/.test(name) || name === '.' || name === '..') {
+    throw new Error('That attachment name is not safe to send.')
+  }
+  if (!Number.isFinite(file?.size) || file.size > MAX_ATTACHMENT_BYTES) {
+    throw new Error(`${name} is larger than the 4 MiB per-file limit.`)
+  }
+  if (imageTypes.has(file.type)) {
+    const dataURL = await readDataURL(file)
+    const dataB64 = dataURL.slice(dataURL.indexOf(',') + 1)
+    return { kind: 'image', name, mediaType: file.type, dataB64, bytes: file.size }
+  }
+  if (file.type.startsWith('text/') || /\.(md|markdown|txt|log|json|yaml|yml|toml|csv)$/i.test(name)) {
+    const text = await file.text()
+    const bytes = new TextEncoder().encode(text).byteLength
+    if (bytes > MAX_ATTACHMENT_BYTES) throw new Error(`${name} is larger than the 4 MiB per-file limit.`)
+    const mediaType = /\.(md|markdown)$/i.test(name) ? 'text/markdown' : 'text/plain'
+    return { kind: 'text', name, mediaType, text, bytes }
+  }
+  throw new Error('Attach a PNG, JPEG, GIF, WebP, plain-text, or Markdown file.')
+}
+function readDataURL(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result || ''))
+    reader.onerror = () => reject(new Error(`Could not read ${file.name}.`))
+    reader.readAsDataURL(file)
+  })
+}
+function removeAttachment(index) { attachments.value.splice(index, 1) }
+function attachmentRequest() {
+  // bytes is a browser-only UI measurement. The wire DTO is explicitly typed
+  // and cannot carry a path, local URL, cache key, or arbitrary file metadata.
+  return attachments.value.map(({ kind, name, mediaType, text, dataB64 }) => ({ kind, name, mediaType, text, dataB64 }))
+}
+async function send() {
+  if (!canSend.value || !selected.value) return
+  sending.value = true
+  actionError.value = ''
+  sendFeedback.value = ''
+  try {
+    const result = await sendPrompt(selected.value.threadId, { text: composer.value.trim(), attachments: attachmentRequest() })
+    composer.value = ''
+    attachments.value = []
+    sendFeedback.value = result?.resuming
+      ? 'Waking the agent — your message will be delivered once its saved session is ready.'
+      : result?.queued && result?.position > 1
+        ? `Queued — message ${result.position} will run after the current turn.`
+        : selected.value.busy ? 'Queued for the next turn.' : 'Accepted by the agent.'
+  } catch (err) {
+    // Preserve the human's draft and browser-held attachment data on a failed
+    // request. A transport failure must never silently eat their message.
+    actionError.value = err?.message || 'Could not send that message.'
+  } finally { sending.value = false }
+}
+
 function pick(question, option, multi) {
   const current = answers.value[question] ?? (multi ? [] : '')
-  if (!multi) answers.value = { ...answers.value, [question]: option }; return
+  if (!multi) { answers.value = { ...answers.value, [question]: option }; return }
   const next = Array.isArray(current) ? [...current] : []
-  const at = next.indexOf(option); if (at >= 0) next.splice(at, 1); else next.push(option)
+  const at = next.indexOf(option)
+  if (at >= 0) next.splice(at, 1); else next.push(option)
   answers.value = { ...answers.value, [question]: next }
 }
 function chosen(question, option) { const value = answers.value[question]; return Array.isArray(value) ? value.includes(option) : value === option }
@@ -126,36 +257,81 @@ async function answer(allow) {
   catch (err) { actionError.value = err?.message || 'Could not send that answer.' }
 }
 async function doLogout() { try { await logout() } catch {} phase.value = 'unauthenticated'; closeStream() }
+
+function agentState(agent) {
+  if (agent.awaitingPermission) return 'Needs you'
+  if (agent.busy) return 'Working'
+  if (agent.status === 'dormant') return 'Dormant'
+  return 'Ready'
+}
+function shortBytes(bytes) { return bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} MiB` : `${Math.ceil(bytes / 1024)} KiB` }
 </script>
 
 <template>
-  <main v-if="phase !== 'ready'" class="shell empty">
-    <h1>Agent Kate Remote Access</h1>
-    <p v-if="phase === 'booting'">Connecting securely…</p>
-    <template v-else>
-      <p>{{ message || (phase === 'unauthenticated' ? 'This device is not paired.' : 'Remote access is unavailable.') }}</p>
-      <p v-if="phase === 'unauthenticated' || phase === 'bad-token'">Open a new pairing link from the desktop Remote Access panel.</p>
-      <button v-if="phase === 'offline'" @click="boot">Try again</button>
-    </template>
+  <main v-if="phase !== 'ready'" class="grid min-h-dvh place-items-center bg-base-100 px-5 pt-safe pb-safe">
+    <section class="card w-full max-w-sm border border-ak-border bg-base-200 shadow-xl">
+      <div class="card-body items-center text-center">
+        <span class="grid h-12 w-12 place-items-center rounded-2xl bg-primary text-2xl text-primary-content">K</span>
+        <template v-if="phase === 'booting'"><span class="loading loading-spinner loading-md text-primary" /><p class="text-sm text-ak-muted">Connecting securely…</p></template>
+        <template v-else>
+          <h1 class="card-title">Agent Kate Remote Access</h1>
+          <p class="text-sm text-ak-muted">{{ message || (phase === 'unauthenticated' ? 'This device is not paired.' : 'Remote access is unavailable.') }}</p>
+          <p v-if="phase === 'unauthenticated' || phase === 'bad-token'" class="text-xs text-ak-muted">Open a new one-time pairing link from the desktop Remote Access panel.</p>
+          <button v-if="phase === 'offline'" type="button" class="btn btn-primary btn-sm mt-2" @click="boot">Try again</button>
+        </template>
+      </div>
+    </section>
   </main>
 
-  <main v-else class="shell">
-    <header class="bar"><button v-if="selected" class="ghost" @click="back">← Agents</button><h1>Agent Kate</h1><span class="spacer" /><button class="ghost" @click="refresh">Refresh</button><button class="ghost" @click="doLogout">Log out</button></header>
-    <p v-if="versionSkew" class="warning">This browser bundle is for API v{{ API_VERSION }} while the core serves v{{ meta?.apiVersion }}. Reload after updating the desktop.</p>
-    <p v-if="actionError" class="error">{{ actionError }}</p>
+  <main v-else class="drawer lg:drawer-open">
+    <input id="agents-drawer" v-model="drawerOpen" type="checkbox" class="drawer-toggle" />
+    <div class="drawer-content flex h-dvh min-w-0 flex-col overflow-hidden bg-base-100">
+      <header class="flex flex-none items-center gap-2 border-b border-ak-border bg-base-200 px-3 py-2 pt-safe">
+        <label for="agents-drawer" class="btn btn-ghost btn-sm btn-square lg:hidden" aria-label="Show agents">☰</label>
+        <button v-if="selected" type="button" class="btn btn-ghost btn-sm lg:hidden" @click="back">Agents</button>
+        <div class="min-w-0"><h1 class="truncate text-sm font-semibold">Agent Kate</h1><p class="text-xs text-ak-muted">Paired remote device</p></div>
+        <span class="flex-1" />
+        <span v-if="agents.filter(a => a.attention).length" class="badge badge-warning badge-sm">{{ agents.filter(a => a.attention).length }} need you</span>
+        <button type="button" class="btn btn-ghost btn-sm" @click="refresh">Refresh</button>
+        <button type="button" class="btn btn-ghost btn-sm" @click="doLogout">Log out</button>
+      </header>
 
-    <section v-if="!selected">
-      <p class="notice">This paired device may view typed, redacted events and answer allowed human prompts. It is not a desktop UI or agent bridge.</p>
-      <div v-if="!agents.length" class="empty">No agents are available. Start or resume one from the desktop.</div>
-      <div v-else class="grid"><button v-for="agent in agents" :key="agent.threadId" class="card" :class="{ attention: agent.attention }" @click="open(agent.threadId)"><strong>{{ agent.title || agent.threadId }}</strong><div class="meta">{{ agent.project }} · {{ agent.engineName || agent.backend }} · {{ agent.model }}</div><div class="meta">{{ agent.busy ? 'Working' : 'Idle' }}<span v-if="agent.awaitingPermission"> · needs your response</span></div></button></div>
-    </section>
+      <div v-if="versionSkew" class="alert alert-info rounded-none px-3 py-2 text-xs"><span>This app was built for API v{{ API_VERSION }} while the core serves v{{ meta?.apiVersion }}. Reload after updating the desktop.</span></div>
+      <div v-if="actionError" class="alert alert-error mx-3 mt-3 flex-none py-2 text-sm"><span>{{ actionError }}</span></div>
 
-    <section v-else>
-      <div class="bar"><div><strong>{{ selected.title || selected.threadId }}</strong><div class="meta">{{ selected.busy ? 'Working' : 'Idle' }} · {{ selected.model }}</div></div><span class="spacer" /><button v-if="selected.busy" @click="control('interrupt')">Interrupt</button><button class="danger" @click="control('stop')">Stop</button></div>
-      <p class="notice">Remote message sending is not available until accepted messages have one canonical desktop and remote transcript echo.</p>
-      <p v-if="transcriptTruncated" class="warning">Some conversation content was clipped for this phone.</p>
-      <div class="conversation"><div v-if="!transcript.length" class="empty">No remote-safe transcript events yet.</div><article v-for="(event, index) in transcript" :key="`${index}-${event.at || ''}`" class="event" :class="event.kind"><MarkdownBlock v-if="event.kind === 'user' || event.kind === 'assistant'" :source="event.text" /><template v-else-if="event.kind === 'tool'"><strong>{{ event.toolName || 'Tool' }}</strong><div>{{ event.summary || 'Tool activity' }}</div></template><template v-else><strong>Agent status</strong><div>{{ event.text }}</div></template></article></div>
-      <aside v-if="prompt" class="permission"><div class="topline"><strong>{{ prompt.kind === 'plan' ? 'Plan approval' : prompt.kind === 'question' ? 'Question for you' : 'Permission needed' }}</strong><span class="spacer" /><span class="meta">{{ prompt.toolName }}</span></div><p>{{ prompt.summary }}</p><MarkdownBlock v-if="detail?.kind === 'plan' && detail.plan" :source="detail.plan" /><template v-else-if="detail?.kind === 'question'"><fieldset v-for="question in detail.questions || []" :key="question.question"><strong>{{ question.question }}</strong><label v-for="option in question.options || []" :key="optionLabel(option)"><input :type="question.multiSelect ? 'checkbox' : 'radio'" :name="question.question" :checked="chosen(question.question, optionLabel(option))" @change="pick(question.question, optionLabel(option), question.multiSelect)" /> {{ optionLabel(option) }}<span v-if="optionDescription(option)" class="meta"> — {{ optionDescription(option) }}</span></label></fieldset></template><p v-else-if="prompt.kind !== 'tool'" class="warning">The allowed details are unavailable. Answer this on the desktop instead.</p><div class="actions"><button class="good" :disabled="prompt.kind === 'question' && !detail" @click="answer(true)">Approve<span v-if="prompt.kind === 'question'"> answers</span></button><button class="danger" @click="answer(false)">Deny</button></div></aside>
-    </section>
+      <section v-if="!selected" class="min-h-0 flex-1 overflow-y-auto px-safe">
+        <div class="mx-auto max-w-5xl p-4 sm:p-6">
+          <div class="alert alert-info mb-4 text-sm"><span>This paired device sees only typed, redacted agent events. It is not a desktop UI or an agent bridge.</span></div>
+          <div v-if="!agents.length" class="hero min-h-64 rounded-box border border-dashed border-ak-border bg-base-200"><div class="hero-content text-center"><div><h2 class="text-lg font-semibold">No agents yet</h2><p class="mt-2 text-sm text-ak-muted">Start or resume an agent from the desktop; it will appear here.</p></div></div></div>
+          <div v-else class="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+            <button v-for="agent in agents" :key="agent.threadId" type="button" class="card min-h-40 border border-ak-border bg-base-200 text-left shadow-sm transition hover:border-primary/70 hover:bg-base-300" :class="{ 'border-warning/70': agent.attention }" @click="open(agent.threadId)">
+              <span class="card-body gap-3 p-4"><span class="flex items-start gap-3"><span class="grid h-10 w-10 flex-none place-items-center rounded-xl bg-primary/20 text-lg text-primary">◆</span><span class="min-w-0 flex-1"><span class="block truncate font-semibold">{{ agent.title || agent.threadId }}</span><span class="mt-1 block truncate text-xs text-ak-muted">{{ agent.project || 'No project name' }}</span></span><span class="badge badge-sm" :class="agent.attention ? 'badge-warning' : agent.busy ? 'badge-primary' : 'badge-ghost'">{{ agentState(agent) }}</span></span><span class="flex flex-wrap gap-1"><span v-if="agent.engineName || agent.backend" class="badge badge-outline badge-sm">{{ agent.engineName || agent.backend }}</span><span v-if="agent.model" class="badge badge-ghost badge-sm max-w-44 truncate font-mono">{{ agent.model }}</span></span><span v-if="agent.awaitingPermission" class="rounded-lg bg-warning/10 p-2 text-xs text-warning">{{ agent.awaitingPermission.summary || agent.awaitingPermission.toolName }}</span></span>
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <section v-else class="flex min-h-0 flex-1 flex-col overflow-hidden">
+        <header class="flex flex-none items-center gap-2 border-b border-ak-border bg-base-200 px-3 py-2"><button type="button" class="btn btn-ghost btn-sm hidden lg:inline-flex" @click="back">← Agents</button><div class="min-w-0"><h2 class="truncate text-sm font-semibold">{{ selected.title || selected.threadId }}</h2><p class="truncate text-xs text-ak-muted">{{ selected.project }} · {{ selected.engineName || selected.backend }} · {{ selected.busy ? 'Working' : selected.status === 'dormant' ? 'Dormant' : 'Ready' }}</p></div><span class="flex-1" /><button v-if="selected.busy" type="button" class="btn btn-warning btn-sm" @click="control('interrupt')">Interrupt</button><button type="button" class="btn btn-outline btn-error btn-sm" @click="control('stop')">Stop</button></header>
+        <p v-if="transcriptTruncated" class="mx-3 mt-3 flex-none rounded-box bg-warning/10 px-3 py-2 text-xs text-warning">Some conversation content was clipped for this phone.</p>
+        <div ref="conversation" class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-safe">
+          <div class="mx-auto flex max-w-4xl flex-col gap-3 p-3 sm:p-5">
+            <div v-if="!transcript.length" class="py-16 text-center text-sm text-ak-muted">No remote-safe conversation events yet.</div>
+            <article v-for="(event, index) in transcript" :key="`${index}-${event.at || ''}`" class="rounded-box border border-ak-border px-3 py-2 text-sm shadow-sm" :class="event.kind === 'user' ? 'ml-7 bg-primary/15 sm:ml-20' : event.kind === 'assistant' ? 'mr-3 bg-base-200 sm:mr-16' : 'bg-base-300 text-xs'">
+              <MarkdownBlock v-if="event.kind === 'user' || event.kind === 'assistant'" :source="event.text" />
+              <template v-else-if="event.kind === 'tool'"><p class="font-semibold">{{ event.toolName || 'Tool activity' }}</p><p class="mt-1 text-ak-muted">{{ event.summary || 'The agent is using a tool.' }}</p></template>
+              <template v-else><p class="font-semibold">Agent status</p><p class="mt-1 text-ak-muted">{{ event.text }}</p></template>
+            </article>
+          </div>
+        </div>
+        <footer class="flex-none border-t border-ak-border bg-base-200 px-safe pt-2 pb-safe">
+          <div class="mx-auto max-w-4xl px-3 pb-2"><p v-if="sendFeedback" class="mb-2 text-xs text-success">{{ sendFeedback }}</p><div v-if="attachments.length" class="mb-2 flex flex-wrap gap-1"><span v-for="(attachment, index) in attachments" :key="`${attachment.name}-${index}`" class="badge badge-outline gap-1 py-3"><span class="max-w-32 truncate">{{ attachment.name }}</span><span class="text-ak-muted">{{ shortBytes(attachment.bytes) }}</span><button type="button" class="ml-1 text-error" :aria-label="`Remove ${attachment.name}`" @click="removeAttachment(index)">×</button></span></div><input ref="attachmentPicker" type="file" multiple class="hidden" accept="image/png,image/jpeg,image/gif,image/webp,text/plain,text/markdown,.md,.markdown,.txt,.log,.json,.yaml,.yml,.toml,.csv" @change="addAttachments" /><div class="flex items-end gap-2"><button type="button" class="btn btn-ghost btn-square" :disabled="sending || attachments.length >= MAX_ATTACHMENTS" aria-label="Attach file" @click="openAttachmentPicker">＋</button><textarea v-model="composer" rows="1" class="textarea textarea-bordered min-h-12 flex-1 resize-none bg-base-100" :disabled="sending || selected.status === 'archived'" :placeholder="selected.busy ? 'Queue a follow-up…' : selected.status === 'dormant' ? 'Wake the agent with a message…' : 'Send a message…'" @keydown.ctrl.enter.prevent="send" @keydown.meta.enter.prevent="send" /><button type="button" class="btn btn-primary" :disabled="!canSend" @click="send"><span v-if="sending" class="loading loading-spinner loading-xs" />Send</button></div><p class="mt-1 text-xs text-ak-muted">Messages queue in order. Attach up to {{ MAX_ATTACHMENTS }} images or text files ({{ shortBytes(MAX_ATTACHMENT_TOTAL) }} total). Ctrl/⌘ Enter sends.</p></div>
+        </footer>
+      </section>
+
+      <dialog v-if="prompt" class="modal modal-open"><div class="modal-box max-h-[85dvh] max-w-2xl overflow-y-auto"><h3 class="text-lg font-semibold">{{ prompt.kind === 'plan' ? 'Plan approval' : prompt.kind === 'question' ? 'Question for you' : 'Permission needed' }}</h3><p class="mt-2 text-sm text-ak-muted">{{ prompt.summary }}</p><MarkdownBlock v-if="detail?.kind === 'plan' && detail.plan" class="mt-4 rounded-box bg-base-200 p-3" :source="detail.plan" /><div v-else-if="detail?.kind === 'question'" class="mt-4 space-y-4"><fieldset v-for="question in detail.questions || []" :key="question.question" class="rounded-box border border-ak-border p-3"><legend class="px-1 font-medium">{{ question.question }}</legend><label v-for="option in question.options || []" :key="optionLabel(option)" class="mt-2 flex cursor-pointer items-start gap-2 text-sm"><input :type="question.multiSelect ? 'checkbox' : 'radio'" :name="question.question" class="checkbox checkbox-sm mt-0.5" :checked="chosen(question.question, optionLabel(option))" @change="pick(question.question, optionLabel(option), question.multiSelect)" /><span>{{ optionLabel(option) }}<small v-if="optionDescription(option)" class="block text-ak-muted">{{ optionDescription(option) }}</small></span></label></fieldset></div><p v-else-if="prompt.kind !== 'tool'" class="mt-4 rounded-box bg-warning/10 p-3 text-sm text-warning">The allowed details are unavailable. Answer this on the desktop instead.</p><div class="modal-action"><button type="button" class="btn btn-outline btn-error" @click="answer(false)">Deny</button><button type="button" class="btn btn-success" :disabled="prompt.kind === 'question' && !detail" @click="answer(true)">Approve<span v-if="prompt.kind === 'question'"> answers</span></button></div></div></dialog>
+    </div>
+
+    <aside class="drawer-side z-30"><label for="agents-drawer" aria-label="Close agents" class="drawer-overlay" /><nav class="flex min-h-full w-72 flex-col border-r border-ak-border bg-base-200 pt-safe"><div class="border-b border-ak-border p-4"><p class="text-xs font-semibold uppercase tracking-wider text-ak-muted">Agents</p><p class="mt-1 text-xs text-ak-muted">{{ activeAgents.length }} available · messages stay queued in order</p></div><div class="min-h-0 flex-1 overflow-y-auto p-2"><button v-for="agent in activeAgents" :key="agent.threadId" type="button" class="mb-1 flex w-full items-center gap-2 rounded-box px-3 py-2 text-left hover:bg-base-300" :class="{ 'bg-primary/20': agent.threadId === selectedID, 'ring-1 ring-warning': agent.attention }" @click="open(agent.threadId)"><span class="h-2 w-2 flex-none rounded-full" :class="agent.attention ? 'bg-warning' : agent.busy ? 'bg-primary' : 'bg-success'" /><span class="min-w-0 flex-1"><span class="block truncate text-sm">{{ agent.title || agent.threadId }}</span><span class="block truncate text-xs text-ak-muted">{{ agentState(agent) }}</span></span></button><p v-if="!activeAgents.length" class="p-4 text-sm text-ak-muted">No active agents.</p></div></nav></aside>
   </main>
 </template>

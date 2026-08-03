@@ -54,6 +54,7 @@ type agentStartParams struct {
 	WorkspacePath  string             `json:"workspacePath"`
 	Prompt         string             `json:"prompt"`
 	PermissionMode string             `json:"permissionMode"`
+	SandboxMode    string             `json:"sandboxMode,omitempty"`
 	Effort         string             `json:"effort"`    // claude --effort level; "" = default
 	Model          string             `json:"model"`     // model id; "" = backend default
 	Backend        string             `json:"backend"`   // "" / "claude" = Claude Code, "kimi" = Kimi Code
@@ -169,6 +170,7 @@ type handlerDeps struct {
 	cowork        *cowork.Service // nil if KDE/consent init failed; handlers guard
 	// remote is an authenticated HTTPS human surface, not an IPC UI role.
 	remote     *remoteControl
+	humanQueue *humanSendQueue
 	socketPath string
 	exePath    string
 	log        *slog.Logger
@@ -1023,7 +1025,7 @@ func registerHandlers(d handlerDeps) {
 		var sendErr error
 		if p.FromThreadID == "" {
 			// requireCallerThread above proved this is the exclusive desktop UI.
-			sendErr = d.humanSend(desktopPrincipal(), p.ThreadID, p.Text, p.Attachments)
+			_, sendErr = d.humanSend(desktopPrincipal(), p.ThreadID, p.Text, p.Attachments)
 		} else {
 			// A bridge reached this point only after caller binding and any
 			// cross-subtree grant. It shares delivery mechanics, not human
@@ -3682,6 +3684,13 @@ func reloadSkillsEverywhere(d handlerDeps, reason string) []string {
 func emitLifecycle(d handlerDeps, threadID, phase, detail string, wt *worktree.Worktree) {
 	if d.turns != nil {
 		d.turns.ObserveLifecycle(threadID, phase)
+	}
+	if phase == "resumed" {
+		// A dormant remote send is queued before the persisted session is
+		// re-launched. Deliver it only after the resume path has made the thread
+		// live; a summary-seeded resume stays busy and drains at its normal turn
+		// boundary instead.
+		drainHumanSendAfterResume(d, threadID)
 	}
 	ev := map[string]any{"type": "_lifecycle", "phase": phase, "detail": detail}
 	if wt != nil {

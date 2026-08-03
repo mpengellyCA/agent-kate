@@ -128,11 +128,61 @@ func TestTranscriptCarriesTheSSECursor(t *testing.T) {
 	}
 }
 
-func TestRemoteSendRouteIsNotExposed(t *testing.T) {
-	env := newTestEnv(t)
-	code, body := env.authJSON("POST", "/api/v1/agents/t-1/send", `{"text":"hello"}`)
-	if code != http.StatusNotFound || body["error"] != "not-found" {
-		t.Fatalf("remote send = %d / %#v, want route-not-found until transcript echo exists", code, body)
+func TestRemoteSendUsesTypedQueueContract(t *testing.T) {
+	backend := &fakeBackend{sendResult: SendResult{Queued: true, Position: 2}}
+	env := newTestEnvWith(t, backend)
+	code, body := env.authJSON("POST", "/api/v1/agents/t-1/send", `{
+        "text":"continue with the safe path",
+        "mode":"queue",
+        "attachments":[{"kind":"text","name":"notes.md","mediaType":"text/markdown","text":"# brief"}]
+    }`)
+	if code != http.StatusOK || body["ok"] != true || body["queued"] != true || body["position"] != float64(2) {
+		t.Fatalf("remote send = %d / %#v", code, body)
+	}
+	backend.mu.Lock()
+	got := backend.lastSend
+	backend.mu.Unlock()
+	if got.ThreadID != "t-1" || got.Mode != "queue" || got.Text != "continue with the safe path" {
+		t.Fatalf("send request = %#v", got)
+	}
+	if len(got.Attachments) != 1 || got.Attachments[0].Name != "notes.md" || got.Attachments[0].Text != "# brief" {
+		t.Fatalf("attachments = %#v", got.Attachments)
+	}
+}
+
+func TestRemoteSendRejectsUnsafeAttachmentAndImmediateMode(t *testing.T) {
+	for name, body := range map[string]string{
+		"path":      `{"text":"x","attachments":[{"kind":"text","name":"../secret","mediaType":"text/plain","text":"x"}]}`,
+		"raw image": `{"text":"x","attachments":[{"kind":"image","name":"x.png","mediaType":"image/png","text":"not allowed"}]}`,
+		"immediate": `{"text":"x","mode":"now"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			env := newTestEnv(t)
+			code, got := env.authJSON("POST", "/api/v1/agents/t-1/send", body)
+			if code != http.StatusBadRequest {
+				t.Fatalf("status = %d / %#v, want 400", code, got)
+			}
+		})
+	}
+}
+
+func TestValidateRemoteAttachmentsKeepsTheUploadDTONarrow(t *testing.T) {
+	valid, err := validateRemoteAttachments([]Attachment{
+		{Kind: "text", Name: "notes.md", MediaType: "text/markdown", Text: "# safe"},
+		{Kind: "image", Name: "photo.png", MediaType: "image/png", DataB64: "cG5n"},
+	})
+	if err != nil || len(valid) != 2 {
+		t.Fatalf("valid attachments = %#v, %v", valid, err)
+	}
+	for _, attachment := range []Attachment{
+		{Kind: "text", Name: "/tmp/x", MediaType: "text/plain", Text: "x"},
+		{Kind: "text", Name: "x.txt", MediaType: "application/json", Text: "{}"},
+		{Kind: "image", Name: "x.png", MediaType: "image/png", DataB64: "not-base64"},
+		{Kind: "image", Name: "x.svg", MediaType: "image/svg+xml", DataB64: "c3Zn"},
+	} {
+		if _, err := validateRemoteAttachments([]Attachment{attachment}); err == nil {
+			t.Fatalf("unsafe attachment was accepted: %#v", attachment)
+		}
 	}
 }
 

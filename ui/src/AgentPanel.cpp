@@ -993,6 +993,19 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
         maybePushOption(QStringLiteral("permissionMode"), mode);
     });
 
+    m_sandboxModeCombo = new QComboBox(this);
+    m_sandboxModeCombo->addItem(i18n("Workspace only (recommended)"), QStringLiteral("workspace-write"));
+    m_sandboxModeCombo->addItem(i18n("Full access (dangerous)"), QStringLiteral("danger-full-access"));
+    m_sandboxModeCombo->setToolTip(i18n("Codex's OS-level command sandbox. Full access can reach the host filesystem and network; approval prompts remain controlled by When to ask."));
+    rebuildSandboxModeCombo();
+    connect(m_sandboxModeCombo, &QComboBox::currentIndexChanged, this, [this] {
+        if (selectedHarnessId() == QLatin1String("codex")) {
+            KSharedConfig::openConfig()->group(QStringLiteral("Agent"))
+                .writeEntry("codexSandboxMode", m_sandboxModeCombo->currentData().toString());
+            maybePushOption(QStringLiteral("sandboxMode"), m_sandboxModeCombo->currentData().toString());
+        }
+    });
+
     m_isolationCombo = new QComboBox(this);
     // The wording is IsolationCopy's, not this file's (audit F30/F49). Three
     // controls choose isolation and this is the one people actually use — the
@@ -1067,6 +1080,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
         HarnessRegistry::self()->ensureModels(m_core, selectedHarnessId(), selectedProviderId());
         rebuildModelCombo();
         rebuildModeCombo();
+        rebuildSandboxModeCombo();
         rebuildEffortCombo();
         refresh();
     });
@@ -1074,6 +1088,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     // (their ctor order); re-run them now the restored engine is known, so a
     // sticky non-default harness shows its own mode/thinking lists.
     rebuildModeCombo();
+    rebuildSandboxModeCombo();
     rebuildEffortCombo();
     // A late harness-list fetch can revise the engine list (a new
     // harness, changed traits) — rebuild the pickers while they are still
@@ -1083,6 +1098,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
             rebuildEngineCombo();
             rebuildModelCombo();
             rebuildModeCombo();
+            rebuildSandboxModeCombo();
             rebuildEffortCombo();
         }
         refresh();
@@ -1314,6 +1330,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
         form->setContentsMargins(10, 8, 10, 8);
         form->addRow(QStringLiteral("Engine"), m_engineCombo);
         form->addRow(QStringLiteral("When to ask"), m_modeCombo);
+        form->addRow(QStringLiteral("Codex sandbox"), m_sandboxModeCombo);
         form->addRow(QStringLiteral("Where it works"), m_isolationCombo);
         form->addRow(QStringLiteral("Thinking effort"), m_effortCombo);
         form->addRow(QStringLiteral("Model"), m_modelCombo);
@@ -1609,6 +1626,17 @@ void AgentPanel::preselectPermission(const QString &mode)
     const int idx = m_modeCombo->findData(mode);
     if (idx >= 0) {
         m_modeCombo->setCurrentIndex(idx);
+    }
+}
+
+void AgentPanel::preselectSandboxMode(const QString &mode)
+{
+    if (!m_sandboxModeCombo || mode.isEmpty() || !m_threadId.isEmpty()) {
+        return;
+    }
+    const int idx = m_sandboxModeCombo->findData(mode);
+    if (idx >= 0) {
+        m_sandboxModeCombo->setCurrentIndex(idx);
     }
 }
 
@@ -1999,6 +2027,26 @@ void AgentPanel::rebuildModeCombo()
     }
 }
 
+void AgentPanel::rebuildSandboxModeCombo()
+{
+    if (!m_sandboxModeCombo) {
+        return;
+    }
+    const bool codex = selectedHarnessId() == QLatin1String("codex");
+    m_sandboxModeCombo->setVisible(codex);
+    m_sandboxModeCombo->setEnabled(m_threadId.isEmpty());
+    if (!codex) {
+        return;
+    }
+    const QString saved = KSharedConfig::openConfig()->group(QStringLiteral("Agent"))
+        .readEntry("codexSandboxMode", QStringLiteral("workspace-write"));
+    const int idx = m_sandboxModeCombo->findData(saved);
+    if (idx >= 0) {
+        QSignalBlocker block(m_sandboxModeCombo);
+        m_sandboxModeCombo->setCurrentIndex(idx);
+    }
+}
+
 void AgentPanel::rebuildEffortCombo()
 {
     if (!m_effortCombo) {
@@ -2098,6 +2146,8 @@ void AgentPanel::maybePushOption(const QString &option, const QString &value)
         requested.insert(QStringLiteral("model"), value);
     } else if (option == QLatin1String("effort")) {
         requested.insert(QStringLiteral("reasoningEffort"), value);
+    } else if (option == QLatin1String("sandboxMode")) {
+        requested.insert(QStringLiteral("sandboxMode"), value);
     } else {
         requested.insert(QStringLiteral("permissionMode"), value);
     }
@@ -2121,7 +2171,9 @@ void AgentPanel::maybePushOption(const QString &option, const QString &value)
                                       ? i18n("model")
                                       : option == QLatin1String("effort")
                                             ? i18n("thinking effort")
-                                            : i18n("approval mode"),
+                                            : option == QLatin1String("sandboxMode")
+                                                ? i18n("Codex sandbox")
+                                                : i18n("approval mode"),
                                   error.value(QStringLiteral("message"))
                                       .toString()
                                       .toHtmlEscaped()),
@@ -2143,7 +2195,9 @@ void AgentPanel::maybePushOption(const QString &option, const QString &value)
                          ? effective.value(QStringLiteral("model")).toString()
                          : option == QLatin1String("effort")
                              ? effective.value(QStringLiteral("reasoningEffort")).toString()
-                             : effective.value(QStringLiteral("permissionMode")).toString();
+                             : option == QLatin1String("sandboxMode")
+                                 ? effective.value(QStringLiteral("sandboxMode")).toString()
+                                 : effective.value(QStringLiteral("permissionMode")).toString();
                      const QString timing = result.value(QStringLiteral("timing")).toString();
                      self->addNote(
                          i18n("%1 changed to <b>%2</b> — applies %3",
@@ -2151,7 +2205,9 @@ void AgentPanel::maybePushOption(const QString &option, const QString &value)
                                   ? i18n("Model")
                                   : option == QLatin1String("effort")
                                         ? i18n("Thinking effort")
-                                        : i18n("Approval mode"),
+                                        : option == QLatin1String("sandboxMode")
+                                            ? i18n("Codex sandbox")
+                                            : i18n("Approval mode"),
                               (applied.isEmpty() ? value : applied).toHtmlEscaped(),
                               timing == QLatin1String("live") ? i18n("now")
                                   : timing == QLatin1String("nextTurn") ? i18n("on the next turn")
@@ -3725,6 +3781,9 @@ void AgentPanel::onSendClicked()
             // permission modes and --effort levels, or a discovered harness's
             // own config-option values), so both send verbatim.
             {QStringLiteral("permissionMode"), m_modeCombo->currentData().toString()},
+            {QStringLiteral("sandboxMode"),
+             selectedHarnessId() == QLatin1String("codex")
+                 ? m_sandboxModeCombo->currentData().toString() : QString()},
             {QStringLiteral("isolation"), m_isolationCombo->currentData().toString()},
             {QStringLiteral("effort"), m_effortCombo->currentData().toString()},
             {QStringLiteral("model"), startModel},
@@ -4478,9 +4537,10 @@ void AgentPanel::openWorkflowMonitor()
     dlg->show();
 }
 
-// deliverMessage sends a message to the live thread right now: it shows the
-// You card, marks the turn busy, and issues agent.send. Used both for an
-// immediate send and to drain one queued follow-up per turn boundary.
+// deliverMessage sends a message to the live thread right now. The core emits
+// the resulting canonical user event only after accepting it, so this panel,
+// another desktop window, and a paired device all see one ordered "You" card
+// rather than each surface inventing its own optimistic transcript row.
 bool AgentPanel::deliverMessage(const QString &text, const QJsonArray &attachments)
 {
     const QJsonObject params{{QStringLiteral("threadId"), m_threadId},
@@ -4491,7 +4551,6 @@ bool AgentPanel::deliverMessage(const QString &text, const QJsonArray &attachmen
     if (wouldOverflowFrame(params)) {
         return false;
     }
-    addYouCard(text, attachments);
     m_idle = false;
     m_errored = false; // a fresh turn clears any prior failure state
     m_working->setActivity(QString()); // a new turn starts in generic mode
@@ -6454,10 +6513,13 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             ev.value(QStringLiteral("message")).toObject().value(QStringLiteral("content")).toArray();
         // A "user" event is either the human's own message (text / image / an
         // inlined "Attached file …" block) or the tool_result blocks the CLI
-        // echoes back after a tool runs. On replay we reconstruct the human's You
-        // card (the live path already drew it via addYouCard); tool_results are
-        // folded into their tool rows in both cases.
-        if (m_replaying) {
+        // echoes back after a tool runs. A canonical accepted-human event is
+        // the one live exception: the core uses it to render the same outgoing
+        // turn in desktop and remote transcripts without broadening NotifyUI.
+        // Tool results remain folded into their tool rows in both cases.
+        const bool canonicalHumanSend =
+            ev.value(QStringLiteral("agentkateAcceptedHumanSend")).toBool();
+        if (m_replaying || canonicalHumanSend) {
             QStringList userLines;
             bool hasInlineAttachment = false; // image block or "Attached file …" text
             bool hasUserBlock = false;        // any non-tool_result block
@@ -6486,10 +6548,15 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
             if (hasUserBlock) {
                 const QString userText = userLines.join(QStringLiteral("\n"));
                 QJsonArray attachments;
-                // Pair this message with the front sidecar turn when it carried
-                // attachments and its recorded prompt matches — keeping the two in
-                // step even if some replayed user messages had no attachments.
-                if (hasInlineAttachment && !m_replayAttachTurns.isEmpty()) {
+                if (canonicalHumanSend) {
+                    // Canonical live echoes already carry only attachment display
+                    // metadata. They never need the desktop-only path/cache
+                    // sidecar, and their raw bytes never leave the core.
+                    attachments = ev.value(QStringLiteral("attachments")).toArray();
+                // Pair replayed messages with the front sidecar turn when it
+                // carried attachments and its recorded prompt matches — keeping
+                // the two in step even if some replayed user messages had none.
+                } else if (hasInlineAttachment && !m_replayAttachTurns.isEmpty()) {
                     const QJsonObject turn = m_replayAttachTurns.first().toObject();
                     attachments = turn.value(QStringLiteral("attachments")).toArray();
                     // Positional (FIFO) pairing: an inline-attachment message must

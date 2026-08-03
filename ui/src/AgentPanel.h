@@ -125,6 +125,7 @@ public:
     // guided New Agent dialog. All no-ops once a thread exists.
     void preselectIsolation(const QString &isolation); // "auto" | "isolated" | "workspace"
     void preselectPermission(const QString &mode);     // permission-mode data value
+    void preselectSandboxMode(const QString &mode);
     void preselectEffort(const QString &effort);       // "" | low | medium | high | xhigh | max
     // Pre-set the plan 16 P6 launch options for the first start (fallback
     // models, a tool deny-list, extra reachable directories). They ride on
@@ -532,6 +533,7 @@ private:
     // backend (Claude's fixed vocabularies vs kimi's discovered config
     // options), restoring the per-backend sticky choice.
     void rebuildModeCombo();
+    void rebuildSandboxModeCombo();
     void rebuildEffortCombo();
     // Grey out the thinking-effort tiers the selected model cannot run, from
     // the per-model effort support the engine reported with its model catalogue.
@@ -845,6 +847,7 @@ private:
     QFrame *m_composerContainer = nullptr;
     QPlainTextEdit *m_input = nullptr;
     QComboBox *m_modeCombo = nullptr;
+    QComboBox *m_sandboxModeCombo = nullptr;
     QComboBox *m_isolationCombo = nullptr;
     QComboBox *m_effortCombo = nullptr;
     // One "who runs this agent" picker: each entry is a harness, optionally

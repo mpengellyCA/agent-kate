@@ -1,6 +1,6 @@
-// The browser's only network door. It deliberately has no send function:
-// remote user messages stay unavailable until the core owns their queue and
-// one accepted message has a canonical echo on desktop and remote transcripts.
+// The browser's only network door. Sending is deliberately one fixed operation:
+// a paired device may only queue a human follow-up through the core-owned
+// human-surface path; it cannot request an immediate/interleaved write.
 export const API_BASE = '/api/v1'
 export const API_VERSION = 1
 
@@ -46,6 +46,9 @@ export const exchangeToken = (token, opts) => apiFetch('/auth/exchange', { ...op
 export const getMeta = (opts) => apiFetch('/meta', opts)
 export const getAgents = (opts) => apiFetch('/agents', opts)
 export const getTranscript = (threadId, opts = {}) => apiFetch(`/agents/${encodeURIComponent(threadId)}/transcript`, { ...opts, query: { limit: opts.limit, maxBytes: opts.maxBytes } })
+export const sendPrompt = (threadId, { text = '', attachments = [] } = {}, opts) => apiFetch(`/agents/${encodeURIComponent(threadId)}/send`, {
+  ...opts, method: 'POST', body: { text, attachments, mode: 'queue' },
+})
 export const interruptAgent = (threadId, opts) => apiFetch(`/agents/${encodeURIComponent(threadId)}/interrupt`, { ...opts, method: 'POST', body: {} })
 export const stopAgent = (threadId, opts) => apiFetch(`/agents/${encodeURIComponent(threadId)}/stop`, { ...opts, method: 'POST', body: {} })
 export const getDiff = (threadId, opts = {}) => apiFetch(`/agents/${encodeURIComponent(threadId)}/diff`, { ...opts, query: { maxBytes: opts.maxBytes, maxLines: opts.maxLines } })

@@ -272,6 +272,18 @@ if(Qt6Test_FOUND)
     set_tests_properties(PanelStackTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
+    # Remote access pairing is a security surface: adapter selection must stay
+    # explicit and the QR code must remain independently testable instead of
+    # relying on a phone being present in every CI run.
+    add_executable(RemotePanelTest tests/RemotePanelTest.cpp
+        src/remote/RemotePanel.cpp src/shell/FlowLayout.cpp src/ipc/CoreClient.cpp)
+    target_include_directories(RemotePanelTest PRIVATE src)
+    target_link_libraries(RemotePanelTest PRIVATE Qt6::Widgets Qt6::Network Qt6::Test
+        KF6::I18n KF6::ColorScheme KF6::ConfigCore KF6::WidgetsAddons)
+    add_test(NAME RemotePanelTest COMMAND RemotePanelTest)
+    set_tests_properties(RemotePanelTest PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
     # Plan 10 phase 2: the virtualized chat transcript model + delegate, plus
     # the stateless formatters that feed them (plan 16 P2's MCP summaries).
     # AgentChatHelpers pulls the harness traits (and their CoreClient probe) in
@@ -693,6 +705,19 @@ if(Qt6Test_FOUND)
     set_tests_properties(WelcomeDialogTest PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 endif()
+
+# Test executables are intentionally explicit targets.  A normal build is the
+# installed application, not the full UI test suite; compiling every test under
+# distro LTO needlessly multiplies link-time disk use and made
+# `install.sh --rebuild` fail before the application could be packaged.  CTest
+# callers build the focused targets they intend to run (for example,
+# `cmake --build build --target RemotePanelTest`) and then invoke ctest.
+get_property(_agentkate_ui_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+foreach(_agentkate_ui_target IN LISTS _agentkate_ui_targets)
+    if(NOT _agentkate_ui_target STREQUAL "agentkate")
+        set_property(TARGET ${_agentkate_ui_target} PROPERTY EXCLUDE_FROM_ALL TRUE)
+    endif()
+endforeach()
 
 # Plan 27 §4: the desktop-integration metadata stays valid, enforced by ctest.
 # Both run through run-validator.sh, which exits 77 — SKIP_RETURN_CODE — when

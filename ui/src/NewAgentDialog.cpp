@@ -595,6 +595,7 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, CoreClient *core,
             m_advancedForm->setRowVisible(m_addDirs, t.addDirs);
             m_advancedForm->setRowVisible(m_strictMcp, t.strictMcpConfig);
             m_advancedForm->setRowVisible(m_budget, t.costBudget);
+            m_advancedForm->setRowVisible(m_sandboxMode, t.id == QLatin1String("codex"));
         }
         applyModelEffortSupport();
     };
@@ -664,6 +665,11 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, CoreClient *core,
     advForm->setContentsMargins(0, 0, 0, 0);
     m_permission = new QComboBox(m_advanced);
     advForm->addRow(i18n("When to ask"), m_permission);
+    m_sandboxMode = new QComboBox(m_advanced);
+    m_sandboxMode->addItem(i18n("Workspace only (recommended)"), QStringLiteral("workspace-write"));
+    m_sandboxMode->addItem(i18n("Full access (dangerous)"), QStringLiteral("danger-full-access"));
+    m_sandboxMode->setToolTip(i18n("Controls Codex's OS-level command sandbox. Full access lets it reach the host filesystem and network; approval prompts remain controlled separately by When to ask."));
+    advForm->addRow(i18n("Codex sandbox"), m_sandboxMode);
     m_effort = new QComboBox(m_advanced);
     advForm->addRow(i18n("Thinking effort"), m_effort);
     // The launch-option sweep (plan 16 P6). Each row is hidden for an engine
@@ -927,6 +933,8 @@ NewAgentChoices NewAgentDialog::choices() const
     c.isolation = m_sandbox->isChecked() ? QStringLiteral("auto")
                                          : QStringLiteral("workspace");
     c.permissionMode = m_permission->currentData().toString();
+    c.sandboxMode = (c.backend == QLatin1String("codex"))
+        ? m_sandboxMode->currentData().toString() : QString();
     c.effort = m_effort->currentData().toString();
     // An unsupported row is an option this engine cannot express — read nothing
     // from it, so a value typed before switching engines cannot leak into the

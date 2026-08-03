@@ -2,8 +2,10 @@ package remote
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"strconv"
@@ -35,6 +37,13 @@ const maxPlanBytes = 16 * 1024
 // on a handset; the cap exists so an authenticated-but-hostile device cannot
 // push an unbounded body into an agent's stdin.
 const maxSendTextBytes = 32 * 1024
+
+const (
+	maxRemoteAttachments     = 4
+	maxRemoteAttachmentBytes = 4 * 1024 * 1024
+	maxRemoteAttachmentTotal = 6 * 1024 * 1024
+	maxRemoteAttachmentName  = 160
+)
 
 // Transcript paging caps. The defaults are deliberately low: this is the reply
 // most likely to be fetched on mobile data, and M0.4's rule is that non-positive
@@ -356,30 +365,28 @@ func (s *Server) handleTranscript(w http.ResponseWriter, r *http.Request) {
 // --- mutations --------------------------------------------------------------
 
 func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
-	// Deliberately not registered in routes(). A remote send has no canonical
-	// cross-surface user-turn echo yet; accepting it would make the desktop and
-	// remote transcripts disagree. Keep this defensive refusal even if a future
-	// route edit accidentally points here before that invariant is implemented.
-	writeError(w, http.StatusNotImplemented, "send-not-ready",
-		"Remote sending is not available until cross-surface transcript echo is ready.")
-	return
-
 	threadID := r.PathValue("threadId")
 	sess := sessionOf(r.Context())
 	var body struct {
-		Text string `json:"text"`
-		Mode string `json:"mode"`
+		Text        string       `json:"text"`
+		Mode        string       `json:"mode"`
+		Attachments []Attachment `json:"attachments"`
 	}
 	if !decodeJSON(w, r, &body) {
 		return
 	}
-	if strings.TrimSpace(body.Text) == "" {
+	if strings.TrimSpace(body.Text) == "" && len(body.Attachments) == 0 {
 		writeError(w, http.StatusBadRequest, "empty-text", "There is nothing to send.")
 		return
 	}
-	if len(body.Text) > maxSendTextBytes {
+	if len(body.Text) > maxSendTextBytes || !utf8.ValidString(body.Text) {
 		writeError(w, http.StatusRequestEntityTooLarge, "text-too-large",
 			"That message is too large to send from a remote device.")
+		return
+	}
+	attachments, err := validateRemoteAttachments(body.Attachments)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid-attachment", err.Error())
 		return
 	}
 	mode := body.Mode
@@ -387,7 +394,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		mode = "queue" // remote default, per the contract
 	}
 	switch mode {
-	case "queue", "reject":
+	case "queue":
 	case sendModeNow:
 		writeError(w, http.StatusBadRequest, "unsupported-mode",
 			"Sending immediately is not available from a remote device; queue the message instead.")
@@ -400,9 +407,13 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), backendTimeout)
 	defer cancel()
 	res, err := s.backend.Send(ctx, principalOf(r), SendRequest{
-		ThreadID: threadID, Text: body.Text, Mode: mode,
+		ThreadID: threadID, Text: body.Text, Attachments: attachments, Mode: mode,
 	})
-	s.auditAction(sess, AuditSend, threadID, "", "mode="+mode, err)
+	detail := "mode=" + mode
+	if len(attachments) > 0 {
+		detail += " attachments=" + strconv.Itoa(len(attachments))
+	}
+	s.auditAction(sess, AuditSend, threadID, "", detail, err)
 	if err != nil {
 		writeBackendError(w, err)
 		return
@@ -413,6 +424,52 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		// says "queued", which is still true.
 		"resuming": res.Resuming,
 	})
+}
+
+func validateRemoteAttachments(in []Attachment) ([]Attachment, error) {
+	if len(in) > maxRemoteAttachments {
+		return nil, fmt.Errorf("send at most %d attachments", maxRemoteAttachments)
+	}
+	out := make([]Attachment, 0, len(in))
+	total := 0
+	for _, a := range in {
+		a.Name = strings.TrimSpace(a.Name)
+		if a.Name == "" || len(a.Name) > maxRemoteAttachmentName || !utf8.ValidString(a.Name) ||
+			a.Name == "." || a.Name == ".." || strings.ContainsAny(a.Name, "/\\\x00") {
+			return nil, fmt.Errorf("attachment name is invalid")
+		}
+		switch a.Kind {
+		case "text":
+			if a.MediaType != "text/plain" && a.MediaType != "text/markdown" {
+				return nil, fmt.Errorf("text attachment %q has an unsupported type", a.Name)
+			}
+			if a.DataB64 != "" || !utf8.ValidString(a.Text) || len(a.Text) > maxRemoteAttachmentBytes {
+				return nil, fmt.Errorf("text attachment %q is too large or invalid", a.Name)
+			}
+			total += len(a.Text)
+		case "image":
+			switch a.MediaType {
+			case "image/png", "image/jpeg", "image/gif", "image/webp":
+			default:
+				return nil, fmt.Errorf("image attachment %q has an unsupported type", a.Name)
+			}
+			if a.Text != "" || len(a.DataB64) == 0 || len(a.DataB64) > base64.StdEncoding.EncodedLen(maxRemoteAttachmentBytes) {
+				return nil, fmt.Errorf("image attachment %q is too large or invalid", a.Name)
+			}
+			decoded, err := base64.StdEncoding.DecodeString(a.DataB64)
+			if err != nil || len(decoded) > maxRemoteAttachmentBytes {
+				return nil, fmt.Errorf("image attachment %q is too large or invalid", a.Name)
+			}
+			total += len(decoded)
+		default:
+			return nil, fmt.Errorf("attachment %q has an unsupported kind", a.Name)
+		}
+		if total > maxRemoteAttachmentTotal {
+			return nil, fmt.Errorf("attachments exceed the %d MiB limit", maxRemoteAttachmentTotal/(1024*1024))
+		}
+		out = append(out, a)
+	}
+	return out, nil
 }
 
 func (s *Server) handleInterrupt(w http.ResponseWriter, r *http.Request) {
