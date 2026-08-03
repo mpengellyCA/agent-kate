@@ -978,6 +978,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
         // The HarnessRegistry::changed connection below rebuilds the combos
         // when the result lands.
         HarnessRegistry::self()->ensureDiscovered(m_core, selectedHarnessId());
+        HarnessRegistry::self()->ensureModels(m_core, selectedHarnessId(), selectedProviderId());
         rebuildModelCombo();
         rebuildModeCombo();
         rebuildEffortCombo();
@@ -988,7 +989,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     // sticky non-default harness shows its own mode/thinking lists.
     rebuildModeCombo();
     rebuildEffortCombo();
-    // A late agent.capabilities fetch can revise the engine list (a new
+    // A late harness-list fetch can revise the engine list (a new
     // harness, changed traits) — rebuild the pickers while they are still
     // free; a bound thread's pickers re-evaluate on the next refresh().
     connect(HarnessRegistry::self(), &HarnessRegistry::changed, this, [this] {
@@ -1004,6 +1005,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     // handler — probe its option lists now too (a no-op for "tiers" engines,
     // a cached vocabulary, or a core that is not connected yet).
     HarnessRegistry::self()->ensureDiscovered(m_core, selectedHarnessId());
+    HarnessRegistry::self()->ensureModels(m_core, selectedHarnessId(), selectedProviderId());
 
     // Model selector. For Claude direct each item carries a tier token the core
     // resolves to a concrete --model id (its resolveModel is the single source of
@@ -1814,10 +1816,10 @@ void AgentPanel::rebuildEngineCombo()
     KConfigGroup cfg = KSharedConfig::openConfig()->group(QStringLiteral("Agent"));
     QString saved = !before.isEmpty() ? before : cfg.readEntry("engine", QString());
     if (saved.isEmpty()) {
-        const QString backend = cfg.readEntry("backend", QStringLiteral("claude"));
+        const QString backend = cfg.readEntry("backend", QString());
         const QString provider = cfg.readEntry("provider", ProviderStore::directId());
         saved = backend;
-        if (backend == QLatin1String("claude") && provider != ProviderStore::directId()) {
+        if (!backend.isEmpty() && provider != ProviderStore::directId()) {
             saved += QLatin1Char('|') + provider;
         }
     }
@@ -1836,24 +1838,6 @@ void AgentPanel::rebuildEngineCombo()
     selectFirstEnabled(m_engineCombo);
 }
 
-// optionValues reads a persisted discovered-option enumeration ("value|name"
-// pairs captured from the init event, key = traits.optionKey) as (value, name).
-static QList<QPair<QString, QString>> optionValues(const QString &key)
-{
-    QList<QPair<QString, QString>> out;
-    const QStringList entries = KSharedConfig::openConfig()
-                                    ->group(QStringLiteral("Agent"))
-                                    .readEntry(key, QStringList());
-    for (const QString &entry : entries) {
-        const QString value = entry.section(QLatin1Char('|'), 0, 0);
-        const QString name = entry.section(QLatin1Char('|'), 1);
-        if (!value.isEmpty()) {
-            out.append({value, name.isEmpty() ? value : name});
-        }
-    }
-    return out;
-}
-
 void AgentPanel::rebuildModeCombo()
 {
     if (!m_modeCombo) {
@@ -1863,17 +1847,8 @@ void AgentPanel::rebuildModeCombo()
     QSignalBlocker block(m_modeCombo);
     m_modeCombo->clear();
     if (t.permissionModes.isEmpty()) {
-        // The harness's modes are discovered per session (configOptions) and
-        // persisted from the init event. Until one has run there is nothing
-        // to enumerate — offer only the CLI default.
-        const auto modes = optionValues(t.optionKey(QStringLiteral("mode")));
-        if (modes.isEmpty()) {
-            m_modeCombo->addItem(i18n("CLI default"), QString());
-            return;
-        }
-        for (const auto &m : modes) {
-            m_modeCombo->addItem(m.second, m.first);
-        }
+        m_modeCombo->addItem(i18n("CLI default"), QString());
+        return;
     } else {
         for (const QString &mode : t.permissionModes) {
             m_modeCombo->addItem(HarnessRegistry::modeLabel(mode), mode);
@@ -1914,10 +1889,18 @@ void AgentPanel::rebuildEffortCombo()
     // An empty value leaves the CLI's own configured default untouched.
     m_effortCombo->addItem(i18n("Default"), QString());
     if (t.efforts.isEmpty()) {
-        // Discovered per session (e.g. kimi's "thinking" low/high/max).
-        const auto levels = optionValues(t.optionKey(QStringLiteral("thinking")));
-        for (const auto &l : levels) {
-            m_effortCombo->addItem(l.second, l.first);
+        // Some catalogues advertise efforts per model rather than as a
+        // harness-wide setting. Expose their union, then narrow it below.
+        const auto choices = HarnessRegistry::self()->modelChoices(
+            t.id, selectedProviderId());
+        for (const QString &entry : choices.all) {
+            const QString model = entry.section(QLatin1Char('|'), 0, 0);
+            for (const QString &effort :
+                 HarnessRegistry::self()->modelEfforts(t.id, selectedProviderId(), model)) {
+                if (!effort.isEmpty() && m_effortCombo->findData(effort) < 0) {
+                    m_effortCombo->addItem(HarnessRegistry::effortLabel(effort), effort);
+                }
+            }
         }
     } else {
         for (const QString &effort : t.efforts) {
@@ -1989,11 +1972,19 @@ void AgentPanel::maybePushOption(const QString &option, const QString &value)
     }
     const QString tid = m_threadId;
     QPointer<AgentPanel> self(this);
-    m_core->call(QStringLiteral("agent.setOption"),
+    QJsonObject requested;
+    if (option == QLatin1String("model")) {
+        requested.insert(QStringLiteral("model"), value);
+    } else if (option == QLatin1String("effort")) {
+        requested.insert(QStringLiteral("reasoningEffort"), value);
+    } else {
+        requested.insert(QStringLiteral("permissionMode"), value);
+    }
+    m_core->call(QStringLiteral("agent.updateSettings"),
                  QJsonObject{
-                     {QStringLiteral("threadId"), tid},
-                     {QStringLiteral("option"), option},
-                     {QStringLiteral("value"), value},
+                     {QStringLiteral("agentRef"), QJsonObject{{QStringLiteral("threadId"), tid},
+                                                               {QStringLiteral("harnessId"), m_backend}}},
+                     {QStringLiteral("requested"), requested},
                  },
                  [self, tid, option, value](const QJsonObject &result,
                                             const QJsonObject &error) {
@@ -2026,16 +2017,24 @@ void AgentPanel::maybePushOption(const QString &option, const QString &value)
                          }
                          return;
                      }
-                     const QString applied =
-                         result.value(QStringLiteral("value")).toString();
+                     const QJsonObject effective = result.value(QStringLiteral("effective")).toObject();
+                     const QString applied = option == QLatin1String("model")
+                         ? effective.value(QStringLiteral("model")).toString()
+                         : option == QLatin1String("effort")
+                             ? effective.value(QStringLiteral("reasoningEffort")).toString()
+                             : effective.value(QStringLiteral("permissionMode")).toString();
+                     const QString timing = result.value(QStringLiteral("timing")).toString();
                      self->addNote(
-                         i18n("%1 changed to <b>%2</b> — applies from the next action",
+                         i18n("%1 changed to <b>%2</b> — applies %3",
                               option == QLatin1String("model")
                                   ? i18n("Model")
                                   : option == QLatin1String("effort")
                                         ? i18n("Thinking effort")
                                         : i18n("Approval mode"),
-                              (applied.isEmpty() ? value : applied).toHtmlEscaped()),
+                              (applied.isEmpty() ? value : applied).toHtmlEscaped(),
+                              timing == QLatin1String("live") ? i18n("now")
+                                  : timing == QLatin1String("nextTurn") ? i18n("on the next turn")
+                                                                            : i18n("at launch")),
                          QStringLiteral("sys"));
                  },
                  this);
@@ -2550,17 +2549,10 @@ void AgentPanel::doResume()
         addNote(i18n("Model updated to <b>%1</b> for this chat.", repl.toHtmlEscaped()),
                 QStringLiteral("sys"));
     }
-    // Re-attach the provider (with its API token) when this panel started the
-    // thread on one this session — the core never persists the token, so a
-    // KWallet-held key would otherwise be unavailable on resume. When the panel
-    // doesn't know the provider (e.g. after an app restart), the core rebuilds it
-    // from the persisted snapshot and resolves the token from its env var.
+    // Resume carries only the opaque provider id. The core resolves the
+    // profile and credential into its private runtime binding.
     if (!m_startedProviderId.isEmpty()) {
-        const ProviderProfile prof = ProviderStore::byId(m_startedProviderId);
-        const QJsonObject pj = ProviderStore::toJson(prof);
-        if (!pj.isEmpty()) {
-            params.insert(QStringLiteral("provider"), pj);
-        }
+        params.insert(QStringLiteral("providerId"), m_startedProviderId);
     }
     m_core->call(QStringLiteral("agent.resume"), params,
                  [this](const QJsonObject &, const QJsonObject &error) {
@@ -2688,6 +2680,7 @@ void AgentPanel::refresh()
     // bound thread's traits, or the engine picker's selection before a thread
     // exists (currentTraits() resolves that).
     const HarnessTraits traits = currentTraits();
+    m_sendBtn->setEnabled(!m_threadId.isEmpty() || !traits.id.isEmpty());
     if (m_subagentsBtn) {
         // Hidden rather than disabled for an engine that writes no subagent
         // files: a greyed button would suggest the conversations exist and are
@@ -3498,14 +3491,12 @@ void AgentPanel::onSendClicked()
     // (akcore inherits this UI's environment, so if the key can't be resolved
     // here it cannot be resolved at launch either.) Only engines with provider
     // routing carry a provider overlay in the first place.
-    QJsonObject providerJson;
     QString startedProviderId;
     const HarnessTraits startTraits = currentTraits();
     if (m_threadId.isEmpty() && startTraits.providerRouting) {
         const ProviderProfile prof = ProviderStore::byId(selectedProviderId());
         if (prof.routed()) {
-            providerJson = ProviderStore::toJson(prof);
-            if (!providerJson.contains(QStringLiteral("authToken"))) {
+            if (!ProviderStore::keyResolvable(prof)) {
                 addNote(QStringLiteral(
                             "No API key is configured for provider “%1”. Set one in "
                             "Options ▸ Configure API Providers… (or its %2 environment "
@@ -3595,8 +3586,8 @@ void AgentPanel::onSendClicked()
             {QStringLiteral("coworkEnabled"),
              startTraits.cowork && m_coworkCheck->isChecked()},
             {QStringLiteral("attachments"), attachments}};
-        if (!providerJson.isEmpty()) {
-            startParams.insert(QStringLiteral("provider"), providerJson);
+        if (!startedProviderId.isEmpty()) {
+            startParams.insert(QStringLiteral("providerId"), startedProviderId);
         }
         // The P6 launch options, sent only when the human asked for them (the
         // New Agent dialog offers each field only where the engine can apply
@@ -5770,70 +5761,6 @@ void AgentPanel::clearRateLimitClaim(bool alsoDropArmedResume)
     refresh();
 }
 
-// adoptDiscoveredOptions drives the pickers to what the CLI is actually running.
-// Only the ids the event lists as changed are touched: the array repeats the
-// FULL option set every time, and re-selecting an untouched picker would fight
-// a choice the user just made.
-void AgentPanel::adoptDiscoveredOptions(const QJsonArray &configOptions,
-                                        const QJsonArray &changed)
-{
-    if (configOptions.isEmpty() || changed.isEmpty()) {
-        return;
-    }
-    for (const QJsonValue &cv : changed) {
-        const QString id = cv.toString();
-        // Find this option's snapshot: currentValue is what the CLI is running.
-        QJsonObject option;
-        for (const QJsonValue &ov : configOptions) {
-            const QJsonObject o = ov.toObject();
-            if (o.value(QStringLiteral("id")).toString() == id) {
-                option = o;
-                break;
-            }
-        }
-        if (option.isEmpty()) {
-            continue;
-        }
-        const QString value = option.value(QStringLiteral("currentValue")).toString();
-        if (value.isEmpty()) {
-            continue;
-        }
-        if (id == QLatin1String("model")) {
-            adoptModel(value);
-            continue;
-        }
-        QComboBox *combo = nullptr;
-        if (id == QLatin1String("mode")) {
-            combo = m_modeCombo;
-        } else if (id == QLatin1String("thinking")) {
-            combo = m_effortCombo;
-        }
-        if (!combo) {
-            continue; // an option with no picker of its own — registry-only
-        }
-        QSignalBlocker block(combo);
-        int idx = combo->findData(value);
-        if (idx < 0) {
-            // The combos are frozen once a thread exists (they are not rebuilt
-            // from the registry mid-session), so a value discovered only now
-            // has no item yet. Add it under its own reported label rather than
-            // leaving the picker showing the previous value.
-            QString label = value;
-            const QJsonArray values = option.value(QStringLiteral("options")).toArray();
-            for (const QJsonValue &vv : values) {
-                const QJsonObject vo = vv.toObject();
-                if (vo.value(QStringLiteral("value")).toString() == value) {
-                    label = vo.value(QStringLiteral("name")).toString();
-                    break;
-                }
-            }
-            combo->addItem(label.isEmpty() ? value : label, value);
-            idx = combo->count() - 1;
-        }
-        combo->setCurrentIndex(idx);
-    }
-}
-
 // --- claude stream channel ---------------------------------------------------
 
 void AgentPanel::resetStreamState()
@@ -6258,27 +6185,6 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
         if (subtype != QLatin1String("init")) {
             renderSystemSubtype(subtype, ev);
             return;
-        }
-        // A discovered-options init event carries the session's config options
-        // (model / thinking / mode enumerations straight from the CLI).
-        // Persist each as "value|name" pairs under the harness's option key so
-        // the pickers can offer the real lists on the next agent instead of
-        // free-text fields. The registry owns the write — the agent.discover-
-        // Options probe persists the identical shape.
-        const QJsonArray configOptions =
-            ev.value(QStringLiteral("configOptions")).toArray();
-        if (!configOptions.isEmpty()) {
-            if (m_replaying) {
-                // Replaying a stored transcript: the vocabulary was already
-                // learned when this session first ran live — persist quietly.
-                HarnessRegistry::persistDiscoveredOptions(currentTraits().id,
-                                                          configOptions);
-            } else {
-                // A live session's real vocabulary: notify so the roster quick
-                // menu and other panels' pickers rebuild now, not on restart.
-                HarnessRegistry::self()->applyDiscoveredOptions(currentTraits().id,
-                                                                configOptions);
-            }
         }
         // The claude init event lists the session's slash commands (names
         // only) — the composer's autocomplete feed.
@@ -6720,25 +6626,8 @@ void AgentPanel::renderEvent(const QJsonObject &ev)
         seedSlashCommands(ev.value(QStringLiteral("commands")).toArray());
 
     } else if (type == QLatin1String("_options")) {
-        // kimi's live config snapshot: the same `configOptions` array the init
-        // event carries, re-sent whenever an option's value changes — including
-        // changes the CLI made on its own (its ExitPlanMode mode switch), which
-        // is exactly the case that used to leave our pickers lying.
-        const QJsonArray configOptions =
-            ev.value(QStringLiteral("configOptions")).toArray();
-        if (!configOptions.isEmpty()) {
-            if (m_replaying) {
-                HarnessRegistry::persistDiscoveredOptions(currentTraits().id,
-                                                          configOptions);
-            } else {
-                HarnessRegistry::self()->applyDiscoveredOptions(currentTraits().id,
-                                                                configOptions);
-            }
-        }
-        if (!m_replaying) {
-            adoptDiscoveredOptions(configOptions,
-                                   ev.value(QStringLiteral("changed")).toArray());
-        }
+        // Native option snapshots are intentionally not a UI discovery path.
+        // Current controls change only through typed AppliedSettings replies.
 
     } else if (type == QLatin1String("_context")) {
         // The core asked the running CLI what its context ACTUALLY holds

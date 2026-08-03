@@ -7,8 +7,8 @@
 class QJsonObject;
 
 // A configured third-party API provider profile. Non-secret fields persist in
-// KConfig (group [Providers][<id>]); the API key is brokered separately through
-// KWallet (or resolved from the named environment variable). An empty baseUrl is
+// KConfig (group [Providers][<id>]); the credential is resolved by akcore from
+// the named environment variable. An empty baseUrl is
 // the built-in "Claude (direct)" sentinel — selecting it injects nothing and the
 // agent talks to Anthropic exactly as before.
 //
@@ -24,9 +24,9 @@ struct ProviderProfile {
     bool routed() const { return !baseUrl.trimmed().isEmpty(); }
 };
 
-// ProviderStore loads/saves provider profiles and brokers their API keys. The
-// secret never touches our config files: it lives in KWallet, or is read from
-// the profile's environment variable at resolve time.
+// ProviderStore loads/saves provider profiles. Secrets never touch UI config
+// files or the launch RPC: akcore resolves the profile's environment credential
+// inside its private runtime binding.
 namespace ProviderStore {
 
 // Model slots, in display order. Each maps to a Claude Code override variable
@@ -41,23 +41,22 @@ QString directId();
 QList<ProviderProfile> load();
 
 // Persist the full set of (non-direct) profiles' non-secret fields, pruning any
-// removed ones. API keys are written separately via setKey().
+// removed ones.
 void save(const QList<ProviderProfile> &profiles);
 
 // Look up one profile by id. An empty/unknown/`directId()` id yields the
 // Claude-direct sentinel (routed() == false).
 ProviderProfile byId(const QString &id);
 
-// Secret brokerage. setKey stores to KWallet (empty value clears the entry);
-// key() resolves from KWallet first, then the profile's envVar, then "".
+// Legacy credential-management hooks. Runtime profiles are environment-backed,
+// so the desktop does not store or retrieve provider secrets.
 bool walletAvailable();
 bool setKey(const QString &id, const QString &key);
-QString key(const ProviderProfile &p);
 bool hasStoredKey(const QString &id);
 
 // Can this profile actually start an agent right now? True for Claude-direct
-// (it needs no key of ours) and for a routed profile whose key resolves from
-// KWallet or its environment variable. The two seeded presets ship with no key,
+// (it needs no key of ours) and for a routed profile whose environment credential
+// is available. The two seeded presets ship with no key,
 // so on a fresh profile they were offered as engine choices that could only
 // ever abort (audit F46) — every picker that lists routed providers must gate
 // or annotate on this.
@@ -66,9 +65,5 @@ bool keyResolvable(const ProviderProfile &p);
 // The name to show in an engine picker: the profile's own name, suffixed when
 // no key resolves, so the choice is visibly dead before it is made.
 QString pickerLabel(const ProviderProfile &p);
-
-// Build the agent.start/agent.resume "provider" JSON for a profile, resolving
-// the key. Returns an empty object for Claude-direct (the caller omits the field).
-QJsonObject toJson(const ProviderProfile &p);
 
 } // namespace ProviderStore

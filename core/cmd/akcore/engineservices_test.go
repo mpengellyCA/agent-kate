@@ -60,7 +60,7 @@ func engineServiceCoreWithSessions(t *testing.T, h harness.Harness, sessions *se
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	sock := filepath.Join(t.TempDir(), "engine.sock")
 	srv := ipc.NewServer(sock, log)
-	harnesses := harness.NewRegistry(h.Capabilities().ID)
+	harnesses := harness.NewRegistry(h.Descriptor().ID)
 	harnesses.Register(h)
 	gitCache := gitstatus.NewCache(log)
 	t.Cleanup(func() { _ = gitCache.Close() })
@@ -113,8 +113,10 @@ type registryHarness struct {
 	listCalls atomic.Int32
 }
 
-func (h *registryHarness) Capabilities() harness.Capabilities {
-	return harness.Capabilities{ID: session.BackendKimi, DisplayName: "Kimi Code", ProviderRegistry: true}
+func (h *registryHarness) Descriptor() harness.HarnessDescriptor {
+	return harness.HarnessDescriptor{ContractVersion: harness.ContractVersion, ID: session.BackendKimi,
+		DisplayName: "Kimi Code", Health: harness.HealthOK,
+		Operations: harness.Operations(harness.OperationProviderRegistry)}
 }
 func (h *registryHarness) ListProviders(string) ([]kimi.Provider, error) {
 	h.listCalls.Add(1)
@@ -187,8 +189,9 @@ func TestHealthCacheKeepsProjectsSeparate(t *testing.T) {
 }
 
 // TestProviderThreadHomeFailsClosed makes the "specific thread's registry"
-// selector safe: an unknown id or a non-Kimi thread is an invalid request, not
-// an empty home that would edit the user's default Kimi registry.
+// selector safe: an unknown id or a thread without the descriptor's
+// provider-registry operation is an invalid request, not an empty home that
+// would edit the user's default registry.
 func TestProviderThreadHomeFailsClosed(t *testing.T) {
 	sessions := testSessions(t)
 	if err := sessions.Put(session.Record{ThreadID: "claude-thread", Backend: session.BackendClaude}); err != nil {
@@ -201,7 +204,7 @@ func TestProviderThreadHomeFailsClosed(t *testing.T) {
 		want     string
 	}{
 		{"missing-thread", "unknown thread missing-thread"},
-		{"claude-thread", "does not use Kimi Code"},
+		{"claude-thread", "does not use a provider registry"},
 	} {
 		err := client.CallTimeout("kimiProvider.list", map[string]any{
 			"threadId": tc.threadID,

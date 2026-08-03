@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -25,6 +26,7 @@ func TestFakeAppServer(t *testing.T) {
 	out := bufio.NewWriter(os.Stdout)
 	defer out.Flush()
 	sc := bufio.NewScanner(os.Stdin)
+	turns := 0
 	for sc.Scan() {
 		var f struct {
 			ID     json.RawMessage `json:"id"`
@@ -35,7 +37,11 @@ func TestFakeAppServer(t *testing.T) {
 			continue
 		}
 		if logPath != "" {
-			_ = os.WriteFile(logPath, append(append([]byte(nil), sc.Bytes()...), '\n'), 0o600)
+			log, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+			if err == nil {
+				_, _ = log.Write(append(append([]byte(nil), sc.Bytes()...), '\n'))
+				_ = log.Close()
+			}
 		}
 		response := func(result any) {
 			b, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": json.RawMessage(f.ID), "result": result})
@@ -50,18 +56,23 @@ func TestFakeAppServer(t *testing.T) {
 		switch f.Method {
 		case "initialize":
 			response(map[string]any{"codexHome": "/fake", "platformFamily": "unix", "platformOs": "linux", "userAgent": "fake"})
+		case "initialized":
+			// JSON-RPC notification: the real app-server sends no response.
 		case "thread/start", "thread/resume", "thread/fork":
 			response(map[string]any{"thread": map[string]any{"id": "codex-thread-1", "model": "gpt-test"}, "model": "gpt-test", "reasoningEffort": "medium", "approvalPolicy": "on-request", "sandbox": "workspace-write"})
 		case "turn/start":
-			response(map[string]any{"turn": map[string]any{"id": "turn-1"}})
-			notify("item/agentMessage/delta", map[string]any{"threadId": "codex-thread-1", "turnId": "turn-1", "itemId": "msg-1", "delta": "hello "})
-			notify("item/agentMessage/delta", map[string]any{"threadId": "codex-thread-1", "turnId": "turn-1", "itemId": "msg-1", "delta": "world"})
-			notify("item/completed", map[string]any{"threadId": "codex-thread-1", "turnId": "turn-1", "completedAtMs": 1, "item": map[string]any{"id": "msg-1", "type": "agentMessage", "text": "hello world"}})
-			notify("turn/completed", map[string]any{"threadId": "codex-thread-1", "turn": map[string]any{"id": "turn-1", "status": "completed"}})
-		case "turn/interrupt", "thread/settings/update":
+			turns++
+			turnID := fmt.Sprintf("turn-%d", turns)
+			notifyID := fmt.Sprintf("msg-%d", turns)
+			response(map[string]any{"turn": map[string]any{"id": turnID}})
+			notify("item/agentMessage/delta", map[string]any{"threadId": "codex-thread-1", "turnId": turnID, "itemId": notifyID, "delta": "hello "})
+			notify("item/agentMessage/delta", map[string]any{"threadId": "codex-thread-1", "turnId": turnID, "itemId": notifyID, "delta": "world"})
+			notify("item/completed", map[string]any{"threadId": "codex-thread-1", "turnId": turnID, "completedAtMs": 1, "item": map[string]any{"id": notifyID, "type": "agentMessage", "text": "hello world"}})
+			notify("turn/completed", map[string]any{"threadId": "codex-thread-1", "turn": map[string]any{"id": turnID, "status": "completed"}})
+		case "turn/interrupt":
 			response(map[string]any{})
 		case "model/list":
-			response(map[string]any{"data": []map[string]any{{"model": "gpt-test", "displayName": "Test model", "supportedReasoningEfforts": []map[string]string{{"reasoningEffort": "low"}, {"reasoningEffort": "medium"}}}}})
+			response(map[string]any{"data": []map[string]any{{"id": "gpt-test", "displayName": "Test model", "supportedReasoningEfforts": []map[string]string{{"reasoningEffort": "low"}, {"reasoningEffort": "medium"}}}}, "nextCursor": nil})
 		default:
 			response(map[string]any{})
 		}
@@ -104,15 +115,37 @@ func fakeSupervisor(t *testing.T, c *collected) *Supervisor {
 	return NewSupervisor(os.Args[0], slog.New(slog.NewTextHandler(io.Discard, nil)), c.add)
 }
 
+func recordedRequests(t *testing.T, path string) []map[string]any {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var frame map[string]any
+		if err := json.Unmarshal([]byte(line), &frame); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, frame)
+	}
+	return out
+}
+
 func TestSupervisorStartsTurnsAndTranslatesEvents(t *testing.T) {
 	var c collected
+	logPath := filepath.Join(t.TempDir(), "rpc.jsonl")
+	t.Setenv("AK_CODEX_FAKE_LOG", logPath)
 	s := fakeSupervisor(t, &c)
-	thread, err := s.Start(StartOptions{ID: "ak-1", WorkDir: t.TempDir(), Prompt: "say hello", Model: "gpt-test", Effort: "medium", ApprovalPolicy: "on-request", Sandbox: "workspace-write"})
+	thread, err := s.Start(StartOptions{ID: "ak-1", WorkDir: t.TempDir(), Prompt: "say hello", Model: "gpt-test", Effort: "high", ApprovalPolicy: "on-request", Sandbox: "workspace-write"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Stop(thread.ID)
-	if thread.SessionID() != "codex-thread-1" || thread.Model() != "gpt-test" || thread.Effort() != "medium" {
+	if thread.SessionID() != "codex-thread-1" || thread.Model() != "gpt-test" || thread.Effort() != "high" {
 		t.Fatalf("thread state = session=%q model=%q effort=%q", thread.SessionID(), thread.Model(), thread.Effort())
 	}
 	if !c.contains(t, func(v map[string]any) bool {
@@ -136,6 +169,77 @@ func TestSupervisorStartsTurnsAndTranslatesEvents(t *testing.T) {
 	got, err := s.ReadTranscript("ak-1")
 	if err != nil || len(got) < 3 {
 		t.Fatalf("ReadTranscript = %d events, %v", len(got), err)
+	}
+	// App-server requires initialize to be acknowledged with a notification,
+	// and effort is a turn/start setting rather than a thread/start field.
+	var sawInitialized, sawInitialEffort bool
+	for _, frame := range recordedRequests(t, logPath) {
+		if frame["method"] == "initialized" {
+			sawInitialized = true
+		}
+		if frame["method"] != "turn/start" {
+			continue
+		}
+		params, _ := frame["params"].(map[string]any)
+		sawInitialEffort = params["effort"] == "high" && params["model"] == "gpt-test"
+	}
+	if !sawInitialized || !sawInitialEffort {
+		t.Fatalf("app-server handshake/turn settings missing: initialized=%v effort=%v",
+			sawInitialized, sawInitialEffort)
+	}
+}
+
+func TestSetOptionQueuesOverridesForTheNextTurn(t *testing.T) {
+	var c collected
+	logPath := filepath.Join(t.TempDir(), "rpc.jsonl")
+	t.Setenv("AK_CODEX_FAKE_LOG", logPath)
+	s := fakeSupervisor(t, &c)
+	thread, err := s.Start(StartOptions{ID: "ak-options", WorkDir: t.TempDir(), Prompt: "first"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for option, value := range map[string]string{
+		"model": "gpt-next", "effort": "xhigh", "permissionMode": "never",
+	} {
+		if got, err := s.SetOption(thread.ID, option, value); err != nil || got != value {
+			t.Fatalf("SetOption(%q) = %q, %v", option, got, err)
+		}
+	}
+	if err := s.Send(thread.ID, "second", nil); err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, frame := range recordedRequests(t, logPath) {
+		if frame["method"] == "thread/settings/update" {
+			t.Fatal("used removed thread/settings/update endpoint")
+		}
+		if frame["method"] != "turn/start" {
+			continue
+		}
+		params, _ := frame["params"].(map[string]any)
+		input, _ := params["input"].([]any)
+		if len(input) == 0 {
+			continue
+		}
+		firstInput, _ := input[0].(map[string]any)
+		if firstInput["text"] == "second" {
+			found = params["model"] == "gpt-next" &&
+				params["effort"] == "xhigh" &&
+				params["approvalPolicy"] == "never"
+		}
+	}
+	if !found {
+		t.Fatal("next Codex turn did not carry the queued model, effort and approval policy")
+	}
+	if err := s.Stop(thread.ID); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for s.Running(thread.ID) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if s.Running(thread.ID) {
+		t.Fatal("Codex child did not stop before test cleanup")
 	}
 }
 

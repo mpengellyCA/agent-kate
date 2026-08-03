@@ -166,10 +166,10 @@ func TestPersonaArgvLimits(t *testing.T) {
 // "unsupported" wording — that would be a lie about a harness that has the
 // capability.
 func TestUnappliedPersonaUsesAdapterReason(t *testing.T) {
-	caps := newClaudeHarness(nil, "", "").Capabilities()
+	descriptor := newClaudeHarness(nil, "", "").Descriptor()
 	got := unappliedPersona("a very long persona", nil, harness.Launched{
 		SystemPromptUnapplied: tooLongForArgv("the system prompt", 200000),
-	}, caps)
+	}, descriptor)
 	if len(got) != 1 || !strings.Contains(got[0]["reason"], "MAX_ARG_STRLEN") {
 		t.Fatalf("unapplied = %v, want the adapter's own reason", got)
 	}
@@ -182,7 +182,7 @@ func TestUnappliedPersonaUsesAdapterReason(t *testing.T) {
 	// the capability.
 	got = unappliedPersona("", []harness.AgentProfile{{Name: "x"}}, harness.Launched{
 		Agents: []harness.AppliedAgent{{Name: "x"}},
-	}, caps)
+	}, descriptor)
 	if len(got) != 1 || got[0]["reason"] != "not applied; the harness gave no reason" {
 		t.Fatalf("fallback reason = %v", got)
 	}
@@ -194,10 +194,9 @@ func TestUnappliedPersonaUsesAdapterReason(t *testing.T) {
 // applied — with a reason, never silently and never emulated with files the
 // running agent could not read.
 func TestKimiPersonaUnapplied(t *testing.T) {
-	caps := newKimiHarness(nil, "", "").Capabilities()
-	if caps.SystemPrompt || caps.CustomSubagents {
-		t.Fatalf("kimi persona capabilities = %v/%v, want false/false",
-			caps.SystemPrompt, caps.CustomSubagents)
+	descriptor := newKimiHarness(nil, "", "").Descriptor()
+	if descriptor.Supports(harness.OperationSystemPrompt) || descriptor.Supports(harness.OperationCustomSubagents) {
+		t.Fatalf("kimi descriptor incorrectly exposes persona operations")
 	}
 	agents := harness.UnappliedAgents([]harness.AgentProfile{
 		{Name: "reviewer", Description: "d", Prompt: "p"},
@@ -215,7 +214,7 @@ func TestKimiPersonaUnapplied(t *testing.T) {
 	// The launch_agent report the controller actually reads.
 	unapplied := unappliedPersona("You are the scout.",
 		[]harness.AgentProfile{{Name: "reviewer"}, {Name: "scout"}},
-		harness.Launched{Agents: agents}, caps)
+		harness.Launched{Agents: agents}, descriptor)
 	if len(unapplied) != 3 {
 		t.Fatalf("unapplied = %v, want the system prompt plus both profiles", unapplied)
 	}
@@ -233,21 +232,20 @@ func TestKimiPersonaUnapplied(t *testing.T) {
 // report: a fully applied persona names nothing, so the controller only ever
 // reads about real downgrades.
 func TestUnappliedPersonaAppliedIsSilent(t *testing.T) {
-	caps := newClaudeHarness(nil, "", "").Capabilities()
-	if !caps.SystemPrompt || !caps.CustomSubagents {
-		t.Fatalf("claude persona capabilities = %v/%v, want true/true",
-			caps.SystemPrompt, caps.CustomSubagents)
+	descriptor := newClaudeHarness(nil, "", "").Descriptor()
+	if !descriptor.Supports(harness.OperationSystemPrompt) || !descriptor.Supports(harness.OperationCustomSubagents) {
+		t.Fatalf("claude descriptor does not expose persona operations")
 	}
 	profiles := []harness.AgentProfile{{Name: "reviewer", Description: "d", Prompt: "p"}}
 	_, applied := buildAgentsJSON(profiles)
 	got := unappliedPersona("You are the scout.", profiles,
-		harness.Launched{SystemPromptApplied: true, Agents: applied}, caps)
+		harness.Launched{SystemPromptApplied: true, Agents: applied}, descriptor)
 	if len(got) != 0 {
 		t.Fatalf("fully applied persona reported as unapplied: %v", got)
 	}
 	// Requesting nothing reports nothing, whatever the capabilities say.
 	if got := unappliedPersona("", nil, harness.Launched{},
-		newKimiHarness(nil, "", "").Capabilities()); len(got) != 0 {
+		newKimiHarness(nil, "", "").Descriptor()); len(got) != 0 {
 		t.Fatalf("nothing requested reported as unapplied: %v", got)
 	}
 }
@@ -257,7 +255,7 @@ func TestUnappliedPersonaAppliedIsSilent(t *testing.T) {
 // a profile with no verdict must surface as unapplied, never vanish.
 func TestUnappliedPersonaBackstop(t *testing.T) {
 	got := unappliedPersona("", []harness.AgentProfile{{Name: "ghost"}, {Name: ""}},
-		harness.Launched{}, newKimiHarness(nil, "", "").Capabilities())
+		harness.Launched{}, newKimiHarness(nil, "", "").Descriptor())
 	if len(got) != 2 {
 		t.Fatalf("unreported profiles = %v, want both named", got)
 	}

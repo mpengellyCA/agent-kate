@@ -108,7 +108,7 @@ type projectHealther interface {
 }
 
 // providerRegistrar is the optional side-interface for engines that keep a
-// persistent provider registry (Capabilities().ProviderRegistry). The
+// persistent provider registry (its descriptor's ProviderRegistry operation). The
 // kimiProvider.* handlers route through it so no backend string compare
 // appears outside the adapter.
 type providerRegistrar interface {
@@ -144,7 +144,7 @@ func registerEngineServiceHandlers(d handlerDeps) {
 	// adapter error is folded into an all-Unknown verdict: engine.health is
 	// best-effort END TO END, and a blank card teaches the user nothing.
 	healthFor := func(h harness.Harness, project string) harness.Health {
-		id := h.Capabilities().ID
+		id := h.Descriptor().ID
 		key := healthCacheKey{engineID: id, project: project}
 		cache.mu.Lock()
 		if e, ok := cache.entries[key]; ok && time.Since(e.at) < engineHealthTTL {
@@ -231,7 +231,7 @@ func registerEngineServiceHandlers(d handlerDeps) {
 	// through the capability + side-interface — never a backend string compare.
 	registryEngine := func() (providerRegistrar, error) {
 		for _, h := range d.harnesses.All() {
-			if !h.Capabilities().ProviderRegistry {
+			if !h.Descriptor().Supports(harness.OperationProviderRegistry) {
 				continue
 			}
 			if r, ok := h.(providerRegistrar); ok {
@@ -253,9 +253,10 @@ func registerEngineServiceHandlers(d handlerDeps) {
 		if !ok {
 			return "", ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+threadID)
 		}
-		if rec.Backend != session.BackendKimi {
+		threadHarness, ok := d.harnesses.Get(rec.Backend)
+		if !ok || !threadHarness.Descriptor().Supports(harness.OperationProviderRegistry) {
 			return "", ipc.Errorf(ipc.CodeInvalidParams,
-				"thread "+threadID+" does not use Kimi Code")
+				"thread "+threadID+" does not use a provider registry")
 		}
 		return session.LaunchEnv(rec.Env)["KIMI_CODE_HOME"], nil
 	}

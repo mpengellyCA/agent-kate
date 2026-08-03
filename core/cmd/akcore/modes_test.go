@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -22,14 +23,19 @@ import (
 // prompt's unattended hint reads the last entry.
 type personaFake struct{ *fakeHarness }
 
-func (p personaFake) Capabilities() harness.Capabilities {
-	c := p.fakeHarness.Capabilities()
-	c.SystemPrompt = true
-	// A ranked vocabulary (authority.go's permissivenessRanks is the single
-	// source): the roster hint names the harness's own most permissive mode,
-	// and only when that mode really never asks.
-	c.PermissionModes = []string{"default", "bypassPermissions"}
-	return c
+func (p personaFake) Descriptor() harness.HarnessDescriptor {
+	return harness.HarnessDescriptor{ContractVersion: harness.ContractVersion, ID: "fake",
+		DisplayName: "Fake Engine", Health: harness.HealthOK,
+		Operations: harness.Operations(harness.OperationMintSessionID, harness.OperationSystemPrompt)}
+}
+
+func (p personaFake) Catalogue(context.Context, harness.CatalogueScope) (harness.CatalogueSnapshot, error) {
+	snapshot := harness.CatalogueSnapshot{ContractVersion: harness.ContractVersion, HarnessID: "fake",
+		Settings: []harness.SettingDescriptor{{Key: harness.SettingPermissionMode, DisplayName: "Permission mode",
+			Choices:      []harness.SettingChoice{{Value: "default", DisplayName: "default"}, {Value: "bypassPermissions", DisplayName: "bypassPermissions"}},
+			DefaultValue: "default", Timing: harness.TimingLaunch}}}
+	snapshot.Revision = harness.CatalogueRevision(snapshot)
+	return snapshot, nil
 }
 
 // modeTestCore spins the mode handlers over a real bus with one registered
@@ -43,7 +49,7 @@ func modeTestCore(t *testing.T, sessions *session.Store, h harness.Harness) (*ip
 	if err != nil {
 		t.Fatalf("modes.NewStore: %v", err)
 	}
-	harnesses := harness.NewRegistry(h.Capabilities().ID)
+	harnesses := harness.NewRegistry(h.Descriptor().ID)
 	harnesses.Register(h)
 	gitCache := gitstatus.NewCache(log)
 	t.Cleanup(func() { _ = gitCache.Close() })

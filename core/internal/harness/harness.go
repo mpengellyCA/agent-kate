@@ -1,16 +1,18 @@
-// Package harness defines the contract every agent backend ("harness")
-// fulfils, plus the capability set that drives routing and UI affordances.
+// Package harness defines the versioned, neutral linkage contract every agent
+// backend ("harness") fulfils.  It is the only package that owns data which
+// crosses from a native harness into the core/UI boundary.
 //
 // A harness is one way of running an agent: a CLI binary spoken to over some
 // protocol (Claude Code over stream-json, Kimi Code over ACP, …). The
 // orchestration layer never asks "is this kimi?" — it asks the thread's
-// harness to act, and consults its Capabilities for anything optional. Adding
-// a backend means implementing this interface and registering it (see
-// docs/HARNESSES.md); no string compares should appear outside the adapter.
+// harness to act and reads its descriptor/catalogue. Adding a backend means
+// implementing this interface and registering it (see docs/HARNESSES.md); no
+// string compares should appear outside the adapter.
 package harness
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -18,125 +20,235 @@ import (
 	"agentkate/internal/agent"
 )
 
-// ModelPicker kinds — how the UI should offer model choice for a harness.
+// ContractVersion changes only when the JSON DTO semantics change.  It is
+// deliberately in each response, rather than negotiated through an SDK: the
+// core and UI are released together but fixtures can still reject a drift.
+const ContractVersion = 1
+
+// OperationKind is a named end-to-end action.  A descriptor contains an entry
+// only when the adapter has implemented and tested that action; absence is the
+// unsupported state.  This replaces the old boolean capability matrix.
+type OperationKind string
+
 const (
-	// ModelPickerTiers: a fixed set of tier tokens (opus/sonnet/…) that the
-	// core resolves to concrete model ids at launch.
-	ModelPickerTiers = "tiers"
-	// ModelPickerDiscovered: the CLI enumerates its models per session (the
-	// init event's configOptions); the picker lists those plus free text.
-	ModelPickerDiscovered = "discovered"
+	OperationFork                OperationKind = "fork"
+	OperationCompaction          OperationKind = "compaction"
+	OperationColdCompaction      OperationKind = "coldCompaction"
+	OperationPromote             OperationKind = "promote"
+	OperationProviderRouting     OperationKind = "providerRouting"
+	OperationProviderRegistry    OperationKind = "providerRegistry"
+	OperationCowork              OperationKind = "cowork"
+	OperationLiveToolReveal      OperationKind = "liveToolReveal"
+	OperationUsageReporting      OperationKind = "usageReporting"
+	OperationSessionBrowse       OperationKind = "sessionBrowse"
+	OperationTranscriptPreview   OperationKind = "transcriptPreview"
+	OperationMintSessionID       OperationKind = "mintSessionId"
+	OperationSystemPrompt        OperationKind = "systemPrompt"
+	OperationCustomSubagents     OperationKind = "customSubagents"
+	OperationFallbackModels      OperationKind = "fallbackModels"
+	OperationDisallowedTools     OperationKind = "disallowedTools"
+	OperationAddDirectories      OperationKind = "addDirectories"
+	OperationStrictMCPConfig     OperationKind = "strictMcpConfig"
+	OperationCostBudget          OperationKind = "costBudget"
+	OperationSubagentTranscripts OperationKind = "subagentTranscripts"
+	OperationSkillReload         OperationKind = "skillReload"
 )
 
-// Capabilities declares what one harness supports. The handlers gate optional
-// RPCs on these (one shared "X is not supported by <DisplayName> agents"
-// message), and the UI fetches them via agent.capabilities to drive its
-// affordances — so a wrong flag here shows up as a wrongly-enabled button,
-// never as a scattered conditional.
-type Capabilities struct {
-	ID          string `json:"id"`          // registry key, e.g. "claude", "kimi"
-	DisplayName string `json:"displayName"` // human name, e.g. "Claude Code"
-	// Badge prefixes the roster subtitle ("Kimi · working"); empty for the
-	// default engine so the common case stays unmarked.
-	Badge string `json:"badge"`
+// ApplicationTiming says when a requested setting takes effect. It is part of
+// the setting descriptor and of every application result, so a client never
+// has to infer timing from a harness id.
+type ApplicationTiming string
 
-	Fork bool `json:"fork"` // agent.fork (--fork-session semantics)
-	// Compaction: the thread's context can be compacted at all — it gates the
-	// strategy/status RPCs and the HOT (in-session) mechanism, which every
-	// compacting harness has.
-	Compaction bool `json:"compaction"`
-	// ColdCompact: the harness can also compact a thread that is NOT running,
-	// by reading the session back from disk (session.ReadTranscript) or
-	// re-running the CLI over the stored session, and hand back summary TEXT
-	// the core stores and later replays into a fresh session.
-	//
-	// False for harnesses whose only mechanism rewrites the LIVE session's own
-	// context and keeps it (kimi's `/compact`): there is no local transcript in
-	// the claude format to read and no summary to store, so the cold path must
-	// be refused rather than fed an empty or foreign-shaped read — seeding a
-	// new session from that would discard the thread's whole history.
-	ColdCompact     bool `json:"coldCompact"`
-	Promote         bool `json:"promote"`         // agent.promote (move session into an isolated worktree)
-	ProviderRouting bool `json:"providerRouting"` // third-party Anthropic-compatible endpoints
-	// ProviderRegistry: the ENGINE keeps its own persistent provider registry
-	// in its home directory (kimi's `kimi provider add/catalog/list/remove`
-	// family), managed by shelling out to the CLI — providers/list is not
-	// implemented over ACP (probed, -32601). Deliberately a SECOND flag, not a
-	// change to ProviderRouting: routing is per-launch env injection whose
-	// keys Agent Kate brokers (claude, plan 11); the registry is per-home
-	// state whose credentials the engine holds itself and Agent Kate never
-	// sees (plan 26). Claude false, kimi true. LOCKSTEP with
-	// ui/src/state/HarnessTraits.h/.cpp (fromJson AND the defaults).
-	ProviderRegistry bool `json:"providerRegistry"`
-	Cowork           bool `json:"cowork"` // the KDE Cowork desktop MCP server
-	// LiveToolReveal: the CLI honours the MCP notifications/tools/list_changed
-	// notification, so a server that starts advertising new tools mid-session
-	// is picked up without a relaunch. True for claude 2.1.220 (probed: the
-	// revealed tool was listed AND callable in the next turn); false for kimi
-	// 0.30, which lists a server's tools once at session/new and never
-	// re-lists — switching Cowork on there re-attaches the session instead
-	// (session/resume keeps the conversation and takes a new mcpServers list,
-	// also probed).
-	LiveToolReveal bool `json:"liveToolReveal"`
-	EffortLive     bool `json:"effortLive"`     // thinking effort adjustable mid-session
-	UsageReporting bool `json:"usageReporting"` // tokens/cost in result events
-	SessionBrowse  bool `json:"sessionBrowse"`  // on-disk session discovery (session.browse)
-	// TranscriptPreview: the harness keeps a previewable, forgettable on-disk
-	// transcript store (session.preview / session.forget). False for harnesses
-	// whose transcript lives only in the core's translated-event log (kimi), so
-	// the session browser shows metadata instead of a preview and hides Forget.
-	TranscriptPreview bool `json:"transcriptPreview"`
-	// MintsSessionID: the core pre-mints the session id and passes it to the
-	// CLI (claude --session-id). False = the CLI assigns its own during the
-	// handshake, so agent.start replies with an empty sessionId and the id is
-	// captured from the init event.
-	MintsSessionID bool `json:"mintsSessionId"`
+const (
+	TimingLaunch   ApplicationTiming = "launch"
+	TimingNextTurn ApplicationTiming = "nextTurn"
+	TimingLive     ApplicationTiming = "live"
+)
 
-	// SystemPrompt: the CLI takes caller-supplied persona text ALONGSIDE its
-	// own system prompt (claude --append-system-prompt). False means the
-	// channel does not exist — Launch reports a requested StartSpec.SystemPrompt
-	// as unapplied and the caller folds the persona into the opening message
-	// instead, which works on every harness.
-	SystemPrompt bool `json:"systemPrompt"`
-	// CustomSubagents: the CLI takes caller-defined subagent profiles for the
-	// session (claude --agents), so the thread's agent can delegate to them.
-	// False means the CLI's subagent vocabulary is fixed; Launch reports every
-	// requested StartSpec.AgentProfile as unapplied.
-	CustomSubagents bool `json:"customSubagents"`
-	// The launch-option sweep (plan 16 P6). Each gates one StartSpec list; a
-	// false flag means the UI does not offer the option and Launch reports a
-	// request for it as unapplied rather than dropping it.
-	FallbackModels  bool `json:"fallbackModels"`  // ordered model fallbacks
-	DisallowedTools bool `json:"disallowedTools"` // per-session tool deny-list
-	AddDirs         bool `json:"addDirs"`         // extra reachable directories
-	// The control-channel sweep. StrictMCPConfig: the thread can be isolated
-	// from the human's globally-configured MCP servers. CostBudget: the thread
-	// takes a hard spend ceiling the CLI enforces itself.
-	StrictMCPConfig bool `json:"strictMcpConfig"`
-	CostBudget      bool `json:"costBudget"`
-	// SubagentTranscripts: the CLI writes a per-subagent conversation file the
-	// UI can tail (agent.subagentTranscripts). False = a thread's delegations
-	// are only visible in its own transcript.
-	SubagentTranscripts bool `json:"subagentTranscripts"`
-	// SkillReload: a RUNNING session can be told to re-read its skill
-	// directories (claude's reload_skills control request), so a skill the
-	// human installs mid-session reaches an agent that is already working.
-	//
-	// False means the session reads its skills once, at start, and nothing can
-	// change that without a relaunch — which is a fact the HUMAN has to be
-	// told (audit F50): they install a skill, the fleet-wide reload reports
-	// success, and the agent they were about to hand the work to silently does
-	// not have it. reloadSkillsEverywhere therefore drops a notice in the
-	// panels of the running threads it had to SKIP, instead of skipping them
-	// silently. Keep in lockstep with ui/src/state/HarnessTraits.cpp.
-	SkillReload bool `json:"skillReload"`
+// OperationDescriptor is intentionally small. Native configuration and bridge
+// bindings do not belong here; they stay inside adapter runtime objects.
+type OperationDescriptor struct {
+	Kind OperationKind `json:"kind"`
+}
 
-	ModelPicker string `json:"modelPicker"` // ModelPickerTiers | ModelPickerDiscovered
-	// PermissionModes / Efforts: the harness's static vocabularies (values
-	// only; the UI owns the human labels). Empty = the vocabulary is
-	// discovered per session from the CLI's configOptions instead.
-	PermissionModes []string `json:"permissionModes"`
-	Efforts         []string `json:"efforts"`
+// HarnessDescriptor is the stable public identity and operation surface of a
+// harness. Health detail remains available through engine.health; Health is a
+// snapshot state suitable for rendering a descriptor before a fresh probe.
+type HarnessDescriptor struct {
+	ContractVersion  int                   `json:"contractVersion"`
+	ID               string                `json:"id"`
+	DisplayName      string                `json:"displayName"`
+	Badge            string                `json:"badge,omitempty"`
+	InstalledVersion string                `json:"installedVersion,omitempty"`
+	ProtocolVersion  string                `json:"protocolVersion,omitempty"`
+	Health           string                `json:"health"`
+	Operations       []OperationDescriptor `json:"operations"`
+}
+
+// Supports is the one operation gate used by core and UI mappers.
+func (d HarnessDescriptor) Supports(kind OperationKind) bool {
+	for _, operation := range d.Operations {
+		if operation.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// Operations is a concise constructor used only by adapters and fixtures.
+func Operations(kinds ...OperationKind) []OperationDescriptor {
+	out := make([]OperationDescriptor, 0, len(kinds))
+	for _, kind := range kinds {
+		out = append(out, OperationDescriptor{Kind: kind})
+	}
+	return out
+}
+
+// SettingKey is a stable, typed key; native names such as ACP's "thinking"
+// never leave the adapter.
+type SettingKey string
+
+const (
+	SettingModel           SettingKey = "model"
+	SettingReasoningEffort SettingKey = "reasoningEffort"
+	SettingPermissionMode  SettingKey = "permissionMode"
+)
+
+type SettingChoice struct {
+	Value       string `json:"value"`
+	DisplayName string `json:"displayName"`
+}
+
+type SettingDependency struct {
+	Key    SettingKey `json:"key"`
+	Equals string     `json:"equals"`
+}
+
+// SettingDescriptor is a picker contract. EffectiveValue is optional because
+// a catalogue can describe a fresh session before an agent exists.
+type SettingDescriptor struct {
+	Key            SettingKey          `json:"key"`
+	DisplayName    string              `json:"displayName"`
+	Choices        []SettingChoice     `json:"choices"`
+	Dependencies   []SettingDependency `json:"dependencies,omitempty"`
+	DefaultValue   string              `json:"defaultValue,omitempty"`
+	EffectiveValue string              `json:"effectiveValue,omitempty"`
+	Timing         ApplicationTiming   `json:"timing"`
+}
+
+type ModelDescriptor struct {
+	ID                        string            `json:"id"`
+	DisplayName               string            `json:"displayName"`
+	SupportedReasoningEfforts []string          `json:"supportedReasoningEfforts,omitempty"`
+	Metadata                  map[string]string `json:"metadata,omitempty"`
+}
+
+// CatalogueScope contains only identities. Profiles, credentials and native
+// client configuration are resolved inside the core/adapters, never supplied
+// by a UI catalogue request.
+type CatalogueScope struct {
+	HarnessID  string `json:"harnessId,omitempty"`
+	ProviderID string `json:"providerId,omitempty"`
+}
+
+type CatalogueSnapshot struct {
+	ContractVersion int                 `json:"contractVersion"`
+	HarnessID       string              `json:"harnessId"`
+	ProviderID      string              `json:"providerId,omitempty"`
+	Revision        string              `json:"revision"`
+	Models          []ModelDescriptor   `json:"models"`
+	Settings        []SettingDescriptor `json:"settings"`
+}
+
+// CatalogueRevision derives a stable content revision without exposing any
+// native protocol state. Adapters call it after their mapping is complete.
+func CatalogueRevision(snapshot CatalogueSnapshot) string {
+	copy := snapshot
+	copy.Revision = ""
+	b, err := json.Marshal(copy)
+	if err != nil {
+		return "invalid"
+	}
+	sum := sha256.Sum256(b)
+	return fmt.Sprintf("v%d-%x", ContractVersion, sum[:8])
+}
+
+// ValidateDescriptor and ValidateCatalogue are deliberately usable by adapter
+// tests and conformance fixtures. They reject malformed neutral contracts
+// before an invalid native value has a chance to reach the UI.
+func ValidateDescriptor(descriptor HarnessDescriptor) error {
+	if descriptor.ContractVersion != ContractVersion {
+		return fmt.Errorf("unsupported harness contract version %d", descriptor.ContractVersion)
+	}
+	if descriptor.ID == "" || descriptor.DisplayName == "" {
+		return fmt.Errorf("harness descriptor needs id and display name")
+	}
+	seen := map[OperationKind]bool{}
+	for _, operation := range descriptor.Operations {
+		if operation.Kind == "" {
+			return fmt.Errorf("harness descriptor has an empty operation kind")
+		}
+		if seen[operation.Kind] {
+			return fmt.Errorf("harness descriptor repeats operation %q", operation.Kind)
+		}
+		seen[operation.Kind] = true
+	}
+	return nil
+}
+
+func ValidateCatalogue(snapshot CatalogueSnapshot) error {
+	if snapshot.ContractVersion != ContractVersion || snapshot.HarnessID == "" || snapshot.Revision == "" {
+		return fmt.Errorf("catalogue needs contract version, harness id and revision")
+	}
+	models := map[string]bool{}
+	for _, model := range snapshot.Models {
+		if model.ID == "" || model.DisplayName == "" || models[model.ID] {
+			return fmt.Errorf("catalogue has an invalid or duplicate model")
+		}
+		models[model.ID] = true
+	}
+	settings := map[SettingKey]bool{}
+	for _, setting := range snapshot.Settings {
+		if setting.Key == "" || setting.DisplayName == "" || setting.Timing == "" || settings[setting.Key] {
+			return fmt.Errorf("catalogue has an invalid or duplicate setting")
+		}
+		settings[setting.Key] = true
+	}
+	return nil
+}
+
+// AgentSettings separates requested settings from each adapter's effective
+// state. It intentionally contains no native configuration blob.
+type AgentSettings struct {
+	Model           string `json:"model,omitempty"`
+	ReasoningEffort string `json:"reasoningEffort,omitempty"`
+	PermissionMode  string `json:"permissionMode,omitempty"`
+}
+
+type AgentRef struct {
+	ThreadID        string `json:"threadId"`
+	HarnessID       string `json:"harnessId"`
+	ProviderID      string `json:"providerId,omitempty"`
+	NativeSessionID string `json:"nativeSessionId,omitempty"`
+}
+
+type AgentSnapshot struct {
+	Ref       AgentRef      `json:"ref"`
+	Requested AgentSettings `json:"requested"`
+	Effective AgentSettings `json:"effective"`
+}
+
+type RejectedSetting struct {
+	Key    SettingKey `json:"key"`
+	Value  string     `json:"value"`
+	Reason string     `json:"reason"`
+}
+
+type AppliedSettings struct {
+	Requested AgentSettings     `json:"requested"`
+	Effective AgentSettings     `json:"effective"`
+	Timing    ApplicationTiming `json:"timing"`
+	Rejected  []RejectedSetting `json:"rejected,omitempty"`
 }
 
 // HealthState is a traffic light, deliberately coarse — the detail lives in
@@ -199,34 +311,6 @@ type Health struct {
 	Models int `json:"models"`
 }
 
-// DiscoveredOption mirrors one CLI config-option enumeration (the shape the
-// init event already carries), for harnesses whose vocabulary is discovered.
-type DiscoveredOption struct {
-	ID      string                  `json:"id"`
-	Name    string                  `json:"name"`
-	Options []DiscoveredOptionValue `json:"options"`
-	// Current is the value a FRESH session of this harness comes up with — the
-	// CLI's own default for the option, not a guess. Empty when the harness
-	// does not report one.
-	//
-	// Load-bearing beyond the picker: the launch authority gate reads the
-	// `mode` option's Current to know what a worker launched with NO permission
-	// mode will actually run at, for engines whose vocabulary is discovered
-	// rather than declared (authority.go, launchBaselineRank). Dropping it here
-	// would make that gate fall back to a guess.
-	Current string `json:"current,omitempty"`
-}
-
-// DiscoveredOptionValue is one selectable value of a DiscoveredOption.
-type DiscoveredOptionValue struct {
-	Value string `json:"value"`
-	Name  string `json:"name"`
-	// Efforts, on a model value, are the reasoning-effort tiers that model
-	// supports (claude's list_models reports them). Empty means the harness
-	// said nothing, which the UI reads as "every tier" — never as "none".
-	Efforts []string `json:"efforts,omitempty"`
-}
-
 // BrowsableSession is one discoverable past session in the neutral browse
 // shape session.browse serves — whichever harness owns it.
 type BrowsableSession struct {
@@ -238,10 +322,10 @@ type BrowsableSession struct {
 	Attached  bool   `json:"attached"` // filled by the handler
 }
 
-// StartSpec is the harness-neutral launch request. Adapters translate it into
-// their CLI's own options; fields a harness doesn't support are validated
-// away by the capability gates before Launch is ever called, so an adapter
-// may simply ignore them.
+// StartSpec is an adapter-private runtime binding. It is deliberately not a
+// JSON DTO: it carries bridge secrets, environment overlays, and native
+// provider data that must never cross the Harness Linkage boundary. The core
+// passes it alongside AgentLaunch only after resolving those private values.
 type StartSpec struct {
 	ThreadID    string
 	WorkDir     string // the worktree (also the MCP bridge's workspace)
@@ -297,12 +381,12 @@ type StartSpec struct {
 	Env map[string]string
 
 	// SystemPrompt is persona text to run the thread's agent with, on top of
-	// the CLI's own system prompt. Gated by Capabilities.SystemPrompt: a
+	// the CLI's own system prompt. Gated by the SystemPrompt operation: a
 	// harness without the channel reports it unapplied rather than emulating
 	// it (an emulated persona would silently outrank the CLI's own prompt).
 	SystemPrompt string
 	// Agents are custom subagent definitions the thread's agent may delegate
-	// to. Gated by Capabilities.CustomSubagents; reported per profile in
+	// to. Gated by CustomSubagents; reported per profile in
 	// Launched.Agents, since a harness may express some fields and not others.
 	Agents []AgentProfile
 
@@ -323,10 +407,10 @@ type StartSpec struct {
 	//
 	//   StrictMCPConfig  run with ONLY the MCP servers the core passes, ignoring
 	//                    the human's global configuration (claude
-	//                    --strict-mcp-config). Gated by Capabilities.StrictMCPConfig.
+	//                    --strict-mcp-config). Gated by StrictMCPConfig.
 	//   MaxBudgetUSD     a hard spend ceiling for the session, enforced by the
 	//                    CLI (claude --max-budget-usd). 0 = uncapped. Gated by
-	//                    Capabilities.CostBudget.
+	//                    CostBudget.
 	//   Title            the thread's human title, passed so the session is
 	//                    identifiable in the CLI's own session listings (claude
 	//                    --name). Cosmetic, so it is NOT capability-gated: an
@@ -334,6 +418,21 @@ type StartSpec struct {
 	StrictMCPConfig bool
 	MaxBudgetUSD    float64
 	Title           string
+}
+
+// AgentLaunch is the serializable, neutral launch DTO. The core turns this
+// into its private StartSpec only after resolving profiles and creating native
+// runtime bindings (credentials, environment overlays and bridge secrets).
+type AgentLaunch struct {
+	Ref         AgentRef           `json:"ref"`
+	WorkDir     string             `json:"workDir"`
+	Prompt      string             `json:"prompt"`
+	Attachments []agent.Attachment `json:"attachments,omitempty"`
+	Settings    AgentSettings      `json:"settings"`
+	Resume      bool               `json:"resume,omitempty"`
+	ForkSession bool               `json:"forkSession,omitempty"`
+	Cowork      bool               `json:"cowork,omitempty"`
+	Title       string             `json:"title,omitempty"`
 }
 
 // AgentProfile is one custom subagent definition, harness-neutrally. Adapters
@@ -419,8 +518,8 @@ type UnappliedOption struct {
 //   - Cold: a fresh, separate pass over SessionID from WorkDir on Model. Works
 //     on a dormant thread and pays a full prefix re-cache.
 //
-// Only ever called on harnesses whose Capabilities().Compaction is true, and
-// the cold shape additionally requires Capabilities().ColdCompact — a harness
+// Only ever called on harnesses whose descriptor supports Compaction, and
+// the cold shape additionally requires ColdCompaction — a harness
 // whose compaction only rewrites the live session has no dormant pass to run.
 // The rest return the shared not-supported error, so no caller needs to know
 // which CLI can do this.
@@ -437,10 +536,14 @@ type CompactSpec struct {
 // Harness is one agent backend. Implementations wrap a supervisor owning the
 // child processes; all methods must be safe for concurrent use.
 type Harness interface {
-	Capabilities() Capabilities
+	// Descriptor is stable, neutral metadata for this harness.
+	Descriptor() HarnessDescriptor
+	// Catalogue returns one revisioned model/settings snapshot. Implementations
+	// accept identities only; credentials and native configuration stay private.
+	Catalogue(ctx context.Context, scope CatalogueScope) (CatalogueSnapshot, error)
 
 	// Launch starts (or resumes, or forks — per spec) one agent thread.
-	Launch(spec StartSpec) (Launched, error)
+	Launch(launch AgentLaunch, runtime StartSpec) (Launched, error)
 
 	Send(threadID, text string, atts []agent.Attachment) error
 	Interrupt(threadID string) error
@@ -453,12 +556,10 @@ type Harness interface {
 	// CLI (claude) need it; harnesses that keep their own event log ignore it.
 	ReadTranscript(threadID, sessionID string) ([]json.RawMessage, error)
 
-	// SetOption changes one session option — "model", "effort" or
-	// "permissionMode" — on a RUNNING thread, mid-session. It returns the
-	// value as applied (e.g. a tier resolved to a concrete model id) so the
-	// caller persists reality. An unsupported option returns an error naming
-	// the harness.
-	SetOption(threadID, option, value string) (applied string, err error)
+	// UpdateSettings applies a typed requested state and returns the state the
+	// native harness actually accepted, including its timing and explicit
+	// rejections. This replaces the stringly per-option mutation API.
+	UpdateSettings(ctx context.Context, ref AgentRef, requested AgentSettings) (AppliedSettings, error)
 
 	// Health answers the engine-level (thread-less) preflight question: is
 	// this engine's CLI present, configured, authenticated, and does it have
@@ -470,18 +571,12 @@ type Harness interface {
 	// The error return is for genuinely unexpected failure only.
 	Health(ctx context.Context) (Health, error)
 
-	// DiscoverOptions probes the harness's live configuration vocabulary
-	// (model / effort / mode enumerations, with display names) without
-	// starting a thread. Static-vocabulary harnesses (ModelPicker "tiers")
-	// return (nil, nil). Implementations may cache.
-	DiscoverOptions() ([]DiscoveredOption, error)
-
 	// BrowseSessions returns this harness's discoverable past sessions. Only
-	// called for harnesses whose Capabilities().SessionBrowse is true.
+	// called for harnesses whose descriptor advertises OperationSessionBrowse.
 	BrowseSessions() ([]BrowsableSession, error)
 
 	// Compact runs one compaction pass and returns the summary body. Gated by
-	// Capabilities().Compaction (and Capabilities().ColdCompact for a cold
+	// OperationCompaction (and OperationColdCompaction for a cold
 	// spec): a harness without it returns Unsupported("Compaction", …) rather
 	// than emulating a summary, because a summary the model never wrote is
 	// worse than none.
@@ -497,8 +592,8 @@ type Harness interface {
 // Unsupported is the shared "this harness cannot do that" error, so a
 // capability gate reads identically wherever it is enforced (the RPC layer
 // wraps the same wording in an IPC error).
-func Unsupported(feature string, caps Capabilities) error {
-	return fmt.Errorf("%s is not supported by %s agents", feature, caps.DisplayName)
+func Unsupported(feature string, descriptor HarnessDescriptor) error {
+	return fmt.Errorf("%s is not supported by %s agents", feature, descriptor.DisplayName)
 }
 
 // Registry holds the registered harnesses. It is built once at startup and
@@ -515,10 +610,10 @@ func NewRegistry(defaultID string) *Registry {
 	return &Registry{defaultID: defaultID, m: make(map[string]Harness)}
 }
 
-// Register adds a harness under its Capabilities().ID. Registration order is
+// Register adds a harness under its Descriptor().ID. Registration order is
 // preserved (it is the order pickers list engines in).
 func (r *Registry) Register(h Harness) {
-	id := h.Capabilities().ID
+	id := h.Descriptor().ID
 	if _, dup := r.m[id]; !dup {
 		r.order = append(r.order, id)
 	}

@@ -1,6 +1,7 @@
 package session
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,6 +21,46 @@ func sampleRecord(id string) Record {
 		Title:          "do a thing",
 		Created:        time.Now(),
 		Status:         StatusRunning,
+	}
+}
+
+func TestLegacyRecordMigratesToHarnessLinkageOnRead(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "threads.json")
+	legacy := `{"threads":[{"threadId":"t-legacy","sessionId":"native-42","backend":"kimi","project":"/tmp/project","permissionMode":"plan","effort":"high","model":"kimi/k3","providerId":"legacy-provider","providerBaseUrl":"https://legacy.example/v1","providerEnvVar":"LEGACY_TOKEN","status":"running"}]}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, ok := store.Get("t-legacy")
+	if !ok {
+		t.Fatal("legacy record was not loaded")
+	}
+	if record.AgentRef.HarnessID != "kimi" || record.AgentRef.NativeSessionID != "native-42" || record.AgentRef.ProviderID != "legacy-provider" {
+		t.Fatalf("agent ref = %+v", record.AgentRef)
+	}
+	if record.EffectiveSettings.Model != "kimi/k3" || record.EffectiveSettings.ReasoningEffort != "high" || record.EffectiveSettings.PermissionMode != "plan" {
+		t.Fatalf("effective settings = %+v", record.EffectiveSettings)
+	}
+	bytes, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var disk struct {
+		Threads []map[string]any `json:"threads"`
+	}
+	if err := json.Unmarshal(bytes, &disk); err != nil || len(disk.Threads) != 1 {
+		t.Fatalf("migrated record is not valid linkage JSON: %v / %s", err, bytes)
+	}
+	for _, forbidden := range []string{"sessionId", "backend", "permissionMode", "effort", "model", "providerBaseUrl", "providerEnvVar", "providerModels"} {
+		if _, found := disk.Threads[0][forbidden]; found {
+			t.Fatalf("migrated record still serializes legacy field %s: %s", forbidden, bytes)
+		}
+	}
+	if _, found := disk.Threads[0]["agentRef"]; !found {
+		t.Fatalf("migrated agentRef missing: %s", bytes)
 	}
 }
 

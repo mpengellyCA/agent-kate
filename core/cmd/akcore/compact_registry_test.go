@@ -43,12 +43,16 @@ type compactFake struct {
 	hotEmpty bool
 }
 
-func (c *compactFake) Capabilities() harness.Capabilities {
-	caps := c.fakeHarness.Capabilities()
-	caps.Compaction = c.capable
-	caps.ColdCompact = c.capable && !c.hotOnly
-	caps.DisplayName = "Fake Engine"
-	return caps
+func (c *compactFake) Descriptor() harness.HarnessDescriptor {
+	operations := harness.Operations(harness.OperationMintSessionID)
+	if c.capable {
+		operations = append(operations, harness.OperationDescriptor{Kind: harness.OperationCompaction})
+		if !c.hotOnly {
+			operations = append(operations, harness.OperationDescriptor{Kind: harness.OperationColdCompaction})
+		}
+	}
+	return harness.HarnessDescriptor{ContractVersion: harness.ContractVersion, ID: "fake",
+		DisplayName: "Fake Engine", Health: harness.HealthOK, Operations: operations}
 }
 
 func (c *compactFake) Running(string) bool { return c.running }
@@ -59,7 +63,7 @@ func (c *compactFake) Compact(_ context.Context, spec harness.CompactSpec) (stri
 	c.calls++
 	c.spec = spec
 	if !c.capable {
-		return "", harness.Unsupported("Compaction", c.Capabilities())
+		return "", harness.Unsupported("Compaction", c.Descriptor())
 	}
 	if c.inPlace {
 		return "", ErrCompactedInPlace
@@ -195,9 +199,9 @@ func TestCompactNowRefusedWithoutTheCapability(t *testing.T) {
 // adapter's own refusal and the RPC-layer gate must read the same, or the same
 // missing capability describes itself two different ways.
 func TestUnsupportedWordingMatchesTheRPCGate(t *testing.T) {
-	caps := harness.Capabilities{ID: "x", DisplayName: "Some Engine"}
-	if got, want := harness.Unsupported("Compaction", caps).Error(),
-		unsupportedDetail("Compaction", caps); got != want {
+	descriptor := harness.HarnessDescriptor{ContractVersion: harness.ContractVersion, ID: "x", DisplayName: "Some Engine", Health: harness.HealthOK}
+	if got, want := harness.Unsupported("Compaction", descriptor).Error(),
+		unsupportedDetail("Compaction", descriptor); got != want {
 		t.Errorf("harness.Unsupported = %q, RPC gate = %q", got, want)
 	}
 }

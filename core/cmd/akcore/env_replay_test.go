@@ -209,7 +209,7 @@ func TestKimiReportsTheSweepUnapplied(t *testing.T) {
 	if n := len(unappliedSweep(harness.StartSpec{})); n != 0 {
 		t.Errorf("reported %d unapplied options for an empty request", n)
 	}
-	if caps := h.Capabilities(); caps.FallbackModels || caps.DisallowedTools || caps.AddDirs {
+	if descriptor := h.Descriptor(); descriptor.Supports(harness.OperationFallbackModels) || descriptor.Supports(harness.OperationDisallowedTools) || descriptor.Supports(harness.OperationAddDirectories) {
 		t.Error("kimi claims a sweep capability it does not have")
 	}
 }

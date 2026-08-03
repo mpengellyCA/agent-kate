@@ -45,6 +45,27 @@ type launchMeta struct {
 	Role           string
 }
 
+// linkageLaunch is the sole conversion from the core's private runtime launch
+// binding to the serializable Harness Linkage DTO. Adapters receive this
+// neutral requested state plus the runtime binding separately, so a bridge
+// secret, environment overlay, or provider configuration cannot accidentally
+// become an RPC/UI field.
+func linkageLaunch(descriptor harness.HarnessDescriptor, spec harness.StartSpec) harness.AgentLaunch {
+	return harness.AgentLaunch{
+		Ref: harness.AgentRef{ThreadID: spec.ThreadID, HarnessID: descriptor.ID,
+			NativeSessionID: spec.SessionID},
+		WorkDir:     spec.WorkDir,
+		Prompt:      spec.Prompt,
+		Attachments: spec.Attachments,
+		Settings: harness.AgentSettings{Model: spec.Model, ReasoningEffort: spec.Effort,
+			PermissionMode: spec.PermissionMode},
+		Resume:      spec.Resume,
+		ForkSession: spec.ForkSession,
+		Cowork:      spec.Cowork,
+		Title:       spec.Title,
+	}
+}
+
 // appliedPersona narrows a persona request down to what the harness CONFIRMED
 // it applied, for the thread's record. Persisting the REQUEST instead would
 // make every later resume replay a persona the agent never actually had —
@@ -76,7 +97,7 @@ func appliedPersona(systemPrompt string, requested []harness.AgentProfile,
 // identical for human- and agent-launched threads.
 func launchThread(d handlerDeps, h harness.Harness, threadID, sessionID string,
 	p agentStartParams, meta launchMeta) (harness.Launched, worktree.Worktree, error) {
-	caps := h.Capabilities()
+	descriptor := h.Descriptor()
 	wt, err := worktree.Create(p.WorkspacePath, threadID, p.Isolation)
 	if err != nil {
 		d.log.Error("worktree create failed", "thread", threadID, "err", err)
@@ -93,7 +114,7 @@ func launchThread(d handlerDeps, h harness.Harness, threadID, sessionID string,
 	// the launch so a failure to mint is a launch that cannot identify, never a
 	// launch that skips the check.
 	secrets := d.bridgeSecrets.mintLaunch(threadID)
-	launched, err := h.Launch(harness.StartSpec{
+	runtime := harness.StartSpec{
 		ThreadID:           threadID,
 		WorkDir:            wt.Path,
 		BridgeSecret:       secrets.Coop,
@@ -126,7 +147,8 @@ func launchThread(d handlerDeps, h harness.Harness, threadID, sessionID string,
 		// own listings. meta.Title is the caller's label; the opening prompt is
 		// the fallback, exactly as for the record's Title below.
 		Title: launchTitle(meta.Title, p.Prompt),
-	})
+	}
+	launched, err := h.Launch(linkageLaunch(descriptor, runtime), runtime)
 	if err != nil {
 		emitLifecycle(d, threadID, "error", err.Error(), &wt)
 		return harness.Launched{}, wt, err
@@ -150,7 +172,7 @@ func launchThread(d handlerDeps, h harness.Harness, threadID, sessionID string,
 		SessionID:      launched.SessionID,
 		Project:        p.WorkspacePath,
 		Worktree:       wt,
-		Backend:        caps.ID,
+		Backend:        descriptor.ID,
 		PermissionMode: launched.PermissionMode,
 		Effort:         launched.Effort,
 		Model:          launched.Model,
@@ -180,7 +202,7 @@ func launchThread(d handlerDeps, h harness.Harness, threadID, sessionID string,
 	if wt.Isolated {
 		mode = "in an isolated worktree on " + wt.Branch
 	}
-	d.log.Info("agent thread started", "thread", threadID, "harness", caps.ID,
+	d.log.Info("agent thread started", "thread", threadID, "harness", descriptor.ID,
 		"isolated", wt.Isolated, "parent", meta.ParentThreadID, "dir", wt.Path)
 	emitLifecycle(d, threadID, "started", "running "+mode, &wt)
 	return launched, wt, nil
@@ -192,7 +214,7 @@ func launchThread(d handlerDeps, h harness.Harness, threadID, sessionID string,
 // transcript — that is where the compaction savings actually land; without
 // one (or without the capability) the original session is re-attached.
 func resumeThread(d handlerDeps, h harness.Harness, rec session.Record, provOverride *agent.Provider) {
-	caps := h.Capabilities()
+	descriptor := h.Descriptor()
 	if _, err := os.Stat(rec.Worktree.Path); err != nil {
 		emitLifecycle(d, rec.ThreadID, "error",
 			"worktree no longer exists: "+rec.Worktree.Path, nil)
@@ -206,6 +228,17 @@ func resumeThread(d handlerDeps, h harness.Harness, rec session.Record, provOver
 	// previous launch's stay valid briefly so bridges from the run being
 	// replaced are not orphaned mid-teardown.
 	resumeSecrets := d.bridgeSecrets.mintLaunch(rec.ThreadID)
+	provider := providerFromRecord(rec) // legacy records still have an in-memory projection
+	if provOverride.Routed() {
+		provider = provOverride
+	} else if rec.AgentRef.ProviderID != "" {
+		resolved, err := resolveProviderBinding(rec.AgentRef.ProviderID)
+		if err != nil {
+			emitLifecycle(d, rec.ThreadID, "error", err.Error(), &rec.Worktree)
+			return
+		}
+		provider = resolved
+	}
 	spec := harness.StartSpec{
 		ThreadID:           rec.ThreadID,
 		WorkDir:            rec.Worktree.Path,
@@ -216,7 +249,7 @@ func resumeThread(d handlerDeps, h harness.Harness, rec session.Record, provOver
 		Effort:         rec.Effort,
 		PermissionMode: rec.PermissionMode,
 		Cowork:         rec.CoworkEnabled,
-		Provider:       providerFromRecord(rec),
+		Provider:       provider,
 		// The persona is a launch-time flag on both paths below: a plain
 		// --resume re-spawns the CLI, and a summary-seeded resume is a brand
 		// new session. Re-passing what the record says was APPLIED keeps the
@@ -240,18 +273,12 @@ func resumeThread(d handlerDeps, h harness.Harness, rec session.Record, provOver
 		MaxBudgetUSD:    rec.MaxBudgetUSD,
 		Title:           rec.Title,
 	}
-	// A fresh override (the UI re-supplying a KWallet-held token the Record never
-	// stores) takes precedence over the env-var resolution baked into the snapshot.
-	if provOverride.Routed() {
-		spec.Provider = provOverride
-	}
-
 	// Seed-from-summary when the harness supports compaction and a current
 	// summary is on disk. A summary is "current" when it has been refreshed
 	// after the last user/agent turn.
 	var sum *compact.Summary
 	seeded := false
-	if caps.Compaction {
+	if descriptor.Supports(harness.OperationCompaction) {
 		sum, _ = d.summaries.Get(rec.ThreadID)
 		// A summary with no body is not a summary. Seeding from one would
 		// start a BRAND NEW session carrying nothing in place of the whole
@@ -259,7 +286,7 @@ func resumeThread(d handlerDeps, h harness.Harness, rec session.Record, provOver
 		seeded = sum != nil && strings.TrimSpace(sum.Body) != "" &&
 			(rec.LastTurnAt.IsZero() || !rec.LastTurnAt.After(rec.SummaryUpdatedAt))
 	}
-	detail := "resumed " + caps.DisplayName + " session"
+	detail := "resumed " + descriptor.DisplayName + " session"
 	if seeded {
 		// Fresh session seeded with the summary text. The instruction line
 		// at the bottom asks the agent to acknowledge briefly so its first
@@ -281,7 +308,7 @@ func resumeThread(d handlerDeps, h harness.Harness, rec session.Record, provOver
 	if seeded {
 		d.turns.TurnQueued(rec.ThreadID)
 	}
-	launched, err := h.Launch(spec)
+	launched, err := h.Launch(linkageLaunch(descriptor, spec), spec)
 	if err != nil {
 		emitLifecycle(d, rec.ThreadID, "error", err.Error(), &rec.Worktree)
 		return
@@ -303,7 +330,7 @@ func resumeThread(d handlerDeps, h harness.Harness, rec session.Record, provOver
 		// stale content.
 		_ = d.summaries.Remove(rec.ThreadID)
 	}
-	d.log.Info("agent thread resumed", "thread", rec.ThreadID, "harness", caps.ID,
+	d.log.Info("agent thread resumed", "thread", rec.ThreadID, "harness", descriptor.ID,
 		"session", launched.SessionID, "seeded", seeded)
 	emitLifecycle(d, rec.ThreadID, "resumed", detail, &rec.Worktree)
 }
@@ -318,7 +345,7 @@ func resumeThread(d handlerDeps, h harness.Harness, rec session.Record, provOver
 // touched. The new session id is captured from the init event by the run loop
 // (see run.go's lastSessionID wiring), so the fork's Record starts with an
 // empty SessionID and is filled in on first event. Callers gate on
-// Capabilities().Fork before reaching here.
+// the Fork descriptor operation before reaching here.
 func forkAgentThread(d handlerDeps, h harness.Harness, src session.Record, newThreadID, model, effort, title string) {
 	// Branch the fork's worktree from the source worktree's HEAD so it starts
 	// from exactly the committed state the conversation was continuing from.
@@ -355,7 +382,7 @@ func forkAgentThread(d handlerDeps, h harness.Harness, src session.Record, newTh
 	// The fork is its own thread with its own bridges — and so its own secrets.
 	// It never inherits the source thread's (F13).
 	forkSecrets := d.bridgeSecrets.mintLaunch(newThreadID)
-	launched, err := h.Launch(harness.StartSpec{
+	runtime := harness.StartSpec{
 		ThreadID:           newThreadID,
 		WorkDir:            wt.Path,
 		BridgeSecret:       forkSecrets.Coop,
@@ -383,7 +410,8 @@ func forkAgentThread(d handlerDeps, h harness.Harness, src session.Record, newTh
 		StrictMCPConfig: src.StrictMCPConfig,
 		MaxBudgetUSD:    src.MaxBudgetUSD,
 		Title:           launchTitle(title, "Fork of "+src.Title),
-	})
+	}
+	launched, err := h.Launch(linkageLaunch(h.Descriptor(), runtime), runtime)
 	if err != nil {
 		emitLifecycle(d, newThreadID, "error", err.Error(), &wt)
 		return
@@ -401,7 +429,7 @@ func forkAgentThread(d handlerDeps, h harness.Harness, src session.Record, newTh
 		SessionID:      launched.SessionID,
 		Project:        src.Project,
 		Worktree:       wt,
-		Backend:        h.Capabilities().ID,
+		Backend:        h.Descriptor().ID,
 		PermissionMode: launched.PermissionMode,
 		Effort:         launched.Effort,
 		Model:          launched.Model,
@@ -439,7 +467,7 @@ func forkAgentThread(d handlerDeps, h harness.Harness, src session.Record, newTh
 
 // promoteAgentThread upgrades a non-isolated thread to an isolated worktree: it
 // stops the agent, moves the working tree and session into a fresh worktree,
-// then resumes the thread there. Callers gate on Capabilities().Promote (the
+// then resumes the thread there. Callers gate on the Promote operation (the
 // session relocation is claude-specific today).
 func promoteAgentThread(d handlerDeps, h harness.Harness, rec session.Record) {
 	// Stop any live process and wait for it to exit before touching git.
@@ -502,7 +530,7 @@ func runHotCompactIfConfigured(d handlerDeps, threadID string) {
 	if !ok {
 		return
 	}
-	if h, ok := d.harnesses.Get(rec.Backend); !ok || !h.Capabilities().Compaction {
+	if h, ok := d.harnesses.Get(rec.Backend); !ok || !h.Descriptor().Supports(harness.OperationCompaction) {
 		return // this thread's harness has no compaction support
 	}
 	if compact.Strategy(rec.CompactStrategy).Resolve() != compact.ExitOpusHot {
@@ -593,7 +621,7 @@ func runHotCompactIfConfigured(d handlerDeps, threadID string) {
 func runHotCompactsAtShutdown(d handlerDeps, progress shutdownProgressFn) {
 	var targets []session.Record
 	for _, rec := range d.sessions.List("") {
-		if h, ok := d.harnesses.Get(rec.Backend); !ok || !h.Capabilities().Compaction {
+		if h, ok := d.harnesses.Get(rec.Backend); !ok || !h.Descriptor().Supports(harness.OperationCompaction) {
 			continue // this thread's harness has no compaction support
 		}
 		if !d.agentRunning(rec.ThreadID) {
@@ -663,7 +691,7 @@ type exitCompactTracker struct {
 func (e *exitCompactTracker) spawn(log *slog.Logger, sessions *session.Store,
 	summaries *compact.Store, rec session.Record, strategy compact.Strategy) {
 	h, ok := e.harnesses.Get(rec.Backend)
-	if !ok || !h.Capabilities().ColdCompact {
+	if !ok || !h.Descriptor().Supports(harness.OperationColdCompaction) {
 		return // nothing to run: this engine has no compaction off the live session
 	}
 	e.wg.Add(1)
@@ -795,16 +823,17 @@ func resolveModel(tier string) string {
 	return strings.TrimSpace(tier)
 }
 
-// applyProviderToRecord copies a provider's NON-SECRET fields onto a session
-// Record so a later resume can rebuild the routing. The API token is deliberately
-// never persisted — it is re-resolved at launch from the provider's env var or
-// re-supplied by the UI. A nil or Claude-direct provider clears the fields.
+// applyProviderToRecord retains the selected provider identity on the linkage
+// record. The rest of the binding is runtime-only and is re-resolved by the
+// core at resume; legacy fields are maintained only for in-process callers.
 func applyProviderToRecord(rec *session.Record, p *agent.Provider) {
 	if !p.Routed() {
 		rec.ProviderID, rec.ProviderName, rec.ProviderBaseURL, rec.ProviderEnvVar, rec.ProviderModels = "", "", "", "", nil
+		rec.AgentRef.ProviderID = ""
 		return
 	}
 	rec.ProviderID = p.ID
+	rec.AgentRef.ProviderID = p.ID
 	rec.ProviderName = p.Name
 	rec.ProviderBaseURL = p.BaseURL
 	rec.ProviderEnvVar = p.EnvVar

@@ -556,14 +556,14 @@ func unappliedOptions(requested map[string]string, launched harness.Launched) []
 // (plan 16 P3). These entries carry a "reason" instead of a requested/applied
 // pair: there is no downgraded value to report, only what was lost and why.
 func unappliedPersona(systemPrompt string, profiles []harness.AgentProfile,
-	launched harness.Launched, caps harness.Capabilities) []map[string]string {
+	launched harness.Launched, descriptor harness.HarnessDescriptor) []map[string]string {
 	var out []map[string]string
 	if strings.TrimSpace(systemPrompt) != "" && !launched.SystemPromptApplied {
 		// The adapter's own reason wins when it has one (an oversize prompt is
 		// not a missing capability); otherwise the channel is simply absent.
 		reason := launched.SystemPromptUnapplied
 		if reason == "" {
-			reason = unsupportedDetail("a custom system prompt", caps) +
+			reason = unsupportedDetail("a custom system prompt", descriptor) +
 				"; put the persona in the worker's opening prompt instead"
 		}
 		out = append(out, map[string]string{
@@ -594,7 +594,7 @@ func unappliedPersona(systemPrompt string, profiles []harness.AgentProfile,
 	for i := len(launched.Agents); i < len(profiles); i++ {
 		out = append(out, map[string]string{
 			"option": "agents[" + profileLabel(profiles[i].Name) + "]",
-			"reason": caps.DisplayName + " did not report whether this subagent " +
+			"reason": descriptor.DisplayName + " did not report whether this subagent " +
 				"profile was applied; assume it was not",
 		})
 	}
@@ -766,7 +766,7 @@ func registerOrchestrationHandlers(d handlerDeps) {
 		if !ok {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown backend "+backend)
 		}
-		caps := h.Capabilities()
+		descriptor := h.Descriptor()
 		switch p.Isolation {
 		case "", worktree.ModeAuto, worktree.ModeIsolated, worktree.ModeWorkspace:
 		default:
@@ -796,9 +796,9 @@ func registerOrchestrationHandlers(d handlerDeps) {
 		// pays for the harness's option probe.
 		engineDefault := ""
 		if strings.TrimSpace(p.PermissionMode) == "" {
-			engineDefault = engineDefaultPermissionMode(h, caps)
+			engineDefault = engineDefaultPermissionMode(h, descriptor)
 		}
-		release, err := d.authorizeWorkerLaunch(parent, caps, engineDefault, req)
+		release, err := d.authorizeWorkerLaunch(parent, descriptor, engineDefault, req)
 		if err != nil {
 			return nil, err
 		}
@@ -817,8 +817,8 @@ func registerOrchestrationHandlers(d handlerDeps) {
 		coworkWhyNot := ""
 		switch {
 		case !p.Cowork:
-		case !caps.Cowork:
-			coworkWhyNot = unsupportedDetail("desktop cowork", caps)
+		case !descriptor.Supports(harness.OperationCowork):
+			coworkWhyNot = unsupportedDetail("desktop cowork", descriptor)
 		case askCoworkEnable(d, p.ParentThreadID, "", orDefault(p.Title, "a new worker"),
 			capText(firstLine(p.Prompt))):
 			cowork = true
@@ -828,7 +828,7 @@ func registerOrchestrationHandlers(d handlerDeps) {
 
 		threadID := agent.NewThreadID()
 		sessionID := ""
-		if caps.MintsSessionID {
+		if descriptor.Supports(harness.OperationMintSessionID) {
 			sessionID = session.NewID()
 		}
 		// The opening prompt is a turn; queue it before the launch so a
@@ -843,7 +843,7 @@ func registerOrchestrationHandlers(d handlerDeps) {
 			PermissionMode: p.PermissionMode,
 			Effort:         p.Effort,
 			Model:          p.Model,
-			Backend:        caps.ID,
+			Backend:        descriptor.ID,
 			Isolation:      p.Isolation,
 			SystemPrompt:   p.SystemPrompt,
 			Agents:         p.Agents,
@@ -885,7 +885,7 @@ func registerOrchestrationHandlers(d handlerDeps) {
 			"permissionMode": p.PermissionMode,
 		}, launched)
 		unapplied = append(unapplied,
-			unappliedPersona(p.SystemPrompt, p.Agents, launched, caps)...)
+			unappliedPersona(p.SystemPrompt, p.Agents, launched, descriptor)...)
 		unapplied = append(unapplied, unappliedSweepReport(launched)...)
 		if coworkWhyNot != "" {
 			unapplied = append(unapplied, map[string]string{
@@ -901,7 +901,7 @@ func registerOrchestrationHandlers(d handlerDeps) {
 		return map[string]any{
 			"threadId":  threadID,
 			"sessionId": launched.SessionID,
-			"backend":   caps.ID,
+			"backend":   descriptor.ID,
 			"isolated":  wt.Isolated,
 			"branch":    wt.Branch,
 			"applied": map[string]string{

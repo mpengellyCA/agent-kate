@@ -25,7 +25,7 @@ import (
 // The rule is RANKED, not positional: each declared mode is looked up in
 // permissivenessRanks (authority.go — the one table every authority decision is
 // made on) and the highest-ranked known mode wins. An earlier version took the
-// last entry of Capabilities().PermissionModes and documented that list as
+// last permission-mode catalogue choice and documented that list as
 // running "most supervised to least", which it does not: claude declares it in
 // PICKER order (acceptEdits, default, plan, …) and only its tail happens to be
 // the permissive end. Two orderings meant two sources of truth for the same
@@ -37,22 +37,33 @@ import (
 func permissiveModes(reg *harness.Registry) map[string]string {
 	out := map[string]string{}
 	for _, h := range reg.All() {
-		caps := h.Capabilities()
+		descriptor := h.Descriptor()
+		catalogue, err := h.Catalogue(context.Background(), harness.CatalogueScope{HarnessID: descriptor.ID})
+		if err != nil {
+			continue
+		}
 		best, bestRank := "", -1
-		for _, m := range caps.PermissionModes {
-			// Only modes the shared table ranks: naming one it has never heard
-			// of would tell a controller that a mode whose authority nobody has
-			// placed is the never-ask mode.
-			if r, ok := permissivenessRanks[m]; ok && r > bestRank {
-				best, bestRank = m, r
+		for _, setting := range catalogue.Settings {
+			if setting.Key != harness.SettingPermissionMode {
+				continue
 			}
+			for _, choice := range setting.Choices {
+				m := choice.Value
+				// Only modes the shared table ranks: naming one it has never heard
+				// of would tell a controller that a mode whose authority nobody has
+				// placed is the never-ask mode.
+				if r, ok := permissivenessRanks[m]; ok && r > bestRank {
+					best, bestRank = m, r
+				}
+			}
+			break
 		}
 		// ...and only if that mode really is one that never asks. An engine
 		// whose most permissive ranked mode still stops at the human's prompt
 		// has no never-ask mode to name, and inventing one would be a lie the
 		// controller then wastes an approval on.
 		if best != "" && bestRank >= permissivenessRanks["dontAsk"] {
-			out[caps.ID] = best
+			out[descriptor.ID] = best
 		}
 	}
 	return out
@@ -200,15 +211,15 @@ func registerModeHandlers(d handlerDeps) {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams,
 				"ensemble "+m.Name+" wants unknown engine "+m.Controller.Backend)
 		}
-		caps := h.Capabilities()
+		descriptor := h.Descriptor()
 		switch m.Controller.Isolation {
 		case "", worktree.ModeAuto, worktree.ModeIsolated, worktree.ModeWorkspace:
 		default:
 			return nil, ipc.Errorf(ipc.CodeInvalidParams,
 				"isolation must be auto, isolated or workspace")
 		}
-		if p.CoworkEnabled && !caps.Cowork {
-			return nil, unsupported("Cowork", caps)
+		if p.CoworkEnabled && !descriptor.Supports(harness.OperationCowork) {
+			return nil, unsupported("Cowork", descriptor)
 		}
 		if err := authorizeCoworkAtStart(d, ctx, p.CoworkEnabled, m.Name,
 			"running the "+m.Name+" ensemble"); err != nil {
@@ -225,13 +236,13 @@ func registerModeHandlers(d handlerDeps) {
 		// the opening message scrolling out of context on a long run — and
 		// where it does not, that is reported, never emulated.
 		systemPrompt := ""
-		if caps.SystemPrompt {
+		if descriptor.Supports(harness.OperationSystemPrompt) {
 			systemPrompt = prompt
 		}
 
 		threadID := agent.NewThreadID()
 		sessionID := ""
-		if caps.MintsSessionID {
+		if descriptor.Supports(harness.OperationMintSessionID) {
 			sessionID = session.NewID()
 		}
 		// The opening prompt is a turn; queue it before the launch so an
@@ -240,7 +251,7 @@ func registerModeHandlers(d handlerDeps) {
 		launched, wt, err := launchThread(d, h, threadID, sessionID, agentStartParams{
 			WorkspacePath:  p.WorkDir,
 			Prompt:         prompt,
-			Backend:        caps.ID,
+			Backend:        descriptor.ID,
 			Model:          m.Controller.Model,
 			Effort:         m.Controller.Effort,
 			PermissionMode: m.Controller.PermissionMode,
@@ -261,12 +272,12 @@ func registerModeHandlers(d handlerDeps) {
 			"permissionMode": m.Controller.PermissionMode,
 		}, launched)
 		unapplied = append(unapplied,
-			unappliedPersona(systemPrompt, nil, launched, caps)...)
+			unappliedPersona(systemPrompt, nil, launched, descriptor)...)
 		unapplied = append(unapplied, unappliedSweepReport(launched)...)
 		return map[string]any{
 			"threadId":  threadID,
 			"sessionId": launched.SessionID,
-			"backend":   caps.ID,
+			"backend":   descriptor.ID,
 			"ensemble":  m.Name,
 			"isolated":  wt.Isolated,
 			"branch":    wt.Branch,

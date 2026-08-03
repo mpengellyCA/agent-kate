@@ -64,6 +64,7 @@ class QLineEdit;
 class QDoubleSpinBox;
 class QFormLayout;
 class QToolButton;
+class QPushButton;
 class QVBoxLayout;
 class QWidget;
 class CoreClient;
@@ -391,6 +392,14 @@ private:
     // engine combo's currentIndexChanged handler; never blocks, never gates
     // the Create button.
     void refreshPreflight();
+    // Disable reasoning efforts that the selected model catalogue says cannot
+    // run. Codex exposes efforts per model rather than as a harness-wide list,
+    // so this is also what makes its discovered efforts usable before the
+    // first agent is created.
+    void applyModelEffortSupport();
+    // A new agent must always be tied to a current core descriptor. The dialog
+    // can remain open while descriptors arrive, but cannot invent one.
+    void updateLaunchAvailability();
 
     CoreClient *m_core = nullptr; // for the lazy discovered-option probe
     QString m_projectPath;        // so claude's doctor reads the right directory
@@ -398,6 +407,7 @@ private:
     QComboBox *m_ensemble = nullptr; // "Single agent" or one ensemble
     QLabel *m_ensembleHint = nullptr;
     QComboBox *m_engine = nullptr; // harness + optional provider overlay
+    QPushButton *m_createButton = nullptr;
     PreflightCard *m_preflight = nullptr; // engine health, under the engine combo
     QComboBox *m_model = nullptr;
     QCheckBox *m_sandbox = nullptr;

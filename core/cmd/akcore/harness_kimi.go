@@ -31,57 +31,49 @@ func newKimiHarness(ksup *kimi.Supervisor, exePath, socketPath string) *kimiHarn
 	return &kimiHarness{ksup: ksup, exePath: exePath, socketPath: socketPath}
 }
 
-func (h *kimiHarness) Capabilities() harness.Capabilities {
-	return harness.Capabilities{
-		ID:          session.BackendKimi,
-		DisplayName: "Kimi Code",
-		Badge:       "Kimi",
+func (h *kimiHarness) Descriptor() harness.HarnessDescriptor {
+	return harness.HarnessDescriptor{
+		ContractVersion: harness.ContractVersion,
+		ID:              session.BackendKimi,
+		DisplayName:     "Kimi Code",
+		Badge:           "Kimi",
+		Health:          harness.HealthUnknown,
 		// session/set_config_option applies mid-session (verified kimi 0.30),
 		// so the thinking level stays adjustable while the agent runs.
-		EffortLive: true,
 		// session/list works via a one-shot probe (verified kimi 0.30), so
 		// past kimi sessions show up in the "Resume a Session…" browser.
-		SessionBrowse: true,
 		// One wire log per subagent under <session-dir>/agents/<id>/, probed
 		// on 0.30.0 — the viewer translates its event shapes.
-		SubagentTranscripts: true,
 		// SkillReload stays false: ACP has no reload-skills request and `kimi
 		// acp` resolves its skill directories once, at session/new. A skill the
 		// human installs while a kimi thread is running does not reach it until
 		// that thread is restarted — a fact reloadSkillsEverywhere now SAYS in
 		// the thread's own panel instead of skipping it in silence (audit F50).
-		// LOCKSTEP with ui/src/state/HarnessTraits.cpp kimiDefaults().
 		// `/compact` sent as ordinary prompt text performs a real in-session
 		// compaction (probed on 0.30.0). It is a live-thread mechanism that
 		// produces no summary text — see Compact for what that costs callers.
-		Compaction: true,
 		// ...but ONLY hot. ColdCompact stays false: there is no
 		// `kimi --resume --print` to run a pass with, and kimi's on-disk store
 		// is its own wire format, not the claude transcript session.ReadTranscript
 		// parses. Letting the cold path run here would read nothing, store a
 		// summary of nothing, and make the next resume seed a fresh session
 		// from it — silently discarding the thread's history.
-		ColdCompact: false,
 		// Kimi forwards stdio MCP servers natively, so the Cowork desktop
 		// bridge works here exactly as it does for claude — every desktop
 		// action is still gated by the core's consent authority, which is
 		// backend-agnostic.
-		Cowork: true,
 		// ...but kimi 0.30 lists each server's tools once, at session/new, and
 		// ignores notifications/tools/list_changed (probed: the notification
 		// was sent, no re-list followed, and the revealed tool stayed invisible
 		// for the rest of the session). Switching Cowork on mid-session
 		// therefore re-attaches the thread — session/resume keeps the
 		// conversation and accepts a fresh mcpServers list (also probed).
-		LiveToolReveal: false,
 		// ProviderRegistry: `kimi provider add/catalog/list/remove` manage a
 		// persistent registry in the engine's home (plan 26) — a genuinely
 		// different mechanism from claude's per-launch env routing, which is
 		// why it is a SECOND flag and ProviderRouting stays false here. The
 		// registry is edited by shelling out (providers/list is not
-		// implemented over ACP — probed, -32601). LOCKSTEP with
-		// ui/src/state/HarnessTraits.cpp kimiDefaults().
-		ProviderRegistry: true,
+		// implemented over ACP — probed, -32601).
 		// UsageReporting stays false (the zero value, stated here because it is
 		// load-bearing): the ACP protocol reports no per-turn token accounting,
 		// and kimi's only token figure is `/usage`, a CUMULATIVE context
@@ -90,12 +82,64 @@ func (h *kimiHarness) Capabilities() harness.Capabilities {
 		// so the UI must not accumulate a session total for kimi threads.
 		// LOCKSTEP with ui/src/state/HarnessTraits.cpp: `usageReporting` is set
 		// for claude only.
-		UsageReporting: false,
-		ModelPicker:    harness.ModelPickerDiscovered,
-		// SystemPrompt / CustomSubagents stay false — see below for what was
-		// probed. PermissionModes/Efforts empty: the vocabularies come from
-		// the session handshake's configOptions ("mode", "thinking").
+		// SystemPrompt / CustomSubagents stay absent — see below for what was
+		// probed. The catalogue supplies ACP's model/thinking/mode vocabulary.
+		Operations: harness.Operations(
+			harness.OperationSessionBrowse,
+			harness.OperationSubagentTranscripts,
+			harness.OperationCompaction,
+			harness.OperationCowork,
+			harness.OperationProviderRegistry,
+		),
 	}
+}
+
+// Catalogue translates ACP configOptions once at the adapter boundary.  ACP's
+// native names (notably "thinking") never cross this DTO boundary.
+func (h *kimiHarness) Catalogue(_ context.Context, scope harness.CatalogueScope) (harness.CatalogueSnapshot, error) {
+	if scope.ProviderID != "" && scope.ProviderID != "direct" {
+		return harness.CatalogueSnapshot{}, fmt.Errorf("Kimi Code does not route provider catalogues")
+	}
+	opts, err := h.ksup.DiscoverOptions()
+	if err != nil {
+		return harness.CatalogueSnapshot{}, err
+	}
+	snapshot := harness.CatalogueSnapshot{ContractVersion: harness.ContractVersion,
+		HarnessID: h.Descriptor().ID, ProviderID: scope.ProviderID,
+		Models: []harness.ModelDescriptor{}, Settings: []harness.SettingDescriptor{}}
+	for _, option := range opts {
+		switch option.ID {
+		case "model":
+			for _, choice := range option.Options {
+				snapshot.Models = append(snapshot.Models, harness.ModelDescriptor{ID: choice.Value, DisplayName: choice.Name})
+			}
+			snapshot.Settings = append(snapshot.Settings, harness.SettingDescriptor{
+				Key: harness.SettingModel, DisplayName: firstNonEmpty(option.Name, "Model"),
+				DefaultValue: option.CurrentValue, Timing: harness.TimingLaunch})
+		case "thinking":
+			snapshot.Settings = append(snapshot.Settings, settingFromACP(harness.SettingReasoningEffort, option, harness.TimingLive))
+		case "mode":
+			snapshot.Settings = append(snapshot.Settings, settingFromACP(harness.SettingPermissionMode, option, harness.TimingLive))
+		}
+	}
+	snapshot.Revision = harness.CatalogueRevision(snapshot)
+	return snapshot, nil
+}
+
+func settingFromACP(key harness.SettingKey, option kimi.ConfigOption, timing harness.ApplicationTiming) harness.SettingDescriptor {
+	setting := harness.SettingDescriptor{Key: key, DisplayName: firstNonEmpty(option.Name, string(key)),
+		DefaultValue: option.CurrentValue, Timing: timing}
+	for _, optionValue := range option.Options {
+		setting.Choices = append(setting.Choices, harness.SettingChoice{Value: optionValue.Value, DisplayName: firstNonEmpty(optionValue.Name, optionValue.Value)})
+	}
+	return setting
+}
+
+func firstNonEmpty(value, fallback string) string {
+	if value != "" {
+		return value
+	}
+	return fallback
 }
 
 // Why the two persona channels are off for kimi, probed against kimi 0.30.0:
@@ -176,7 +220,20 @@ func unappliedSweep(spec harness.StartSpec) []harness.UnappliedOption {
 	return out
 }
 
-func (h *kimiHarness) Launch(spec harness.StartSpec) (harness.Launched, error) {
+func (h *kimiHarness) Launch(launch harness.AgentLaunch, runtime harness.StartSpec) (harness.Launched, error) {
+	spec := runtime
+	spec.ThreadID = launch.Ref.ThreadID
+	spec.WorkDir = launch.WorkDir
+	spec.Prompt = launch.Prompt
+	spec.Attachments = launch.Attachments
+	spec.Model = launch.Settings.Model
+	spec.Effort = launch.Settings.ReasoningEffort
+	spec.PermissionMode = launch.Settings.PermissionMode
+	spec.SessionID = launch.Ref.NativeSessionID
+	spec.Resume = launch.Resume
+	spec.ForkSession = launch.ForkSession
+	spec.Cowork = launch.Cowork
+	spec.Title = launch.Title
 	th, err := h.ksup.Start(kimi.StartOptions{
 		ID:          spec.ThreadID,
 		WorkDir:     spec.WorkDir,
@@ -289,7 +346,7 @@ func (h *kimiHarness) Health(ctx context.Context) (harness.Health, error) {
 	}
 	checks := []harness.Check{binaryCheck, config, authCheck, modelsCheck}
 	return harness.Health{
-		EngineID: h.Capabilities().ID,
+		EngineID: h.Descriptor().ID,
 		State:    harness.WorstState(checks),
 		Version:  version,
 		Checks:   checks,
@@ -308,29 +365,6 @@ func (h *kimiHarness) ImportCatalog(home string) ([]kimi.Provider, error) {
 	return kimi.ImportCatalog(home)
 }
 func (h *kimiHarness) RemoveProvider(home, id string) error { return kimi.RemoveProvider(home, id) }
-
-// DiscoverOptions probes the CLI's live config-option vocabulary (model /
-// thinking / mode enumerations) via a one-shot `kimi acp` handshake, cached by
-// the supervisor for the process lifetime.
-func (h *kimiHarness) DiscoverOptions() ([]harness.DiscoveredOption, error) {
-	opts, err := h.ksup.DiscoverOptions()
-	if err != nil {
-		return nil, err
-	}
-	out := make([]harness.DiscoveredOption, 0, len(opts))
-	for _, o := range opts {
-		// CurrentValue travels with the enumeration: it is the value a fresh
-		// `kimi acp` session reports for the option, i.e. the CLI's own default.
-		// The launch authority gate reads the `mode` one (authority.go).
-		d := harness.DiscoveredOption{ID: o.ID, Name: o.Name, Current: o.CurrentValue}
-		for _, v := range o.Options {
-			d.Options = append(d.Options,
-				harness.DiscoveredOptionValue{Value: v.Value, Name: v.Name})
-		}
-		out = append(out, d)
-	}
-	return out, nil
-}
 
 // BrowseSessions lists kimi's stored past sessions (session/list via a
 // one-shot probe) in the neutral browse shape.
@@ -434,14 +468,24 @@ func (h *kimiHarness) Compact(ctx context.Context, spec harness.CompactSpec) (st
 	return text, nil
 }
 
-func (h *kimiHarness) SetOption(threadID, option, value string) (string, error) {
-	configID := map[string]string{
-		"model":          "model",
-		"effort":         "thinking",
-		"permissionMode": "mode",
-	}[option]
-	if configID == "" {
-		return "", fmt.Errorf("unknown option %q", option)
+func (h *kimiHarness) UpdateSettings(_ context.Context, ref harness.AgentRef, requested harness.AgentSettings) (harness.AppliedSettings, error) {
+	for _, update := range []struct{ id, value string }{
+		{"model", requested.Model},
+		{"thinking", requested.ReasoningEffort},
+		{"mode", requested.PermissionMode},
+	} {
+		if update.value == "" {
+			continue
+		}
+		if err := h.ksup.SetConfigOption(ref.ThreadID, update.id, update.value); err != nil {
+			return harness.AppliedSettings{}, err
+		}
 	}
-	return value, h.ksup.SetConfigOption(threadID, configID, value)
+	model, thinking, mode, err := h.ksup.AppliedSettings(ref.ThreadID)
+	if err != nil {
+		return harness.AppliedSettings{}, err
+	}
+	return harness.AppliedSettings{Requested: requested,
+		Effective: harness.AgentSettings{Model: model, ReasoningEffort: thinking, PermissionMode: mode},
+		Timing:    harness.TimingLive}, nil
 }

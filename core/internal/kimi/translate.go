@@ -281,7 +281,7 @@ func (t *translator) setUsage(u usageInfo) json.RawMessage {
 // per-turn cost line for spend that never happened. The honest wire has kimi
 // send its context fill exactly once, as the `_context` event setUsage emits,
 // and claim no per-turn usage at all — which is also what the kimi harness
-// advertises (Capabilities().UsageReporting is false; LOCKSTEP with
+// advertises (UsageReporting is absent from its descriptor; LOCKSTEP with
 // ui/src/state/HarnessTraits.cpp's usageReporting for "kimi").
 func (t *translator) contextFieldsLocked() map[string]any {
 	if !t.usage.known() || t.usage.ContextWindow <= 0 {

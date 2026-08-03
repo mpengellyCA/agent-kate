@@ -42,13 +42,6 @@ type agentEventParams struct {
 	Events   []json.RawMessage `json:"events"`
 }
 
-// modelDiscoverer is implemented by harnesses that can enumerate a live model
-// catalogue (optionally routed through a provider). agent.discoverModels
-// type-asserts to it, so harnesses without model discovery need no stub.
-type modelDiscoverer interface {
-	DiscoverModels(*agent.Provider) ([]harness.DiscoveredOptionValue, error)
-}
-
 // skillReloader is implemented by harnesses whose CLI can re-read its skill
 // directories mid-session (claude: the reload_skills control request). Without
 // it a skill installed while a thread is running is invisible to that thread
@@ -66,8 +59,12 @@ type agentStartParams struct {
 	Backend        string             `json:"backend"`   // "" / "claude" = Claude Code, "kimi" = Kimi Code
 	Isolation      string             `json:"isolation"` // worktree.Mode*; "" = auto
 	Attachments    []agent.Attachment `json:"attachments"`
-	CoworkEnabled  bool               `json:"coworkEnabled"`      // opt into the KDE Cowork desktop tools
-	Provider       *agent.Provider    `json:"provider,omitempty"` // third-party API routing; nil = Claude direct
+	CoworkEnabled  bool               `json:"coworkEnabled"` // opt into the KDE Cowork desktop tools
+	// ProviderID is an opaque profile identifier. The core resolves it into a
+	// private runtime binding; URLs, model maps, and credentials are never RPC
+	// DTO fields.
+	ProviderID string          `json:"providerId,omitempty"`
+	Provider   *agent.Provider `json:"-"` // internal/test launch binding only
 	// SystemPrompt / Agents are the persona channels (plan 16 P3). Both are
 	// capability-gated per harness and reported as applied-truth by Launch —
 	// a harness without the channel names the request as unapplied rather
@@ -200,8 +197,8 @@ func (d handlerDeps) harnessFor(threadID string) harness.Harness {
 	return h
 }
 
-func (d handlerDeps) capsFor(threadID string) harness.Capabilities {
-	return d.harnessFor(threadID).Capabilities()
+func (d handlerDeps) descriptorFor(threadID string) harness.HarnessDescriptor {
+	return d.harnessFor(threadID).Descriptor()
 }
 
 func (d handlerDeps) agentRunning(threadID string) bool {
@@ -259,14 +256,14 @@ func waitAgentExit(d handlerDeps, threadID string) bool {
 // every feature a harness lacks, so it never drifts per call site. Used both
 // by the hard gate below and by the applied-truth reports, where a missing
 // capability is a downgrade to name rather than a request to refuse.
-func unsupportedDetail(feature string, caps harness.Capabilities) string {
-	return feature + " is not supported by " + caps.DisplayName + " agents"
+func unsupportedDetail(feature string, descriptor harness.HarnessDescriptor) string {
+	return feature + " is not supported by " + descriptor.DisplayName + " agents"
 }
 
 // unsupported is the capability-gate error: an optional RPC a harness cannot
 // serve is rejected outright with the shared wording.
-func unsupported(feature string, caps harness.Capabilities) error {
-	return ipc.Errorf(ipc.CodeInvalidParams, unsupportedDetail(feature, caps))
+func unsupported(feature string, descriptor harness.HarnessDescriptor) error {
+	return ipc.Errorf(ipc.CodeInvalidParams, unsupportedDetail(feature, descriptor))
 }
 
 // recordAttachments appends a compact, body-free attachment sidecar entry for a
@@ -388,105 +385,56 @@ func registerHandlers(d handlerDeps) {
 
 	// --- agent threads -----------------------------------------------------
 
-	// agent.capabilities lists the registered harnesses with their capability
-	// sets, in engine-picker order. The UI fetches this once per connection
-	// and derives every backend-specific affordance from it — no harness
-	// knowledge is hardcoded client-side.
-	d.srv.Handle("agent.capabilities", func(_ context.Context, _ json.RawMessage) (any, error) {
-		list := make([]harness.Capabilities, 0, len(d.harnesses.All()))
-		for _, h := range d.harnesses.All() {
-			list = append(list, h.Capabilities())
-		}
-		return map[string]any{"harnesses": list}, nil
-	})
-
-	// agent.discoverOptions probes a harness's live configuration vocabulary
-	// (model / thinking / mode enumerations, with display names) WITHOUT
-	// starting a thread, so the UI can offer real pickers before the first
-	// agent ever runs. Static-vocabulary harnesses return an empty list.
-	//
-	// UI-only (audit F36 pass 5). "Metadata" undersold it: the caller-supplied
-	// `backend` picks which CLI is SPAWNED — kimi's discovery is a real `kimi
-	// acp` handshake — so an agent bridge could drive process launches at will.
-	// The authority gate's own read of the same vocabulary
-	// (engineDefaultPermissionMode, authority.go) calls the harness in-process
-	// and does not come through here, so this gate cannot starve it.
-	d.srv.Handle("agent.discoverOptions", func(ctx context.Context, raw json.RawMessage) (any, error) {
+	// harness.list is the complete descriptor surface. The UI is deliberately
+	// not given a fallback list: no descriptor means launch controls stay
+	// disabled until the core has answered.
+	d.srv.Handle("harness.list", func(ctx context.Context, _ json.RawMessage) (any, error) {
 		if err := requireUIWindow(d.srv, ctx); err != nil {
 			return nil, err
 		}
-		var p struct {
-			Backend string `json:"backend"`
+		list := make([]harness.HarnessDescriptor, 0, len(d.harnesses.All()))
+		for _, h := range d.harnesses.All() {
+			descriptor := h.Descriptor()
+			if err := harness.ValidateDescriptor(descriptor); err != nil {
+				return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+			}
+			list = append(list, descriptor)
 		}
-		if err := json.Unmarshal(raw, &p); err != nil {
+		return map[string]any{"contractVersion": harness.ContractVersion, "harnesses": list}, nil
+	})
+
+	// harness.catalog returns one revisioned provider scope. Its request carries
+	// identities only; it never accepts a provider URL, credential, environment
+	// overlay or native config blob from the UI.
+	d.srv.Handle("harness.catalog", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
+		var scope harness.CatalogueScope
+		if err := json.Unmarshal(raw, &scope); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
-		h, ok := d.harnesses.Get(p.Backend)
-		if !ok {
-			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown backend "+p.Backend)
+		if scope.HarnessID == "" {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "harnessId is required")
 		}
-		opts, err := h.DiscoverOptions()
+		h, ok := d.harnesses.Get(scope.HarnessID)
+		if !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown harness "+scope.HarnessID)
+		}
+		snapshot, err := h.Catalogue(ctx, scope)
 		if err != nil {
 			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
 		}
-		if opts == nil {
-			opts = []harness.DiscoveredOption{}
+		if err := harness.ValidateCatalogue(snapshot); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
 		}
-		return map[string]any{"configOptions": opts}, nil
-	})
-
-	// agent.discoverModels enumerates a harness's live model catalogue, optionally
-	// routed through a provider (whose non-secret metadata + transient authToken
-	// the UI supplies, exactly as for agent.start). Claude direct answers from the
-	// list_models control request (which also reports each model's supported
-	// effort tiers); a routed provider from its /v1/models. It is best-effort:
-	// harnesses that don't implement discovery, or a probe that fails, return an
-	// empty list so the UI keeps its last cached catalogue.
-	//
-	// UI-only (audit F36 pass 5 — the MOVED half of F34/F36). This is the
-	// handler with the widest caller-supplied reach in the file, and it was the
-	// last one classified as harmless "engine metadata": the Provider it accepts
-	// carries a BaseURL and an EnvVar, and harness_claude.go's DiscoverModels
-	// resolves the EnvVar out of AKCORE'S OWN ENVIRONMENT and sends it as the
-	// bearer token to that BaseURL. An agent bridge could therefore name
-	// ANTHROPIC_API_KEY (or any other variable in the daemon's environment) and
-	// a URL it controls, and have the core post the human's credential to it —
-	// in-band, with no human in the chain, from the one handler nobody thought
-	// needed a gate. Unrouted, it still spawns `claude -p /model`. Only the UI
-	// may supply a Provider, and the UI is the only caller there has ever been
-	// (ui/src/state/HarnessTraits.cpp).
-	d.srv.Handle("agent.discoverModels", func(ctx context.Context, raw json.RawMessage) (any, error) {
-		if err := requireUIWindow(d.srv, ctx); err != nil {
-			return nil, err
-		}
-		var p struct {
-			Backend  string          `json:"backend"`
-			Provider *agent.Provider `json:"provider"`
-		}
-		if err := json.Unmarshal(raw, &p); err != nil {
-			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
-		}
-		h, ok := d.harnesses.Get(p.Backend)
-		if !ok {
-			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown backend "+p.Backend)
-		}
-		models := []harness.DiscoveredOptionValue{}
-		if md, ok := h.(modelDiscoverer); ok {
-			found, err := md.DiscoverModels(p.Provider)
-			if err != nil {
-				return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
-			}
-			if found != nil {
-				models = found
-			}
-		}
-		return map[string]any{"models": models}, nil
+		return snapshot, nil
 	})
 
 	// agent.start is the HUMAN's start path, and every one of its parameters is
 	// authority the agent-facing launch_agent deliberately cannot reach (audit
 	// F5): an arbitrary WorkspacePath (any directory on the machine, not the
-	// parent's project), CoworkEnabled (desktop control), a Provider override,
+	// parent's project), CoworkEnabled (desktop control), a ProviderID selection,
 	// and an Env overlay that is applied AFTER the provider credential scrub
 	// (core/internal/agent/agent.go) — so it can rewrite ANTHROPIC_BASE_URL and
 	// redirect the injected provider token to an endpoint of the caller's
@@ -502,16 +450,23 @@ func registerHandlers(d handlerDeps) {
 		if p.WorkspacePath == "" || p.Prompt == "" {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "workspacePath and prompt are required")
 		}
+		if p.Provider == nil {
+			provider, err := resolveProviderBinding(p.ProviderID)
+			if err != nil {
+				return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+			}
+			p.Provider = provider
+		}
 		h, ok := d.harnesses.Get(p.Backend)
 		if !ok {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown backend "+p.Backend)
 		}
-		caps := h.Capabilities()
-		if p.Provider.Routed() && !caps.ProviderRouting {
-			return nil, unsupported("Provider routing", caps)
+		descriptor := h.Descriptor()
+		if p.Provider.Routed() && !descriptor.Supports(harness.OperationProviderRouting) {
+			return nil, unsupported("Provider routing", descriptor)
 		}
-		if p.CoworkEnabled && !caps.Cowork {
-			return nil, unsupported("Cowork", caps)
+		if p.CoworkEnabled && !descriptor.Supports(harness.OperationCowork) {
+			return nil, unsupported("Cowork", descriptor)
 		}
 		if err := authorizeCoworkAtStart(d, ctx, p.CoworkEnabled,
 			summarizePrompt(p.Prompt), firstLine(p.Prompt)); err != nil {
@@ -524,7 +479,7 @@ func registerHandlers(d handlerDeps) {
 		// the UI captures it from the init event.
 		threadID := agent.NewThreadID()
 		sessionID := ""
-		if caps.MintsSessionID {
+		if descriptor.Supports(harness.OperationMintSessionID) {
 			sessionID = session.NewID()
 		}
 		// The opening prompt is a turn: mark it queued BEFORE the async start so
@@ -539,7 +494,7 @@ func registerHandlers(d handlerDeps) {
 		return map[string]any{
 			"threadId":  threadID,
 			"sessionId": sessionID,
-			"backend":   caps.ID,
+			"backend":   descriptor.ID,
 		}, nil
 	})
 
@@ -548,7 +503,7 @@ func registerHandlers(d handlerDeps) {
 	//
 	// UI-only (audit F5): resume replays the record's persisted authority — its
 	// permission mode, its CoworkEnabled flag, its Env overlay — and accepts a
-	// caller-supplied Provider (with its API token) and Model. An agent bridge
+	// caller-supplied ProviderID and Model. An agent bridge
 	// waking a dormant thread would be re-arming authority the human granted to
 	// a thread they believed was finished.
 	d.srv.Handle("agent.resume", func(ctx context.Context, raw json.RawMessage) (any, error) {
@@ -562,9 +517,9 @@ func registerHandlers(d handlerDeps) {
 			// live replacement, so the chat continues instead of failing on a
 			// retired id.
 			Model string `json:"model,omitempty"`
-			// Optional: re-supply the provider (with its API token) on resume.
-			// Needed when the key lives in KWallet — the Record never persists it.
-			Provider *agent.Provider `json:"provider,omitempty"`
+			// Optional opaque profile selection. The core resolves the current
+			// runtime binding rather than accepting a provider configuration blob.
+			ProviderID string `json:"providerId,omitempty"`
 		}
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
@@ -591,13 +546,21 @@ func registerHandlers(d handlerDeps) {
 		}
 		if rec.SessionID == "" {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams,
-				"thread has no "+h.Capabilities().DisplayName+" session to resume")
+				"thread has no "+h.Descriptor().DisplayName+" session to resume")
 		}
 		// The human got here first: drop any usage-window auto-resume armed for
 		// this thread, so the schedule stops promising something that has
 		// already happened (plan 28 §Phase 2).
 		d.rateWakes.Cancel(p.ThreadID, "you resumed it yourself")
-		safe.Go("agent.resumeThread", func() { resumeThread(d, h, rec, p.Provider) })
+		providerID := p.ProviderID
+		if providerID == "" {
+			providerID = rec.ProviderID
+		}
+		provider, err := resolveProviderBinding(providerID)
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		safe.Go("agent.resumeThread", func() { resumeThread(d, h, rec, provider) })
 		return map[string]any{"threadId": rec.ThreadID, "sessionId": rec.SessionID}, nil
 	})
 
@@ -702,8 +665,8 @@ func registerHandlers(d handlerDeps) {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
 		}
 		h := d.harnessFor(p.ThreadID)
-		if !h.Capabilities().Fork {
-			return nil, unsupported("Forking", h.Capabilities())
+		if !h.Descriptor().Supports(harness.OperationFork) {
+			return nil, unsupported("Forking", h.Descriptor())
 		}
 		if src.SessionID == "" {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams,
@@ -748,8 +711,8 @@ func registerHandlers(d handlerDeps) {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
 		}
 		h := d.harnessFor(p.ThreadID)
-		if !h.Capabilities().Promote {
-			return nil, unsupported("Promoting", h.Capabilities())
+		if !h.Descriptor().Supports(harness.OperationPromote) {
+			return nil, unsupported("Promoting", h.Descriptor())
 		}
 		if rec.Worktree.Isolated {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams,
@@ -812,14 +775,14 @@ func registerHandlers(d handlerDeps) {
 		}
 		var found []harness.BrowsableSession
 		for _, h := range d.harnesses.All() {
-			caps := h.Capabilities()
-			if !caps.SessionBrowse {
+			descriptor := h.Descriptor()
+			if !descriptor.Supports(harness.OperationSessionBrowse) {
 				continue
 			}
 			list, err := h.BrowseSessions()
 			if err != nil {
 				d.log.Warn("session browse failed; skipping harness",
-					"harness", caps.ID, "err", err)
+					"harness", descriptor.ID, "err", err)
 				continue
 			}
 			found = append(found, list...)
@@ -882,8 +845,14 @@ func registerHandlers(d handlerDeps) {
 		// apply-edits default the attach flow always used; a discovered
 		// vocabulary stays empty — the CLI's own default applies at resume.
 		mode := ""
-		if len(h.Capabilities().PermissionModes) > 0 {
-			mode = "acceptEdits"
+		catalogue, err := h.Catalogue(ctx, harness.CatalogueScope{HarnessID: h.Descriptor().ID})
+		if err == nil {
+			for _, setting := range catalogue.Settings {
+				if setting.Key == harness.SettingPermissionMode {
+					mode = setting.DefaultValue
+					break
+				}
+			}
 		}
 		threadID := agent.NewThreadID()
 		rec := session.Record{
@@ -1103,13 +1072,9 @@ func registerHandlers(d handlerDeps) {
 		return map[string]any{"ok": true}, nil
 	})
 
-	// agent.setOption changes one session option — model, permissionMode or
-	// effort — on a RUNNING thread, mid-session, and persists it to the record
-	// so a later resume replays the same choice. Each harness maps the option
-	// onto its own mechanism (claude: set_model / set_permission_mode control
-	// requests, no mid-session effort; kimi: session/set_config_option). The
-	// CLI's own rejection (unknown model id, bad mode) is passed through
-	// verbatim so the UI can show it and revert the picker.
+	// agent.updateSettings applies a complete typed requested settings object.
+	// The response says what native state actually took effect and when; a
+	// client must not treat a request as fact merely because it was accepted.
 	//
 	// UI-only (audit F5), and this is the sharpest of the three: `option:
 	// "permissionMode"` RE-ARMS A LIVE THREAD'S AUTHORITY. Without the check, a
@@ -1117,43 +1082,50 @@ func registerHandlers(d handlerDeps) {
 	// mid-turn and skip every gate — a shorter path than launching a worker,
 	// and one the launch gate would never see. The change is persisted too, so
 	// it would survive the resume. Only the human's own pickers may move it.
-	d.srv.Handle("agent.setOption", func(ctx context.Context, raw json.RawMessage) (any, error) {
+	d.srv.Handle("agent.updateSettings", func(ctx context.Context, raw json.RawMessage) (any, error) {
 		if err := requireUIWindow(d.srv, ctx); err != nil {
 			return nil, err
 		}
 		var p struct {
-			ThreadID string `json:"threadId"`
-			Option   string `json:"option"` // "model" | "permissionMode" | "effort"
-			Value    string `json:"value"`
+			AgentRef  harness.AgentRef      `json:"agentRef"`
+			Requested harness.AgentSettings `json:"requested"`
 		}
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
-		if p.ThreadID == "" || p.Option == "" {
-			return nil, ipc.Errorf(ipc.CodeInvalidParams, "threadId and option are required")
+		if p.AgentRef.ThreadID == "" {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "agentRef.threadId is required")
 		}
-		if !d.agentRunning(p.ThreadID) {
+		if !d.agentRunning(p.AgentRef.ThreadID) {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams,
 				"the agent is not running — options apply at the next start instead")
 		}
-		applied, err := d.harnessFor(p.ThreadID).SetOption(p.ThreadID, p.Option, p.Value)
+		record, _ := d.sessions.Get(p.AgentRef.ThreadID)
+		if p.AgentRef.HarnessID == "" {
+			p.AgentRef.HarnessID = record.Backend
+		}
+		if p.AgentRef.NativeSessionID == "" {
+			p.AgentRef.NativeSessionID = record.SessionID
+		}
+		applied, err := d.harnessFor(p.AgentRef.ThreadID).UpdateSettings(ctx, p.AgentRef, p.Requested)
 		if err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
 		// Persist so a resume replays the latest choice, not the start-time one.
-		_ = d.sessions.UpdateQuiet(p.ThreadID, func(r *session.Record) {
-			switch p.Option {
-			case "model":
-				r.Model = applied
-			case "effort":
-				r.Effort = applied
-			case "permissionMode":
-				r.PermissionMode = applied
+		_ = d.sessions.UpdateQuiet(p.AgentRef.ThreadID, func(r *session.Record) {
+			if applied.Effective.Model != "" {
+				r.Model = applied.Effective.Model
+			}
+			if applied.Effective.ReasoningEffort != "" {
+				r.Effort = applied.Effective.ReasoningEffort
+			}
+			if applied.Effective.PermissionMode != "" {
+				r.PermissionMode = applied.Effective.PermissionMode
 			}
 		})
-		d.log.Info("agent option changed", "thread", p.ThreadID,
-			"option", p.Option, "value", applied)
-		return map[string]any{"ok": true, "value": applied}, nil
+		d.log.Info("agent settings updated", "thread", p.AgentRef.ThreadID,
+			"timing", applied.Timing)
+		return applied, nil
 	})
 
 	// agent.interrupt cancels the in-flight turn immediately (no further tokens
@@ -1312,7 +1284,7 @@ func registerHandlers(d handlerDeps) {
 	//
 	// Deliberately absent, and why: `tags` (the human's own filing labels),
 	// `updated`, `backend` and the resolved `harness` capability struct (which
-	// engine each thread runs — agent.capabilities already answers that
+	// engine each thread runs — harness.list already answers that
 	// per-engine, without saying who is running what).
 	d.srv.Handle("agent.list", func(_ context.Context, raw json.RawMessage) (any, error) {
 		var p struct {
@@ -1579,7 +1551,7 @@ func registerHandlers(d handlerDeps) {
 	// Reduces prefix re-cache cost on resume. See package compact.
 	//
 	// SECURITY (audit F36 pass 3): UI-only, like every other per-thread setting
-	// (agent.rename, agent.setTags, agent.setOption). It writes to ANY thread's
+	// (agent.rename, agent.setTags, agent.updateSettings). It writes to ANY thread's
 	// record with no caller binding, and the setting it writes is not cosmetic:
 	// a strategy arms a pass that rewrites the thread's stored context at exit
 	// and reseeds its next resume from the result, so an agent could quietly
@@ -1601,17 +1573,17 @@ func registerHandlers(d handlerDeps) {
 		if p.Strategy != "" && !s.Valid() {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown strategy "+p.Strategy)
 		}
-		caps := d.capsFor(p.ThreadID)
-		if !caps.Compaction {
-			return nil, unsupported("Compaction", caps)
+		descriptor := d.descriptorFor(p.ThreadID)
+		if !descriptor.Supports(harness.OperationCompaction) {
+			return nil, unsupported("Compaction", descriptor)
 		}
 		// Every strategy but the hot one runs after the process is gone, off a
 		// transcript the engine may not write. Storing one on an engine with no
 		// cold pass would arm a compaction that can never fire (or, worse, one
 		// that summarises nothing and reseeds the next resume from it).
-		if !caps.ColdCompact && s.Resolve() != compact.ExitOpusHot {
+		if !descriptor.Supports(harness.OperationColdCompaction) && s.Resolve() != compact.ExitOpusHot {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams,
-				caps.DisplayName+" agents compact only inside a live session; "+
+				descriptor.DisplayName+" agents compact only inside a live session; "+
 					"the only strategy they support is "+string(compact.ExitOpusHot))
 		}
 		if err := d.sessions.Update(p.ThreadID, func(r *session.Record) {
@@ -1646,8 +1618,8 @@ func registerHandlers(d handlerDeps) {
 		if !ok {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
 		}
-		if caps := d.capsFor(p.ThreadID); !caps.Compaction {
-			return nil, unsupported("Compaction", caps)
+		if descriptor := d.descriptorFor(p.ThreadID); !descriptor.Supports(harness.OperationCompaction) {
+			return nil, unsupported("Compaction", descriptor)
 		}
 		sum, err := d.summaries.Get(p.ThreadID)
 		if err != nil {
@@ -1700,12 +1672,12 @@ func registerHandlers(d handlerDeps) {
 		if !ok {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
 		}
-		if caps := d.capsFor(p.ThreadID); !caps.Compaction {
-			return nil, unsupported("Compaction", caps)
+		if descriptor := d.descriptorFor(p.ThreadID); !descriptor.Supports(harness.OperationCompaction) {
+			return nil, unsupported("Compaction", descriptor)
 		}
 		if rec.SessionID == "" {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams,
-				"thread has no "+d.capsFor(p.ThreadID).DisplayName+" session yet")
+				"thread has no "+d.descriptorFor(p.ThreadID).DisplayName+" session yet")
 		}
 
 		var sum compact.Summary
@@ -1771,9 +1743,9 @@ func registerHandlers(d handlerDeps) {
 			// ColdCompact has neither, and running them anyway would store a
 			// summary of nothing — which the next resume would seed a fresh
 			// session from, throwing the real history away.
-			if caps := d.capsFor(p.ThreadID); !caps.ColdCompact {
+			if descriptor := d.descriptorFor(p.ThreadID); !descriptor.Supports(harness.OperationColdCompaction) {
 				return nil, ipc.Errorf(ipc.CodeInvalidParams,
-					caps.DisplayName+" agents compact only inside a live session; "+
+					descriptor.DisplayName+" agents compact only inside a live session; "+
 						"resume the thread and compact it hot instead")
 			}
 			modelID, strategy, isLocal := resolveCompactModel(p.Model)
@@ -3549,7 +3521,7 @@ const skillReloadFanout = 16
 // idempotent — a thread with nothing new to find re-reads and moves on — so
 // over-sending is strictly safer than under-sending here.
 //
-// A running thread whose harness CANNOT reload (Capabilities().SkillReload is
+// A running thread whose harness CANNOT reload (its descriptor lacks SkillReload) is
 // false — kimi, whose CLI resolves skills once at session/new) gets a notice
 // too (audit F50). It used to get nothing at all: it was dropped while the
 // target list was built, and the notice loop only ran over threads whose reload
@@ -3576,7 +3548,7 @@ func reloadSkillsEverywhere(d handlerDeps, reason string) []string {
 		// declares it without the method would be dropped without a word —
 		// the same silence F50 is about.
 		r, hasMethod := d.harnessFor(rec.ThreadID).(skillReloader)
-		declared := d.capsFor(rec.ThreadID).SkillReload
+		declared := d.descriptorFor(rec.ThreadID).Supports(harness.OperationSkillReload)
 		if hasMethod && declared {
 			targets = append(targets, target{rec.ThreadID, r})
 			continue
@@ -3588,7 +3560,7 @@ func reloadSkillsEverywhere(d handlerDeps, reason string) []string {
 		// affected thread, so the drift is findable (audit F50 pass 4).
 		if hasMethod != declared {
 			d.log.Warn("harness disagrees with itself about skill reload",
-				"thread", rec.ThreadID, "harness", d.capsFor(rec.ThreadID).ID,
+				"thread", rec.ThreadID, "harness", d.descriptorFor(rec.ThreadID).ID,
 				"hasReloadSkillsMethod", hasMethod, "declaresSkillReload", declared)
 		}
 		skipped = append(skipped, rec.ThreadID)
@@ -3635,7 +3607,7 @@ func reloadSkillsEverywhere(d handlerDeps, reason string) []string {
 	for _, threadID := range skipped {
 		emitLifecycle(d, threadID, "notice",
 			"you "+reason+" while this agent was running, but "+
-				d.capsFor(threadID).DisplayName+" agents read their skills only "+
+				d.descriptorFor(threadID).DisplayName+" agents read their skills only "+
 				"at start — restart this agent to pick them up", nil)
 	}
 	if len(reloaded) > 0 || len(skipped) > 0 {

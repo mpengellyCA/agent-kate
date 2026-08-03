@@ -101,10 +101,10 @@ func TestKimiHarnessCompactRefusesCold(t *testing.T) {
 		t.Errorf("refusal %q does not say the session must be live", err)
 	}
 	// And the capability says the same thing, so the RPC layer never asks.
-	caps := h.Capabilities()
-	if !caps.Compaction || caps.ColdCompact {
-		t.Errorf("caps Compaction=%v ColdCompact=%v, want true/false",
-			caps.Compaction, caps.ColdCompact)
+	descriptor := h.Descriptor()
+	if !descriptor.Supports(harness.OperationCompaction) || descriptor.Supports(harness.OperationColdCompaction) {
+		t.Errorf("descriptor compaction/coldCompaction = %v/%v, want true/false",
+			descriptor.Supports(harness.OperationCompaction), descriptor.Supports(harness.OperationColdCompaction))
 	}
 }
 

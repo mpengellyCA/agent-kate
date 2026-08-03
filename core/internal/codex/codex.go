@@ -81,6 +81,12 @@ type Thread struct {
 	alive          bool
 	stopping       bool
 	activeTurnID   string
+	// completedTurns bridges the JSON-RPC response/notification race: app-server
+	// can emit turn/completed immediately after the turn/start response, and the
+	// read loop may observe that notification before Send has recorded its id as
+	// active. The first later Send-side check consumes the marker instead of
+	// resurrecting a completed turn as permanently busy.
+	completedTurns map[string]bool
 	interrupted    bool
 	logFile        *os.File
 	text           map[string]*strings.Builder // item id -> streaming text
@@ -229,7 +235,8 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 	_ = stderrW.Close()
 
 	t := &Thread{ID: id, WorkDir: opts.WorkDir, cmd: cmd, stdin: stdin, alive: true,
-		text: make(map[string]*strings.Builder), stdoutDrained: make(chan struct{}), stderrDrained: make(chan struct{})}
+		text: make(map[string]*strings.Builder), completedTurns: make(map[string]bool),
+		stdoutDrained: make(chan struct{}), stderrDrained: make(chan struct{})}
 	t.rpc = newRPCClient(stdin, s.log)
 	t.rpc.onNotification = func(method string, params json.RawMessage) { s.onNotification(t, method, params) }
 	t.rpc.onRequest = func(requestID json.RawMessage, method string, params json.RawMessage) {
@@ -249,6 +256,10 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 	}, &init); err != nil {
 		s.discardFailedStart(t)
 		return nil, fmt.Errorf("codex initialize: %w", err)
+	}
+	if err := t.rpc.notify("initialized", map[string]any{}); err != nil {
+		s.discardFailedStart(t)
+		return nil, fmt.Errorf("codex initialized: %w", err)
 	}
 
 	params := startParams(opts)
@@ -280,7 +291,11 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 	t.mu.Lock()
 	t.sessionID = response.Thread.ID
 	t.model = first(response.Model, response.Thread.Model, opts.Model)
-	t.effort = first(response.ReasoningEffort, opts.Effort)
+	// Reasoning effort is a turn/start override in the current app-server
+	// protocol, not a thread/start field. Preserve the requested value here so
+	// the opening Send applies it even when thread/start reports the account's
+	// previous default effort.
+	t.effort = first(opts.Effort, response.ReasoningEffort)
 	t.approvalPolicy = first(response.ApprovalPolicy, opts.ApprovalPolicy)
 	t.mu.Unlock()
 	if err := s.openLog(t, opts.Resume); err != nil {
@@ -345,6 +360,8 @@ func (s *Supervisor) Send(id, text string, atts []agent.Attachment) error {
 	}
 	t.mu.Lock()
 	stopping := t.stopping
+	sessionID, model, effort, approvalPolicy :=
+		t.sessionID, t.model, t.effort, t.approvalPolicy
 	t.mu.Unlock()
 	if stopping {
 		return fmt.Errorf("codex thread %q is stopping", id)
@@ -369,11 +386,30 @@ func (s *Supervisor) Send(id, text string, atts []agent.Attachment) error {
 			ID string `json:"id"`
 		} `json:"turn"`
 	}
-	if err := t.rpc.call(ctx, "turn/start", map[string]any{"threadId": t.SessionID(), "input": input}, &out); err != nil {
+	// The current app-server API applies model, effort and approval-policy
+	// overrides on turn/start, and retains them for later turns. This is also
+	// how a picker change made while a prior turn was active takes effect: it
+	// is queued here for the next action rather than sent to the obsolete
+	// thread/settings/update endpoint.
+	params := map[string]any{"threadId": sessionID, "input": input}
+	if model != "" {
+		params["model"] = model
+	}
+	if effort != "" {
+		params["effort"] = effort
+	}
+	if approvalPolicy != "" {
+		params["approvalPolicy"] = approvalPolicy
+	}
+	if err := t.rpc.call(ctx, "turn/start", params, &out); err != nil {
 		return fmt.Errorf("codex turn/start: %w", err)
 	}
 	t.mu.Lock()
-	t.activeTurnID = out.Turn.ID
+	if t.completedTurns != nil && t.completedTurns[out.Turn.ID] {
+		delete(t.completedTurns, out.Turn.ID)
+	} else {
+		t.activeTurnID = out.Turn.ID
+	}
 	t.mu.Unlock()
 	return nil
 }
@@ -498,8 +534,12 @@ func (s *Supervisor) StopAll() {
 	}
 }
 
-// SetOption changes the two app-server thread settings that map directly to
-// Agent Kate's picker vocabulary. Permission changes use approvalPolicy.
+// SetOption queues a new app-server setting for the next turn. Codex 0.146
+// exposes model, effort and approvalPolicy on turn/start (where they become
+// defaults for later turns); its generated protocol schema deliberately has no
+// thread/settings/update request. Keeping this state in the resident thread
+// makes Agent Kate's existing live picker mean exactly "next action", rather
+// than claiming an update the server will reject.
 func (s *Supervisor) SetOption(id, option, value string) (string, error) {
 	t, err := s.thread(id)
 	if err != nil {
@@ -511,21 +551,8 @@ func (s *Supervisor) SetOption(id, option, value string) (string, error) {
 	if stopping || !alive {
 		return "", fmt.Errorf("codex thread %q is not accepting option changes", id)
 	}
-	p := map[string]any{"threadId": t.SessionID()}
-	switch option {
-	case "model":
-		p["model"] = value
-	case "effort":
-		p["effort"] = value
-	case "permissionMode":
-		p["approvalPolicy"] = value
-	default:
-		return "", fmt.Errorf("unknown codex option %q", option)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	if err := t.rpc.call(ctx, "thread/settings/update", p, nil); err != nil {
-		return "", fmt.Errorf("codex thread/settings/update: %w", err)
+	if value == "" {
+		return "", fmt.Errorf("codex option %q needs a concrete value", option)
 	}
 	t.mu.Lock()
 	switch option {
@@ -535,6 +562,9 @@ func (s *Supervisor) SetOption(id, option, value string) (string, error) {
 		t.effort = value
 	case "permissionMode":
 		t.approvalPolicy = value
+	default:
+		t.mu.Unlock()
+		return "", fmt.Errorf("unknown codex option %q", option)
 	}
 	t.mu.Unlock()
 	return value, nil
@@ -566,27 +596,61 @@ func (s *Supervisor) DiscoverModels(ctx context.Context) ([]Model, error) {
 	}, nil); err != nil {
 		return nil, fmt.Errorf("codex initialize: %w", err)
 	}
+	if err := rpc.notify("initialized", map[string]any{}); err != nil {
+		return nil, fmt.Errorf("codex initialized: %w", err)
+	}
 	var result struct {
 		Data []struct {
+			ID          string `json:"id"`
 			Model       string `json:"model"`
 			DisplayName string `json:"displayName"`
 			Efforts     []struct {
 				ReasoningEffort string `json:"reasoningEffort"`
 			} `json:"supportedReasoningEfforts"`
 		} `json:"data"`
+		NextCursor string `json:"nextCursor"`
 	}
-	if err := rpc.call(ctx, "model/list", map[string]any{}, &result); err != nil {
-		return nil, err
-	}
-	out := make([]Model, 0, len(result.Data))
-	for _, m := range result.Data {
-		efforts := make([]string, 0, len(m.Efforts))
-		for _, e := range m.Efforts {
-			if e.ReasoningEffort != "" {
-				efforts = append(efforts, e.ReasoningEffort)
+	// App-server model/list is cursor-paginated. The contemporary catalogue is
+	// small, but honouring the continuation is what keeps an account with many
+	// configured providers from silently losing models in Agent Kate.
+	const maxModelPages = 20
+	out := make([]Model, 0)
+	cursor := ""
+	for page := 0; page < maxModelPages; page++ {
+		result = struct {
+			Data []struct {
+				ID          string `json:"id"`
+				Model       string `json:"model"`
+				DisplayName string `json:"displayName"`
+				Efforts     []struct {
+					ReasoningEffort string `json:"reasoningEffort"`
+				} `json:"supportedReasoningEfforts"`
+			} `json:"data"`
+			NextCursor string `json:"nextCursor"`
+		}{}
+		params := map[string]any{"limit": 100, "includeHidden": false}
+		if cursor != "" {
+			params["cursor"] = cursor
+		}
+		if err := rpc.call(ctx, "model/list", params, &result); err != nil {
+			return nil, err
+		}
+		for _, m := range result.Data {
+			efforts := make([]string, 0, len(m.Efforts))
+			for _, e := range m.Efforts {
+				if e.ReasoningEffort != "" {
+					efforts = append(efforts, e.ReasoningEffort)
+				}
+			}
+			id := first(m.ID, m.Model)
+			if id != "" {
+				out = append(out, Model{ID: id, Name: first(m.DisplayName, id), Efforts: efforts})
 			}
 		}
-		out = append(out, Model{ID: m.Model, Name: first(m.DisplayName, m.Model), Efforts: efforts})
+		if result.NextCursor == "" {
+			break
+		}
+		cursor = result.NextCursor
 	}
 	return out, nil
 }
@@ -737,6 +801,7 @@ func (s *Supervisor) onNotification(t *Thread, method string, raw json.RawMessag
 			Arguments        json.RawMessage `json:"arguments"`
 		} `json:"item"`
 		Turn struct {
+			ID     string          `json:"id"`
 			Status string          `json:"status"`
 			Error  json.RawMessage `json:"error"`
 		} `json:"turn"`
@@ -763,9 +828,20 @@ func (s *Supervisor) onNotification(t *Thread, method string, raw json.RawMessag
 	case "item/completed":
 		s.handleItemCompleted(t, p.Item)
 	case "turn/completed":
+		turnID := first(p.TurnID, p.Turn.ID)
 		t.mu.Lock()
-		if p.TurnID == "" || p.TurnID == t.activeTurnID {
+		if turnID == "" || turnID == t.activeTurnID {
 			t.activeTurnID = ""
+		} else {
+			// See Thread.completedTurns. Keep the guard bounded even if a
+			// malformed app-server floods unknown completion notifications.
+			if t.completedTurns == nil {
+				t.completedTurns = make(map[string]bool)
+			}
+			if len(t.completedTurns) >= 64 {
+				clear(t.completedTurns)
+			}
+			t.completedTurns[turnID] = true
 		}
 		t.mu.Unlock()
 		result := map[string]any{"type": "result", "subtype": "success", "session_id": t.SessionID()}

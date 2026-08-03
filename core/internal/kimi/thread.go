@@ -1847,6 +1847,17 @@ func (s *Supervisor) SetConfigOption(threadID, configID, value string) error {
 	return nil
 }
 
+// AppliedSettings returns the values the ACP session has actually accepted.
+// Kimi may normalize a requested config option, so callers must read this
+// snapshot rather than persist their request as if it were fact.
+func (s *Supervisor) AppliedSettings(threadID string) (model, thinking, mode string, err error) {
+	t := s.thread(threadID)
+	if t == nil {
+		return "", "", "", fmt.Errorf("unknown thread %q", threadID)
+	}
+	return t.Model(), t.Thinking(), t.Mode(), nil
+}
+
 // applyConfigResponse folds an authoritative config snapshot into the session
 // and announces it, so every consumer converges on what the CLI actually did.
 // Shared by the set_config_option response and anything else that returns one.

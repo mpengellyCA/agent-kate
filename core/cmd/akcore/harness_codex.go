@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"time"
+	"fmt"
 
 	"agentkate/internal/agent"
 	"agentkate/internal/codex"
@@ -22,23 +22,54 @@ func newCodexHarness(sup *codex.Supervisor) *codexHarness {
 	return &codexHarness{sup: sup}
 }
 
-func (h *codexHarness) Capabilities() harness.Capabilities {
-	return harness.Capabilities{
-		ID:          "codex",
-		DisplayName: "Codex CLI",
-		Badge:       "Codex",
+func (h *codexHarness) Descriptor() harness.HarnessDescriptor {
+	return harness.HarnessDescriptor{
+		ContractVersion: harness.ContractVersion,
+		ID:              "codex",
+		DisplayName:     "Codex CLI",
+		Badge:           "Codex",
+		Health:          harness.HealthUnknown,
 		// The app-server owns persistent threads and exposes thread/fork. The
 		// child supervisor reports the newly-minted id back from that request.
-		Fork:           true,
-		MintsSessionID: false,
+		Operations: harness.Operations(harness.OperationFork),
 		// Codex has a run-time model catalogue. The first implementation keeps
 		// its option vocabulary discovered rather than freezing model or effort
-		// tokens in Agent Kate.
-		ModelPicker: harness.ModelPickerDiscovered,
+		// tokens in Agent Kate. Efforts are part of each model/list entry, and
+		// a change is queued into the next turn/start request, which makes the
+		// running picker truthful without relying on the removed
+		// thread/settings/update endpoint.
 		// Cowork, persona injection, provider routing, transcript preview and
 		// every advanced launch option remain off until they have an end-to-end
 		// app-server probe. Do not emulate a missing capability here.
 	}
+}
+
+// Catalogue maps app-server model/list into the linkage DTO.  Codex lists the
+// valid reasoning efforts alongside each model, which is why the dependency is
+// represented on ModelDescriptor rather than duplicated as native data in UI.
+func (h *codexHarness) Catalogue(ctx context.Context, scope harness.CatalogueScope) (harness.CatalogueSnapshot, error) {
+	if scope.ProviderID != "" && scope.ProviderID != "direct" {
+		return harness.CatalogueSnapshot{}, fmt.Errorf("Codex CLI provider routing is not available")
+	}
+	found, err := h.sup.DiscoverModels(ctx)
+	if err != nil {
+		return harness.CatalogueSnapshot{}, err
+	}
+	models := make([]harness.ModelDescriptor, 0, len(found))
+	for _, model := range found {
+		models = append(models, harness.ModelDescriptor{ID: model.ID, DisplayName: model.Name,
+			SupportedReasoningEfforts: model.Efforts})
+	}
+	snapshot := harness.CatalogueSnapshot{ContractVersion: harness.ContractVersion,
+		HarnessID: h.Descriptor().ID, ProviderID: scope.ProviderID, Models: models,
+		Settings: []harness.SettingDescriptor{
+			{Key: harness.SettingModel, DisplayName: "Model", Timing: harness.TimingNextTurn},
+			{Key: harness.SettingReasoningEffort, DisplayName: "Reasoning effort", Timing: harness.TimingNextTurn},
+			{Key: harness.SettingPermissionMode, DisplayName: "Approval policy",
+				Choices: choices("untrusted", "on-request", "never"), Timing: harness.TimingNextTurn},
+		}}
+	snapshot.Revision = harness.CatalogueRevision(snapshot)
+	return snapshot, nil
 }
 
 const codexNoCustomSubagents = "Codex CLI custom subagent profiles are not wired into Agent Kate yet"
@@ -68,7 +99,20 @@ func codexUnappliedOptions(spec harness.StartSpec) []harness.UnappliedOption {
 	return out
 }
 
-func (h *codexHarness) Launch(spec harness.StartSpec) (harness.Launched, error) {
+func (h *codexHarness) Launch(launch harness.AgentLaunch, runtime harness.StartSpec) (harness.Launched, error) {
+	spec := runtime
+	spec.ThreadID = launch.Ref.ThreadID
+	spec.WorkDir = launch.WorkDir
+	spec.Prompt = launch.Prompt
+	spec.Attachments = launch.Attachments
+	spec.Model = launch.Settings.Model
+	spec.Effort = launch.Settings.ReasoningEffort
+	spec.PermissionMode = launch.Settings.PermissionMode
+	spec.SessionID = launch.Ref.NativeSessionID
+	spec.Resume = launch.Resume
+	spec.ForkSession = launch.ForkSession
+	spec.Cowork = launch.Cowork
+	spec.Title = launch.Title
 	th, err := h.sup.Start(codex.StartOptions{
 		ID:             spec.ThreadID,
 		WorkDir:        spec.WorkDir,
@@ -118,8 +162,21 @@ func (h *codexHarness) DeleteTranscript(threadID string) error {
 	return h.sup.DeleteTranscript(threadID)
 }
 
-func (h *codexHarness) SetOption(threadID, option, value string) (string, error) {
-	return h.sup.SetOption(threadID, option, value)
+func (h *codexHarness) UpdateSettings(_ context.Context, ref harness.AgentRef, requested harness.AgentSettings) (harness.AppliedSettings, error) {
+	effective := requested
+	for _, update := range []struct{ option, value string }{
+		{"model", requested.Model},
+		{"effort", requested.ReasoningEffort},
+		{"permissionMode", requested.PermissionMode},
+	} {
+		if update.value == "" {
+			continue
+		}
+		if _, err := h.sup.SetOption(ref.ThreadID, update.option, update.value); err != nil {
+			return harness.AppliedSettings{}, err
+		}
+	}
+	return harness.AppliedSettings{Requested: requested, Effective: effective, Timing: harness.TimingNextTurn}, nil
 }
 
 // Health is intentionally small and non-invasive: a version probe tells the
@@ -129,50 +186,20 @@ func (h *codexHarness) SetOption(threadID, option, value string) (string, error)
 func (h *codexHarness) Health(ctx context.Context) (harness.Health, error) {
 	binary, version := versionCheck(ctx, "codex")
 	return harness.Health{
-		EngineID: h.Capabilities().ID,
+		EngineID: h.Descriptor().ID,
 		State:    binary.State,
 		Version:  version,
 		Checks:   []harness.Check{binary},
 	}, nil
 }
 
-// Codex model and reasoning vocabularies are app-server supplied, not fixed
-// CLI flags. Until the supervisor's catalogue handshake is promoted into the
-// public adapter API, a nil result keeps the UI's free-text discovered picker
-// available without claiming a stale static list.
-func (h *codexHarness) DiscoverOptions() ([]harness.DiscoveredOption, error) {
-	return nil, nil
-}
-
-// DiscoverModels is the optional modelDiscoverer interface used by the shared
-// engine catalogue RPC. Codex provider routing is not implemented, so a
-// routed request reports no catalogue instead of borrowing the direct one.
-func (h *codexHarness) DiscoverModels(p *agent.Provider) ([]harness.DiscoveredOptionValue, error) {
-	if p != nil && p.Routed() {
-		return nil, nil
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	found, err := h.sup.DiscoverModels(ctx)
-	if err != nil {
-		return nil, nil // discovery is best-effort, matching the Claude adapter
-	}
-	out := make([]harness.DiscoveredOptionValue, 0, len(found))
-	for _, m := range found {
-		out = append(out, harness.DiscoveredOptionValue{
-			Value: m.ID, Name: m.Name, Efforts: m.Efforts,
-		})
-	}
-	return out, nil
-}
-
 // Session browsing is not exposed until the supervisor can safely enumerate
 // only this harness's persisted threads; reporting an empty list is the
-// required Harness method shape while Capabilities.SessionBrowse remains false.
+// required Harness method shape while SessionBrowse remains absent.
 func (h *codexHarness) BrowseSessions() ([]harness.BrowsableSession, error) {
 	return nil, nil
 }
 
 func (h *codexHarness) Compact(_ context.Context, _ harness.CompactSpec) (string, error) {
-	return "", harness.Unsupported("Compaction", h.Capabilities())
+	return "", harness.Unsupported("Compaction", h.Descriptor())
 }

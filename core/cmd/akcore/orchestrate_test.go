@@ -108,11 +108,21 @@ type fakeHarness struct {
 	personaApplied bool
 }
 
-func (f *fakeHarness) Capabilities() harness.Capabilities {
-	return harness.Capabilities{ID: "fake", DisplayName: "Fake Engine", MintsSessionID: true}
+func (f *fakeHarness) Descriptor() harness.HarnessDescriptor {
+	return harness.HarnessDescriptor{ContractVersion: harness.ContractVersion, ID: "fake",
+		DisplayName: "Fake Engine", Health: harness.HealthOK,
+		Operations: harness.Operations(harness.OperationMintSessionID)}
 }
 
-func (f *fakeHarness) Launch(spec harness.StartSpec) (harness.Launched, error) {
+func (f *fakeHarness) Catalogue(context.Context, harness.CatalogueScope) (harness.CatalogueSnapshot, error) {
+	snapshot := harness.CatalogueSnapshot{ContractVersion: harness.ContractVersion, HarnessID: f.Descriptor().ID,
+		Settings: []harness.SettingDescriptor{{Key: harness.SettingPermissionMode, DisplayName: "Permission mode",
+			Choices: []harness.SettingChoice{{Value: "default", DisplayName: "default"}}, DefaultValue: "default", Timing: harness.TimingLaunch}}}
+	snapshot.Revision = harness.CatalogueRevision(snapshot)
+	return snapshot, nil
+}
+
+func (f *fakeHarness) Launch(_ harness.AgentLaunch, spec harness.StartSpec) (harness.Launched, error) {
 	f.mu.Lock()
 	f.last = spec
 	persona := f.personaApplied
@@ -146,16 +156,15 @@ func (f *fakeHarness) StopAll()                                      {}
 func (f *fakeHarness) ReadTranscript(string, string) ([]json.RawMessage, error) {
 	return nil, nil
 }
-func (f *fakeHarness) SetOption(string, string, string) (string, error) { return "", nil }
-func (f *fakeHarness) DiscoverOptions() ([]harness.DiscoveredOption, error) {
-	return nil, nil
+func (f *fakeHarness) UpdateSettings(_ context.Context, _ harness.AgentRef, requested harness.AgentSettings) (harness.AppliedSettings, error) {
+	return harness.AppliedSettings{Requested: requested, Effective: requested, Timing: harness.TimingLive}, nil
 }
 func (f *fakeHarness) BrowseSessions() ([]harness.BrowsableSession, error) { return nil, nil }
 
 // Compact stands in for a harness with no compaction support — the honest
 // default, and the one the shared gate wording is written for.
 func (f *fakeHarness) Compact(context.Context, harness.CompactSpec) (string, error) {
-	return "", harness.Unsupported("Compaction", f.Capabilities())
+	return "", harness.Unsupported("Compaction", f.Descriptor())
 }
 
 // serveIPC starts srv on sock and blocks until the socket exists.

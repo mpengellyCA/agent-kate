@@ -143,7 +143,14 @@ func fireRateWake(d handlerDeps, w schedule.Wake) {
 // case we must decline out loud rather than fail on a launch error the user has
 // to decode.
 func missingProviderCredential(rec session.Record) string {
-	p := providerFromRecord(rec)
+	p := providerFromRecord(rec) // compatibility for records not yet rewritten
+	if rec.AgentRef.ProviderID != "" {
+		resolved, err := resolveProviderBinding(rec.AgentRef.ProviderID)
+		if err != nil {
+			return "its provider profile is no longer available to the core"
+		}
+		p = resolved
+	}
 	if !p.Routed() || p.EnvVar == "" {
 		return ""
 	}

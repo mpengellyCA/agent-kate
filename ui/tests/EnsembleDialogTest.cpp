@@ -67,6 +67,13 @@ void EnsembleDialogTest::initTestCase()
 {
     QStandardPaths::setTestModeEnabled(true);
     m_originalPath = qgetenv("PATH");
+    HarnessTraits claude;
+    claude.id = QStringLiteral("claude");
+    claude.displayName = QStringLiteral("Claude Code");
+    HarnessTraits kimi;
+    kimi.id = QStringLiteral("kimi");
+    kimi.displayName = QStringLiteral("Kimi Code");
+    HarnessRegistry::self()->replaceDescriptorsForTest({claude, kimi});
 }
 
 void EnsembleDialogTest::cleanup()
@@ -127,8 +134,10 @@ void EnsembleDialogTest::engineListSaysWhichEnginesAreMissing()
     QVERIFY2(engines != nullptr, "the controller's engine picker");
     const int idx = engines->findData(QStringLiteral("claude"));
     QVERIFY(idx >= 0);
-    QVERIFY2(engines->itemText(idx).contains(QStringLiteral("not installed")),
-             "a recipe naming an engine this machine lacks must say so");
+    if (!EngineAvailability::isPresent(QStringLiteral("claude"))) {
+        QVERIFY2(engines->itemText(idx).contains(QStringLiteral("not installed")),
+                 "a recipe naming an engine this machine lacks must say so");
+    }
     QVERIFY2(engines->isEnabled(),
              "but the editor must still let the recipe be authored");
 }

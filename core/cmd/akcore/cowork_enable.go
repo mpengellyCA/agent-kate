@@ -117,9 +117,9 @@ func setCoworkEnabled(d handlerDeps, threadID string, enabled bool) (map[string]
 		return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+threadID)
 	}
 	h := d.harnessFor(threadID)
-	caps := h.Capabilities()
-	if enabled && !caps.Cowork {
-		return nil, unsupported("desktop cowork", caps)
+	descriptor := h.Descriptor()
+	if enabled && !descriptor.Supports(harness.OperationCowork) {
+		return nil, unsupported("desktop cowork", descriptor)
 	}
 
 	changed := rec.CoworkEnabled != enabled
@@ -132,7 +132,7 @@ func setCoworkEnabled(d handlerDeps, threadID string, enabled bool) (map[string]
 	applied := coworkApplyNextStart
 	if d.agentRunning(threadID) {
 		applied = coworkApplyLive
-		if !caps.LiveToolReveal {
+		if !descriptor.Supports(harness.OperationLiveToolReveal) {
 			applied = coworkApplyReattach
 		}
 	}
@@ -189,7 +189,7 @@ func setCoworkEnabled(d handlerDeps, threadID string, enabled bool) (map[string]
 
 	return map[string]any{
 		"ok": true, "enabled": enabled, "changed": changed, "applied": applied,
-		"harness": caps.ID, "liveToolReveal": caps.LiveToolReveal,
+		"harness": descriptor.ID, "liveToolReveal": descriptor.Supports(harness.OperationLiveToolReveal),
 		// revealed: the CLI confirmed it re-listed, so the very next turn has
 		// the tools. False after a live enable means it had not re-listed yet
 		// when we gave up waiting — it still will, just perhaps a turn later.
@@ -346,11 +346,11 @@ func registerCoworkEnableHandlers(d handlerDeps) {
 			return nil, err
 		}
 		rec, ok := d.sessions.Get(p.ThreadID)
-		caps := d.harnessFor(p.ThreadID).Capabilities()
+		descriptor := d.harnessFor(p.ThreadID).Descriptor()
 		return map[string]any{
 			"enabled":        ok && rec.CoworkEnabled,
-			"supported":      caps.Cowork,
-			"liveToolReveal": caps.LiveToolReveal,
+			"supported":      descriptor.Supports(harness.OperationCowork),
+			"liveToolReveal": descriptor.Supports(harness.OperationLiveToolReveal),
 			"available":      d.cowork != nil && d.cowork.Available(),
 		}, nil
 	})
@@ -410,9 +410,9 @@ func registerCoworkEnableHandlers(d handlerDeps) {
 		if _, ok := d.sessions.Get(target); !ok {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+target)
 		}
-		caps := d.harnessFor(target).Capabilities()
-		if !caps.Cowork {
-			return nil, unsupported("desktop cowork", caps)
+		descriptor := d.harnessFor(target).Descriptor()
+		if !descriptor.Supports(harness.OperationCowork) {
+			return nil, unsupported("desktop cowork", descriptor)
 		}
 		// Reaching a thread outside your own worker subtree needs the standard
 		// orchestration approval too — asking for desktop access on someone
@@ -481,8 +481,8 @@ func requireUIOrOwnBridge(d handlerDeps, ctx context.Context, threadID string) e
 func coworkCapableHarnesses(reg *harness.Registry) []string {
 	var names []string
 	for _, h := range reg.All() {
-		if c := h.Capabilities(); c.Cowork {
-			names = append(names, c.DisplayName)
+		if descriptor := h.Descriptor(); descriptor.Supports(harness.OperationCowork) {
+			names = append(names, descriptor.DisplayName)
 		}
 	}
 	return names

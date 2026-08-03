@@ -145,10 +145,7 @@ func requestedPermissiveness(mode string) int {
 // falls back to rankStaticEngineDefault — the most permissive baseline any
 // registered engine applies — because an unknown baseline must cost a prompt,
 // never a silent grant.
-func launchBaselineRank(caps harness.Capabilities, engineDefault string) int {
-	if len(caps.PermissionModes) > 0 {
-		return rankStaticEngineDefault
-	}
+func launchBaselineRank(_ harness.HarnessDescriptor, engineDefault string) int {
 	if m := strings.TrimSpace(engineDefault); m != "" {
 		if r, ok := permissivenessRanks[m]; ok {
 			return r
@@ -167,19 +164,17 @@ func launchBaselineRank(caps harness.Capabilities, engineDefault string) int {
 // `kimi acp` handshake cached by the supervisor for the process lifetime (and
 // warmed by the UI's engine picker long before any worker is launched). A
 // failed probe returns "" and the caller fails closed.
-func engineDefaultPermissionMode(h harness.Harness, caps harness.Capabilities) string {
-	if h == nil || len(caps.PermissionModes) > 0 {
+func engineDefaultPermissionMode(h harness.Harness, _ harness.HarnessDescriptor) string {
+	if h == nil {
 		return ""
 	}
-	opts, err := h.DiscoverOptions()
+	catalogue, err := h.Catalogue(context.Background(), harness.CatalogueScope{})
 	if err != nil {
 		return ""
 	}
-	for _, o := range opts {
-		// "mode" is kimi's id for the approval-mode option; the second spelling
-		// is the neutral one, accepted so a future adapter needs no change here.
-		if o.ID == "mode" || o.ID == "permissionMode" {
-			return o.Current
+	for _, setting := range catalogue.Settings {
+		if setting.Key == harness.SettingPermissionMode {
+			return setting.DefaultValue
 		}
 	}
 	return ""
@@ -628,7 +623,7 @@ func missingFrom(want, have []string) []string {
 //     scrubbing and could redirect a provider token, so no agent-facing path
 //     may set it.
 func (d handlerDeps) authorizeWorkerLaunch(parent session.Record,
-	caps harness.Capabilities, engineDefault string, req workerLaunchRequest) (func(), error) {
+	descriptor harness.HarnessDescriptor, engineDefault string, req workerLaunchRequest) (func(), error) {
 	noop := func() {}
 	// Fail closed: without the ledger there is no way to bound fan-out, and an
 	// unbounded launch path is exactly what the cap exists to prevent. This is
@@ -664,7 +659,7 @@ func (d handlerDeps) authorizeWorkerLaunch(parent session.Record,
 	var why []string
 	wantRank := requestedPermissiveness(req.PermissionMode)
 	if strings.TrimSpace(req.PermissionMode) == "" {
-		wantRank = launchBaselineRank(caps, engineDefault)
+		wantRank = launchBaselineRank(descriptor, engineDefault)
 	}
 	haveRank := heldPermissiveness(parent.PermissionMode)
 	if wantRank > haveRank {

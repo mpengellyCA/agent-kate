@@ -164,6 +164,19 @@ func (c *rpcClient) call(ctx context.Context, method string, params, out any) er
 	}
 }
 
+// notify writes a JSON-RPC notification. Codex app-server requires the
+// initialized acknowledgement after a successful initialize response; unlike a
+// request, it deliberately carries no id and has no response to await.
+func (c *rpcClient) notify(method string, params any) error {
+	frame, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0", "method": method, "params": params,
+	})
+	if err != nil {
+		return err
+	}
+	return c.writeFrame(append(frame, '\n'))
+}
+
 // writeFrame mirrors the Claude/Kimi supervisors' F9/F52 hardening. Pipes
 // returned by StdinPipe support deadlines; a wedged child can therefore never
 // leave every IPC writer parked forever behind wmu.

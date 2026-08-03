@@ -367,7 +367,7 @@ func runCore() {
 				// session that is no longer running (ColdCompact).
 				if probe.Phase == "exited" {
 					if rec, ok := sessions.Get(threadID); ok && harnesses != nil {
-						if h, ok := harnesses.Get(rec.Backend); ok && h.Capabilities().ColdCompact {
+						if h, ok := harnesses.Get(rec.Backend); ok && h.Descriptor().Supports(harness.OperationColdCompaction) {
 							strat := compact.Strategy(rec.CompactStrategy).Resolve()
 							if strat.RunsOnExit() && strat != compact.ExitOpusHot {
 								coldCompacts.spawn(log, sessions, summaries, rec, strat)

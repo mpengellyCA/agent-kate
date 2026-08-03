@@ -32,8 +32,9 @@ func (f *slowReloadFake) Running(string) bool { return true }
 
 // SkillReload declared, since the broadcast now consults the CAPABILITY as well
 // as the interface (audit F50) — a harness that reloads must say so.
-func (f *slowReloadFake) Capabilities() harness.Capabilities {
-	return harness.Capabilities{ID: "fake", DisplayName: "Fake Engine", SkillReload: true}
+func (f *slowReloadFake) Descriptor() harness.HarnessDescriptor {
+	return harness.HarnessDescriptor{ContractVersion: harness.ContractVersion, ID: "fake", DisplayName: "Fake Engine", Health: harness.HealthOK,
+		Operations: harness.Operations(harness.OperationSkillReload)}
 }
 
 func (f *slowReloadFake) ReloadSkills(string) error {
@@ -96,8 +97,8 @@ type staticSkillsFake struct {
 	ids map[string]bool
 }
 
-func (f *staticSkillsFake) Capabilities() harness.Capabilities {
-	return harness.Capabilities{ID: "static", DisplayName: "Static Engine"}
+func (f *staticSkillsFake) Descriptor() harness.HarnessDescriptor {
+	return harness.HarnessDescriptor{ContractVersion: harness.ContractVersion, ID: "static", DisplayName: "Static Engine", Health: harness.HealthOK}
 }
 func (f *staticSkillsFake) Running(id string) bool { return f.ids[id] }
 
@@ -108,9 +109,9 @@ type reloadingFake struct {
 	calls atomic.Int32
 }
 
-func (f *reloadingFake) Capabilities() harness.Capabilities {
-	return harness.Capabilities{ID: "reloading", DisplayName: "Reloading Engine",
-		SkillReload: true}
+func (f *reloadingFake) Descriptor() harness.HarnessDescriptor {
+	return harness.HarnessDescriptor{ContractVersion: harness.ContractVersion, ID: "reloading", DisplayName: "Reloading Engine", Health: harness.HealthOK,
+		Operations: harness.Operations(harness.OperationSkillReload)}
 }
 func (f *reloadingFake) Running(id string) bool { return f.ids[id] }
 func (f *reloadingFake) ReloadSkills(string) error {
@@ -285,7 +286,7 @@ func TestReloadSkillsTellsTheThreadsItCannotReload(t *testing.T) {
 // --- the AND, enforced in both directions (audit F50 pass 4) -----------------
 
 // The broadcast asks for BOTH halves: the ReloadSkills method (how the reload
-// is called) and Capabilities().SkillReload (what the harness declares, and
+// is called) and the SkillReload descriptor operation (what the harness declares, and
 // what ui/src/state/HarnessTraits.cpp mirrors). Pass 3 wrote the AND and tested
 // only the case where the two agree — so `hasMethod || declared`,
 // `hasMethod` alone and `declared` alone all passed its fixtures, and the
@@ -305,8 +306,8 @@ type undeclaredReloadFake struct {
 	calls atomic.Int32
 }
 
-func (f *undeclaredReloadFake) Capabilities() harness.Capabilities {
-	return harness.Capabilities{ID: "undeclared", DisplayName: "Undeclared Engine"}
+func (f *undeclaredReloadFake) Descriptor() harness.HarnessDescriptor {
+	return harness.HarnessDescriptor{ContractVersion: harness.ContractVersion, ID: "undeclared", DisplayName: "Undeclared Engine", Health: harness.HealthOK}
 }
 func (f *undeclaredReloadFake) Running(id string) bool { return f.ids[id] }
 func (f *undeclaredReloadFake) ReloadSkills(string) error {
@@ -324,9 +325,9 @@ type declaredNoMethodFake struct {
 	ids map[string]bool
 }
 
-func (f *declaredNoMethodFake) Capabilities() harness.Capabilities {
-	return harness.Capabilities{ID: "declaredonly", DisplayName: "Declared-Only Engine",
-		SkillReload: true}
+func (f *declaredNoMethodFake) Descriptor() harness.HarnessDescriptor {
+	return harness.HarnessDescriptor{ContractVersion: harness.ContractVersion, ID: "declaredonly", DisplayName: "Declared-Only Engine", Health: harness.HealthOK,
+		Operations: harness.Operations(harness.OperationSkillReload)}
 }
 func (f *declaredNoMethodFake) Running(id string) bool { return f.ids[id] }
 

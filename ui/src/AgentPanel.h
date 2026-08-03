@@ -413,10 +413,6 @@ private:
     // painting the green "computing" arc over a thread that cannot spend a
     // token until 14:37.
     bool rateLimitParked() const;
-    // Drive the mode/model/thinking pickers to the values a kimi `_options`
-    // event reports, for each id it lists as changed.
-    void adoptDiscoveredOptions(const QJsonArray &configOptions,
-                                const QJsonArray &changed);
     void onPermissionRequested(const QJsonObject &params);
     // Desktop access, toggled while the agent exists: the core switches the
     // thread's Cowork tools on or off in place (or re-attaches the session on an
@@ -544,7 +540,7 @@ private:
     // one, the per-category breakdown of where the window went.
     QString contextTooltip() const;
     // Apply a model / effort / permission-mode change to the RUNNING agent via
-    // agent.setOption (mid-session); a no-op before start or while dormant —
+    // agent.updateSettings (mid-session); a no-op before start or while dormant —
     // those apply at the next (re)start through the normal launch params.
     void maybePushOption(const QString &option, const QString &value);
     void addNote(const QString &html, const QString &kind);

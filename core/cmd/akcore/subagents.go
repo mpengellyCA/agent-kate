@@ -16,7 +16,7 @@ import (
 // on-disk conversation per subagent. It is an OPTIONAL interface, asserted at
 // the call site (the same pattern as modelDiscoverer) rather than a method on
 // harness.Harness: a backend without subagent files should not have to carry a
-// stub, and Capabilities().SubagentTranscripts is what the UI gates on.
+// stub, and the SubagentTranscripts descriptor operation is what the UI gates on.
 type subagentTranscriber interface {
 	SubagentTranscripts(threadID, sessionID string) ([]harness.SubagentTranscript, error)
 }
@@ -118,13 +118,13 @@ func registerSubagentHandlers(d handlerDeps) {
 				return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
 			}
 			h := d.harnessFor(p.ThreadID)
-			caps := h.Capabilities()
-			if !caps.SubagentTranscripts {
-				return nil, unsupported("Subagent transcripts", caps)
+			descriptor := h.Descriptor()
+			if !descriptor.Supports(harness.OperationSubagentTranscripts) {
+				return nil, unsupported("Subagent transcripts", descriptor)
 			}
 			finder, ok := h.(subagentTranscriber)
 			if !ok {
-				return nil, unsupported("Subagent transcripts", caps)
+				return nil, unsupported("Subagent transcripts", descriptor)
 			}
 			list, err := finder.SubagentTranscripts(p.ThreadID, rec.SessionID)
 			if err != nil {

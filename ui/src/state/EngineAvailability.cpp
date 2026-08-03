@@ -6,6 +6,7 @@
 
 #include <KLocalizedString>
 
+#include <QDir>
 #include <QHash>
 #include <QStandardPaths>
 
@@ -13,8 +14,8 @@ namespace {
 
 // The program each harness's supervisor spawns, and where a human gets it.
 //
-// NOT a capability — nothing here mirrors core/internal/harness's Capabilities
-// struct, so the LOCKSTEP rule does not apply. What it does mirror is the
+// NOT an operation descriptor — this reports local executable availability,
+// while linkage support comes from the core descriptor. What it does mirror is the
 // *binary name* the core defaults to when it is given none:
 // agent.NewSupervisor("") → "claude" (core/internal/agent/agent.go) and
 // kimi.NewSupervisor("") → "kimi" (core/internal/kimi/thread.go), and Codex
@@ -44,6 +45,44 @@ QList<EngineAvailability::Engine> *cache()
 {
     static QList<EngineAvailability::Engine> cached;
     return &cached;
+}
+
+// Match akcore's desktop-launch PATH repair (core/cmd/akcore/path.go).  The
+// core adds these directories before it spawns an engine, but the UI process
+// itself retains Plasma's often-minimal PATH.  Looking only at that original
+// PATH made a Kimi installed in ~/.kimi-code/bin look unavailable even though
+// the core could run it just fine.
+QStringList engineSearchPaths()
+{
+    const QString home = QDir::homePath();
+    QStringList paths = {
+        QDir(home).filePath(QStringLiteral(".local/bin")),
+        QDir(home).filePath(QStringLiteral(".kimi-code/bin")),
+        QDir(home).filePath(QStringLiteral(".npm-global/bin")),
+        QDir(home).filePath(QStringLiteral(".bun/bin")),
+        QDir(home).filePath(QStringLiteral(".volta/bin")),
+        QDir(home).filePath(QStringLiteral(".cargo/bin")),
+        QDir(home).filePath(QStringLiteral("go/bin")),
+        QStringLiteral("/usr/local/bin"),
+    };
+#ifdef Q_OS_MACOS
+    paths << QStringLiteral("/opt/homebrew/bin")
+          << QStringLiteral("/opt/homebrew/sbin");
+#endif
+    paths.append(qEnvironmentVariable("PATH").split(QDir::listSeparator(),
+                                                       Qt::SkipEmptyParts));
+    paths.removeDuplicates();
+    return paths;
+}
+
+bool executableIsAvailable(const QString &executable)
+{
+    // Keep the normal lookup first: it covers platform-specific executable
+    // suffixes and the common terminal-launched case without extra work.
+    if (!QStandardPaths::findExecutable(executable).isEmpty()) {
+        return true;
+    }
+    return !QStandardPaths::findExecutable(executable, engineSearchPaths()).isEmpty();
 }
 
 } // namespace
@@ -82,7 +121,7 @@ QList<Engine> scan()
         if (it != knownEngines().constEnd()) {
             e.installUrl = QString::fromLatin1(it->installUrl);
         }
-        e.present = !QStandardPaths::findExecutable(e.executable).isEmpty();
+        e.present = executableIsAvailable(e.executable);
         cached->append(e);
     }
     return *cached;

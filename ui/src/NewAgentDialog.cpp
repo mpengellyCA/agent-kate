@@ -11,9 +11,7 @@
 #include "state/HarnessTraits.h"
 
 #include <KColorScheme>
-#include <KConfigGroup>
 #include <KLocalizedString>
-#include <KSharedConfig>
 
 #include <QCheckBox>
 #include <QClipboard>
@@ -494,11 +492,9 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, CoreClient *core,
     m_ensembleHint->setVisible(false);
     root->addWidget(m_ensembleHint);
 
-    // The model, when-to-ask and effort lists all follow the engine's harness:
-    // its static vocabularies where it has them, else the lists discovered
-    // from its last session's handshake — until one has run, only the
-    // defaults are offered (the panel's Setup menu additionally takes a
-    // free-text model id for discovered-model harnesses).
+    // Model, permission, and effort choices are all sourced from the current
+    // core catalogue. Until it arrives, the pickers make no claim beyond the
+    // harness's own defaults.
     auto rebuildBackendChoices = [this] {
         const HarnessTraits t = HarnessRegistry::self()->traits(
             m_engine->currentData().toString().section(QLatin1Char('|'), 0, 0));
@@ -515,18 +511,6 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, CoreClient *core,
         m_model->clear();
         m_permission->clear();
         m_effort->clear();
-        const auto addDiscovered = [](QComboBox *combo, const QString &key) {
-            const QStringList entries = KSharedConfig::openConfig()
-                                            ->group(QStringLiteral("Agent"))
-                                            .readEntry(key, QStringList());
-            for (const QString &entry : entries) {
-                const QString value = entry.section(QLatin1Char('|'), 0, 0);
-                const QString name = entry.section(QLatin1Char('|'), 1);
-                if (!value.isEmpty()) {
-                    combo->addItem(name.isEmpty() ? value : name, value);
-                }
-            }
-        };
         m_model->addItem(i18n("Use my default"), QString());
         // Live model catalogue for this engine/provider: a short recommended
         // group, then the full list. Both come from the cache the startup probe
@@ -552,7 +536,6 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, CoreClient *core,
         }
         if (t.permissionModes.isEmpty()) {
             m_permission->addItem(i18n("CLI default"), QString());
-            addDiscovered(m_permission, t.optionKey(QStringLiteral("mode")));
         } else {
             for (const QString &mode : t.permissionModes) {
                 m_permission->addItem(HarnessRegistry::modeLabel(mode), mode);
@@ -560,7 +543,22 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, CoreClient *core,
         }
         m_effort->addItem(i18n("Default"), QString());
         if (t.efforts.isEmpty()) {
-            addDiscovered(m_effort, t.optionKey(QStringLiteral("thinking")));
+            // Some catalogues advertise reasoning efforts per model rather
+            // than harness-wide. Offer their union, then narrow it to the
+            // selected model below.
+            const QString data = m_engine->currentData().toString();
+            const QString backend = data.section(QLatin1Char('|'), 0, 0);
+            const QString provider = data.section(QLatin1Char('|'), 1, 1);
+            const auto choices = HarnessRegistry::self()->modelChoices(backend, provider);
+            for (const QString &entry : choices.all) {
+                const QString model = entry.section(QLatin1Char('|'), 0, 0);
+                for (const QString &effort :
+                     HarnessRegistry::self()->modelEfforts(backend, provider, model)) {
+                    if (!effort.isEmpty() && m_effort->findData(effort) < 0) {
+                        m_effort->addItem(HarnessRegistry::effortLabel(effort), effort);
+                    }
+                }
+            }
         } else {
             for (const QString &effort : t.efforts) {
                 m_effort->addItem(HarnessRegistry::effortLabel(effort), effort);
@@ -598,23 +596,31 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, CoreClient *core,
             m_advancedForm->setRowVisible(m_strictMcp, t.strictMcpConfig);
             m_advancedForm->setRowVisible(m_budget, t.costBudget);
         }
+        applyModelEffortSupport();
     };
     // Selecting a discovered-model engine (e.g. Kimi) with no cached option
     // lists probes the CLI once so the lists fill before the agent starts; the
     // HarnessRegistry::changed handler below repopulates the combos when the
     // result lands. A no-op for tier engines or an already-cached vocabulary.
     auto probeEngine = [this] {
-        HarnessRegistry::self()->ensureDiscovered(
-            m_core, m_engine->currentData().toString().section(QLatin1Char('|'), 0, 0));
+        const QString data = m_engine->currentData().toString();
+        const QString backend = data.section(QLatin1Char('|'), 0, 0);
+        HarnessRegistry::self()->ensureDiscovered(m_core, backend);
+        HarnessRegistry::self()->ensureModels(
+            m_core, backend, data.section(QLatin1Char('|'), 1, 1));
     };
     connect(m_engine, &QComboBox::currentIndexChanged, this,
             [this, rebuildBackendChoices, probeEngine] {
         probeEngine();
         rebuildBackendChoices();
         refreshPreflight();
+        updateLaunchAvailability();
     });
     connect(HarnessRegistry::self(), &HarnessRegistry::changed, this,
-            rebuildBackendChoices);
+            [this, rebuildBackendChoices] {
+                rebuildBackendChoices();
+                updateLaunchAvailability();
+            });
 
     // HONEST LABELLING (audit F30/F49). Every word of this control, and the
     // reasoning behind splitting the promise off the label and into a note that
@@ -708,17 +714,21 @@ NewAgentDialog::NewAgentDialog(const QString &projectName, CoreClient *core,
     probeEngine();
     rebuildBackendChoices();
     refreshPreflight();
+    connect(m_model, &QComboBox::currentIndexChanged, this,
+            [this] { applyModelEffortSupport(); });
     connect(m_ensemble, &QComboBox::currentIndexChanged, this,
             &NewAgentDialog::applyEnsembleMode);
     applyEnsembleMode();
 
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
-    buttons->button(QDialogButtonBox::Ok)->setText(i18n("Create Agent"));
-    buttons->button(QDialogButtonBox::Ok)->setIcon(QIcon::fromTheme(QStringLiteral("list-add")));
+    m_createButton = buttons->button(QDialogButtonBox::Ok);
+    m_createButton->setText(i18n("Create Agent"));
+    m_createButton->setIcon(QIcon::fromTheme(QStringLiteral("list-add")));
     connect(buttons, &QDialogButtonBox::accepted, this, &QDialog::accept);
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
     root->addWidget(buttons);
 
+    updateLaunchAvailability();
     m_task->setFocus();
     resize(460, 420);
 }
@@ -739,6 +749,7 @@ void NewAgentDialog::applyEnsembleMode()
     m_advanced->setEnabled(!crew);
     m_ensembleHint->setVisible(crew);
     if (!crew) {
+        updateLaunchAvailability();
         return;
     }
     const Ensemble e = EnsembleCatalog::self()->get(name);
@@ -755,8 +766,27 @@ void NewAgentDialog::applyEnsembleMode()
             ? i18n("Starts one controller agent on %1. It defines no worker roles, so it "
                    "chooses any helpers itself.", controller)
             : i18n("Starts one controller agent on %1, which may launch these workers as "
-                   "the job needs them: %2.", controller, roles.join(i18nc(
+                       "the job needs them: %2.", controller, roles.join(i18nc(
                        "list separator", ", "))));
+    updateLaunchAvailability();
+}
+
+void NewAgentDialog::updateLaunchAvailability()
+{
+    if (!m_createButton || !m_engine || !m_ensemble) {
+        return;
+    }
+    QString harnessID = m_engine->currentData().toString().section(QLatin1Char('|'), 0, 0);
+    if (!m_ensemble->currentData().toString().isEmpty()) {
+        harnessID = EnsembleCatalog::self()->get(m_ensemble->currentData().toString())
+                        .controller.backend;
+    }
+    const bool available = !harnessID.isEmpty()
+        && !HarnessRegistry::self()->traits(harnessID).id.isEmpty();
+    m_createButton->setEnabled(available);
+    m_createButton->setToolTip(available
+        ? QString()
+        : i18n("Waiting for the core to provide a current harness descriptor."));
 }
 
 // updateIsolationState keeps the checkbox and the sentence under it telling the
@@ -781,6 +811,40 @@ void NewAgentDialog::updateIsolationState()
     m_isolationNote->setText(
         IsolationCopy::isolationNote(m_isolationAvailability,
                                      m_sandbox->isChecked()));
+}
+
+void NewAgentDialog::applyModelEffortSupport()
+{
+    if (!m_engine || !m_model || !m_effort) {
+        return;
+    }
+    const QString data = m_engine->currentData().toString();
+    const QString backend = data.section(QLatin1Char('|'), 0, 0);
+    const QString provider = data.section(QLatin1Char('|'), 1, 1);
+    const QString model = m_model->currentData().toString();
+    const QStringList supported =
+        HarnessRegistry::self()->modelEfforts(backend, provider, model);
+    auto *items = qobject_cast<QStandardItemModel *>(m_effort->model());
+    if (!items) {
+        return;
+    }
+    for (int i = 0; i < m_effort->count(); ++i) {
+        const QString effort = m_effort->itemData(i).toString();
+        const bool enabled = supported.isEmpty() || effort.isEmpty()
+            || supported.contains(effort, Qt::CaseInsensitive);
+        QStandardItem *item = items->item(i);
+        if (!item) {
+            continue;
+        }
+        item->setEnabled(enabled);
+        item->setToolTip(enabled || model.isEmpty()
+                             ? QString()
+                             : i18n("%1 does not support this thinking effort.", model));
+    }
+    const int current = m_effort->currentIndex();
+    if (current >= 0 && items->item(current) && !items->item(current)->isEnabled()) {
+        m_effort->setCurrentIndex(0);
+    }
 }
 
 // refreshPreflight asks the core for the selected engine's health and

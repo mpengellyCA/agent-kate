@@ -1,19 +1,19 @@
 #include "ProviderConfig.h"
 
 #include <QJsonObject>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QDir>
+#include <QSaveFile>
+#include <QStandardPaths>
 
 #include <KConfigGroup>
 #include <KLocalizedString>
 #include <KSharedConfig>
 
-#ifdef AK_HAVE_KWALLET
-#include <KWallet>
-#endif
-
 namespace {
 
 const char *kGroup = "Providers";
-const char *kWalletFolder = "agentkate";
 
 const QStringList &slotList()
 {
@@ -59,35 +59,6 @@ void seedPresets(KConfigGroup &g)
     g.writeEntry("ids", ids);
     g.sync();
 }
-
-#ifdef AK_HAVE_KWALLET
-// walletHandle returns a cached, open wallet positioned on our folder, or
-// nullptr when KWallet is disabled / unavailable. Opening is synchronous and may
-// prompt the user to unlock on first use.
-KWallet::Wallet *walletHandle()
-{
-    static KWallet::Wallet *w = nullptr;
-    if (w && w->isOpen()) {
-        return w;
-    }
-    delete w;
-    w = nullptr;
-    if (!KWallet::Wallet::isEnabled()) {
-        return nullptr;
-    }
-    w = KWallet::Wallet::openWallet(KWallet::Wallet::NetworkWallet(), 0,
-                                    KWallet::Wallet::Synchronous);
-    if (!w) {
-        return nullptr;
-    }
-    const QString folder = QString::fromLatin1(kWalletFolder);
-    if (!w->hasFolder(folder)) {
-        w->createFolder(folder);
-    }
-    w->setFolder(folder);
-    return w;
-}
-#endif
 
 } // namespace
 
@@ -155,11 +126,42 @@ void save(const QList<ProviderProfile> &profiles)
     for (const QString &oldId : oldIds) {
         if (!ids.contains(oldId)) {
             g.deleteGroup(oldId);
-            setKey(oldId, QString());
         }
     }
     g.writeEntry("ids", ids);
     g.sync();
+
+    // akcore owns runtime provider bindings. Give it a key-free mirror of the
+    // selected profile metadata; credentials come only from the named
+    // environment and are resolved inside the core process.
+    QJsonArray encoded;
+    for (const ProviderProfile &p : profiles) {
+        if (!p.routed() || p.id.isEmpty()) {
+            continue;
+        }
+        QJsonObject profile{{QStringLiteral("id"), p.id},
+                            {QStringLiteral("name"), p.name},
+                            {QStringLiteral("baseUrl"), p.baseUrl.trimmed()},
+                            {QStringLiteral("envVar"), p.envVar}};
+        QJsonObject models;
+        for (auto it = p.models.constBegin(); it != p.models.constEnd(); ++it) {
+            if (!it.value().trimmed().isEmpty()) {
+                models.insert(it.key(), it.value().trimmed());
+            }
+        }
+        profile.insert(QStringLiteral("models"), models);
+        encoded.append(profile);
+    }
+    const QString directory = QStandardPaths::writableLocation(
+        QStandardPaths::GenericConfigLocation) + QStringLiteral("/agentkate");
+    if (QDir().mkpath(directory)) {
+        QSaveFile mirror(directory + QStringLiteral("/providers.json"));
+        if (mirror.open(QIODevice::WriteOnly)) {
+            mirror.write(QJsonDocument(QJsonObject{{QStringLiteral("profiles"), encoded}})
+                             .toJson(QJsonDocument::Compact));
+            mirror.commit();
+        }
+    }
 }
 
 ProviderProfile byId(const QString &id)
@@ -182,60 +184,18 @@ ProviderProfile byId(const QString &id)
 
 bool walletAvailable()
 {
-#ifdef AK_HAVE_KWALLET
-    return walletHandle() != nullptr;
-#else
     return false;
-#endif
 }
 
 bool setKey(const QString &id, const QString &keyValue)
 {
-#ifdef AK_HAVE_KWALLET
-    KWallet::Wallet *w = walletHandle();
-    if (!w) {
-        return false;
-    }
-    if (keyValue.isEmpty()) {
-        if (w->hasEntry(id)) {
-            return w->removeEntry(id) == 0;
-        }
-        return true;
-    }
-    return w->writePassword(id, keyValue) == 0;
-#else
     Q_UNUSED(id);
     Q_UNUSED(keyValue);
     return false;
-#endif
-}
-
-QString key(const ProviderProfile &p)
-{
-#ifdef AK_HAVE_KWALLET
-    if (KWallet::Wallet *w = walletHandle()) {
-        QString v;
-        if (w->hasEntry(p.id) && w->readPassword(p.id, v) == 0 && !v.isEmpty()) {
-            return v;
-        }
-    }
-#endif
-    if (!p.envVar.isEmpty()) {
-        const QByteArray e = qgetenv(p.envVar.toLocal8Bit().constData());
-        if (!e.isEmpty()) {
-            return QString::fromLocal8Bit(e);
-        }
-    }
-    return QString();
 }
 
 bool hasStoredKey(const QString &id)
 {
-#ifdef AK_HAVE_KWALLET
-    if (KWallet::Wallet *w = walletHandle()) {
-        return w->hasEntry(id);
-    }
-#endif
     Q_UNUSED(id);
     return false;
 }
@@ -245,16 +205,13 @@ bool keyResolvable(const ProviderProfile &p)
     if (!p.routed()) {
         return true; // Claude-direct: the CLI brings its own credential
     }
-    // Environment variable FIRST, deliberately — the opposite of key()'s
-    // resolution order. This runs while a picker is being built, and reaching
-    // into KWallet can pop a synchronous unlock prompt; a profile whose env var
-    // is set must never provoke one just to render a label. The secret itself
-    // is never read here, only its existence.
+    // akcore resolves credentials in its own process, so the launchable
+    // credential source is the profile's named environment variable.
     if (!p.envVar.isEmpty()
         && !qgetenv(p.envVar.toLocal8Bit().constData()).isEmpty()) {
         return true;
     }
-    return hasStoredKey(p.id);
+    return false;
 }
 
 QString pickerLabel(const ProviderProfile &p)
@@ -264,34 +221,6 @@ QString pickerLabel(const ProviderProfile &p)
     }
     return i18nc("provider entry in an engine picker with no credential stored",
                  "%1 (no API key set)", p.name);
-}
-
-QJsonObject toJson(const ProviderProfile &p)
-{
-    QJsonObject o;
-    if (!p.routed()) {
-        return o; // Claude direct — caller omits the field entirely
-    }
-    o.insert(QStringLiteral("id"), p.id);
-    o.insert(QStringLiteral("name"), p.name);
-    o.insert(QStringLiteral("baseUrl"), p.baseUrl.trimmed());
-    if (!p.envVar.isEmpty()) {
-        o.insert(QStringLiteral("envVar"), p.envVar);
-    }
-    const QString k = key(p);
-    if (!k.isEmpty()) {
-        o.insert(QStringLiteral("authToken"), k);
-    }
-    QJsonObject models;
-    for (auto it = p.models.constBegin(); it != p.models.constEnd(); ++it) {
-        if (!it.value().trimmed().isEmpty()) {
-            models.insert(it.key(), it.value().trimmed());
-        }
-    }
-    if (!models.isEmpty()) {
-        o.insert(QStringLiteral("models"), models);
-    }
-    return o;
 }
 
 } // namespace ProviderStore

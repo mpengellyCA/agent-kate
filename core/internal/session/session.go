@@ -44,14 +44,22 @@ const (
 
 // Record is the persisted metadata for one agent thread — enough to resume it.
 type Record struct {
-	ThreadID       string            `json:"threadId"`
-	SessionID      string            `json:"sessionId"`         // agent session, for resume (Claude Code or kimi)
-	Project        string            `json:"project"`           // workspace path
-	Backend        string            `json:"backend,omitempty"` // "" = Claude Code, "kimi" = Kimi Code; set once at start
+	// SchemaVersion 1 is the Harness Linkage record shape. The flattened
+	// fields below stay in memory only as a source-compatible projection for
+	// older core paths; flush writes the linkage fields exclusively.
+	SchemaVersion     int                   `json:"schemaVersion"`
+	AgentRef          harness.AgentRef      `json:"agentRef"`
+	RequestedSettings harness.AgentSettings `json:"requestedSettings"`
+	EffectiveSettings harness.AgentSettings `json:"effectiveSettings"`
+
+	ThreadID       string            `json:"-"`
+	SessionID      string            `json:"-"`       // AgentRef.NativeSessionID
+	Project        string            `json:"project"` // workspace path
+	Backend        string            `json:"-"`       // AgentRef.HarnessID
 	Worktree       worktree.Worktree `json:"worktree"`
-	PermissionMode string            `json:"permissionMode"`
-	Effort         string            `json:"effort"`         // claude --effort level; "" = Claude Code default
-	Model          string            `json:"model"`          // claude --model id; "" = Claude Code default
+	PermissionMode string            `json:"-"`
+	Effort         string            `json:"-"`
+	Model          string            `json:"-"`
 	Title          string            `json:"title"`          // short summary of the opening prompt
 	Tags           []string          `json:"tags,omitempty"` // user/auto labels for roster organization
 	Created        time.Time         `json:"created"`
@@ -118,17 +126,14 @@ type Record struct {
 	// (cowork.setEnabled). See docs/plans/08-kde-cowork/.
 	CoworkEnabled bool `json:"coworkEnabled,omitempty"`
 
-	// Third-party API provider routing (non-secret snapshot). When
-	// ProviderBaseURL is set, this thread ran the `claude` harness against a
-	// third-party Anthropic-compatible endpoint (Fireworks, OpenRouter, …)
-	// rather than Anthropic's own. The API token is DELIBERATELY not stored: it
-	// is re-resolved at resume from ProviderEnvVar, or re-supplied by the UI.
-	// Empty ProviderBaseURL means Claude direct. See docs/plans/11-third-party-providers.md.
-	ProviderID      string            `json:"providerId,omitempty"`
-	ProviderName    string            `json:"providerName,omitempty"`
-	ProviderBaseURL string            `json:"providerBaseUrl,omitempty"`
-	ProviderEnvVar  string            `json:"providerEnvVar,omitempty"`
-	ProviderModels  map[string]string `json:"providerModels,omitempty"`
+	// Legacy provider projections exist only while an old record is being read.
+	// New records retain the opaque provider identity in AgentRef; the core
+	// resolves a private runtime binding at launch/resume.
+	ProviderID      string            `json:"-"` // AgentRef.ProviderID
+	ProviderName    string            `json:"-"` // legacy runtime projection
+	ProviderBaseURL string            `json:"-"` // legacy runtime projection
+	ProviderEnvVar  string            `json:"-"` // legacy runtime projection
+	ProviderModels  map[string]string `json:"-"` // legacy runtime projection
 }
 
 // Store is the on-disk set of thread records, mirrored in memory.
@@ -223,26 +228,152 @@ func (s *Store) load() error {
 		return err
 	}
 	var file struct {
-		Threads []Record `json:"threads"`
+		Threads []json.RawMessage `json:"threads"`
 	}
 	if err := json.Unmarshal(b, &file); err != nil {
 		return fmt.Errorf("thread store %s: %w", s.path, err)
 	}
-	for _, r := range file.Threads {
+	migratedAny := false
+	for _, raw := range file.Threads {
+		r, migrated, err := decodeRecord(raw)
+		if err != nil {
+			return fmt.Errorf("thread store %s: %w", s.path, err)
+		}
 		r.Status = StatusDormant // nothing is running in a fresh process
 		// Credential-shaped Env values are never on disk (see flush); re-resolve
 		// them from the environment akcore itself runs in, exactly as the
 		// provider token is re-resolved from ProviderEnvVar at launch.
 		r.Env = resolveEnvFromProcess(r.Env)
 		s.recs[r.ThreadID] = r
+		migratedAny = migratedAny || migrated
 	}
 	// Backfill the project-scoped Worktree.Number for records from before
 	// the field existed. Assign sequentially in Created order so older
 	// agents keep the lower numbers a user would expect.
-	if s.backfillNumbers() {
+	if s.backfillNumbers() || migratedAny {
 		_ = s.flush()
 	}
 	return nil
+}
+
+// legacyRecord is read-only compatibility for the flattened records written
+// before Harness Linkage. It is deliberately not embedded in Record: JSON
+// marshaling must never reintroduce these fields.
+type legacyRecord struct {
+	ThreadID        string            `json:"threadId"`
+	SessionID       string            `json:"sessionId"`
+	Backend         string            `json:"backend"`
+	PermissionMode  string            `json:"permissionMode"`
+	Effort          string            `json:"effort"`
+	Model           string            `json:"model"`
+	ProviderID      string            `json:"providerId"`
+	ProviderName    string            `json:"providerName"`
+	ProviderBaseURL string            `json:"providerBaseUrl"`
+	ProviderEnvVar  string            `json:"providerEnvVar"`
+	ProviderModels  map[string]string `json:"providerModels"`
+}
+
+// decodeRecord accepts both record shapes, normalizes legacy data into the
+// linkage DTOs, and restores the flat in-memory view until every caller has
+// moved to AgentRef/AgentSettings.
+func decodeRecord(raw json.RawMessage) (Record, bool, error) {
+	var record Record
+	if err := json.Unmarshal(raw, &record); err != nil {
+		return Record{}, false, err
+	}
+	var legacy legacyRecord
+	if err := json.Unmarshal(raw, &legacy); err != nil {
+		return Record{}, false, err
+	}
+	migrated := record.SchemaVersion < 1 || record.AgentRef.ThreadID == ""
+	if record.AgentRef.ThreadID == "" {
+		record.AgentRef.ThreadID = legacy.ThreadID
+	}
+	if record.AgentRef.NativeSessionID == "" {
+		record.AgentRef.NativeSessionID = legacy.SessionID
+	}
+	if record.AgentRef.HarnessID == "" {
+		record.AgentRef.HarnessID = legacy.Backend
+		if record.AgentRef.HarnessID == BackendClaude {
+			record.AgentRef.HarnessID = "claude"
+		}
+	}
+	if record.AgentRef.ProviderID == "" {
+		record.AgentRef.ProviderID = legacy.ProviderID
+	}
+	// Retain old profile details only for this in-memory migration pass. Future
+	// writes keep the opaque provider id; the core resolves the profile into a
+	// private runtime binding when a session resumes.
+	record.ProviderID = record.AgentRef.ProviderID
+	record.ProviderName = legacy.ProviderName
+	record.ProviderBaseURL = legacy.ProviderBaseURL
+	record.ProviderEnvVar = legacy.ProviderEnvVar
+	record.ProviderModels = legacy.ProviderModels
+	if record.RequestedSettings.Model == "" {
+		record.RequestedSettings.Model = legacy.Model
+	}
+	if record.RequestedSettings.ReasoningEffort == "" {
+		record.RequestedSettings.ReasoningEffort = legacy.Effort
+	}
+	if record.RequestedSettings.PermissionMode == "" {
+		record.RequestedSettings.PermissionMode = legacy.PermissionMode
+	}
+	if record.EffectiveSettings.Model == "" {
+		record.EffectiveSettings.Model = record.RequestedSettings.Model
+	}
+	if record.EffectiveSettings.ReasoningEffort == "" {
+		record.EffectiveSettings.ReasoningEffort = record.RequestedSettings.ReasoningEffort
+	}
+	if record.EffectiveSettings.PermissionMode == "" {
+		record.EffectiveSettings.PermissionMode = record.RequestedSettings.PermissionMode
+	}
+	record.SchemaVersion = harness.ContractVersion
+	record.projectLegacyView()
+	return record, migrated, nil
+}
+
+// normalizeForWrite moves any legacy caller's in-memory changes back into the
+// neutral record and returns a record that serializes only the linkage shape.
+func (r *Record) normalizeForWrite() {
+	if r.ThreadID != "" {
+		r.AgentRef.ThreadID = r.ThreadID
+	}
+	if r.SessionID != "" {
+		r.AgentRef.NativeSessionID = r.SessionID
+	}
+	if r.Backend != "" {
+		r.AgentRef.HarnessID = r.Backend
+	}
+	if r.ProviderID != "" {
+		r.AgentRef.ProviderID = r.ProviderID
+	}
+	if r.AgentRef.HarnessID == "" {
+		r.AgentRef.HarnessID = "claude"
+	}
+	if r.Model != "" {
+		r.RequestedSettings.Model = r.Model
+		r.EffectiveSettings.Model = r.Model
+	}
+	if r.Effort != "" {
+		r.RequestedSettings.ReasoningEffort = r.Effort
+		r.EffectiveSettings.ReasoningEffort = r.Effort
+	}
+	if r.PermissionMode != "" {
+		r.RequestedSettings.PermissionMode = r.PermissionMode
+		r.EffectiveSettings.PermissionMode = r.PermissionMode
+	}
+	r.SchemaVersion = harness.ContractVersion
+	r.projectLegacyView()
+}
+
+func (r *Record) projectLegacyView() {
+	r.ThreadID = r.AgentRef.ThreadID
+	r.SessionID = r.AgentRef.NativeSessionID
+	r.Backend = r.AgentRef.HarnessID
+	r.ProviderID = r.AgentRef.ProviderID
+	r.Model = r.EffectiveSettings.Model
+	r.Effort = r.EffectiveSettings.ReasoningEffort
+	r.PermissionMode = r.EffectiveSettings.PermissionMode
 }
 
 // backfillNumbers stamps Worktree.Number on every record that lacks one,
@@ -251,6 +382,7 @@ func (s *Store) load() error {
 func (s *Store) backfillNumbers() bool {
 	byProject := make(map[string][]Record)
 	for _, r := range s.recs {
+		r.normalizeForWrite()
 		byProject[r.Project] = append(byProject[r.Project], r)
 	}
 	changed := false
@@ -301,6 +433,7 @@ func (s *Store) NextNumber(project string) int {
 func (s *Store) flush() error {
 	list := make([]Record, 0, len(s.recs))
 	for _, r := range s.recs {
+		r.normalizeForWrite()
 		// The single choke point where records become bytes on disk: strip
 		// credential-shaped Env values here so no caller can forget to. The
 		// in-memory record keeps the real value for this process's own
@@ -333,6 +466,10 @@ func (s *Store) Put(rec Record) error {
 	if rec.Updated.IsZero() {
 		rec.Updated = time.Now()
 	}
+	// Keep the in-memory copy in the same linkage shape that flush writes.
+	// Callers still constructing a legacy flat Record must not observe an empty
+	// HarnessID until the process is restarted and the record is read back.
+	rec.normalizeForWrite()
 	s.recs[rec.ThreadID] = rec
 	return s.flush()
 }
@@ -466,22 +603,43 @@ func (s *Store) loadArchiveLocked() ([]ArchiveRecord, error) {
 		return nil, err
 	}
 	var file struct {
-		Threads []ArchiveRecord `json:"threads"`
+		Threads []json.RawMessage `json:"threads"`
 	}
 	if err := json.Unmarshal(b, &file); err != nil {
 		return nil, fmt.Errorf("archive store %s: %w", s.archivePath(), err)
 	}
-	for i := range file.Threads {
+	archives := make([]ArchiveRecord, 0, len(file.Threads))
+	migratedAny := false
+	for _, raw := range file.Threads {
+		var envelope struct {
+			ArchivedAt time.Time `json:"archivedAt"`
+			Reason     string    `json:"reason"`
+		}
+		if err := json.Unmarshal(raw, &envelope); err != nil {
+			return nil, fmt.Errorf("archive store %s: %w", s.archivePath(), err)
+		}
+		record, migrated, err := decodeRecord(raw)
+		if err != nil {
+			return nil, fmt.Errorf("archive store %s: %w", s.archivePath(), err)
+		}
+		entry := ArchiveRecord{Record: record, ArchivedAt: envelope.ArchivedAt, Reason: envelope.Reason}
 		// Same re-resolution as the live store: a restored thread relaunches
 		// with the credential the environment supplies now, never one the
 		// archive kept in cleartext.
-		file.Threads[i].Env = resolveEnvFromProcess(file.Threads[i].Env)
+		entry.Env = resolveEnvFromProcess(entry.Env)
+		archives = append(archives, entry)
+		migratedAny = migratedAny || migrated
 	}
-	if file.Threads == nil {
-		file.Threads = []ArchiveRecord{}
+	if archives == nil {
+		archives = []ArchiveRecord{}
 	}
-	s.archCache = file.Threads
-	return file.Threads, nil
+	s.archCache = archives
+	if migratedAny {
+		if err := s.writeArchiveLocked(archives); err != nil {
+			return nil, err
+		}
+	}
+	return archives, nil
 }
 
 // Archive retention (audit F10). Nothing ever pruned threads-archive.json:
@@ -520,6 +678,7 @@ func (s *Store) writeArchiveLocked(list []ArchiveRecord) error {
 	// carried it, in a file nobody ever looks at again.
 	out := make([]ArchiveRecord, 0, len(list))
 	for _, ar := range list {
+		ar.Record.normalizeForWrite()
 		ar.Env = redactEnvForPersist(ar.Env)
 		out = append(out, ar)
 	}

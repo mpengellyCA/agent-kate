@@ -11,7 +11,6 @@ import (
 
 	"agentkate/internal/agent"
 	"agentkate/internal/harness"
-	"agentkate/internal/modelcatalog"
 	"agentkate/internal/session"
 )
 
@@ -29,90 +28,108 @@ func newClaudeHarness(sup *agent.Supervisor, exePath, socketPath string) *claude
 	return &claudeHarness{sup: sup, exePath: exePath, socketPath: socketPath}
 }
 
-func (h *claudeHarness) Capabilities() harness.Capabilities {
-	return harness.Capabilities{
+func (h *claudeHarness) Descriptor() harness.HarnessDescriptor {
+	return harness.HarnessDescriptor{
+		ContractVersion: harness.ContractVersion,
 		// The canonical id. Persisted records historically use "" for the
 		// default backend (session.BackendClaude); the registry resolves ""
 		// here, and records written from now on carry the explicit id.
 		ID:          "claude",
 		DisplayName: "Claude Code",
 		Badge:       "", // the default engine stays unmarked in the roster
-		Fork:        true,
-		Compaction:  true,
+		Health:      harness.HealthUnknown,
 		// `claude --print --resume` runs a pass over a dormant session, and
 		// session.ReadTranscript reads its on-disk transcript for the local
 		// strategy — both produce summary text, so the cold path is real here.
-		ColdCompact: true,
-		// Verified present on claude 2.1.220: --fallback-model (one
-		// comma-separated value), --disallowedTools and --add-dir (both
-		// variadic).
-		FallbackModels:  true,
-		DisallowedTools: true,
-		AddDirs:         true,
-		Promote:         true,
-		ProviderRouting: true,
-		Cowork:          true,
-		// Probed on 2.1.220 with a stdio server that revealed a second tool
-		// mid-session: claude re-listed on notifications/tools/list_changed and
-		// called the new tool in the same session, so Cowork can be switched on
-		// without touching the running process.
-		LiveToolReveal: true,
-		// Verified against claude 2.1.220: there is no set_effort control
-		// request, but set_max_thinking_tokens IS accepted mid-session — and
-		// the effort tiers are thinking-token budgets underneath, so the lever
-		// exists under its real name. SetOption("effort") drives it; no
-		// relaunch. Keep in lockstep with ui/src/state/HarnessTraits.cpp
-		// claudeDefaults().
-		EffortLive:        true,
-		UsageReporting:    true,
-		SessionBrowse:     true,
-		TranscriptPreview: true, // claude keeps the on-disk session store
-		MintsSessionID:    true,
-		// subagents/agent-<id>.jsonl beside the session transcript.
-		SubagentTranscripts: true,
-		// The reload_skills control request, sent on the live session's stdin
-		// (ReloadSkills below). Keep in lockstep with
-		// ui/src/state/HarnessTraits.cpp claudeDefaults().
-		SkillReload: true,
-		// Both verified against claude 2.1.220 in print mode:
-		// --append-system-prompt reaches the model (a probe persona changed the
-		// reply), and --agents registers custom subagents whose tools AND model
-		// are honored (a haiku main agent's "sonnet" profile ran on
-		// claude-sonnet-5 and saw only its allow-listed tools).
-		SystemPrompt:    true,
-		CustomSubagents: true,
-		// Models are discovered live (`claude -p /model` for direct, the
-		// provider's /v1/models for routed); the picker lists those plus free
-		// text. Permission modes and effort remain static vocabularies below.
-		// --strict-mcp-config and --max-budget-usd, both verified in
-		// `claude -p --help` on 2.1.220.
-		StrictMCPConfig: true,
-		CostBudget:      true,
-		ModelPicker:     harness.ModelPickerDiscovered,
-		// The modes claude 2.1.220 accepts AND HONORS in print mode, in the
-		// order the UI's picker offers them — NOT in permissiveness order, and
-		// nothing reads it as one. How permissive each mode is lives in exactly
-		// one place, permissivenessRanks in authority.go, which both the launch
-		// authority gate and permissiveModes() consult; adding a mode here means
-		// ranking it there too, or it is treated as unknown (which fails closed:
-		// requesting it asks the human, and it is never named as a hint).
-		//
-		// `manual` is deliberately ABSENT even though `--permission-mode
-		// manual` is a valid choice. Probed against 2.1.220: a print-mode
-		// session launched with it reports `"permissionMode":"default"` in its
-		// init event — the flag is accepted and then silently downgraded, so
-		// offering it would promise a supervision level the session does not
-		// have. Every other entry here was probed the same way and reports
-		// itself back verbatim (`dontAsk` -> "dontAsk", `auto` -> "auto",
-		// `default` -> "default"). Re-probe before adding a mode:
-		//   claude -p --permission-mode <m> --output-format stream-json \
-		//     --verbose hi | head -1   # check .permissionMode
-		PermissionModes: []string{
-			"acceptEdits", "default", "plan", "auto",
-			"dontAsk", "bypassPermissions",
-		},
-		Efforts: []string{"low", "medium", "high", "xhigh", "max"},
+		Operations: harness.Operations(
+			harness.OperationFork,
+			harness.OperationCompaction,
+			harness.OperationColdCompaction,
+			harness.OperationFallbackModels,
+			harness.OperationDisallowedTools,
+			harness.OperationAddDirectories,
+			harness.OperationPromote,
+			harness.OperationProviderRouting,
+			harness.OperationCowork,
+			// Probed on 2.1.220 with a stdio server that revealed a second tool
+			// mid-session: claude re-listed on notifications/tools/list_changed and
+			// called the new tool in the same session, so Cowork can be switched on
+			// without touching the running process.
+			harness.OperationLiveToolReveal,
+			// Verified against claude 2.1.220: there is no set_effort control
+			// request, but set_max_thinking_tokens IS accepted mid-session — and
+			// the effort tiers are thinking-token budgets underneath, so the lever
+			// exists under its real name. The adapter maps reasoning effort to it
+			// without a relaunch.
+			harness.OperationUsageReporting,
+			harness.OperationSessionBrowse,
+			harness.OperationTranscriptPreview,
+			harness.OperationMintSessionID,
+			// subagents/agent-<id>.jsonl beside the session transcript.
+			harness.OperationSubagentTranscripts,
+			// The reload_skills control request, sent on the live session's stdin
+			// (ReloadSkills below).
+			harness.OperationSkillReload,
+			// Both verified against claude 2.1.220 in print mode:
+			// --append-system-prompt reaches the model (a probe persona changed the
+			// reply), and --agents registers custom subagents whose tools AND model
+			// are honored (a haiku main agent's "sonnet" profile ran on
+			// claude-sonnet-5 and saw only its allow-listed tools).
+			harness.OperationSystemPrompt,
+			harness.OperationCustomSubagents,
+			// Models are discovered live (`claude -p /model` for direct, the
+			// provider's /v1/models for routed); the picker lists those plus free
+			// text. Permission modes and effort remain static vocabularies below.
+			// --strict-mcp-config and --max-budget-usd, both verified in
+			// `claude -p --help` on 2.1.220.
+			harness.OperationStrictMCPConfig,
+			harness.OperationCostBudget,
+		),
 	}
+}
+
+// Catalogue maps Claude's static control vocabulary and its live model list
+// into one neutral snapshot. Provider IDs are intentionally opaque here: the
+// core resolves a provider binding before an adapter is ever given one, and a
+// catalogue request never transports a URL, token, environment, or raw CLI
+// option blob.
+func (h *claudeHarness) Catalogue(ctx context.Context, scope harness.CatalogueScope) (harness.CatalogueSnapshot, error) {
+	if scope.ProviderID != "" && scope.ProviderID != "direct" {
+		return harness.CatalogueSnapshot{}, fmt.Errorf("provider %q is not available to this Claude catalogue", scope.ProviderID)
+	}
+	models := make([]harness.ModelDescriptor, 0)
+	if h.sup != nil {
+		found, err := h.sup.DiscoverModels(ctx)
+		if err != nil {
+			return harness.CatalogueSnapshot{}, err
+		}
+		for _, model := range found {
+			models = append(models, harness.ModelDescriptor{
+				ID: model.Value, DisplayName: model.Name,
+				SupportedReasoningEfforts: model.Efforts,
+			})
+		}
+	}
+	settings := []harness.SettingDescriptor{
+		{Key: harness.SettingModel, DisplayName: "Model", Timing: harness.TimingLaunch},
+		{Key: harness.SettingReasoningEffort, DisplayName: "Reasoning effort",
+			Choices: choices("low", "medium", "high", "xhigh", "max"), Timing: harness.TimingLive},
+		{Key: harness.SettingPermissionMode, DisplayName: "Permission mode",
+			Choices:      choices("acceptEdits", "default", "plan", "auto", "dontAsk", "bypassPermissions"),
+			DefaultValue: "acceptEdits", Timing: harness.TimingLive},
+	}
+	snapshot := harness.CatalogueSnapshot{ContractVersion: harness.ContractVersion,
+		HarnessID: h.Descriptor().ID, ProviderID: scope.ProviderID, Models: models, Settings: settings}
+	snapshot.Revision = harness.CatalogueRevision(snapshot)
+	return snapshot, nil
+}
+
+func choices(values ...string) []harness.SettingChoice {
+	out := make([]harness.SettingChoice, 0, len(values))
+	for _, value := range values {
+		out = append(out, harness.SettingChoice{Value: value, DisplayName: value})
+	}
+	return out
 }
 
 // claudeAgentEntry is one value of claude's --agents JSON object (the name is
@@ -221,7 +238,20 @@ func buildAgentsJSON(profiles []harness.AgentProfile) (string, []harness.Applied
 	return string(payload), applied
 }
 
-func (h *claudeHarness) Launch(spec harness.StartSpec) (harness.Launched, error) {
+func (h *claudeHarness) Launch(launch harness.AgentLaunch, runtime harness.StartSpec) (harness.Launched, error) {
+	spec := runtime
+	spec.ThreadID = launch.Ref.ThreadID
+	spec.WorkDir = launch.WorkDir
+	spec.Prompt = launch.Prompt
+	spec.Attachments = launch.Attachments
+	spec.Model = launch.Settings.Model
+	spec.Effort = launch.Settings.ReasoningEffort
+	spec.PermissionMode = launch.Settings.PermissionMode
+	spec.SessionID = launch.Ref.NativeSessionID
+	spec.Resume = launch.Resume
+	spec.ForkSession = launch.ForkSession
+	spec.Cowork = launch.Cowork
+	spec.Title = launch.Title
 	// spec.Cowork is not a launch input here: both bridges are always wired in,
 	// and the thread's opt-in (session.Record.CoworkEnabled, already persisted
 	// by the caller) is what the bridge reads to decide whether the desktop
@@ -345,8 +375,13 @@ func (h *claudeHarness) HealthIn(ctx context.Context, project string) (harness.H
 		defer wg.Done()
 		// Direct catalogue only: a preflight card describes the ENGINE, and a
 		// routed provider's reachability is the provider picker's business.
-		found, _ := h.DiscoverModels(&agent.Provider{}) // never errors; empty on failure
-		models = len(found)
+		if h.sup == nil {
+			return
+		}
+		found, err := h.sup.DiscoverModels(ctx)
+		if err == nil {
+			models = len(found)
+		}
 	}()
 	wg.Wait()
 	modelsCheck := harness.Check{Name: "models", State: harness.HealthOK,
@@ -359,56 +394,12 @@ func (h *claudeHarness) HealthIn(ctx context.Context, project string) (harness.H
 	}
 	checks := []harness.Check{binaryCheck, doctor, modelsCheck}
 	return harness.Health{
-		EngineID: h.Capabilities().ID,
+		EngineID: h.Descriptor().ID,
 		State:    harness.WorstState(checks),
 		Version:  version,
 		Checks:   checks,
 		Models:   models,
 	}, nil
-}
-
-// DiscoverOptions: Claude's mode/effort vocabularies are static (see
-// Capabilities); its models are discovered separately via DiscoverModels, so
-// there is nothing to probe here.
-func (h *claudeHarness) DiscoverOptions() ([]harness.DiscoveredOption, error) {
-	return nil, nil
-}
-
-// DiscoverModels enumerates the live model vocabulary. For a routed provider it
-// GETs that provider's /v1/models; for Claude direct it runs `claude -p /model`.
-// Both are best-effort: any failure returns an empty list (never an error that
-// would blank a cached picker), so the UI keeps its last good catalogue.
-func (h *claudeHarness) DiscoverModels(p *agent.Provider) ([]harness.DiscoveredOptionValue, error) {
-	if p.Routed() {
-		key := p.AuthToken
-		if key == "" && p.EnvVar != "" {
-			key = os.Getenv(p.EnvVar)
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
-		defer cancel()
-		models, err := modelcatalog.Fetch(ctx, p.BaseURL, key)
-		if err != nil {
-			return nil, nil
-		}
-		out := make([]harness.DiscoveredOptionValue, 0, len(models))
-		for _, m := range models {
-			out = append(out, harness.DiscoveredOptionValue{Value: m.ID, Name: m.Name})
-		}
-		return out, nil
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	models, err := h.sup.DiscoverModels(ctx)
-	if err != nil {
-		return nil, nil
-	}
-	out := make([]harness.DiscoveredOptionValue, 0, len(models))
-	for _, m := range models {
-		out = append(out, harness.DiscoveredOptionValue{
-			Value: m.Value, Name: m.Name, Efforts: m.Efforts,
-		})
-	}
-	return out, nil
 }
 
 // BrowseSessions wraps the on-disk transcript discovery in the neutral browse
@@ -422,7 +413,7 @@ func (h *claudeHarness) BrowseSessions() ([]harness.BrowsableSession, error) {
 	for _, f := range found {
 		out = append(out, harness.BrowsableSession{
 			SessionID: f.SessionID,
-			Backend:   h.Capabilities().ID,
+			Backend:   h.Descriptor().ID,
 			Project:   f.Project,
 			Title:     f.Title,
 			// Second-precision UTC, matching the other adapters, so the merged
@@ -478,19 +469,28 @@ func (h *claudeHarness) Compact(ctx context.Context, spec harness.CompactSpec) (
 	})
 }
 
-func (h *claudeHarness) SetOption(threadID, option, value string) (string, error) {
-	switch option {
-	case "model":
-		applied := resolveModel(value)
-		return applied, h.sup.SetModel(threadID, applied)
-	case "permissionMode":
-		return value, h.sup.SetPermissionMode(threadID, value)
-	case "effort":
-		// No set_effort control request exists, but the tiers ARE thinking-token
-		// budgets and set_max_thinking_tokens takes them mid-session, so the
-		// change lands from the next turn without a relaunch.
-		return value, h.sup.SetEffort(threadID, value)
-	default:
-		return "", fmt.Errorf("unknown option %q", option)
+func (h *claudeHarness) UpdateSettings(_ context.Context, ref harness.AgentRef, requested harness.AgentSettings) (harness.AppliedSettings, error) {
+	if ref.ThreadID == "" {
+		return harness.AppliedSettings{}, fmt.Errorf("settings update needs a thread id")
 	}
+	effective := harness.AgentSettings{}
+	if requested.Model != "" {
+		effective.Model = resolveModel(requested.Model)
+		if err := h.sup.SetModel(ref.ThreadID, effective.Model); err != nil {
+			return harness.AppliedSettings{}, err
+		}
+	}
+	if requested.PermissionMode != "" {
+		effective.PermissionMode = requested.PermissionMode
+		if err := h.sup.SetPermissionMode(ref.ThreadID, effective.PermissionMode); err != nil {
+			return harness.AppliedSettings{}, err
+		}
+	}
+	if requested.ReasoningEffort != "" {
+		effective.ReasoningEffort = requested.ReasoningEffort
+		if err := h.sup.SetEffort(ref.ThreadID, effective.ReasoningEffort); err != nil {
+			return harness.AppliedSettings{}, err
+		}
+	}
+	return harness.AppliedSettings{Requested: requested, Effective: effective, Timing: harness.TimingLive}, nil
 }

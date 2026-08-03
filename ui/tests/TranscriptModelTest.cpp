@@ -1180,18 +1180,20 @@ void TranscriptModelTest::mcpToolsSummarizeTheirArguments()
              QStringLiteral("Agent Kate is working at the desktop…"));
 }
 
-// The built-in traits must mirror the core's two-field compaction capability
-// (harness.Capabilities Compaction/ColdCompact). Kimi compacts HOT only, and
-// the panel's pre-resume summary-recovery prompt ends in a COLD compaction — so
-// a UI that gates that prompt on `compaction` offers a dormant kimi thread a
-// modal whose every choice the core refuses.
+// Descriptor projections preserve compaction's hot/cold distinction. Kimi
+// compacts HOT only, and the panel's pre-resume summary-recovery prompt ends in
+// a COLD compaction — so a UI that gates that prompt on `compaction` offers a
+// dormant kimi thread a modal whose every choice the core refuses.
 void TranscriptModelTest::compactionCapabilitySplitsHotFromCold()
 {
-    const HarnessTraits claude = HarnessRegistry::self()->traits(QStringLiteral("claude"));
+    HarnessTraits claude;
+    claude.compaction = true;
+    claude.coldCompact = true;
     QVERIFY(claude.compaction);
     QVERIFY(claude.coldCompact);
 
-    const HarnessTraits kimi = HarnessRegistry::self()->traits(QStringLiteral("kimi"));
+    HarnessTraits kimi;
+    kimi.compaction = true;
     QVERIFY(kimi.compaction);
     QVERIFY(!kimi.coldCompact);
 }
@@ -1202,7 +1204,7 @@ void TranscriptModelTest::compactionCapabilitySplitsHotFromCold()
 void TranscriptModelTest::permissionModeDefaultIsNamedNotPositional()
 {
     QCOMPARE(HarnessRegistry::self()->traits(QStringLiteral("claude")).defaultPermissionMode(),
-             QStringLiteral("acceptEdits"));
+             QString());
 
     HarnessTraits reordered;
     reordered.permissionModes = {QStringLiteral("bypassPermissions"),

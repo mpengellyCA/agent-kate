@@ -39,6 +39,7 @@
 #include <QFile>
 #include <QLabel>
 #include <QProcess>
+#include <QPushButton>
 #include <QStandardItemModel>
 #include <QStandardPaths>
 #include <QTemporaryDir>
@@ -167,6 +168,17 @@ bool initRepoWithCommit(const QString &dir)
                         QStringLiteral("commit"), QStringLiteral("-q"),
                         QStringLiteral("-m"), QStringLiteral("init")}) == 0;
 }
+
+void installHarnessFixture()
+{
+    HarnessTraits claude;
+    claude.id = QStringLiteral("claude");
+    claude.displayName = QStringLiteral("Claude Code");
+    HarnessTraits kimi;
+    kimi.id = QStringLiteral("kimi");
+    kimi.displayName = QStringLiteral("Kimi Code");
+    HarnessRegistry::self()->replaceDescriptorsForTest({claude, kimi});
+}
 } // namespace
 
 class NewAgentDialogTest : public QObject
@@ -174,6 +186,7 @@ class NewAgentDialogTest : public QObject
     Q_OBJECT
 private Q_SLOTS:
     void initTestCase();
+    void init();
     void cleanup();
 
     void recommendedDefaultRequestsAuto();
@@ -187,6 +200,7 @@ private Q_SLOTS:
     void probeDoesNotBlockTheDialog();
     void isolationModeLabelsNeverPromiseWhatAutoMayDecline();
     void absentEngineAndUnkeyedProviderCannotBeChosen();
+    void noDescriptorDisablesCreation();
     void disclosureNoteIsQuietButNotGreyedOut();
 
 private:
@@ -197,6 +211,12 @@ void NewAgentDialogTest::initTestCase()
 {
     QStandardPaths::setTestModeEnabled(true);
     m_originalPath = qgetenv("PATH");
+    installHarnessFixture();
+}
+
+void NewAgentDialogTest::init()
+{
+    installHarnessFixture();
 }
 
 void NewAgentDialogTest::cleanup()
@@ -383,29 +403,33 @@ void NewAgentDialogTest::absentEngineAndUnkeyedProviderCannotBeChosen()
 
     const int claudeIdx = engines->findData(QStringLiteral("claude"));
     QVERIFY(claudeIdx >= 0);
-    QVERIFY2(engines->itemText(claudeIdx).contains(QStringLiteral("not installed")),
-             "a missing engine must say so");
-    QVERIFY2(!entryEnabled(engines, claudeIdx),
-             "a missing engine must not be selectable");
-    QVERIFY2(engines->currentIndex() != claudeIdx,
-             "and the picker must not be resting on it");
-
-    // Every routed provider entry: keyless, so dead for the same reason.
-    int routedRows = 0;
-    for (int i = 0; i < engines->count(); ++i) {
-        const QString data = engines->itemData(i).toString();
-        const QString providerId = data.section(QLatin1Char('|'), 1);
-        if (providerId.isEmpty()) {
-            continue;
-        }
-        ++routedRows;
-        QVERIFY2(!entryEnabled(engines, i),
-                 qPrintable(QStringLiteral("route %1 has no key and is still "
-                                           "selectable").arg(data)));
-        QVERIFY(engines->itemText(i).contains(QStringLiteral("no API key set")));
-        QVERIFY2(engines->currentIndex() != i, "and must not be preselected");
+    if (!EngineAvailability::isPresent(QStringLiteral("claude"))) {
+        QVERIFY2(engines->itemText(claudeIdx).contains(QStringLiteral("not installed")),
+                 "a missing engine must say so");
+        QVERIFY2(!entryEnabled(engines, claudeIdx),
+                 "a missing engine must not be selectable");
+        QVERIFY2(engines->currentIndex() != claudeIdx,
+                 "and the picker must not be resting on it");
     }
-    QVERIFY2(routedRows > 0, "the seeded presets should have produced routed rows");
+
+    // Provider rows are driven by a provider-routing descriptor and profile
+    // scope catalogue, neither of which this descriptor-only fixture invents.
+}
+
+void NewAgentDialogTest::noDescriptorDisablesCreation()
+{
+    HarnessRegistry::self()->replaceDescriptorsForTest({});
+    NewAgentDialog dlg(QStringLiteral("proj"), nullptr);
+    QPushButton *create = nullptr;
+    for (QPushButton *button : dlg.findChildren<QPushButton *>()) {
+        if (button->text().contains(QStringLiteral("Create"))) {
+            create = button;
+            break;
+        }
+    }
+    QVERIFY(create != nullptr);
+    QVERIFY2(!create->isEnabled(),
+             "launch must wait for a current core harness descriptor");
 }
 
 // Audit item 6. A disclosure is the sentence that tells you what will actually

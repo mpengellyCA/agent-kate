@@ -84,8 +84,8 @@ func TestPermissivenessOrdering(t *testing.T) {
 // rewrites it), and the ENGINE'S OWN reported default — not the launcher's
 // mode — on a discovered-vocabulary engine (kimi).
 func TestLaunchBaselineRank(t *testing.T) {
-	static := harness.Capabilities{ID: "claude", PermissionModes: []string{"plan", "bypassPermissions"}}
-	discovered := harness.Capabilities{ID: "kimi"}
+	static := harness.HarnessDescriptor{ContractVersion: harness.ContractVersion, ID: "claude"}
+	discovered := harness.HarnessDescriptor{ContractVersion: harness.ContractVersion, ID: "kimi"}
 
 	if got := launchBaselineRank(static, ""); got != rankStaticEngineDefault {
 		t.Errorf("static baseline = %d, want %d", got, rankStaticEngineDefault)
@@ -113,20 +113,12 @@ func TestLaunchBaselineRank(t *testing.T) {
 // verifier pointed at: the `mode` option's currentValue, which the harness
 // already discovers and reports.
 func TestEngineDefaultPermissionMode(t *testing.T) {
-	discovered := harness.Capabilities{ID: "kimi"}
-	h := &optionFake{fakeHarness: &fakeHarness{}, opts: []harness.DiscoveredOption{
-		{ID: "model", Name: "Model", Current: "kimi-code/k3"},
-		{ID: "mode", Name: "Mode", Current: "auto"},
-	}}
+	discovered := harness.HarnessDescriptor{ContractVersion: harness.ContractVersion, ID: "kimi"}
+	h := &optionFake{fakeHarness: &fakeHarness{}, defaultMode: "auto"}
 	if got := engineDefaultPermissionMode(h, discovered); got != "auto" {
 		t.Errorf("engine default = %q, want auto", got)
 	}
-	// A static-vocabulary harness is never probed (it declares its modes), and
-	// a failing probe reports nothing so the caller can fail closed.
-	if got := engineDefaultPermissionMode(h, harness.Capabilities{
-		PermissionModes: []string{"plan"}}); got != "" {
-		t.Errorf("static harness was probed: %q", got)
-	}
+	// A failing catalogue reports nothing so the caller can fail closed.
 	broken := &optionFake{fakeHarness: &fakeHarness{}, err: errors.New("no CLI")}
 	if got := engineDefaultPermissionMode(broken, discovered); got != "" {
 		t.Errorf("failed probe reported %q, want the empty fail-closed answer", got)
@@ -136,12 +128,18 @@ func TestEngineDefaultPermissionMode(t *testing.T) {
 // optionFake is a fakeHarness with a scripted option-discovery answer.
 type optionFake struct {
 	*fakeHarness
-	opts []harness.DiscoveredOption
-	err  error
+	defaultMode string
+	err         error
 }
 
-func (o *optionFake) DiscoverOptions() ([]harness.DiscoveredOption, error) {
-	return o.opts, o.err
+func (o *optionFake) Catalogue(context.Context, harness.CatalogueScope) (harness.CatalogueSnapshot, error) {
+	if o.err != nil {
+		return harness.CatalogueSnapshot{}, o.err
+	}
+	snapshot := harness.CatalogueSnapshot{ContractVersion: harness.ContractVersion, HarnessID: o.Descriptor().ID,
+		Settings: []harness.SettingDescriptor{{Key: harness.SettingPermissionMode, DisplayName: "Mode", DefaultValue: o.defaultMode, Timing: harness.TimingLaunch}}}
+	snapshot.Revision = harness.CatalogueRevision(snapshot)
+	return snapshot, nil
 }
 
 // runningFake is a fakeHarness whose threads all report as live, for the
@@ -203,7 +201,7 @@ func authTestDeps(t *testing.T, sessions *session.Store, h harness.Harness) (han
 	sock := filepath.Join(t.TempDir(), "auth.sock")
 	srv := ipc.NewServer(sock, log)
 	broker := permission.New()
-	harnesses := harness.NewRegistry(h.Capabilities().ID)
+	harnesses := harness.NewRegistry(h.Descriptor().ID)
 	harnesses.Register(h)
 	gitCache := gitstatus.NewCache(log)
 	t.Cleanup(func() { _ = gitCache.Close() })
@@ -224,7 +222,7 @@ func authTestDeps(t *testing.T, sessions *session.Store, h harness.Harness) (han
 // gate calls the authority gate and releases the reserved slot immediately —
 // for the tests that are about the DECISION rather than the reservation.
 // TestWorkerLaunchReservationIsAtomic below holds slots instead.
-func (d handlerDeps) gate(parent session.Record, caps harness.Capabilities,
+func (d handlerDeps) gate(parent session.Record, caps harness.HarnessDescriptor,
 	req workerLaunchRequest) error {
 	release, err := d.authorizeWorkerLaunch(parent, caps, "", req)
 	release()
@@ -245,7 +243,7 @@ func TestWorkerLaunchEscalationNeedsTheHuman(t *testing.T) {
 	if err := sessions.Put(parent); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	caps := harness.Capabilities{ID: "fake", PermissionModes: []string{"plan", "bypassPermissions"}}
+	caps := harness.HarnessDescriptor{ContractVersion: harness.ContractVersion, ID: "fake"}
 	fake := &fakeHarness{}
 	d, allow, asks := authTestDeps(t, sessions, fake)
 
@@ -327,7 +325,7 @@ func TestWorkerLaunchCaps(t *testing.T) {
 	}
 	put("t-root", "")
 	parent, _ := sessions.Get("t-root")
-	caps := harness.Capabilities{ID: "fake", PermissionModes: []string{"acceptEdits"}}
+	caps := harness.HarnessDescriptor{ContractVersion: harness.ContractVersion, ID: "fake"}
 	fake := &fakeHarness{}
 	d, allow, asks := authTestDeps(t, sessions, runningFake{fake})
 	allow.Store(true)
@@ -431,13 +429,13 @@ func TestThreadCreationIsUIOnly(t *testing.T) {
 		"permission.respond": {"permission.respond", map[string]any{"requestId": "r-1", "allow": true}},
 		// The three F5 sites the first pass missed. agent.fork CREATES a thread
 		// carrying the source's whole authority; agent.promote relaunches one
-		// somewhere else; agent.setOption can raise a LIVE thread's permission
+		// somewhere else; agent.updateSettings can raise a LIVE thread's permission
 		// mode, which is the shortest escalation path in the whole surface.
 		"agent.fork":    {"agent.fork", map[string]any{"threadId": "t-dormant"}},
 		"agent.promote": {"agent.promote", map[string]any{"threadId": "t-dormant"}},
-		"agent.setOption": {"agent.setOption", map[string]any{
-			"threadId": "t-dormant", "option": "permissionMode",
-			"value": "bypassPermissions"}},
+		"agent.updateSettings": {"agent.updateSettings", map[string]any{
+			"agentRef": map[string]any{"threadId": "t-dormant"},
+			"requested": map[string]any{"permissionMode": "bypassPermissions"}}},
 		// ...and the stored recipes that decide what a future thread starts with.
 		"mode.save": {"mode.save", map[string]any{
 			"mode": map[string]any{"name": "planted"}}},
@@ -766,7 +764,7 @@ func TestWorkerLaunchReservationIsAtomic(t *testing.T) {
 	if err := sessions.Put(parent); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	caps := harness.Capabilities{ID: "fake", PermissionModes: []string{"acceptEdits"}}
+	caps := harness.HarnessDescriptor{ContractVersion: harness.ContractVersion, ID: "fake"}
 	d, allow, _ := authTestDeps(t, sessions, runningFake{&fakeHarness{}})
 	allow.Store(true)
 
@@ -884,7 +882,7 @@ func TestEffectiveIsolationIsWhatIsGated(t *testing.T) {
 
 	// ...and the gate asks the human for a fresh-repo "auto" exactly as it does
 	// for an explicit "workspace", at the launcher's own permission mode.
-	caps := harness.Capabilities{ID: "fake", PermissionModes: []string{"acceptEdits"}}
+	caps := harness.HarnessDescriptor{ContractVersion: harness.ContractVersion, ID: "fake"}
 	for name, tc := range map[string]struct {
 		project   string
 		isolation string
@@ -987,7 +985,7 @@ func TestRestrictionRelaxationAsksTheHuman(t *testing.T) {
 	if err := sessions.Put(parent); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	caps := harness.Capabilities{ID: "fake", PermissionModes: []string{"acceptEdits"}}
+	caps := harness.HarnessDescriptor{ContractVersion: harness.ContractVersion, ID: "fake"}
 	d, allow, asks := authTestDeps(t, sessions, &fakeHarness{})
 
 	allow.Store(false)

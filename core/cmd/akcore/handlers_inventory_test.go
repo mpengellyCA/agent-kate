@@ -17,7 +17,7 @@ package main
 // handlers. It did not catch a WRONG reason: the entry was a free-text string
 // and the only assertion on it was that it was non-empty, so
 //
-//	"agent.discoverModels": "the engine/provider model catalogue; no thread state"
+//	"harness.catalog": "the engine/provider model catalogue; no thread state"
 //
 // passed — a sentence that is true about the RESULT and silent about the
 // parameter, which was an attacker-chosen URL plus the name of an environment
@@ -41,7 +41,7 @@ package main
 //     every key that could name a network endpoint, a filesystem path, an
 //     environment variable or another thread. A handler that HONOURS one of
 //     those is not a static catalogue whatever its comment says. This is the
-//     check that agent.discoverModels fails.
+//     check that a caller-controlled catalogue lookup fails.
 //  4. Every entry must be PROVEN REACHABLE. An exemption for a method that is
 //     actually gated is a lie about the boundary and now fails.
 //
@@ -199,7 +199,7 @@ func bindingName(f any) string {
 // endpoint, an environment variable to read a credential from, a filesystem
 // path, another thread. A handler whose reply changes when these are supplied
 // is reaching somewhere on the caller's instruction, and "static catalogue" is
-// the wrong basis for it — which is exactly what agent.discoverModels was doing
+// the wrong basis for it — which is exactly what the former catalogue lookup did
 // under "no thread state".
 //
 // Deliberately absent: keys that select WITHIN the handler's own catalogue
@@ -207,22 +207,19 @@ func bindingName(f any) string {
 // including it here would flag the honest handlers along with the dangerous
 // ones — a check that fires on everything gets suppressed like any other.
 var hostileProbe = map[string]any{
-	"provider": map[string]any{
-		"id": "probe", "baseUrl": "http://127.0.0.1:9/",
-		"envVar": "HOME", "authToken": "probe",
-	},
-	"baseUrl":   "http://127.0.0.1:9/",
-	"url":       "http://127.0.0.1:9/",
-	"envVar":    "HOME",
-	"env":       map[string]string{"HOME": "/"},
-	"backend":   "probe-no-such-backend",
-	"target":    "/",
-	"path":      "/",
-	"cwd":       "/",
-	"command":   "/bin/true",
-	"threadId":  "t-a",
-	"sessionId": "probe",
-	"query":     "probe",
+	"providerId": "probe",
+	"baseUrl":    "http://127.0.0.1:9/",
+	"url":        "http://127.0.0.1:9/",
+	"envVar":     "HOME",
+	"env":        map[string]string{"HOME": "/"},
+	"backend":    "probe-no-such-backend",
+	"target":     "/",
+	"path":       "/",
+	"cwd":        "/",
+	"command":    "/bin/true",
+	"threadId":   "t-a",
+	"sessionId":  "probe",
+	"query":      "probe",
 }
 
 // agentReachable is the reviewed set: methods an agent's own (authenticated,
@@ -364,14 +361,9 @@ var agentReachable = map[string]reachDecision{
 
 	// --- static catalogues: the same answer for every caller ---------------
 	// Verified by hostileProbe, not asserted. Everything that used to sit here
-	// and DID take caller-supplied reach — agent.discoverOptions,
-	// agent.discoverModels, vsix.list, vsix.search, skills.listInstalled — is
+	// and DID take caller-supplied reach — the former option/catalogue lookup,
+	// vsix.list, vsix.search, skills.listInstalled — is
 	// gated in handlers.go now (audit F36 pass 5) and is deliberately absent.
-	"agent.capabilities": {
-		Basis: basisStaticCatalogue,
-		Why: "the registered harnesses' compiled-in capability sets, in picker " +
-			"order; the handler reads no parameters at all",
-	},
 	"mode.list": {
 		Basis: basisStaticCatalogue,
 		Why: "the ensemble recipe catalogue; the mutations (save/delete/apply) " +
@@ -616,7 +608,7 @@ func checkBasis(t *testing.T, method string, d reachDecision, p basisProbes) {
 				"that names a URL, an environment variable, a path or a thread "+
 				"gets a DIFFERENT answer — so caller-supplied input reaches "+
 				"something.\n  bare:    %s / %s\n  hostile: %s / %s\n"+
-				"This is the shape agent.discoverModels had: a truthful sentence "+
+				"This is the shape a caller-controlled catalogue lookup had: a truthful sentence "+
 				"about the result, and a parameter nobody classified. Gate it, or "+
 				"give it a basis that describes what the parameter reaches.",
 				method, bareRes, bareErr, hostRes, hostErr)
