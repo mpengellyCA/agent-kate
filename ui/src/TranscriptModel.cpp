@@ -70,6 +70,17 @@ void TranscriptModel::normalizeFirstMessageRun()
     }
 }
 
+void TranscriptModel::touchPreviousActivityNeighbour(int appendedRow)
+{
+    if (appendedRow <= 0 || appendedRow > m_items.size() - 1) {
+        return;
+    }
+    const Kind previous = m_items.at(appendedRow - 1).kind;
+    if (previous == Tool || previous == Thinking || previous == Note) {
+        touched(appendedRow - 1);
+    }
+}
+
 int TranscriptModel::appendMessage(Speaker speaker, const QString &bodyHtml,
                                    const QString &plain, bool replayed,
                                    const QString &timestamp,
@@ -99,6 +110,7 @@ int TranscriptModel::appendMessage(Speaker speaker, const QString &bodyHtml,
         m_items[row].runPosition = MessageRunPosition::Last;
         touched(row - 1);
     }
+    touchPreviousActivityNeighbour(row);
     // A row appended while find is active (streaming under an open find bar)
     // must highlight without waiting for the next keystroke.
     if (!m_findNeedleLower.isEmpty()) {
@@ -123,6 +135,7 @@ int TranscriptModel::appendNote(const QString &html, const QString &noteKind,
     beginInsertRows({}, row, row);
     m_items.append(it);
     endInsertRows();
+    touchPreviousActivityNeighbour(row);
     if (!m_findNeedleLower.isEmpty()) {
         updateFindMatch(row);
     }
@@ -145,6 +158,7 @@ int TranscriptModel::appendTool(const QString &toolName, const QString &summary,
     beginInsertRows({}, row, row);
     m_items.append(it);
     endInsertRows();
+    touchPreviousActivityNeighbour(row);
     enforceCap();
     return key;
 }
@@ -163,6 +177,7 @@ int TranscriptModel::appendThinking(const QString &bodyHtml, const QString &plai
     beginInsertRows({}, row, row);
     m_items.append(it);
     endInsertRows();
+    touchPreviousActivityNeighbour(row);
     enforceCap();
     return key;
 }
@@ -178,6 +193,7 @@ int TranscriptModel::appendChecklist(const QJsonArray &items)
     beginInsertRows({}, row, row);
     m_items.append(it);
     endInsertRows();
+    touchPreviousActivityNeighbour(row);
     enforceCap();
     return key;
 }

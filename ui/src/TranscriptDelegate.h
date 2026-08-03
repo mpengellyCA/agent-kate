@@ -262,21 +262,28 @@ private:
 
     // Geometry helpers shared by paint() and editorEvent(): given the row rect
     // and index, compute the sub-rects of the tool header / copy button.
-    QRect toolHeaderRect(const QRect &row) const;
-    QRect toolCopyRect(const QRect &row) const;
+    QRect toolHeaderRect(const QRect &row, const QStyleOptionViewItem &opt) const;
+    QRect toolCopyRect(const QRect &row, const QStyleOptionViewItem &opt) const;
     // The "open in inspector" glyph sits immediately left of the copy glyph.
-    QRect toolInspectRect(const QRect &row) const;
+    QRect toolInspectRect(const QRect &row, const QStyleOptionViewItem &opt) const;
 
     QList<QRect> attachmentRects(const QRect &row, const QStyleOptionViewItem &opt,
                                  const QModelIndex &idx) const;
 
-    // Height of the attachment chip block for a Message row (0 if none),
+    // The same durable attachment tile geometry is used below a message and a
+    // tool result. Keeping the tool variant private avoids expanding the
+    // delegate's view contract while ensuring its click targets match paint.
+    QList<QRect> toolAttachmentRects(const QRect &row,
+                                     const QStyleOptionViewItem &opt,
+                                     const QModelIndex &idx) const;
+
+    // Height of the attachment tile block for a Message row (0 if none),
     // including the gap above it — used by messageBodyRect and layoutRow so the
     // overlay never covers the chips.
     int attachmentsBlockHeight(const QModelIndex &idx,
                                const QStyleOptionViewItem &opt, int innerW) const;
 
-    // The index of the attachment chip a point falls in (in the row's device
+    // The index of the attachment tile a point falls in (in the row's device
     // coordinates), or -1 — used by editorEvent to open the clicked attachment.
     int attachmentChipAt(const QRect &row, const QStyleOptionViewItem &opt,
                          const QModelIndex &idx, const QPoint &pos) const;

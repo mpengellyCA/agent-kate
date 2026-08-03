@@ -13,6 +13,7 @@
 #include "ToolInspectorDialog.h"
 #include "TranscriptDelegate.h"
 #include "TranscriptModel.h"
+#include "state/ChatAppearance.h"
 #include "WorkflowMonitor.h"
 #include "WorkflowMonitorDialog.h"
 #include "ipc/CoreClient.h"
@@ -671,6 +672,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
             &AgentPanel::openToolInspector);
     connect(m_delegate, &TranscriptDelegate::appearanceChanged, this, [this] {
         closeSelectionOverlay();
+        applyChatSettings(); // re-space prompts/controls with the transcript
         // QListView may ask every row for its estimate here, but the delegate
         // deliberately serves cached old heights until the existing settle pass
         // walks only the visible rows at the new appearance generation.
@@ -2121,6 +2123,24 @@ void AgentPanel::applyChatSettings()
 
     const bool showTools = cfg.readEntry("showTools", true);
     m_model->setToolsVisible(showTools);
+    // The two action-focused transcript companions remain stronger than passive
+    // activity, but must share the selected transcript type scale and rhythm.
+    const TranscriptMetrics metrics = ChatAppearance::instance()->metrics(
+        font(), palette(), m_view ? m_view->viewport()->width() : width(), devicePixelRatioF());
+    if (m_permBar) {
+        m_permBar->setFont(metrics.bodyFont);
+        if (auto *layout = qobject_cast<QHBoxLayout *>(m_permBar->layout())) {
+            layout->setContentsMargins(metrics.activityPaddingX, metrics.activityPaddingY,
+                                       metrics.activityPaddingX, metrics.activityPaddingY);
+            layout->setSpacing(metrics.activityGap * 2);
+        }
+    }
+    if (m_questionBox && m_questionLayout) {
+        m_questionBox->setFont(metrics.bodyFont);
+        m_questionLayout->setContentsMargins(metrics.activityPaddingX, metrics.activityPaddingX,
+                                             metrics.activityPaddingX, metrics.activityPaddingX);
+        m_questionLayout->setSpacing(metrics.activityGap + 2);
+    }
     // The empty state quotes the send key, so it has to be re-composed when the
     // setting flips (audit F44).
     updateFeedEmptyState();

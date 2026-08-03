@@ -23,10 +23,20 @@ struct TranscriptMetrics {
     int messageHeaderHeight = 18;
     int messageHeaderGap = 4;
     int attachmentGap = 8;
+    // Passive transcript activity (tools, thinking and ordinary notes) uses a
+    // quieter rhythm than a conversational bubble. Keeping these values here
+    // means its paint, hit testing and measurement respond together to density.
+    int activityGap = 3;
+    int activityPaddingX = 10;
+    int activityPaddingY = 6;
+    int activityHeaderHeight = 30;
     int narrowBubbleWidth = 480;
     int activityRailWidth = 3;
     int attachmentTileEdge = 48;
     int attachmentTileDeviceEdge = 48;
+    int attachmentTileHeight = 44;
+    int attachmentTileGap = 6;
+    int attachmentTileMaxWidth = 248;
     int assistantMaxWidth = 820;
     int userMaxWidth = 0;
     QFont bodyFont;

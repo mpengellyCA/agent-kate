@@ -113,11 +113,18 @@ TranscriptMetrics ChatAppearance::metrics(const QFont &applicationFont, const QP
     result.messageHeaderHeight = scaled(18, densityFactor);
     result.messageHeaderGap = scaled(4, densityFactor);
     result.attachmentGap = scaled(8, densityFactor);
+    result.activityGap = scaled(3, densityFactor);
+    result.activityPaddingX = scaled(10, densityFactor);
+    result.activityPaddingY = scaled(6, densityFactor);
+    result.activityHeaderHeight = scaled(30, densityFactor);
     result.narrowBubbleWidth = scaled(480, densityFactor);
     result.activityRailWidth = scaled(3, densityFactor);
     result.attachmentTileEdge = scaled(48, densityFactor);
     result.attachmentTileDeviceEdge = qMax(1, qRound(result.attachmentTileEdge
                                                        * qMax<qreal>(1.0, devicePixelRatio)));
+    result.attachmentTileHeight = scaled(44, densityFactor);
+    result.attachmentTileGap = scaled(6, densityFactor);
+    result.attachmentTileMaxWidth = scaled(248, densityFactor);
 
     result.bodyFont = applicationFont;
     result.bodyFont.setPointSizeF(qMax(6.0, applicationFont.pointSizeF() + 1.0 + m_textScale));

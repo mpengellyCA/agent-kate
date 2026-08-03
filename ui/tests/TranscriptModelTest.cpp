@@ -54,6 +54,7 @@ private Q_SLOTS:
     void thinkingRowExpands();
     void checklistUpdatesInPlace();
     void toolAttachmentsAddChips();
+    void activityNeighbourInvalidationIsTargeted();
     void mcpToolsSummarizeTheirArguments();
     void compactionCapabilitySplitsHotFromCold();
     void permissionModeDefaultIsNamedNotPositional();
@@ -1212,6 +1213,28 @@ void TranscriptModelTest::toolAttachmentsAddChips()
     const int note = m.appendNote(QStringLiteral("n"), QStringLiteral("sys"));
     m.setToolAttachments(note, got);
     QVERIFY(m.data(m.index(1), TranscriptModel::AttachmentsRole).toJsonArray().isEmpty());
+}
+
+// Phase 3 activity rails are derived from adjacent rows at paint time. Only the
+// previous activity can change when a row is appended, so the model must not
+// turn this small visual update into a full-feed dataChanged.
+void TranscriptModelTest::activityNeighbourInvalidationIsTargeted()
+{
+    TranscriptModel m;
+    const int tool = m.appendTool(QStringLiteral("Read"), QStringLiteral("main.cpp"),
+                                  QStringLiteral("{}"), true);
+    QSignalSpy changed(&m, &QAbstractItemModel::dataChanged);
+
+    m.appendThinking(QStringLiteral("<p>check includes</p>"),
+                     QStringLiteral("check includes"), QStringLiteral("check includes"));
+    QCOMPARE(changed.count(), 1);
+    QCOMPARE(changed.takeFirst().at(0).toModelIndex().row(), tool);
+
+    const int thinking = 1;
+    m.appendMessage(TranscriptModel::Speaker::Agent, QStringLiteral("Done"),
+                    QStringLiteral("Done"), false, QString());
+    QCOMPARE(changed.count(), 1);
+    QCOMPARE(changed.takeFirst().at(0).toModelIndex().row(), thinking);
 }
 
 // Cooperation and Cowork tool rows (plan 16 P2 / Feature 4b) read as sentences

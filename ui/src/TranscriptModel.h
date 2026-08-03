@@ -241,6 +241,10 @@ private:
     // bounded. Called after every append.
     void enforceCap();
     void normalizeFirstMessageRun();
+    // Activity rows draw a continuous rail with their immediate neighbours.
+    // Appending a boundary can therefore alter only the preceding activity
+    // row's paint/height; notify that one row instead of invalidating the feed.
+    void touchPreviousActivityNeighbour(int appendedRow);
 
     QList<Item> m_items;
     quintptr m_nextId = 1;

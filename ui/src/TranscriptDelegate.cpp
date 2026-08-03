@@ -31,26 +31,10 @@
 #include <QUrl>
 
 namespace {
-// Geometry constants for a transcript row. All paint/measure/hit-test code goes
-// through these so the height cache, the painter and editorEvent stay in sync.
-constexpr int kOuterMarginX = 4;  // matches the old feed layout contentsMargins
-constexpr int kRowSpacing = 8;    // vertical gap between rows (old layout spacing)
-constexpr int kCardPadX = 12;     // message card horizontal padding
-constexpr int kCardPadTop = 9;
-constexpr int kCardPadBottom = 11;
-constexpr int kRoleRowGap = 3;    // gap under the role row
-constexpr int kNotePadX = 8;
-constexpr int kNotePadY = 1;
-// Attachment chip row under a You message body (plan 13 phase 4).
-constexpr int kChipGapTop = 8;  // gap between the body and the chip row
-constexpr int kChipH = 24;      // chip height
-constexpr int kChipVGap = 4;    // vertical gap between wrapped chip rows
-constexpr int kChipHGap = 6;    // horizontal gap between chips
-constexpr int kChipPadX = 9;    // text padding inside a chip
-constexpr int kChipIcon = 16;   // image-preview icon edge inside a chip
-constexpr int kChipMaxW = 220;  // max chip width before the name elides
+// Remaining tool-local geometry. Transcript-wide geometry belongs to
+// TranscriptMetrics so density changes remain coherent across measure, paint
+// and hit testing.
 constexpr int kToolPad = 6;       // tool card inner padding
-constexpr int kToolHeaderH = 28;  // clickable header height
 constexpr int kToolCopyW = 26;    // copy hit zone on the right of the header
 constexpr int kToolInspectW = 26; // "open in inspector" glyph, left of the copy glyph
 constexpr int kDetailPadX = 10;
@@ -261,52 +245,142 @@ void configureTranscriptDocument(QTextDocument *doc, const TranscriptMetrics &me
     doc->setTextWidth(contentWidth);
 }
 
-// One laid-out attachment chip: its rect (in the coordinate space of the origin
-// passed to layoutAttachmentChips) plus the elided label and whether it carries
-// an image thumbnail.
-struct ChipLayout {
+// A compact durable attachment object. Its details are intentionally derived
+// only from fields already in the model: resolving a path or stat'ing a file
+// while scrolling would turn a rich visual into a scroll-path regression.
+struct AttachmentTileLayout {
     QRect rect;
-    QString label;   // already elided to fit
+    QString name;    // already elided to fit
+    QString detail;  // type-only metadata, never synchronous file metadata
     bool image = false;
+    QString glyph;
 };
 
-// Flow-lay the attachment chips of a You message across `availW`, wrapping onto
-// further rows. `origin` is the top-left of the chip area. Returns the chips and,
-// via `outHeight`, the total height the chip block occupies (0 for no chips).
-// Shared by measure, paint and hit-test so all three agree exactly.
-QList<ChipLayout> layoutAttachmentChips(const QJsonArray &atts, const QFont &font,
-                                        const QPoint &origin, int availW, int &outHeight)
+QString attachmentDetail(const QJsonObject &att)
 {
-    QList<ChipLayout> chips;
+    const QString mediaType = att.value(QStringLiteral("mediaType")).toString();
+    if (!mediaType.isEmpty()) {
+        const int slash = mediaType.indexOf(QLatin1Char('/'));
+        const QString subtype = slash >= 0 ? mediaType.mid(slash + 1).toUpper()
+                                           : mediaType.toUpper();
+        return i18nc("attachment type", "%1 file", subtype);
+    }
+    const QString kind = att.value(QStringLiteral("kind")).toString();
+    if (kind == QLatin1String("image"))
+        return i18n("Image");
+    if (kind == QLatin1String("text"))
+        return i18n("Text file");
+    return i18n("Attachment");
+}
+
+QString attachmentGlyph(const QJsonObject &att, bool image)
+{
+    if (image)
+        return QStringLiteral("▧");
+    if (att.value(QStringLiteral("kind")).toString() == QLatin1String("text"))
+        return QStringLiteral("▤");
+    return QStringLiteral("▱");
+}
+
+// Shared by message and tool-result attachments. It has no file-system work:
+// thumbnails are resolved only at paint through the delegate's bounded cache.
+QList<AttachmentTileLayout> layoutAttachmentTiles(const QJsonArray &atts,
+                                                   const TranscriptMetrics &metrics,
+                                                   const QPoint &origin, int availW,
+                                                   int &outHeight)
+{
+    QList<AttachmentTileLayout> tiles;
     outHeight = 0;
     if (atts.isEmpty() || availW <= 0) {
-        return chips;
+        return tiles;
     }
-    const QFontMetrics fm(font);
+    const QFontMetrics nameFm(metrics.bodyFont);
+    const QFontMetrics detailFm(metrics.metadataFont);
     int x = origin.x();
     int y = origin.y();
-    int rowH = kChipH;
+    const int iconEdge = qMax(16, metrics.attachmentTileHeight - 10);
+    const int pad = qMax(5, metrics.activityPaddingY);
+    const int minW = qMin(availW, qMax(112, iconEdge + pad * 3 + 48));
     for (const QJsonValue &av : atts) {
         const QJsonObject att = av.toObject();
-        const bool image =
-            att.value(QStringLiteral("kind")).toString() == QLatin1String("image");
-        const QString name = att.value(QStringLiteral("name")).toString();
-        const int iconW = image ? kChipIcon + kChipHGap : 0;
-        const int textAvail = qMax(1, kChipMaxW - 2 * kChipPadX - iconW);
-        const QString label = fm.elidedText(name, Qt::ElideMiddle, textAvail);
-        const int chipW = qMin(kChipMaxW,
-                               2 * kChipPadX + iconW + fm.horizontalAdvance(label));
-        // Wrap to the next row when this chip would overflow the available width
-        // (but always place at least one chip per row).
-        if (x > origin.x() && x + chipW > origin.x() + availW) {
+        const QString media = att.value(QStringLiteral("mediaType")).toString();
+        const bool image = att.value(QStringLiteral("kind")).toString() == QLatin1String("image")
+            || media.startsWith(QLatin1String("image/"), Qt::CaseInsensitive);
+        const QString detail = attachmentDetail(att);
+        const int maximumText = qMax(1, metrics.attachmentTileMaxWidth - iconEdge - 3 * pad);
+        const QString name = nameFm.elidedText(att.value(QStringLiteral("name")).toString(),
+                                                Qt::ElideMiddle, maximumText);
+        const int textW = qMax(nameFm.horizontalAdvance(name), detailFm.horizontalAdvance(detail));
+        const int tileW = qMin(metrics.attachmentTileMaxWidth,
+                               qMax(minW, iconEdge + 3 * pad + textW));
+        if (x > origin.x() && x + tileW > origin.x() + availW) {
             x = origin.x();
-            y += rowH + kChipVGap;
+            y += metrics.attachmentTileHeight + metrics.attachmentTileGap;
         }
-        chips.append(ChipLayout{QRect(x, y, chipW, kChipH), label, image});
-        x += chipW + kChipHGap;
+        tiles.append(AttachmentTileLayout{QRect(x, y, tileW, metrics.attachmentTileHeight),
+                                          name, detail, image, attachmentGlyph(att, image)});
+        x += tileW + metrics.attachmentTileGap;
     }
-    outHeight = (y - origin.y()) + rowH;
-    return chips;
+    outHeight = (y - origin.y()) + metrics.attachmentTileHeight;
+    return tiles;
+}
+
+void paintAttachmentTiles(QPainter *painter, const TranscriptDelegate *delegate,
+                          const QJsonArray &atts,
+                          const QList<AttachmentTileLayout> &tiles,
+                          const QPoint &origin, const QStyleOptionViewItem &opt,
+                          const TranscriptMetrics &metrics)
+{
+    const int pad = qMax(5, metrics.activityPaddingY);
+    const int iconEdge = qMax(16, metrics.attachmentTileHeight - 10);
+    const QFontMetrics nameFm(metrics.bodyFont);
+    painter->save();
+    painter->setRenderHint(QPainter::Antialiasing, true);
+    for (int i = 0; i < tiles.size(); ++i) {
+        AttachmentTileLayout tile = tiles.at(i);
+        tile.rect.translate(origin);
+        const QJsonObject att = atts.at(i).toObject();
+        painter->setPen(ThemeManager::palette().chatBorder);
+        painter->setBrush(ThemeManager::palette().chatAttachmentSurface);
+        painter->drawRoundedRect(tile.rect.adjusted(0, 0, -1, -1), 7, 7);
+        const QRect iconR(tile.rect.left() + pad,
+                          tile.rect.top() + (tile.rect.height() - iconEdge) / 2,
+                          iconEdge, iconEdge);
+        if (tile.image) {
+            const QPixmap pm = delegate->chipPixmap(att, iconEdge,
+                                                      painter->device()->devicePixelRatioF());
+            if (!pm.isNull()) {
+                drawChipThumbnail(painter, iconR, pm);
+            } else {
+                painter->setPen(ThemeManager::palette().chatMetadata);
+                painter->drawText(iconR, Qt::AlignCenter, tile.glyph);
+            }
+        } else {
+            painter->setPen(ThemeManager::palette().chatMetadata);
+            painter->drawText(iconR, Qt::AlignCenter, tile.glyph);
+        }
+        const int textLeft = iconR.right() + pad + 1;
+        const QRect nameR(textLeft, tile.rect.top() + 4,
+                          tile.rect.right() - textLeft - pad + 1,
+                          qMax(1, tile.rect.height() / 2 - 2));
+        const QRect detailR(textLeft, nameR.bottom() + 1, nameR.width(),
+                            tile.rect.bottom() - nameR.bottom() - 3);
+        painter->setFont(metrics.bodyFont);
+        painter->setPen(opt.palette.color(QPalette::Text));
+        painter->drawText(nameR, Qt::AlignLeft | Qt::AlignVCenter,
+                          nameFm.elidedText(tile.name, Qt::ElideMiddle, nameR.width()));
+        painter->setFont(metrics.metadataFont);
+        painter->setPen(att.value(QStringLiteral("outside")).toBool()
+                            ? opt.palette.color(QPalette::LinkVisited)
+                            : ThemeManager::palette().chatMetadata);
+        QString detail = tile.detail;
+        if (att.value(QStringLiteral("outside")).toBool())
+            detail += QStringLiteral(" · ") + i18n("outside workspace");
+        painter->drawText(detailR, Qt::AlignLeft | Qt::AlignVCenter,
+                          QFontMetrics(metrics.metadataFont).elidedText(
+                              detail, Qt::ElideRight, detailR.width()));
+    }
+    painter->restore();
 }
 
 // THE WIDTH TRAP: sizeHint() and paint() must measure at the SAME width, or the
@@ -336,6 +410,42 @@ int rowMeasureWidth(const QStyleOptionViewItem &opt)
         return opt.rect.width();
     }
     return opt.widget && opt.widget->width() > 0 ? opt.widget->width() : 400;
+}
+
+bool isPassiveActivity(const TranscriptModel::Item &item)
+{
+    // Errors deliberately break the quiet stream: their stronger treatment is
+    // an attention boundary rather than a continuation of routine activity.
+    return item.kind == TranscriptModel::Tool || item.kind == TranscriptModel::Thinking
+        || (item.kind == TranscriptModel::Note && item.noteKind != QLatin1String("err"));
+}
+
+struct ActivityNeighbours {
+    bool previous = false;
+    bool next = false;
+};
+
+ActivityNeighbours activityNeighbours(const QModelIndex &idx)
+{
+    const auto *model = qobject_cast<const TranscriptModel *>(idx.model());
+    if (!model || idx.row() < 0 || idx.row() >= model->count()
+        || !isPassiveActivity(model->itemAt(idx.row()))) {
+        return {};
+    }
+    return {idx.row() > 0 && isPassiveActivity(model->itemAt(idx.row() - 1)),
+            idx.row() + 1 < model->count() && isPassiveActivity(model->itemAt(idx.row() + 1))};
+}
+
+void paintActivityRail(QPainter *painter, const QRect &row, const TranscriptMetrics &metrics,
+                       const ActivityNeighbours &neighbours, const QColor &color)
+{
+    const int x = row.left() + metrics.outerInsetX;
+    const int top = row.top() + (neighbours.previous ? 0 : metrics.activityPaddingY);
+    const int bottom = row.bottom() - (neighbours.next ? 0 : metrics.activityPaddingY);
+    if (bottom < top) {
+        return;
+    }
+    painter->fillRect(QRect(x, top, metrics.activityRailWidth, bottom - top + 1), color);
 }
 } // namespace
 
@@ -640,8 +750,12 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
         return 0;
     }
 
-    const int contentLeft = kOuterMarginX;
-    const int contentWidth = width - 2 * kOuterMarginX;
+    const qreal dpr = painter ? painter->device()->devicePixelRatioF()
+                              : (opt.widget ? opt.widget->devicePixelRatioF() : 1.0);
+    const TranscriptMetrics metrics = ChatAppearance::instance()->metrics(
+        opt.font, opt.palette, width, dpr);
+    const int contentLeft = metrics.outerInsetX;
+    const int contentWidth = width - 2 * metrics.outerInsetX;
     if (contentWidth <= 0) {
         return lineH;
     }
@@ -653,17 +767,35 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
         // the note's own wrap width so the two never overlap. Replayed notes
         // have no timestamp — and get no reserved column.
         const QString ts = idx.data(TranscriptModel::TimestampRole).toString();
-        QFont small = opt.font;
-        small.setPointSizeF(opt.font.pointSizeF() * 0.85);
+        const bool error = idx.data(TranscriptModel::NoteKindRole).toString()
+            == QLatin1String("err");
+        const ActivityNeighbours neighbours = activityNeighbours(idx);
+        QFont small = metrics.metadataFont;
         const int tsW =
-            ts.isEmpty() ? 0 : QFontMetrics(small).horizontalAdvance(ts) + kNotePadX;
-        const int textW = contentWidth - 2 * kNotePadX - tsW;
+            ts.isEmpty() ? 0 : QFontMetrics(small).horizontalAdvance(ts) + metrics.activityPaddingX;
+        const int textW = contentWidth - 2 * metrics.activityPaddingX - tsW
+            - metrics.activityRailWidth - metrics.activityPaddingX;
         QTextDocument *doc = self->bodyDoc(idx, qMax(1, textW), opt);
-        const int h = int(doc->size().height()) + 2 * kNotePadY;
+        const int h = int(doc->size().height()) + 2 * metrics.activityPaddingY;
         if (painter) {
+            const QRect surface(rowRect.left() + contentLeft + metrics.activityRailWidth
+                                    + metrics.activityPaddingX,
+                                rowRect.top(),
+                                qMax(1, contentWidth - metrics.activityRailWidth
+                                           - metrics.activityPaddingX), h);
             painter->save();
-            painter->translate(rowRect.left() + contentLeft + kNotePadX,
-                               rowRect.top() + kNotePadY);
+            painter->setRenderHint(QPainter::Antialiasing, true);
+            QColor background = error ? ThemeManager::palette().negative
+                                      : ThemeManager::palette().chatActivitySurface;
+            background.setAlpha(error ? 48 : 255);
+            painter->setPen(error ? ThemeManager::palette().negative : Qt::NoPen);
+            painter->setBrush(background);
+            painter->drawRoundedRect(surface.adjusted(0, 0, -1, -1), 6, 6);
+            if (!error)
+                paintActivityRail(painter, rowRect, metrics, neighbours,
+                                  ThemeManager::palette().chatRail);
+            painter->translate(surface.left() + metrics.activityPaddingX,
+                               surface.top() + metrics.activityPaddingY);
             QAbstractTextDocumentLayout::PaintContext ctx;
             ctx.palette = opt.palette;
             ctx.palette.setColor(QPalette::Text,
@@ -674,9 +806,9 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
             if (tsW > 0) {
                 painter->save();
                 painter->setFont(small);
-                painter->setPen(opt.palette.color(QPalette::Mid));
-                painter->drawText(QRect(rowRect.left() + contentLeft + kNotePadX + textW,
-                                        rowRect.top() + kNotePadY, tsW, lineH),
+                painter->setPen(ThemeManager::palette().chatMetadata);
+                painter->drawText(QRect(surface.left() + metrics.activityPaddingX + textW,
+                                        surface.top() + metrics.activityPaddingY, tsW, lineH),
                                   Qt::AlignRight | Qt::AlignVCenter, ts);
                 painter->restore();
             }
@@ -685,10 +817,6 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
     }
 
     if (kind == TranscriptModel::Message) {
-        const qreal dpr = painter ? painter->device()->devicePixelRatioF()
-                                  : (opt.widget ? opt.widget->devicePixelRatioF() : 1.0);
-        const TranscriptMetrics metrics = ChatAppearance::instance()->metrics(
-            opt.font, opt.palette, width, dpr);
         const auto speaker = TranscriptModel::Speaker(
             idx.data(TranscriptModel::SpeakerRole).toInt());
         const auto position = TranscriptModel::MessageRunPosition(
@@ -708,10 +836,9 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
         // translated when painting — this used to run twice per paint (once to
         // measure, once to place), rebuilding every elided label string (audit
         // F18).
-        QList<ChipLayout> chips;
+        QList<AttachmentTileLayout> tiles;
         if (!atts.isEmpty()) {
-            chips = layoutAttachmentChips(atts, metrics.bodyFont, QPoint(0, 0), innerW,
-                                          chipsH);
+            tiles = layoutAttachmentTiles(atts, metrics, QPoint(0, 0), innerW, chipsH);
         }
         const int chipsBlock = chipsH > 0 ? metrics.attachmentGap + chipsH : 0;
         const int headerH = showHeader ? metrics.messageHeaderHeight
@@ -765,65 +892,28 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
             doc->documentLayout()->draw(painter, ctx);
             painter->restore();
 
-            // Attachment chips, laid out in the coordinate space of the card so
-            // the chip rects here match the hit-test rects in editorEvent().
+            // Typed attachment tiles are laid out in the coordinate space of the
+            // card so their paint and click targets remain identical.
             if (chipsH > 0) {
                 const QPoint origin(bodyRect.left(), bodyRect.bottom() + 1
                                                     + metrics.attachmentGap);
-                painter->save();
-                painter->setRenderHint(QPainter::Antialiasing, true);
-                QFont chipFont = metrics.metadataFont;
-                for (int i = 0; i < chips.size(); ++i) {
-                    ChipLayout c = chips.at(i);
-                    c.rect.translate(origin);
-                    const QJsonObject att = atts.at(i).toObject();
-                    // Chip background + border (palette-only).
-                    painter->setPen(opt.palette.color(QPalette::Mid));
-                    painter->setBrush(opt.palette.color(QPalette::Base));
-                    painter->drawRoundedRect(c.rect.adjusted(0, 0, -1, -1), 6, 6);
-                    int textLeft = c.rect.left() + kChipPadX;
-                    if (c.image) {
-                        // Chips on replayed cards have only a path (no dataB64),
-                        // so the thumbnail comes from a file. Which file is
-                        // resolveAttachmentPath's call: the origin unless our
-                        // cached copy is the one still holding the sent bytes.
-                        const QPixmap pm = self->chipPixmap(
-                            att, kChipIcon, painter->device()->devicePixelRatioF());
-                        const QRect iconR(textLeft, c.rect.top() + (kChipH - kChipIcon) / 2,
-                                          kChipIcon, kChipIcon);
-                        if (!pm.isNull()) {
-                            drawChipThumbnail(painter, iconR, pm);
-                        } else {
-                            painter->setPen(opt.palette.color(QPalette::Mid));
-                            painter->drawText(iconR, Qt::AlignCenter,
-                                              QStringLiteral("\U0001f5bc"));
-                        }
-                        textLeft += kChipIcon + kChipHGap;
-                    }
-                    painter->setFont(chipFont);
-                    painter->setPen(opt.palette.color(
-                        att.value(QStringLiteral("outside")).toBool()
-                            ? QPalette::LinkVisited
-                            : QPalette::Link));
-                    painter->drawText(
-                        QRect(textLeft, c.rect.top(),
-                              c.rect.right() - textLeft - kChipPadX + 1, c.rect.height()),
-                        Qt::AlignLeft | Qt::AlignVCenter, c.label);
-                }
-                painter->restore();
+                paintAttachmentTiles(painter, self, atts, tiles, origin, opt, metrics);
             }
         }
         return total;
     }
 
     if (kind == TranscriptModel::Thinking) {
-        // A quiet, collapsible reasoning row: no card frame, just a dim header
-        // line ("▸ 💭 Thinking · preview") that expands to the dim body.
+        // Reasoning is passive activity, not a second chat speaker. Its rail
+        // joins adjacent tools/notes while the disclosure keeps the body on
+        // demand.
         const bool expanded = idx.data(TranscriptModel::ToolExpandedRole).toBool();
-        int total = kToolHeaderH;
+        const ActivityNeighbours neighbours = activityNeighbours(idx);
+        int total = metrics.activityHeaderHeight;
         QTextDocument *thinkDoc = nullptr;
         int bodyH = 0;
-        const int bodyW = contentWidth - 2 * kDetailPadX;
+        const int bodyW = contentWidth - metrics.activityRailWidth
+            - metrics.activityPaddingX - kDetailPadX;
         if (expanded) {
             thinkDoc = self->bodyDoc(idx, qMax(1, bodyW), opt);
             bodyH = int(thinkDoc->size().height());
@@ -832,22 +922,34 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
         if (painter) {
             const QString arrow = expanded ? QStringLiteral("▾") : QStringLiteral("▸");
             const QString preview = idx.data(TranscriptModel::ToolSummaryRole).toString();
-            const QString header = QStringLiteral("%1  \U0001f4ad %2   %3")
+            const QString header = QStringLiteral("%1  %2  —  %3")
                                        .arg(arrow, i18n("Thinking"), preview);
-            const QRect hdr(rowRect.left() + contentLeft + 8, rowRect.top(),
-                            contentWidth - 16, kToolHeaderH);
+            const QRect surface(rowRect.left() + contentLeft + metrics.activityRailWidth + 8,
+                                rowRect.top(), contentWidth - metrics.activityRailWidth - 8,
+                                metrics.activityHeaderHeight);
+            const QRect hdr(surface.left() + metrics.activityPaddingX, surface.top(),
+                            surface.width() - 2 * metrics.activityPaddingX, surface.height());
             painter->save();
-            painter->setPen(opt.palette.color(QPalette::Mid));
+            painter->setRenderHint(QPainter::Antialiasing, true);
+            painter->setPen(Qt::NoPen);
+            painter->setBrush(ThemeManager::palette().chatActivitySurface);
+            painter->drawRoundedRect(surface.adjusted(0, 0, -1, -1), 6, 6);
+            paintActivityRail(painter, rowRect, metrics, neighbours,
+                              ThemeManager::palette().chatRail);
+            painter->setFont(metrics.metadataFont);
+            painter->setPen(ThemeManager::palette().chatMetadata);
             painter->drawText(hdr, Qt::AlignLeft | Qt::AlignVCenter,
-                              fm.elidedText(header, Qt::ElideRight, hdr.width()));
+                              QFontMetrics(metrics.metadataFont).elidedText(
+                                  header, Qt::ElideRight, hdr.width()));
             painter->restore();
             if (thinkDoc) {
                 painter->save();
-                painter->translate(rowRect.left() + contentLeft + kDetailPadX,
-                                   rowRect.top() + kToolHeaderH + kToolPad);
+                painter->translate(rowRect.left() + contentLeft + metrics.activityRailWidth
+                                       + metrics.activityPaddingX,
+                                   rowRect.top() + metrics.activityHeaderHeight + kToolPad);
                 QAbstractTextDocumentLayout::PaintContext ctx;
                 ctx.palette = opt.palette;
-                ctx.palette.setColor(QPalette::Text, ThemeManager::palette().agentIdle);
+                ctx.palette.setColor(QPalette::Text, ThemeManager::palette().chatMetadata);
                 thinkDoc->documentLayout()->draw(painter, ctx);
                 painter->restore();
             }
@@ -859,15 +961,15 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
         // The agent's plan: a bordered card listing every item with a status
         // glyph. Always fully visible — the plan is the thing to watch.
         const QJsonArray items = idx.data(TranscriptModel::ChecklistRole).toJsonArray();
-        const int itemH = lineH + 4;
-        const int total = kToolHeaderH + items.size() * itemH + kToolPad;
+        const int itemH = QFontMetrics(metrics.bodyFont).height() + metrics.activityGap + 3;
+        const int total = metrics.activityHeaderHeight + items.size() * itemH + kToolPad;
         if (painter) {
             const QRect card(rowRect.left() + contentLeft, rowRect.top(),
                              contentWidth, total);
             painter->save();
             painter->setRenderHint(QPainter::Antialiasing, true);
-            painter->setPen(opt.palette.color(QPalette::Mid));
-            painter->setBrush(Qt::NoBrush);
+            painter->setPen(ThemeManager::palette().chatBorder);
+            painter->setBrush(ThemeManager::palette().chatActivitySurface);
             painter->drawRoundedRect(card.adjusted(0, 0, -1, -1), 7, 7);
             painter->restore();
 
@@ -884,16 +986,17 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
                          i18nc("checklist progress", "%1 of %2 done", done, items.size()));
             painter->save();
             painter->setPen(opt.palette.color(QPalette::WindowText));
-            QFont bold = opt.font;
+            QFont bold = metrics.bodyFont;
             bold.setBold(true);
             painter->setFont(bold);
             painter->drawText(QRect(card.left() + 8, card.top(), card.width() - 16,
-                                    kToolHeaderH),
+                                    metrics.activityHeaderHeight),
                               Qt::AlignLeft | Qt::AlignVCenter,
-                              fm.elidedText(header, Qt::ElideRight, card.width() - 16));
+                              QFontMetrics(bold).elidedText(header, Qt::ElideRight,
+                                                            card.width() - 16));
             painter->restore();
 
-            int y = card.top() + kToolHeaderH;
+            int y = card.top() + metrics.activityHeaderHeight;
             painter->save();
             for (const QJsonValue &v : items) {
                 const QJsonObject item = v.toObject();
@@ -901,7 +1004,7 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
                     item.value(QStringLiteral("status")).toString();
                 const QString text = item.value(QStringLiteral("content")).toString();
                 QString glyph = QStringLiteral("☐"); // ☐ pending
-                QFont f = opt.font;
+                QFont f = metrics.bodyFont;
                 QColor pen = opt.palette.color(QPalette::WindowText);
                 if (status == QLatin1String("completed")) {
                     glyph = QStringLiteral("✓"); // ✓
@@ -933,18 +1036,17 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
     const bool expanded = idx.data(TranscriptModel::ToolExpandedRole).toBool();
     const bool done = idx.data(TranscriptModel::ToolDoneRole).toBool();
 
-    int total = kToolHeaderH;
+    int total = metrics.activityHeaderHeight;
     // Image chips (a tool_result carrying image blocks, e.g. a screenshot)
     // sit directly under the header in both states — the image usually IS the
     // result, so it reads first; the expanded detail shifts below it.
     const QJsonArray toolAtts =
         idx.data(TranscriptModel::AttachmentsRole).toJsonArray();
     int toolChipsH = 0;
-    QList<ChipLayout> toolChips; // laid out once; translated at paint time (F18)
+    QList<AttachmentTileLayout> toolTiles; // laid out once; translated at paint time
     if (!toolAtts.isEmpty()) {
-        toolChips = layoutAttachmentChips(toolAtts, opt.font, QPoint(0, 0),
-                                          qMax(1, contentWidth - 2 * kDetailPadX),
-                                          toolChipsH);
+        toolTiles = layoutAttachmentTiles(toolAtts, metrics, QPoint(0, 0),
+                                          qMax(1, contentWidth - 2 * kDetailPadX), toolChipsH);
         total += toolChipsH + kToolPad;
     }
     // Detail (input JSON + result) measured with the mono document only when open.
@@ -954,6 +1056,7 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
     int resultH = 0;
     int extraH = 0; // "show full output" link line
     const int detailW = contentWidth - 2 * kDetailPadX;
+    const int detailTextW = qMax(1, detailW - 2 * kToolPad);
     if (expanded) {
         QFont mono = opt.font;
         mono.setFamily(QStringLiteral("monospace"));
@@ -964,7 +1067,7 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
         const QString detail = idx.data(TranscriptModel::ToolDetailRole).toString();
         if (!detail.isEmpty()) {
             detailDoc = self->toolDoc(idx, TranscriptDelegate::ToolSlot::Detail, detail,
-                                      mono, detailW);
+                                      mono, detailTextW);
             detailH = int(detailDoc->size().height());
         }
         QString result = idx.data(TranscriptModel::ToolResultRole).toString();
@@ -983,30 +1086,39 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
             // re-lays this row's own document rather than defeating the cache
             // or serving a stale height (audit F18).
             resultDoc = self->toolDoc(idx, TranscriptDelegate::ToolSlot::Result, result,
-                                      mono, detailW);
+                                      mono, detailTextW);
             resultH = int(resultDoc->size().height());
         }
         if (idx.data(TranscriptModel::ToolTruncatedRole).toBool()) {
             extraH = lineH + kToolPad;
         }
-        total += kToolPad + detailH + (detailH && resultH ? kToolPad : 0) + resultH
-               + extraH + kToolPad;
+        const int detailBlock = detailH > 0 ? detailH + 2 * kToolPad : 0;
+        const int resultBlock = resultH > 0 ? resultH + 2 * kToolPad : 0;
+        total += kToolPad + detailBlock + (detailBlock && resultBlock ? kToolPad : 0)
+               + resultBlock + extraH + kToolPad;
     }
 
     if (painter) {
-        // A failed tool used to render exactly like a successful one — same ✓,
-        // same frame — so the only way to find the failure in a long turn was
-        // to expand every row (audit F40). It now carries a ✗ in the theme's
-        // negative colour and a negative card border.
+        // Tools are an activity stream: a slim status rail, sentence-like
+        // primary action and quiet surface. An expanded tool earns a card for
+        // its code/result detail; a failure remains an explicit, high-contrast
+        // boundary instead of relying on its red mark alone.
         const bool failed = idx.data(TranscriptModel::ToolErrorRole).toBool();
+        const ActivityNeighbours neighbours = activityNeighbours(idx);
         const QColor errColor = ThemeManager::palette().negative;
         const QRect card(rowRect.left() + contentLeft, rowRect.top(),
                          contentWidth, total);
+        const QRect surface(card.left() + metrics.activityRailWidth + 8, card.top(),
+                            card.width() - metrics.activityRailWidth - 8,
+                            expanded ? card.height() : metrics.activityHeaderHeight);
         painter->save();
         painter->setRenderHint(QPainter::Antialiasing, true);
-        painter->setPen(failed ? errColor : opt.palette.color(QPalette::Mid));
-        painter->setBrush(Qt::NoBrush);
-        painter->drawRoundedRect(card.adjusted(0, 0, -1, -1), 7, 7);
+        painter->setPen(expanded ? (failed ? errColor : ThemeManager::palette().chatBorder)
+                                 : Qt::NoPen);
+        painter->setBrush(ThemeManager::palette().chatActivitySurface);
+        painter->drawRoundedRect(surface.adjusted(0, 0, -1, -1), 7, 7);
+        paintActivityRail(painter, rowRect, metrics, neighbours,
+                          failed ? errColor : ThemeManager::palette().chatRail);
         painter->restore();
 
         // Header line: arrow + mark + kind glyph + name + summary, with a copy
@@ -1022,7 +1134,11 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
                                  ? QStringLiteral("⇄")
                                  : QStringLiteral("\U0001f527");
         const QString prefix = QStringLiteral("%1  %2  ").arg(arrow, mark);
-        QString header = QStringLiteral("%1 %2   %3").arg(kind, name, summary);
+        const QString state = !done ? i18n("Running")
+            : failed ? i18n("Failed") : i18n("Done");
+        QString header = summary.isEmpty()
+            ? QStringLiteral("%1  ·  %2").arg(name, state)
+            : QStringLiteral("%1  —  %2  ·  %3").arg(name, summary, state);
         // A RUNNING row carrying partial output shows its latest line right in
         // the header. Tool rows are collapsed by default, so painting live text
         // only inside the expanded body would still leave a subagent's whole
@@ -1035,8 +1151,9 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
                 header += QStringLiteral("   · ") + tail;
             }
         }
-        const QRect hdr(card.left() + 8, card.top(),
-                        card.width() - 8 - kToolCopyW - kToolInspectW, kToolHeaderH);
+        const QRect hdr(surface.left() + 8, surface.top(),
+                        surface.width() - 8 - kToolCopyW - kToolInspectW,
+                        metrics.activityHeaderHeight);
         painter->save();
         const int prefixW = fm.horizontalAdvance(prefix);
         painter->setPen(failed ? errColor : opt.palette.color(QPalette::WindowText));
@@ -1048,69 +1165,50 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
                           fm.elidedText(header, Qt::ElideRight, restR.width()));
         painter->setPen(opt.palette.color(QPalette::Mid));
         // "Open in inspector" glyph, then the copy glyph on the far right.
-        const QRect inspectR(card.right() - kToolCopyW - kToolInspectW, card.top(),
-                             kToolInspectW, kToolHeaderH);
+        const QRect inspectR(surface.right() - kToolCopyW - kToolInspectW + 1, card.top(),
+                             kToolInspectW, metrics.activityHeaderHeight);
         painter->drawText(inspectR, Qt::AlignCenter, QStringLiteral("⤢"));
-        const QRect copyR(card.right() - kToolCopyW, card.top(), kToolCopyW,
-                          kToolHeaderH);
+        const QRect copyR(surface.right() - kToolCopyW + 1, card.top(), kToolCopyW,
+                          metrics.activityHeaderHeight);
         painter->drawText(copyR, Qt::AlignCenter, QStringLiteral("⧉"));
         painter->restore();
 
         if (toolChipsH > 0) {
-            const QPoint origin(card.left() + kDetailPadX, card.top() + kToolHeaderH);
-            painter->save();
-            painter->setRenderHint(QPainter::Antialiasing, true);
-            for (int i = 0; i < toolChips.size(); ++i) {
-                ChipLayout c = toolChips.at(i);
-                c.rect.translate(origin);
-                const QJsonObject att = toolAtts.at(i).toObject();
-                painter->setPen(opt.palette.color(QPalette::Mid));
-                painter->setBrush(opt.palette.color(QPalette::Base));
-                painter->drawRoundedRect(c.rect.adjusted(0, 0, -1, -1), 6, 6);
-                int textLeft = c.rect.left() + kChipPadX;
-                if (c.image) {
-                    const QPixmap pm = self->chipPixmap(
-                        att, kChipIcon, painter->device()->devicePixelRatioF());
-                    const QRect iconR(textLeft, c.rect.top() + (kChipH - kChipIcon) / 2,
-                                      kChipIcon, kChipIcon);
-                    if (!pm.isNull()) {
-                        drawChipThumbnail(painter, iconR, pm);
-                    } else {
-                        painter->setPen(opt.palette.color(QPalette::Mid));
-                        painter->drawText(iconR, Qt::AlignCenter,
-                                          QStringLiteral("\U0001f5bc"));
-                    }
-                    textLeft += kChipIcon + kChipHGap;
-                }
-                painter->setFont(opt.font);
-                painter->setPen(opt.palette.color(QPalette::Link));
-                painter->drawText(QRect(textLeft, c.rect.top(),
-                                        c.rect.right() - textLeft - kChipPadX + 1,
-                                        c.rect.height()),
-                                  Qt::AlignLeft | Qt::AlignVCenter, c.label);
-            }
-            painter->restore();
+            const QPoint origin(card.left() + kDetailPadX,
+                                card.top() + metrics.activityHeaderHeight);
+            paintAttachmentTiles(painter, self, toolAtts, toolTiles, origin, opt, metrics);
         }
 
         if (expanded) {
-            int y = card.top() + kToolHeaderH
+            int y = surface.top() + metrics.activityHeaderHeight
                     + (toolChipsH > 0 ? toolChipsH + kToolPad : 0) + kToolPad;
             QFont mono = opt.font;
             mono.setFamily(QStringLiteral("monospace"));
             painter->save();
             painter->setPen(opt.palette.color(QPalette::WindowText));
             if (detailDoc) {
+                painter->setPen(Qt::NoPen);
+                painter->setBrush(ThemeManager::palette().chatCodeSurface);
+                painter->drawRoundedRect(QRect(card.left() + kDetailPadX, y, detailW,
+                                               detailH + 2 * kToolPad), 5, 5);
                 painter->save();
-                painter->translate(card.left() + kDetailPadX, y);
+                painter->translate(card.left() + kDetailPadX + kToolPad, y + kToolPad);
                 QAbstractTextDocumentLayout::PaintContext ctx;
                 ctx.palette = opt.palette;
                 detailDoc->documentLayout()->draw(painter, ctx);
                 painter->restore();
-                y += detailH + kToolPad;
+                y += detailH + 2 * kToolPad;
             }
             if (resultDoc) {
+                if (detailDoc) {
+                    y += kToolPad;
+                }
+                painter->setPen(Qt::NoPen);
+                painter->setBrush(ThemeManager::palette().chatCodeSurface);
+                painter->drawRoundedRect(QRect(card.left() + kDetailPadX, y, detailW,
+                                               resultH + 2 * kToolPad), 5, 5);
                 painter->save();
-                painter->translate(card.left() + kDetailPadX, y);
+                painter->translate(card.left() + kDetailPadX + kToolPad, y + kToolPad);
                 QAbstractTextDocumentLayout::PaintContext ctx;
                 ctx.palette = opt.palette;
                 if (!done) {
@@ -1121,7 +1219,7 @@ int layoutRow(const QModelIndex &idx, int width, const QStyleOptionViewItem &opt
                 }
                 resultDoc->documentLayout()->draw(painter, ctx);
                 painter->restore();
-                y += resultH;
+                y += resultH + 2 * kToolPad;
             }
             if (idx.data(TranscriptModel::ToolTruncatedRole).toBool()) {
                 y += kToolPad;
@@ -1193,24 +1291,34 @@ void TranscriptDelegate::paint(QPainter *painter, const QStyleOptionViewItem &op
     painter->restore();
 }
 
-QRect TranscriptDelegate::toolHeaderRect(const QRect &row) const
+QRect TranscriptDelegate::toolHeaderRect(const QRect &row,
+                                         const QStyleOptionViewItem &opt) const
 {
-    return QRect(row.left() + kOuterMarginX, row.top(),
-                 row.width() - 2 * kOuterMarginX - kToolCopyW - kToolInspectW,
-                 kToolHeaderH);
+    const TranscriptMetrics metrics = ChatAppearance::instance()->metrics(
+        opt.font, opt.palette, row.width(), opt.widget ? opt.widget->devicePixelRatioF() : 1.0);
+    return QRect(row.left() + metrics.outerInsetX + metrics.activityRailWidth + 16, row.top(),
+                 row.width() - 2 * metrics.outerInsetX - metrics.activityRailWidth - 16
+                     - kToolCopyW - kToolInspectW,
+                 metrics.activityHeaderHeight);
 }
 
-QRect TranscriptDelegate::toolCopyRect(const QRect &row) const
+QRect TranscriptDelegate::toolCopyRect(const QRect &row,
+                                       const QStyleOptionViewItem &opt) const
 {
-    const int right = row.right() - kOuterMarginX;
-    return QRect(right - kToolCopyW, row.top(), kToolCopyW, kToolHeaderH);
+    const TranscriptMetrics metrics = ChatAppearance::instance()->metrics(
+        opt.font, opt.palette, row.width(), opt.widget ? opt.widget->devicePixelRatioF() : 1.0);
+    const int right = row.right() - metrics.outerInsetX;
+    return QRect(right - kToolCopyW, row.top(), kToolCopyW, metrics.activityHeaderHeight);
 }
 
-QRect TranscriptDelegate::toolInspectRect(const QRect &row) const
+QRect TranscriptDelegate::toolInspectRect(const QRect &row,
+                                          const QStyleOptionViewItem &opt) const
 {
-    const int right = row.right() - kOuterMarginX;
+    const TranscriptMetrics metrics = ChatAppearance::instance()->metrics(
+        opt.font, opt.palette, row.width(), opt.widget ? opt.widget->devicePixelRatioF() : 1.0);
+    const int right = row.right() - metrics.outerInsetX;
     return QRect(right - kToolCopyW - kToolInspectW, row.top(), kToolInspectW,
-                 kToolHeaderH);
+                 metrics.activityHeaderHeight);
 }
 
 int TranscriptDelegate::attachmentsBlockHeight(const QModelIndex &idx,
@@ -1225,7 +1333,7 @@ int TranscriptDelegate::attachmentsBlockHeight(const QModelIndex &idx,
         opt.font, opt.palette, rowMeasureWidth(opt),
         opt.widget ? opt.widget->devicePixelRatioF() : 1.0);
     int chipsH = 0;
-    layoutAttachmentChips(atts, metrics.bodyFont, QPoint(0, 0), qMax(1, innerW), chipsH);
+    layoutAttachmentTiles(atts, metrics, QPoint(0, 0), qMax(1, innerW), chipsH);
     return chipsH > 0 ? metrics.attachmentGap + chipsH : 0;
 }
 
@@ -1298,18 +1406,42 @@ QList<QRect> TranscriptDelegate::attachmentRects(const QRect &row,
         opt.font, opt.palette, row.width(), opt.widget ? opt.widget->devicePixelRatioF() : 1.0);
     const QRect body = messageBodyRect(row, opt, idx);
     int ignored = 0;
-    const QList<ChipLayout> chips = layoutAttachmentChips(
-        atts, metrics.bodyFont, QPoint(body.left(), body.bottom() + 1 + metrics.attachmentGap),
+    const QList<AttachmentTileLayout> tiles = layoutAttachmentTiles(
+        atts, metrics, QPoint(body.left(), body.bottom() + 1 + metrics.attachmentGap),
         body.width(), ignored);
     QList<QRect> rects;
-    rects.reserve(chips.size());
-    for (const ChipLayout &chip : chips) {
-        rects.append(chip.rect);
+    rects.reserve(tiles.size());
+    for (const AttachmentTileLayout &tile : tiles) {
+        rects.append(tile.rect);
     }
     return rects;
 }
 
-// The chip a point falls in, or -1. Recomputes the chip layout in the card's
+QList<QRect> TranscriptDelegate::toolAttachmentRects(const QRect &row,
+                                                      const QStyleOptionViewItem &opt,
+                                                      const QModelIndex &idx) const
+{
+    const QJsonArray atts = idx.data(TranscriptModel::AttachmentsRole).toJsonArray();
+    if (atts.isEmpty()) {
+        return {};
+    }
+    const TranscriptMetrics metrics = ChatAppearance::instance()->metrics(
+        opt.font, opt.palette, row.width(), opt.widget ? opt.widget->devicePixelRatioF() : 1.0);
+    int ignored = 0;
+    const QList<AttachmentTileLayout> tiles = layoutAttachmentTiles(
+        atts, metrics,
+        QPoint(row.left() + metrics.outerInsetX + kDetailPadX,
+               row.top() + metrics.activityHeaderHeight),
+        qMax(1, row.width() - 2 * metrics.outerInsetX - 2 * kDetailPadX), ignored);
+    QList<QRect> rects;
+    rects.reserve(tiles.size());
+    for (const AttachmentTileLayout &tile : tiles) {
+        rects.append(tile.rect);
+    }
+    return rects;
+}
+
+// The tile a point falls in, or -1. Recomputes the tile layout in the card's
 // coordinate space (matching paint) and tests each rect.
 int TranscriptDelegate::attachmentChipAt(const QRect &row,
                                          const QStyleOptionViewItem &opt,
@@ -1439,27 +1571,21 @@ bool TranscriptDelegate::editorEvent(QEvent *event, QAbstractItemModel *model,
             const QJsonArray toolAtts =
                 idx.data(TranscriptModel::AttachmentsRole).toJsonArray();
             if (!toolAtts.isEmpty()) {
-                const int availW =
-                    opt.rect.width() - 2 * kOuterMarginX - 2 * kDetailPadX;
-                const QPoint origin(opt.rect.left() + kOuterMarginX + kDetailPadX,
-                                    opt.rect.top() + kToolHeaderH);
-                int dummy = 0;
-                const QList<ChipLayout> laid = layoutAttachmentChips(
-                    toolAtts, opt.font, origin, qMax(1, availW), dummy);
+                const QList<QRect> laid = toolAttachmentRects(opt.rect, opt, idx);
                 for (int i = 0; i < laid.size(); ++i) {
-                    if (laid.at(i).rect.contains(pos)) {
+                    if (laid.at(i).contains(pos)) {
                         emit attachmentActivated(toolAtts.at(i).toObject());
                         return true;
                     }
                 }
             }
             // "Open in inspector" glyph — opens the full tool-call modal.
-            if (toolInspectRect(opt.rect).contains(pos)) {
+            if (toolInspectRect(opt.rect, opt).contains(pos)) {
                 emit inspectToolRequested(idx);
                 return true;
             }
             // Copy button.
-            if (toolCopyRect(opt.rect).contains(pos)) {
+            if (toolCopyRect(opt.rect, opt).contains(pos)) {
                 QString out = idx.data(TranscriptModel::ToolNameRole).toString();
                 const QString detail = idx.data(TranscriptModel::ToolDetailRole).toString();
                 const QString full = idx.data(TranscriptModel::ToolFullResultRole).toString();
@@ -1483,7 +1609,7 @@ bool TranscriptDelegate::editorEvent(QEvent *event, QAbstractItemModel *model,
                 }
             }
             // Header toggles expand/collapse.
-            if (toolHeaderRect(opt.rect).contains(pos)) {
+            if (toolHeaderRect(opt.rect, opt).contains(pos)) {
                 tm->setExpanded(idx.row(), !idx.data(TranscriptModel::ToolExpandedRole).toBool());
                 return true;
             }
@@ -1492,7 +1618,11 @@ bool TranscriptDelegate::editorEvent(QEvent *event, QAbstractItemModel *model,
 
         if (kind == TranscriptModel::Thinking) {
             // The header line toggles the reasoning body open/closed.
-            if (QRect(opt.rect.left(), opt.rect.top(), opt.rect.width(), kToolHeaderH)
+            const TranscriptMetrics metrics = ChatAppearance::instance()->metrics(
+                opt.font, opt.palette, opt.rect.width(),
+                opt.widget ? opt.widget->devicePixelRatioF() : 1.0);
+            if (QRect(opt.rect.left(), opt.rect.top(), opt.rect.width(),
+                      metrics.activityHeaderHeight)
                     .contains(pos)) {
                 tm->setExpanded(idx.row(),
                                 !idx.data(TranscriptModel::ToolExpandedRole).toBool());
@@ -1572,11 +1702,11 @@ bool TranscriptDelegate::helpEvent(QHelpEvent *event, QAbstractItemView *view,
 
     if (kind == TranscriptModel::Tool
         && idx.data(TranscriptModel::ToolVisibleRole).toBool()) {
-        if (toolInspectRect(opt.rect).contains(pos)) {
+        if (toolInspectRect(opt.rect, opt).contains(pos)) {
             QToolTip::showText(event->globalPos(), i18n("Open in inspector"), view);
             return true;
         }
-        if (toolCopyRect(opt.rect).contains(pos)) {
+        if (toolCopyRect(opt.rect, opt).contains(pos)) {
             QToolTip::showText(event->globalPos(), i18n("Copy tool call"), view);
             return true;
         }
