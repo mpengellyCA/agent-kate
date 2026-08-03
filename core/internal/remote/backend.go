@@ -1,0 +1,261 @@
+package remote
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"time"
+)
+
+// Backend is everything the remote server borrows from the core.
+//
+// It is an interface rather than a direct dependency because cmd/akcore is
+// package main and cannot be imported. That constraint turns out to be the
+// right shape anyway: the frozen /api/v1/ contract is deliberately NOT a mirror
+// of the internal IPC vocabulary (the socket churns freely, a phone's cached
+// PWA cannot), and this interface is the seam where the two vocabularies meet.
+// Keeping it this narrow is also a security property — a capability the phone
+// must never reach is one that simply has no method here. There is no Cowork
+// verb, no agent creation, and nothing that takes a filesystem path: every
+// method keys on threadId and lets the core resolve the worktree itself.
+//
+// Implementations must be safe for concurrent use and must respect ctx: an HTTP
+// handler cancels it when the phone walks out of Wi-Fi range, and a backend that
+// ignores that leaks a goroutine per abandoned request.
+type Backend interface {
+	// ListAgents returns the roster. It is called both by GET /agents and by the
+	// SSE roster coalescer, so the two can never disagree about what a row says.
+	ListAgents(ctx context.Context) ([]Agent, error)
+
+	// Transcript returns a page of redacted, typed transcript events,
+	// newest-last. It is deliberately not a transport for harness stream-json.
+	Transcript(ctx context.Context, req TranscriptRequest) (Transcript, error)
+
+	// Send is reserved until the core can publish one canonical user-turn echo
+	// to desktop and remote transcripts. Its principal is session-derived.
+	Send(ctx context.Context, principal Principal, req SendRequest) (SendResult, error)
+
+	// PermissionDetail returns the renderable content of ONE parked prompt.
+	//
+	// It exists because permissionRequested deliberately carries no `input`,
+	// and the two prompt kinds a human most wants to answer from a phone —
+	// ExitPlanMode and AskUserQuestion — keep the material you need to answer
+	// them inside it. It must return ErrUnknownRequest for an id that is
+	// unknown OR already resolved: a prompt that has been answered has no
+	// detail to render, and pretending otherwise would put a live-looking
+	// approve button on a lock screen.
+	PermissionDetail(ctx context.Context, requestID string) (PermissionDetail, error)
+
+	// RespondPermission answers a parked prompt. It must return one of
+	// ErrUnknownRequest, ErrAlreadyResolved or ErrExpired when the answer did not
+	// land — "you were too late" and "that never existed" are different messages
+	// to someone staring at a stale lock-screen button. If the core cannot tell
+	// them apart (Broker.Resolve only reports a bool), return ErrAlreadyResolved:
+	// it is the more useful of the two and by far the more likely.
+	RespondPermission(ctx context.Context, principal Principal, ans PermissionAnswer) error
+
+	// Interrupt stops the current turn, leaving the thread alive.
+	Interrupt(ctx context.Context, principal Principal, threadID string) error
+
+	// Stop shuts the thread's process down gracefully. It is deliberately the
+	// most destructive verb reachable from a phone: nothing here discards an
+	// agent, deletes a worktree or edits a file.
+	Stop(ctx context.Context, principal Principal, threadID string) error
+
+	// Diff returns the thread's worktree diff, already capped core-side.
+	Diff(ctx context.Context, req DiffRequest) (Diff, error)
+
+	// GitStatus and GitLog are passed through verbatim as the JSON body. They are
+	// `any` on purpose: the contract does not freeze their shape, so pinning a
+	// struct here would force a lockstep change in three repositories the first
+	// time git.status grows a field.
+	GitStatus(ctx context.Context, threadID string) (any, error)
+	GitLog(ctx context.Context, threadID string, limit int) (any, error)
+}
+
+// Principal is constructed from a verified HTTPS session. It is immutable
+// attribution, never an IPC UI role and never a caller-supplied JSON field.
+type Principal struct {
+	DeviceID   string
+	DeviceName string
+	SessionID  string
+}
+
+// Sentinel errors the Backend returns so the HTTP layer can choose a status code
+// and a stable machine-readable `error` string. Anything else becomes a 500.
+var (
+	// ErrUnknownThread → 404 unknown-thread.
+	ErrUnknownThread = errors.New("remote: unknown thread")
+	// ErrUnknownRequest → 404 unknown-request.
+	ErrUnknownRequest = errors.New("remote: unknown permission request")
+	// ErrAlreadyResolved → 409 already-resolved.
+	ErrAlreadyResolved = errors.New("remote: permission already resolved")
+	// ErrExpired → 410 expired.
+	ErrExpired = errors.New("remote: permission expired")
+	// ErrBusy → 409 busy (only reachable with mode="reject").
+	ErrBusy = errors.New("remote: thread is mid-turn")
+	// ErrUnsupported → 501 unsupported; the thread's harness lacks the capability.
+	ErrUnsupported = errors.New("remote: unsupported for this harness")
+	// ErrNotListening is returned by MintDevice when remote access is off. A
+	// pairing URL is only meaningful with a listener behind it; minting one
+	// anyway produces a QR code pointing at whatever else holds that port.
+	ErrNotListening = errors.New("remote: remote access is not switched on")
+)
+
+// Agent is one roster row, in Go types. The wire form is built in handlers.go so
+// redaction and formatting happen in exactly one place.
+type Agent struct {
+	ThreadID string
+	Title    string
+	// Project is a DISPLAY NAME. The wire encoder strips anything that looks
+	// like a path, because "no route takes a filesystem path" is worth nothing
+	// if a response hands one out.
+	Project    string
+	Backend    string // harness id, for a badge — never for behaviour
+	EngineName string // display string from the harness registry
+	Model      string
+	Status     string // running | dormant | archived (PROCESS state)
+	Busy       bool   // TURN state, from TurnTracker
+	// AwaitingPermission is nil when nothing is parked. A client diffing rows
+	// needs to see the field go to null, not merely stop being sent.
+	AwaitingPermission *Awaiting
+	// Attention is computed core-side on purpose: "which of my eight agents
+	// needs me" must not be a client-side rule two clients can disagree about.
+	Attention      bool
+	LastActivityAt time.Time
+	ParentThreadID string
+	Role           string // "" | controller | worker
+}
+
+// Awaiting describes a parked permission prompt.
+//
+// There is deliberately no raw tool input here. permission.requested carries
+// `input` on the local socket because the desktop needs it to render
+// ExitPlanMode markdown and AskUserQuestion forms; nothing that leaves this
+// machine may carry it, so the struct that crosses the network simply does not
+// have the field. Summary is the core-computed, already-redacted digest.
+type Awaiting struct {
+	RequestID string
+	Kind      string // tool | question | plan
+	ToolName  string
+	Summary   string
+	Deadline  time.Time
+}
+
+// PermissionDetail is one parked prompt, in enough detail to answer it.
+//
+// Kind decides which of the last two fields is populated, and the rule has no
+// exceptions: "plan" carries Plan, "question" carries Questions, and "tool" —
+// the Bash command line the whole redaction discipline exists for — carries
+// NEITHER. A remote caller looking at a tool prompt gets the core-computed
+// Summary and nothing else, exactly as before this route existed.
+type PermissionDetail struct {
+	RequestID string
+	ThreadID  string
+	Kind      string // tool | question | plan
+	ToolName  string
+	Summary   string
+	Deadline  time.Time
+	// Plan is ExitPlanMode's markdown; populated only when Kind == "plan".
+	Plan string
+	// Questions is AskUserQuestion's list, verbatim; populated only when
+	// Kind == "question". An answer echoes it back unchanged and keys its
+	// answers by each question's own text, so anything less than verbatim is
+	// unanswerable rather than merely lossy.
+	Questions json.RawMessage
+}
+
+// TranscriptRequest is a page request. Before is an opaque cursor the backend
+// minted; the remote server never interprets it.
+type TranscriptRequest struct {
+	ThreadID string
+	Limit    int
+	Before   string
+	MaxBytes int
+}
+
+// TranscriptEvent is the allowlisted remote projection of one transcript row.
+// Tool arguments and raw permission input have no field here by design.
+type TranscriptEvent struct {
+	Kind     string    `json:"kind"` // user | assistant | tool | lifecycle
+	Text     string    `json:"text,omitempty"`
+	ToolName string    `json:"toolName,omitempty"`
+	Summary  string    `json:"summary,omitempty"`
+	At       time.Time `json:"at,omitempty"`
+}
+
+// Transcript is one page of a thread's remote-safe conversation projection.
+type Transcript struct {
+	Events []TranscriptEvent
+	// Truncated reports that a single oversized result was clipped, matching
+	// M0.4's shape. It is emitted unconditionally on the wire, even when false:
+	// a field that only appears on the bad path is a field nobody handles.
+	Truncated bool
+	// HasMore reports that older events exist beyond this page.
+	HasMore bool
+	// NextBefore is the cursor to feed back as ?before=. Empty when !HasMore.
+	NextBefore string
+}
+
+// SendRequest carries a prompt to a thread.
+type SendRequest struct {
+	ThreadID string
+	Text     string
+	// Mode is M0.3's core-side semantics: "queue" | "reject". The HTTP layer
+	// never passes "now" — see sendModeNow in handlers.go for why.
+	Mode string
+}
+
+// SendResult is what the core did with the prompt.
+type SendResult struct {
+	Queued bool
+	// Position is the 1-based slot in the thread's follow-up queue, 0 when the
+	// message went straight to the agent.
+	Position int
+	// Resuming reports that the thread was asleep and is being woken to take
+	// this message, which arrives once the session is back. The desktop does
+	// the same thing — its Send button reads "Resume agent" on a dormant
+	// thread — so a phone that merely refused would be the weaker client for
+	// no reason. It is surfaced because "sent" and "sent, and your agent is
+	// starting up" deserve different words on screen.
+	Resuming bool
+}
+
+// PermissionAnswer is a human decision arriving from a phone.
+type PermissionAnswer struct {
+	RequestID string
+	Allow     bool
+	// DenyMessage is the optional reason shown to the agent on a refusal.
+	DenyMessage string
+	// UpdatedInput carries AskUserQuestion answers and ExitPlanMode's plan back
+	// to the harness. It is validated as a JSON object before it gets here.
+	UpdatedInput json.RawMessage
+}
+
+// DiffRequest asks for a thread's worktree diff.
+type DiffRequest struct {
+	ThreadID string
+	MaxBytes int
+	MaxLines int
+}
+
+// Diff is a capped worktree diff.
+type Diff struct {
+	// Files may be left nil: the wire encoder derives the per-file stat from
+	// Patch when it is, so an adapter can be a straight passthrough of the
+	// core's agent.diff reply (which returns a patch and no file list).
+	Files []DiffFile
+	Patch string
+	// Truncated reports the patch was cut to fit the caps.
+	Truncated bool
+	// OmittedFiles is emitted only when Truncated, per the frozen contract.
+	OmittedFiles int
+}
+
+// DiffFile is one changed path in a diff.
+type DiffFile struct {
+	Path      string
+	Status    string // M | A | D | R
+	Additions int
+	Deletions int
+}

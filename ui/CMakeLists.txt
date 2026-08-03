@@ -98,6 +98,7 @@ add_executable(agentkate
     src/cowork/ConsentDialog.cpp
     src/cowork/ControlConsentDialog.cpp
     src/cowork/BrowserLaunch.cpp
+    src/remote/RemotePanel.cpp
     src/notify/AgentNotifier.cpp
     src/CooperationPanel.cpp
     src/AiInspectorPanel.cpp

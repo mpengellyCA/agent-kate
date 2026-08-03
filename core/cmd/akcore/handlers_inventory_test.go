@@ -871,6 +871,8 @@ func TestInventoryCoversTheWholeRegistry(t *testing.T) {
 		"cowork.listWindows", // reg.agent — an agent-reachable desktop tool
 		"cowork.setPolicy",   // reg.ui — a UI-only desktop RPC
 		"cowork.status",      // reg.probe — must answer even with no service
+		"remote.status",      // remote desktop control plane; UI-only
+		"remote.killSwitch",  // paired-device revocation control; UI-only
 	} {
 		if !methods[want] {
 			t.Errorf("Methods() does not report %q; the inventory is not "+
@@ -1034,6 +1036,11 @@ func inventoryCore(t *testing.T, records []session.Record) (sock string,
 		modes:         ensembles,
 		cowork:        selfService(t),
 	})
+	// The remote desktop-control plane is registered separately by runCore so
+	// that the paired HTTPS principal never gains an IPC identity. Register it
+	// here as well: every one of these controls must stay UI-window-only, and
+	// the registry inventory is the guard that proves that from a real bridge.
+	registerRemoteHandlers(handlerDeps{srv: srv})
 	// app.shutdown is registered by runCore, not registerHandlers, so without
 	// this it is invisible to every test in this file AND to the registry
 	// inventory — which is precisely how the most powerful RPC the core serves

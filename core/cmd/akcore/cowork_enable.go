@@ -8,6 +8,7 @@ import (
 
 	"agentkate/internal/harness"
 	"agentkate/internal/ipc"
+	"agentkate/internal/permission"
 	"agentkate/internal/safe"
 	"agentkate/internal/session"
 )
@@ -291,7 +292,7 @@ func coworkPreflight(ctx context.Context, d handlerDeps, threadID string, announ
 // already controls. It resolves through the same broker (and the same
 // permission.respond RPC) as every other human decision.
 func askCoworkEnable(d handlerDeps, fromThreadID, targetThreadID, targetTitle, reason string) bool {
-	id, ch := d.broker.Open()
+	id, ch := d.broker.OpenLocal()
 	// NOBODY TO ASK (audit F35 pass 3 / F53): the delivery count is the
 	// authority, exactly as in askHumanPermission — taken from the same
 	// snapshot as the send, it cannot race a UI that disconnects in between.
@@ -307,14 +308,14 @@ func askCoworkEnable(d handlerDeps, fromThreadID, targetThreadID, targetTitle, r
 		"self":           fromThreadID == targetThreadID,
 		"timeoutSeconds": int(permissionTimeout / time.Second),
 	}) == 0 {
-		d.broker.Close(id)
+		d.broker.Close(id, permission.NoHuman)
 		return false
 	}
 	select {
 	case dec := <-ch:
 		return dec.Allow
 	case <-time.After(permissionTimeout):
-		d.broker.Close(id)
+		d.broker.Close(id, permission.TimedOut)
 		return false
 	}
 }

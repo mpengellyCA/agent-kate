@@ -1,0 +1,25 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: LGPL-2.0-or-later -->
+<!-- SPDX-FileCopyrightText: 2026 The Agent Kate developers -->
+<html lang="en" data-theme="midnight">
+  <head>
+    <meta charset="utf-8" />
+    <!-- viewport-fit=cover + the env(safe-area-inset-*) padding in style.css is
+         what keeps the composer clear of a phone's home indicator. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#0b0e24" />
+    <!-- The pairing token rides in the URL fragment. Belt and braces on top of
+         the server's Referrer-Policy header: never leak a referrer, so a link
+         inside a transcript cannot carry the origin (or a stale fragment) out. -->
+    <meta name="referrer" content="no-referrer" />
+    <title>Agent Kate</title>
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/icon.svg" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

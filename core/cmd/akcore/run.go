@@ -160,6 +160,7 @@ func runCore() {
 	defer stop()
 
 	srv := ipc.NewServer(*socket, log)
+	remoteCtl := newRemoteControl(ctx, log)
 	coopState := coop.NewState()
 	threads := newThreadRegistry()
 	broker := permission.New()
@@ -287,6 +288,9 @@ func runCore() {
 		// dormant thread through agent.transcript, so a reconnecting UI loses
 		// nothing by this feed being UI-only.
 		srv.NotifyUI("agent.event", agentEventParams{ThreadID: threadID, Events: events})
+		// The paired-device sink is separate from IPC. It receives only the
+		// explicit typed projection below; no bridge ever sees this raw batch.
+		remoteCtl.publishRawEvents(threadID, events)
 		for _, event := range events {
 			turns.Observe(threadID, event)
 			var probe struct {
@@ -310,7 +314,11 @@ func runCore() {
 			// retaining the frame until the eight-minute timeout.  Broker
 			// cancellation delivers a zero decision, which is fail-closed.
 			if probe.Type == "_lifecycle" && (probe.Phase == "turn_aborted" || probe.Phase == "exited" || probe.Phase == "interrupted") {
-				broker.CancelThread(threadID)
+				reason := permission.Exited
+				if probe.Phase == "turn_aborted" || probe.Phase == "interrupted" {
+					reason = permission.Interrupted
+				}
+				broker.CancelThread(threadID, reason)
 			}
 			// Persist a changed session id (rare — only on an in-session compaction)
 			// so resume follows it. UpdateQuiet: bookkeeping, not user activity.
@@ -350,6 +358,7 @@ func runCore() {
 			// configured for a cold-exit compaction strategy, fire it in the
 			// background — Hot-Opus is a separate pre-reap flow.
 			if probe.Type == "_lifecycle" && (probe.Phase == "exited" || probe.Phase == "interrupted") {
+				remoteCtl.publishAgentGone(threadID, probe.Phase)
 				coopState.ClearOwner(threadID)
 				srv.NotifyPrimaryUI("coop.changed", map[string]any{})
 				// Drop this thread's throttle bookkeeping so the maps don't grow
@@ -385,7 +394,7 @@ func runCore() {
 	// identical across backends.
 	ksup := kimi.NewSupervisor("", log, relayEvents,
 		func(threadID, toolName string, input json.RawMessage) (bool, json.RawMessage) {
-			dec, ok := askHumanPermission(srv, broker, threadID, toolName, input, questionSide)
+			dec, ok := askHumanPermissionForSurfaces(srv, remoteCtl, broker, threadID, toolName, input, questionSide)
 			if !ok {
 				// Denied, and worth logging WHY: the human let the window
 				// lapse, or there was no window connected to ask at all — in
@@ -406,7 +415,7 @@ func runCore() {
 	// through the registry.
 	csup := codex.NewSupervisor("", log, relayEvents)
 	csup.SetPermissionFunc(func(threadID, toolName string, input json.RawMessage) bool {
-		dec, ok := askHumanPermission(srv, broker, threadID, toolName, input, questionSide)
+		dec, ok := askHumanPermissionForSurfaces(srv, remoteCtl, broker, threadID, toolName, input, questionSide)
 		if !ok {
 			log.Warn("codex tool permission denied without a human answer",
 				"thread", threadID, "tool", toolName, "uiConnected", srv.HasUI())
@@ -494,11 +503,18 @@ func runCore() {
 		claudePlugins: extcatalog.NewClaudePlugins("claude"),
 		gitCache:      gitCache,
 		cowork:        coworkSvc,
+		remote:        remoteCtl,
 		socketPath:    *socket,
 		exePath:       exePath,
 		log:           log,
 	}
+	remoteCtl.attach(deps)
+	broker.SetObserver(remoteCtl)
+	turns.SetOnChange(func(threadID string, busy bool) {
+		remoteCtl.publishTurnState(threadID, busy)
+	})
 	registerHandlers(deps)
+	registerRemoteHandlers(deps)
 
 	// gracefulShutdown runs the ordered teardown: compact live (Hot-Opus)
 	// threads, stop every agent, drain any cold-exit compactions, then close the
@@ -508,6 +524,9 @@ func runCore() {
 	var shutdownOnce sync.Once
 	gracefulShutdown := func(progress shutdownProgressFn) {
 		shutdownOnce.Do(func() {
+			// Stop the network surface before reaping agents: a phone cannot keep
+			// receiving a transcript while the desktop is deliberately closing.
+			remoteCtl.stop(context.Background())
 			running := 0
 			for _, rec := range sessions.List("") {
 				if deps.agentRunning(rec.ThreadID) {

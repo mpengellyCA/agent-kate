@@ -42,6 +42,24 @@ fi
 # Vendor Go modules so the package build can run offline.
 ( cd "${STAGE}/core" && go mod vendor )
 
+# The source tree deliberately carries only the embedded web stub. A release
+# tarball bakes the pinned browser bundle once, so ordinary distro builds do
+# not acquire a Node/npm dependency. Refusing by default prevents a release
+# from silently advertising remote access but serving a development stub.
+WEBUI="${STAGE}/core/internal/remote/webui"
+if [[ -f "${WEBUI}/package.json" ]]; then
+    if command -v npm >/dev/null 2>&1; then
+        echo "building the web UI into the release tarball…"
+        "${STAGE}/scripts/build-webui.sh" --force
+        rm -rf "${WEBUI}/node_modules"
+    else
+        echo "ERROR: npm is required to build the release web bundle." >&2
+        echo "       Set ALLOW_WEBUI_STUB=1 only for an intentionally stubbed tarball." >&2
+        [[ "${ALLOW_WEBUI_STUB:-0}" == "1" ]] || exit 1
+        echo "WARNING: release tarball will contain the Remote Access stub." >&2
+    fi
+fi
+
 tar -C "${DIST_DIR}" -czf "${DIST_DIR}/${NAME}.tar.gz" "${NAME}"
 rm -rf "${STAGE}"
 

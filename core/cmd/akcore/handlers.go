@@ -167,9 +167,11 @@ type handlerDeps struct {
 	claudePlugins *extensions.ClaudePlugins
 	gitCache      *gitstatus.Cache
 	cowork        *cowork.Service // nil if KDE/consent init failed; handlers guard
-	socketPath    string
-	exePath       string
-	log           *slog.Logger
+	// remote is an authenticated HTTPS human surface, not an IPC UI role.
+	remote     *remoteControl
+	socketPath string
+	exePath    string
+	log        *slog.Logger
 	// agentExitWait overrides how long the destructive paths wait for a stopped
 	// process to exit before refusing (waitAgentExit); zero means the default.
 	// Set by tests only — a fake harness has no real backstops to wait out.
@@ -1018,14 +1020,19 @@ func registerHandlers(d handlerDeps) {
 			map[string]any{"message": p.Text}, alsoGrant...); err != nil {
 			return nil, err
 		}
-		d.turns.TurnQueued(p.ThreadID)
-		if err := d.agentSend(p.ThreadID, p.Text, p.Attachments); err != nil {
-			d.turns.TurnFailed(p.ThreadID)
-			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		var sendErr error
+		if p.FromThreadID == "" {
+			// requireCallerThread above proved this is the exclusive desktop UI.
+			sendErr = d.humanSend(desktopPrincipal(), p.ThreadID, p.Text, p.Attachments)
+		} else {
+			// A bridge reached this point only after caller binding and any
+			// cross-subtree grant. It shares delivery mechanics, not human
+			// authority or the remote-human principal.
+			sendErr = d.deliverAcceptedSend(p.ThreadID, p.Text, p.Attachments)
 		}
-		// Persist a compact attachment sidecar so the "You" card's chips survive
-		// a resume; the transcript keeps only inlined content, not the origin.
-		recordAttachments(d, p.ThreadID, p.Text, p.Attachments)
+		if sendErr != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, sendErr.Error())
+		}
 		return map[string]any{"ok": true}, nil
 	})
 
@@ -1042,17 +1049,7 @@ func registerHandlers(d handlerDeps) {
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
-		// A human stopping an agent means they do not want it starting itself
-		// again at 14:37 — so an armed usage-window resume is cancelled here,
-		// and the cancellation is reported. Only the process EXITING on its own
-		// (which arrives as the same lifecycle event) leaves the schedule
-		// standing, because that is the stall this feature exists to end.
-		d.rateWakes.Cancel(p.ThreadID, "you stopped it")
-		// Hot-Opus runs against the live session so it has to happen BEFORE
-		// the supervisor terminates the process; cold strategies fire from
-		// the exit lifecycle handler instead.
-		runHotCompactIfConfigured(d, p.ThreadID)
-		if err := d.agentStop(p.ThreadID); err != nil {
+		if err := d.humanStop(desktopPrincipal(), p.ThreadID); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
 		return map[string]any{"ok": true}, nil
@@ -1199,15 +1196,7 @@ func registerHandlers(d handlerDeps) {
 		if err := json.Unmarshal(raw, &p); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
-		// Resolve a parked question/permission frame before sending the
-		// harness interrupt.  The latter may need a child acknowledgement (or a
-		// signal backstop); the human pressed Escape now, so its answer must be
-		// a prompt refusal now as well.  CancelThread only delivers zero
-		// decisions, preserving the broker's human-only, fail-closed authority.
-		if d.broker != nil {
-			d.broker.CancelThread(p.ThreadID)
-		}
-		if err := d.agentInterrupt(p.ThreadID); err != nil {
+		if err := d.humanInterrupt(desktopPrincipal(), p.ThreadID); err != nil {
 			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 		}
 		return map[string]any{"ok": true}, nil
@@ -2056,8 +2045,7 @@ func registerHandlers(d handlerDeps) {
 		// request; surface it so the UI can tell a real answer from one that hit an
 		// already-timed-out or unknown request (a stale dialog) instead of always
 		// claiming success.
-		delivered := d.broker.Resolve(p.RequestID,
-			permission.Decision{Allow: p.Allow, UpdatedInput: p.UpdatedInput})
+		delivered := d.humanRespondPermission(desktopPrincipal(), p.RequestID, p.Allow, p.UpdatedInput)
 		return map[string]any{"ok": delivered}, nil
 	})
 
@@ -3515,6 +3503,15 @@ const permissionTimeout = 8 * time.Minute
 // race a UI that disconnects in between. Still FAIL CLOSED — no window means no
 // approval — only promptly.
 func askHumanPermission(srv *ipc.Server, broker *permission.Broker, threadID, toolName string, input json.RawMessage, questionStores ...*session.QuestionStore) (permission.Decision, bool) {
+	return askHumanPermissionForSurfaces(srv, nil, broker, threadID, toolName, input, questionStores...)
+}
+
+// askHumanPermissionForSurfaces keeps raw input on the desktop-only IPC
+// notification while allowing a running paired-device surface to count as a
+// real human who can answer the broker's redacted prompt. A paired device is
+// never promoted to a UI connection: it only receives the broker DTO via its
+// own HTTPS/SSE sink.
+func askHumanPermissionForSurfaces(srv *ipc.Server, remoteAccess *remoteControl, broker *permission.Broker, threadID, toolName string, input json.RawMessage, questionStores ...*session.QuestionStore) (permission.Decision, bool) {
 	var questions *session.QuestionStore
 	if len(questionStores) != 0 {
 		questions = questionStores[0]
@@ -3536,15 +3533,21 @@ func askHumanPermission(srv *ipc.Server, broker *permission.Broker, threadID, to
 			slog.Warn("could not persist question history", "thread", threadID, "err", err)
 		}
 	}
-	id, ch := broker.OpenForThread(threadID)
-	if srv.NotifyUI("permission.requested", map[string]any{
-		"threadId":       threadID,
-		"requestId":      id,
-		"toolName":       toolName,
-		"input":          input,
+	req, ch := broker.OpenWithDetail(threadID, toolName, permission.Summary(toolName),
+		permission.RenderableDetail(toolName, input), permissionTimeout)
+	desktopDelivered := srv.NotifyUI("permission.requested", map[string]any{
+		"threadId":  threadID,
+		"requestId": req.ID,
+		"toolName":  toolName,
+		"input":     input,
+		// Summary and deadline are safe to mirror to a remote human surface;
+		// input remains NotifyUI-only and never enters the broker.
+		"summary":        req.Summary,
+		"deadline":       req.Deadline.UTC().Format(time.RFC3339),
 		"timeoutSeconds": int(permissionTimeout / time.Second),
-	}) == 0 {
-		broker.Close(id)
+	})
+	if desktopDelivered == 0 && (remoteAccess == nil || !remoteAccess.canAnswerPermissions()) {
+		broker.Close(req.ID, permission.NoHuman)
 		recordQuestion(permission.Decision{})
 		return permission.Decision{}, false
 	}
@@ -3553,7 +3556,7 @@ func askHumanPermission(srv *ipc.Server, broker *permission.Broker, threadID, to
 		recordQuestion(dec)
 		return dec, true
 	case <-time.After(permissionTimeout):
-		broker.Close(id)
+		broker.Close(req.ID, permission.TimedOut)
 		recordQuestion(permission.Decision{})
 		return permission.Decision{}, false
 	}

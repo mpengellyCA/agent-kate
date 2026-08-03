@@ -26,6 +26,7 @@
 #include "CooperationPanel.h"
 #include "cowork/CoworkPanel.h"
 #include "cowork/CoworkPortal.h"
+#include "remote/RemotePanel.h"
 #include "shell/ActionIds.h"
 #include "shell/ShellLayout.h"
 #include "shell/SideBar.h"
@@ -262,6 +263,7 @@ void MainWindow::setupUi()
     m_worktreeDashboard = new WorktreeDashboard(m_core, this);
     m_logViewer = new LogViewer(m_core, this);
     m_coworkPanel = new CoworkPanel(m_core, this);
+    m_remotePanel = new RemotePanel(m_core, this);
     // CoworkPortal services the core's portal requests using this window's surface.
     m_coworkPortal = new CoworkPortal(m_core, this, this);
     // The panel's browser-launch button needs the portal's park-then-flip of the
@@ -340,6 +342,8 @@ void MainWindow::setupUi()
                   i18n("Cooperation"), m_coopPanel, QStringLiteral("right"));
     registerPanel(m_keyCowork, QIcon::fromTheme(QStringLiteral("video-display")),
                   i18n("Cowork"), m_coworkPanel, QStringLiteral("right"));
+    registerPanel(m_keyRemote, QIcon::fromTheme(QStringLiteral("smartphone")),
+                  i18n("Remote"), m_remotePanel, QStringLiteral("right"));
     m_inspectorPanel = new AiInspectorPanel(m_core, this);
     registerPanel(m_keyInspector, QIcon::fromTheme(QStringLiteral("view-statistics")),
                   i18n("Agent Activity"), m_inspectorPanel, QStringLiteral("right"));
@@ -386,6 +390,7 @@ void MainWindow::setupUi()
         {m_keyGitLog, i18n("The commit history for the active project.")},
         {m_keyCoop, i18n("See who — human or agent — is editing what, in real time.")},
         {m_keyCowork, i18n("Let an agent see and control your desktop, only with your permission.")},
+        {m_keyRemote, i18n("Pair a device for the separate, limited remote human surface.")},
         {m_keyInspector, i18n("A live view of the agent's model, token use, cost and tool calls.")},
         {m_keyTerminal, i18n("A built-in command-line terminal.")},
         {m_keyReferences, i18n("Everywhere the selected symbol is used.")},

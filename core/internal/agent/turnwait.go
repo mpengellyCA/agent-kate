@@ -31,6 +31,10 @@ type TurnTracker struct {
 	mu      sync.Mutex
 	changed chan struct{} // closed + replaced on every state change (broadcast)
 	threads map[string]*turnState
+	// onChange receives only busy-edge transitions. It is invoked after tt.mu
+	// is released: a consumer may publish or re-enter the tracker without
+	// stalling an in-flight wait.
+	onChange func(threadID string, busy bool)
 }
 
 type turnState struct {
@@ -82,40 +86,79 @@ func (tt *TurnTracker) broadcastLocked() {
 	tt.changed = make(chan struct{})
 }
 
+// SetOnChange installs the busy-edge observer used by human-facing surfaces.
+// The callback is always invoked without tt.mu held.
+func (tt *TurnTracker) SetOnChange(f func(threadID string, busy bool)) {
+	tt.mu.Lock()
+	tt.onChange = f
+	tt.mu.Unlock()
+}
+
+// busyLocked is the single definition of a busy turn. Keeping it shared by
+// Busy, Snapshot, Wait and edge delivery prevents two surfaces disagreeing.
+func busyLocked(st *turnState) bool {
+	return st != nil && st.inFlight > 0 && !st.ended
+}
+
+// changedLocked wakes waiters and returns an edge callback for the caller to
+// invoke after unlocking. Caller holds tt.mu.
+func (tt *TurnTracker) changedLocked(threadID string, before bool, st *turnState) func() {
+	tt.broadcastLocked()
+	after := busyLocked(st)
+	callback := tt.onChange
+	if callback == nil || before == after {
+		return nil
+	}
+	return func() { callback(threadID, after) }
+}
+
 // TurnQueued records that a user message was (or is about to be) written to
 // the thread, so the thread counts as busy until the matching result lands.
 // Call it BEFORE the asynchronous launch/send so a wait that races the start
 // never sees a false idle.
 func (tt *TurnTracker) TurnQueued(threadID string) {
 	tt.mu.Lock()
-	defer tt.mu.Unlock()
 	st := tt.state(threadID)
+	before := busyLocked(st)
 	st.inFlight++
 	st.ended = false
-	tt.broadcastLocked()
+	callback := tt.changedLocked(threadID, before, st)
+	tt.mu.Unlock()
+	if callback != nil {
+		callback()
+	}
 }
 
 // TurnFailed undoes a TurnQueued whose send never reached the agent (write
 // error, dead thread) — no result is coming for it.
 func (tt *TurnTracker) TurnFailed(threadID string) {
 	tt.mu.Lock()
-	defer tt.mu.Unlock()
 	st := tt.threads[threadID]
 	if st == nil {
+		tt.mu.Unlock()
 		return
 	}
+	before := busyLocked(st)
 	if st.inFlight > 0 {
 		st.inFlight--
 	}
-	tt.broadcastLocked()
+	callback := tt.changedLocked(threadID, before, st)
+	tt.mu.Unlock()
+	if callback != nil {
+		callback()
+	}
 }
 
 // Forget drops a thread's state (discard/cleanup paths).
 func (tt *TurnTracker) Forget(threadID string) {
 	tt.mu.Lock()
-	defer tt.mu.Unlock()
+	before := busyLocked(tt.threads[threadID])
 	delete(tt.threads, threadID)
-	tt.broadcastLocked()
+	callback := tt.changedLocked(threadID, before, nil)
+	tt.mu.Unlock()
+	if callback != nil {
+		callback()
+	}
 }
 
 // Observe feeds one translated stream-json event through the tracker. Called
@@ -167,14 +210,18 @@ func (tt *TurnTracker) Observe(threadID string, raw json.RawMessage) {
 			tt.mu.Unlock()
 			return
 		}
+		before := busyLocked(st)
 		if strings.TrimSpace(resText) != "" {
 			st.lastText = capLastText(resText)
 		}
 		if st.inFlight > 0 {
 			st.inFlight--
 		}
-		tt.broadcastLocked()
+		callback := tt.changedLocked(threadID, before, st)
 		tt.mu.Unlock()
+		if callback != nil {
+			callback()
+		}
 	case "_lifecycle":
 		tt.ObserveLifecycle(threadID, head.Phase)
 	}
@@ -188,16 +235,17 @@ func (tt *TurnTracker) Observe(threadID string, raw json.RawMessage) {
 // resumed / launch errors).
 func (tt *TurnTracker) ObserveLifecycle(threadID, phase string) {
 	tt.mu.Lock()
-	defer tt.mu.Unlock()
 	switch phase {
 	case "exited", "interrupted", "error":
 		st := tt.threads[threadID]
 		if st == nil {
+			tt.mu.Unlock()
 			return // never tracked; nothing to end, nothing to sweep
 		}
+		before := busyLocked(st)
 		st.inFlight = 0
 		st.ended = true
-		tt.broadcastLocked()
+		callback := tt.changedLocked(threadID, before, st)
 		// Reap sweep (F61): the entry's only remaining consumer is a parked
 		// waiter reading lastText on wake. With none registered, drop it now
 		// instead of holding the final message until discard/stopClose; with
@@ -206,9 +254,37 @@ func (tt *TurnTracker) ObserveLifecycle(threadID, phase string) {
 		if st.waiters == 0 {
 			delete(tt.threads, threadID)
 		}
+		tt.mu.Unlock()
+		if callback != nil {
+			callback()
+		}
 	case "started", "resumed":
 		tt.state(threadID).ended = false
+		tt.mu.Unlock()
+	default:
+		tt.mu.Unlock()
 	}
+}
+
+// Busy reports whether a turn is currently in flight for threadID. It does
+// not allocate state for an unknown id: roster reads must not leak entries
+// which can never receive a lifecycle event to reap them.
+func (tt *TurnTracker) Busy(threadID string) bool {
+	tt.mu.Lock()
+	defer tt.mu.Unlock()
+	return busyLocked(tt.threads[threadID])
+}
+
+// Snapshot returns busy state for every tracked thread in one lock acquisition.
+// An absent id is idle.
+func (tt *TurnTracker) Snapshot() map[string]bool {
+	tt.mu.Lock()
+	defer tt.mu.Unlock()
+	out := make(map[string]bool, len(tt.threads))
+	for id, st := range tt.threads {
+		out[id] = busyLocked(st)
+	}
+	return out
 }
 
 // LastText returns the thread's last known assistant text.

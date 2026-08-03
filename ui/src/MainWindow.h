@@ -26,6 +26,7 @@ class TerminalPanel;
 class WorktreeDashboard;
 class LogViewer;
 class CoworkPanel;
+class RemotePanel;
 class CooperationPanel;
 class AiInspectorPanel;
 class JobsPanel;
@@ -273,6 +274,7 @@ private:
     WorktreeDashboard *m_worktreeDashboard = nullptr;
     LogViewer *m_logViewer = nullptr;
     CoworkPanel *m_coworkPanel = nullptr;
+    RemotePanel *m_remotePanel = nullptr;
     CooperationPanel *m_coopPanel = nullptr;
     AiInspectorPanel *m_inspectorPanel = nullptr;
     JobsPanel *m_jobsPanel = nullptr;
@@ -319,6 +321,7 @@ private:
     QString m_keyGitLog = QStringLiteral("gitlog");
     QString m_keyCoop = QStringLiteral("coop");
     QString m_keyCowork = QStringLiteral("cowork");
+    QString m_keyRemote = QStringLiteral("remote");
     QString m_keyInspector = QStringLiteral("inspector");
     QString m_keyTerminal = QStringLiteral("terminal");
     QString m_keyReferences = QStringLiteral("references");

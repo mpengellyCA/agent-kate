@@ -1,0 +1,10 @@
+dist/*
+!dist/.gitkeep
+
+# Explicit web-build artefacts. Neither dependencies nor built assets are
+# source: release packaging builds the pinned bundle into its staging tree.
+node_modules/
+.vite/
+coverage/
+*.local
+npm-debug.log*
