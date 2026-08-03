@@ -135,10 +135,10 @@ TranscriptMetrics ChatAppearance::metrics(const QFont &applicationFont, const QP
 
     const int usable = qMax(0, viewportWidth - 2 * result.outerInsetX);
     result.assistantMaxWidth = qMin(820, usable);
-    // Keep the human bubble visibly more compact than assistant prose even in
-    // a very wide pane. It is still at most 82% of usable width, and both
-    // speakers intentionally become full-width in a narrow layout.
+    // Keep the human bubble visibly more compact than assistant prose. Its
+    // width follows the available conversation pane; both speakers become
+    // full-width in a narrow layout.
     result.userMaxWidth = usable <= result.narrowBubbleWidth
-        ? usable : qMin(qRound(usable * 0.82), qRound(820 * 0.82));
+        ? usable : qRound(usable * 0.82);
     return result;
 }

@@ -14,6 +14,7 @@
 
 #include "AiInspectorPanel.h"
 #include "ipc/CoreClient.h"
+#include "state/HarnessTraits.h"
 
 #include <QJsonArray>
 #include <QJsonObject>
@@ -121,6 +122,16 @@ private Q_SLOTS:
 void AiInspectorPanelTest::initTestCase()
 {
     QStandardPaths::setTestModeEnabled(true);
+
+    // The production registry has no offline defaults: harness.list is its
+    // authority. Install the two traits this test needs so its accounting
+    // assertions exercise both supported result-usage semantics.
+    HarnessTraits claude;
+    claude.id = QStringLiteral("claude");
+    claude.usageReporting = true;
+    HarnessTraits kimi;
+    kimi.id = QStringLiteral("kimi");
+    HarnessRegistry::self()->replaceDescriptorsForTest({claude, kimi});
 }
 
 // The F60 gate. Kimi declares no usage reporting: its result usage is a
