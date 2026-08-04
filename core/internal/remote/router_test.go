@@ -35,8 +35,10 @@ var frozenRoutes = []string{
 	"POST /api/v1/agents/{threadId}/send",
 	"POST /api/v1/agents/{threadId}/fork",
 	"POST /api/v1/agents/{threadId}/new",
+	"GET /api/v1/agents/{threadId}/launch-options",
 	"GET /api/v1/agents/{threadId}/files",
 	"GET /api/v1/agents/{threadId}/file",
+	"GET /api/v1/agents/{threadId}/file/image",
 	"PUT /api/v1/agents/{threadId}/file",
 	"POST /api/v1/agents/{threadId}/interrupt",
 	"POST /api/v1/agents/{threadId}/stop",
@@ -144,7 +146,7 @@ func TestBackendInterfaceHasNoPrivilegedVerb(t *testing.T) {
 	// reflect reports interface methods in sorted order.
 	want := []string{
 		"Diff", "Fork", "GitLog", "GitStatus", "Interrupt", "ListAgents", "ListFiles",
-		"PermissionDetail", "ReadFile", "RespondPermission", "Send", "StartProjectAgent", "Stop", "Transcript", "WriteFile",
+		"PermissionDetail", "ProjectLaunchOptions", "ReadFile", "ReadImage", "RespondPermission", "Send", "StartProjectAgent", "Stop", "Transcript", "WriteFile",
 	}
 	got := backendMethodNames()
 	if len(got) != len(want) {

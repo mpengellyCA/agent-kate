@@ -5,8 +5,9 @@ import MarkdownBlock from './components/MarkdownBlock.vue'
 import { bootstrapAuth } from './api/auth.js'
 import {
   API_VERSION, eventsUrl, getAgents, getMeta, getPermission, getTranscript,
+  getProjectLaunchOptions,
   forkAgent, interruptAgent, listWorktreeFiles, logout, readWorktreeFile,
-  respondPermission, sendPrompt, startProjectAgent, stopAgent, writeWorktreeFile,
+  respondPermission, sendPrompt, startProjectAgent, stopAgent, worktreeImageUrl, writeWorktreeFile,
 } from './api/client.js'
 
 const MAX_ATTACHMENTS = 4
@@ -37,6 +38,13 @@ const forking = ref(false)
 const newAgentOpen = ref(false)
 const newAgentPrompt = ref('')
 const newAgentTitle = ref('')
+const launchOptions = ref(null)
+const launchBackend = ref('')
+const launchProvider = ref('')
+const launchModel = ref('')
+const launchEffort = ref('')
+const launchIsolation = ref('auto')
+const launchOptionsLoading = ref(false)
 const startingAgent = ref(false)
 const filePanelOpen = ref(false)
 const fileDirectory = ref('')
@@ -44,6 +52,8 @@ const fileEntries = ref([])
 const filePath = ref('')
 const fileText = ref('')
 const fileRevision = ref('')
+const filePreviewKind = ref('')
+const fileImageURL = ref('')
 const fileLoading = ref(false)
 const fileSaving = ref(false)
 const fileDirty = ref(false)
@@ -87,6 +97,8 @@ const canSend = computed(() => !!selected.value && !sending.value &&
   (!!composer.value.trim() || attachments.value.length > 0) && selected.value.status !== 'archived')
 const attachmentBytes = computed(() => attachments.value.reduce((total, attachment) => total + attachment.bytes, 0))
 const canManageAgents = computed(() => Array.isArray(meta.value?.capabilities) && meta.value.capabilities.includes('agent_manage'))
+const canConfigureAgents = computed(() => Array.isArray(meta.value?.capabilities) && meta.value.capabilities.includes('agent_configure'))
+const launchModelChoice = computed(() => launchOptions.value?.models?.find((model) => model.id === launchModel.value) ?? null)
 const canViewWorktree = computed(() => Array.isArray(meta.value?.capabilities) && meta.value.capabilities.includes('worktree_view'))
 const canEditWorktree = computed(() => Array.isArray(meta.value?.capabilities) && meta.value.capabilities.includes('worktree_edit'))
 const projectSeed = computed(() => selected.value || currentProject.value?.agents?.[0] || null)
@@ -265,18 +277,44 @@ async function forkSelected() {
   finally { forking.value = false }
 }
 
-function openNewAgent() {
+async function openNewAgent() {
   if (!canManageAgents.value || !projectSeed.value) return
   newAgentPrompt.value = ''
   newAgentTitle.value = ''
+  launchOptions.value = null
+  launchBackend.value = ''
+  launchProvider.value = ''
+  launchModel.value = ''
+  launchEffort.value = ''
+  launchIsolation.value = 'auto'
   newAgentOpen.value = true
+  if (canConfigureAgents.value) await loadLaunchOptions()
 }
+async function loadLaunchOptions() {
+  if (!projectSeed.value || !canConfigureAgents.value) return
+  launchOptionsLoading.value = true
+  try {
+    const options = await getProjectLaunchOptions(projectSeed.value.threadId, { backend: launchBackend.value, providerId: launchProvider.value })
+    launchOptions.value = options
+    launchBackend.value = options?.default?.backend || launchBackend.value
+    launchProvider.value = options?.default?.providerId || launchProvider.value || 'direct'
+    const modelIDs = new Set((options?.models || []).map((model) => model.id))
+    launchModel.value = modelIDs.has(launchModel.value) ? launchModel.value
+      : modelIDs.has(options?.default?.model) ? options.default.model : (options?.models?.[0]?.id || '')
+    const selectedModel = options?.models?.find((model) => model.id === launchModel.value)
+    launchEffort.value = selectedModel?.efforts?.includes(launchEffort.value) ? launchEffort.value
+      : selectedModel?.efforts?.includes(options?.default?.effort) ? options.default.effort : ''
+    launchIsolation.value = options?.default?.isolation || 'auto'
+  } catch (err) { actionError.value = err?.message || 'Could not load launch options.' }
+  finally { launchOptionsLoading.value = false }
+}
+async function changeLaunchScope() { await loadLaunchOptions() }
 async function createProjectAgent() {
   if (!projectSeed.value || !newAgentPrompt.value.trim() || startingAgent.value) return
   startingAgent.value = true
   actionError.value = ''
   try {
-    await startProjectAgent(projectSeed.value.threadId, { prompt: newAgentPrompt.value.trim(), title: newAgentTitle.value.trim() })
+    await startProjectAgent(projectSeed.value.threadId, { prompt: newAgentPrompt.value.trim(), title: newAgentTitle.value.trim(), backend: launchBackend.value, providerId: launchProvider.value, model: launchModel.value, effort: launchEffort.value, isolation: launchIsolation.value })
     newAgentOpen.value = false
     newAgentPrompt.value = ''
     newAgentTitle.value = ''
@@ -292,6 +330,8 @@ async function openFiles() {
   filePath.value = ''
   fileText.value = ''
   fileRevision.value = ''
+  filePreviewKind.value = ''
+  fileImageURL.value = ''
   fileDirty.value = false
   fileError.value = ''
   await loadFiles('')
@@ -315,6 +355,12 @@ function parentDirectory(path) {
 async function openFile(path) {
   if (!selected.value || !canViewWorktree.value) return
   if (autosaveTimer) clearTimeout(autosaveTimer)
+  filePreviewKind.value = 'text'
+  fileImageURL.value = ''
+  filePath.value = path
+  fileText.value = ''
+  fileRevision.value = ''
+  fileDirty.value = false
   fileLoading.value = true
   fileError.value = ''
   try {
@@ -325,6 +371,26 @@ async function openFile(path) {
     fileDirty.value = false
   } catch (err) { fileError.value = err?.message || 'Could not open this file.' }
   finally { fileLoading.value = false }
+}
+function isPreviewableImage(entry) {
+  return !entry?.directory && /\.(png|jpe?g|gif|webp)$/i.test(String(entry?.name || entry?.path || ''))
+}
+function openImage(path) {
+  if (!selected.value || !canViewWorktree.value) return
+  if (autosaveTimer) clearTimeout(autosaveTimer)
+  filePath.value = path
+  fileText.value = ''
+  fileRevision.value = ''
+  fileDirty.value = false
+  fileError.value = ''
+  filePreviewKind.value = 'image'
+  fileLoading.value = true
+  fileImageURL.value = worktreeImageUrl(selected.value.threadId, path)
+}
+function imageLoaded() { fileLoading.value = false }
+function imageFailed() {
+  fileLoading.value = false
+  fileError.value = 'This image could not be loaded from the worktree.'
 }
 function scheduleFileSave() {
   fileDirty.value = true
@@ -347,7 +413,11 @@ async function saveFile() {
       : (err?.message || 'Could not save this file.')
   } finally { fileSaving.value = false }
 }
-async function reloadFile() { if (filePath.value) await openFile(filePath.value) }
+async function reloadFile() {
+  if (!filePath.value) return
+  if (filePreviewKind.value === 'image') openImage(filePath.value)
+  else await openFile(filePath.value)
+}
 async function closeFiles() {
   if (autosaveTimer) {
     clearTimeout(autosaveTimer)
@@ -568,9 +638,42 @@ function relativeActivity(value) {
         </footer>
       </section>
 
-      <dialog v-if="newAgentOpen" class="modal modal-open"><div class="modal-box max-w-lg"><p class="text-xs font-semibold uppercase tracking-[0.16em] text-primary">{{ selectedProject }}</p><h3 class="mt-1 text-lg font-semibold">Start a project agent</h3><p class="mt-2 text-sm text-ak-muted">A fresh isolated worktree will use this project’s trusted desktop configuration. Cowork stays off.</p><label class="form-control mt-5"><span class="label-text text-sm">First instruction</span><textarea v-model="newAgentPrompt" rows="4" class="textarea textarea-bordered mt-1 resize-none bg-base-200" placeholder="What should this agent work on?" /></label><label class="form-control mt-3"><span class="label-text text-sm">Title <span class="text-ak-muted">(optional)</span></span><input v-model="newAgentTitle" class="input input-bordered mt-1 bg-base-200" placeholder="e.g. API review" /></label><div class="modal-action"><button type="button" class="btn btn-ghost" :disabled="startingAgent" @click="newAgentOpen = false">Cancel</button><button type="button" class="btn btn-primary" :disabled="startingAgent || !newAgentPrompt.trim()" @click="createProjectAgent"><span v-if="startingAgent" class="loading loading-spinner loading-xs" />Start agent</button></div></div></dialog>
+      <dialog v-if="newAgentOpen" class="modal modal-open"><div class="modal-box max-h-[90dvh] max-w-2xl overflow-y-auto"><p class="text-xs font-semibold uppercase tracking-[0.16em] text-primary">{{ selectedProject }}</p><h3 class="mt-1 text-lg font-semibold">Start a project agent</h3><p class="mt-2 text-sm text-ak-muted">{{ canConfigureAgents ? 'Choose a desktop-approved launch profile for this project. Cowork stays off.' : 'Uses this project’s trusted desktop configuration. Cowork stays off.' }}</p><label class="form-control mt-5"><span class="label-text text-sm">First instruction</span><textarea v-model="newAgentPrompt" rows="4" class="textarea textarea-bordered mt-1 resize-none bg-base-200" placeholder="What should this agent work on?" /></label><label class="form-control mt-3"><span class="label-text text-sm">Title <span class="text-ak-muted">(optional)</span></span><input v-model="newAgentTitle" class="input input-bordered mt-1 bg-base-200" placeholder="e.g. API review" /></label><div v-if="canConfigureAgents" class="mt-5 rounded-box border border-ak-border bg-base-200 p-4"><div class="mb-3 flex items-center justify-between"><p class="text-sm font-semibold">Launch configuration</p><span v-if="launchOptionsLoading" class="loading loading-spinner loading-xs text-primary" /></div><div v-if="launchOptions" class="grid gap-3 sm:grid-cols-2"><label class="form-control"><span class="label-text text-xs">Harness</span><select v-model="launchBackend" class="select select-bordered select-sm mt-1 bg-base-100" :disabled="launchOptionsLoading" @change="changeLaunchScope"><option v-for="option in launchOptions.harnesses" :key="option.id" :value="option.id">{{ option.name }}</option></select></label><label class="form-control"><span class="label-text text-xs">Provider</span><select v-model="launchProvider" class="select select-bordered select-sm mt-1 bg-base-100" :disabled="launchOptionsLoading" @change="changeLaunchScope"><option v-for="option in launchOptions.providers" :key="option.id" :value="option.id">{{ option.name }}</option></select></label><label class="form-control"><span class="label-text text-xs">Model</span><select v-model="launchModel" class="select select-bordered select-sm mt-1 bg-base-100" :disabled="launchOptionsLoading"><option v-for="option in launchOptions.models" :key="option.id" :value="option.id">{{ option.name }}</option></select></label><label class="form-control"><span class="label-text text-xs">Reasoning</span><select v-model="launchEffort" class="select select-bordered select-sm mt-1 bg-base-100" :disabled="launchOptionsLoading || !launchModelChoice?.efforts?.length"><option value="">Default</option><option v-for="effort in launchModelChoice?.efforts || []" :key="effort" :value="effort">{{ effort }}</option></select></label><label class="form-control sm:col-span-2"><span class="label-text text-xs">Worktree</span><select v-model="launchIsolation" class="select select-bordered select-sm mt-1 bg-base-100"><option v-for="option in launchOptions.worktreeModes" :key="option.id" :value="option.id">{{ option.name }}</option></select></label></div><p v-else-if="!launchOptionsLoading" class="text-sm text-error">Launch options are unavailable. The trusted project default will be used.</p></div><div class="modal-action"><button type="button" class="btn btn-ghost" :disabled="startingAgent" @click="newAgentOpen = false">Cancel</button><button type="button" class="btn btn-primary" :disabled="startingAgent || !newAgentPrompt.trim()" @click="createProjectAgent"><span v-if="startingAgent" class="loading loading-spinner loading-xs" />Start agent</button></div></div></dialog>
 
-      <dialog v-if="filePanelOpen" class="modal modal-open"><div class="modal-box file-workspace max-h-[92dvh] max-w-5xl overflow-hidden p-0"><header class="flex items-center gap-3 border-b border-ak-border bg-base-200 px-4 py-3"><div class="min-w-0 flex-1"><p class="text-xs font-semibold uppercase tracking-[0.16em] text-primary">Worktree</p><h3 class="truncate font-mono text-sm">{{ filePath || (fileDirectory || 'project root') }}</h3></div><span v-if="fileSaving" class="text-xs text-primary">Saving…</span><span v-else-if="fileDirty" class="text-xs text-warning">Unsaved</span><span v-else-if="filePath" class="text-xs text-success">Saved</span><button type="button" class="btn btn-ghost btn-sm btn-square" aria-label="Close files" @click="closeFiles">×</button></header><div class="grid min-h-0 md:grid-cols-[16rem_minmax(0,1fr)]"><aside class="max-h-52 overflow-y-auto border-b border-ak-border bg-base-200 p-2 md:max-h-[72dvh] md:border-b-0 md:border-r"><div class="mb-2 flex items-center gap-1"><button type="button" class="btn btn-ghost btn-xs" :disabled="!fileDirectory || fileLoading" @click="loadFiles(parentDirectory(fileDirectory))">↑ Up</button><button type="button" class="btn btn-ghost btn-xs" :disabled="fileLoading" @click="loadFiles(fileDirectory)">↻</button></div><p v-if="fileLoading && !filePath" class="p-3 text-xs text-ak-muted">Loading worktree…</p><p v-else-if="!fileEntries.length" class="p-3 text-xs text-ak-muted">No readable files here.</p><button v-for="entry in fileEntries" :key="entry.path" type="button" class="file-entry" :class="{ 'file-entry-active': entry.path === filePath }" @click="entry.directory ? loadFiles(entry.path) : openFile(entry.path)"><span class="text-primary">{{ entry.directory ? '▸' : '·' }}</span><span class="min-w-0 flex-1 truncate font-mono text-xs">{{ entry.name }}</span><span v-if="!entry.directory && entry.size" class="text-[0.65rem] text-ak-muted">{{ shortBytes(entry.size) }}</span></button></aside><section class="flex min-h-72 min-w-0 flex-col bg-base-100"><div v-if="fileError" class="m-3 rounded-box bg-error/10 px-3 py-2 text-sm text-error">{{ fileError }}<button v-if="filePath" type="button" class="btn btn-link btn-xs ml-1" @click="reloadFile">Reload</button></div><template v-else-if="filePath"><textarea v-model="fileText" class="file-editor min-h-72 flex-1 resize-none border-0 bg-base-100 p-4 font-mono text-sm leading-6 outline-none" :readonly="!canEditWorktree" :aria-label="`Edit ${filePath}`" @input="scheduleFileSave" /><footer class="flex items-center justify-between border-t border-ak-border px-4 py-2 text-xs text-ak-muted"><span>{{ canEditWorktree ? 'Autosaves after a short pause.' : 'View-only — editing is not enabled for this device.' }}</span><button v-if="canEditWorktree" type="button" class="btn btn-primary btn-xs" :disabled="fileSaving || !fileDirty" @click="saveFile">Save now</button></footer></template><div v-else class="grid min-h-72 place-items-center p-8 text-center text-sm text-ak-muted"><p>Choose a text file to inspect.<br><span v-if="canEditWorktree">Changes autosave with revision protection.</span><span v-else>This device has view-only worktree access.</span></p></div></section></div></div></dialog>
+      <dialog v-if="filePanelOpen" class="modal modal-open">
+        <div class="modal-box file-workspace max-h-[92dvh] max-w-5xl overflow-hidden p-0">
+          <header class="flex items-center gap-3 border-b border-ak-border bg-base-200 px-4 py-3">
+            <div class="min-w-0 flex-1"><p class="text-xs font-semibold uppercase tracking-[0.16em] text-primary">Worktree</p><h3 class="truncate font-mono text-sm">{{ filePath || (fileDirectory || 'project root') }}</h3></div>
+            <span v-if="fileSaving" class="text-xs text-primary">Saving…</span>
+            <span v-else-if="fileDirty" class="text-xs text-warning">Unsaved</span>
+            <span v-else-if="filePreviewKind === 'image'" class="text-xs text-primary">Image preview</span>
+            <span v-else-if="filePath" class="text-xs text-success">Saved</span>
+            <button type="button" class="btn btn-ghost btn-sm btn-square" aria-label="Close files" @click="closeFiles">×</button>
+          </header>
+          <div class="grid min-h-0 md:grid-cols-[16rem_minmax(0,1fr)]">
+            <aside class="max-h-52 overflow-y-auto border-b border-ak-border bg-base-200 p-2 md:max-h-[72dvh] md:border-b-0 md:border-r">
+              <div class="mb-2 flex items-center gap-1"><button type="button" class="btn btn-ghost btn-xs" :disabled="!fileDirectory || fileLoading" @click="loadFiles(parentDirectory(fileDirectory))">↑ Up</button><button type="button" class="btn btn-ghost btn-xs" :disabled="fileLoading" @click="loadFiles(fileDirectory)">↻</button></div>
+              <p v-if="fileLoading && !filePath" class="p-3 text-xs text-ak-muted">Loading worktree…</p><p v-else-if="!fileEntries.length" class="p-3 text-xs text-ak-muted">No readable files here.</p>
+              <button v-for="entry in fileEntries" :key="entry.path" type="button" class="file-entry" :class="{ 'file-entry-active': entry.path === filePath }" @click="entry.directory ? loadFiles(entry.path) : isPreviewableImage(entry) ? openImage(entry.path) : openFile(entry.path)"><span class="text-primary">{{ entry.directory ? '▸' : isPreviewableImage(entry) ? '▧' : '·' }}</span><span class="min-w-0 flex-1 truncate font-mono text-xs">{{ entry.name }}</span><span v-if="!entry.directory && entry.size" class="text-[0.65rem] text-ak-muted">{{ shortBytes(entry.size) }}</span></button>
+            </aside>
+            <section class="flex min-h-72 min-w-0 flex-col bg-base-100">
+              <div v-if="fileError" class="m-3 rounded-box bg-error/10 px-3 py-2 text-sm text-error">{{ fileError }}<button v-if="filePath" type="button" class="btn btn-link btn-xs ml-1" @click="reloadFile">Reload</button></div>
+              <template v-else-if="filePreviewKind === 'image' && fileImageURL">
+                <div class="relative grid min-h-72 flex-1 place-items-center overflow-auto bg-base-300 p-4">
+                  <span v-if="fileLoading" class="loading loading-spinner loading-md text-primary" aria-label="Loading image" />
+                  <img :src="fileImageURL" :alt="filePath" class="max-h-[58dvh] max-w-full rounded-box object-contain shadow-2xl" :class="{ 'invisible': fileLoading }" @load="imageLoaded" @error="imageFailed" />
+                </div>
+                <footer class="border-t border-ak-border px-4 py-2 text-xs text-ak-muted">Raster preview only. Image edits stay in your project’s editor or agent workflow.</footer>
+              </template>
+              <template v-else-if="filePath">
+                <textarea v-model="fileText" class="file-editor min-h-72 flex-1 resize-none border-0 bg-base-100 p-4 font-mono text-sm leading-6 outline-none" :readonly="!canEditWorktree" :aria-label="`Edit ${filePath}`" @input="scheduleFileSave" />
+                <footer class="flex items-center justify-between border-t border-ak-border px-4 py-2 text-xs text-ak-muted"><span>{{ canEditWorktree ? 'Autosaves after a short pause.' : 'View-only — editing is not enabled for this device.' }}</span><button v-if="canEditWorktree" type="button" class="btn btn-primary btn-xs" :disabled="fileSaving || !fileDirty" @click="saveFile">Save now</button></footer>
+              </template>
+              <div v-else class="grid min-h-72 place-items-center p-8 text-center text-sm text-ak-muted"><p>Choose a text file or image to inspect.<br><span v-if="canEditWorktree">Text changes autosave with revision protection.</span><span v-else>This device has view-only worktree access.</span></p></div>
+            </section>
+          </div>
+        </div>
+      </dialog>
 
       <dialog v-if="prompt" class="modal modal-open"><div class="modal-box max-h-[85dvh] max-w-2xl overflow-y-auto"><h3 class="text-lg font-semibold">{{ prompt.kind === 'plan' ? 'Plan approval' : prompt.kind === 'question' ? 'Question for you' : 'Permission needed' }}</h3><p class="mt-2 text-sm text-ak-muted">{{ prompt.summary }}</p><MarkdownBlock v-if="detail?.kind === 'plan' && detail.plan" class="mt-4 rounded-box bg-base-200 p-3" :source="detail.plan" /><div v-else-if="detail?.kind === 'question'" class="mt-4 space-y-4"><fieldset v-for="question in detail.questions || []" :key="question.question" class="rounded-box border border-ak-border p-3"><legend class="px-1 font-medium">{{ question.question }}</legend><label v-for="option in question.options || []" :key="optionLabel(option)" class="mt-2 flex cursor-pointer items-start gap-2 text-sm"><input :type="question.multiSelect ? 'checkbox' : 'radio'" :name="question.question" class="checkbox checkbox-sm mt-0.5" :checked="chosen(question.question, optionLabel(option))" @change="pick(question.question, optionLabel(option), question.multiSelect)" /><span>{{ optionLabel(option) }}<small v-if="optionDescription(option)" class="block text-ak-muted">{{ optionDescription(option) }}</small></span></label></fieldset></div><p v-else-if="prompt.kind !== 'tool'" class="mt-4 rounded-box bg-warning/10 p-3 text-sm text-warning">The allowed details are unavailable. Answer this on the desktop instead.</p><div class="modal-action"><button type="button" class="btn btn-outline btn-error" @click="answer(false)">Deny</button><button type="button" class="btn btn-success" :disabled="prompt.kind === 'question' && !detail" @click="answer(true)">Approve<span v-if="prompt.kind === 'question'"> answers</span></button></div></div></dialog>
     </div>

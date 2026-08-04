@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { sendPrompt } from './client.js'
+import { sendPrompt, worktreeImageUrl } from './client.js'
 
 describe('sendPrompt', () => {
   it('always uses the queued, typed remote-send contract', async () => {
@@ -22,5 +22,12 @@ describe('sendPrompt', () => {
       attachments: [{ kind: 'text', name: 'notes.md', mediaType: 'text/markdown', text: '# note' }],
       mode: 'queue',
     })
+  })
+})
+
+describe('worktreeImageUrl', () => {
+  it('uses the dedicated, path-encoded image-preview route', () => {
+    expect(worktreeImageUrl('thread / one', 'assets/mobile screenshot.png'))
+      .toBe('/api/v1/agents/thread%20%2F%20one/file/image?path=assets%2Fmobile+screenshot.png')
   })
 })

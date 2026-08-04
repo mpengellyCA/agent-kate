@@ -1472,6 +1472,7 @@ void RemotePanel::renderDevices(const QJsonArray &devices)
         struct CapabilityAction { QString key; QAction *action; };
         const QList<CapabilityAction> actions{
             {QStringLiteral("agent_manage"), menu->addAction(i18n("Start and fork agents"))},
+            {QStringLiteral("agent_configure"), menu->addAction(i18n("Configure new agents"))},
             {QStringLiteral("worktree_view"), menu->addAction(i18n("View worktree files"))},
             {QStringLiteral("worktree_edit"), menu->addAction(i18n("Edit and autosave files"))},
         };

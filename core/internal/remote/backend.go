@@ -39,8 +39,10 @@ type Backend interface {
 	// HTTPS handler admits it only for devices with CapAgentManage.
 	Fork(ctx context.Context, principal Principal, req ForkRequest) (ForkResult, error)
 	StartProjectAgent(ctx context.Context, principal Principal, req ProjectAgentRequest) (ProjectAgentResult, error)
+	ProjectLaunchOptions(ctx context.Context, req ProjectLaunchOptionsRequest) (ProjectLaunchOptions, error)
 	ListFiles(ctx context.Context, req FileRequest) ([]FileEntry, error)
 	ReadFile(ctx context.Context, req FileRequest) (FileContent, error)
+	ReadImage(ctx context.Context, req FileRequest) (ImageContent, error)
 	WriteFile(ctx context.Context, principal Principal, req FileWriteRequest) (FileContent, error)
 
 	// PermissionDetail returns the renderable content of ONE parked prompt.
@@ -267,8 +269,22 @@ type ForkResult struct{ ThreadID string }
 
 // ProjectAgentRequest is seeded from an existing project member. The paired
 // browser cannot supply a workspace, provider, environment, or Cowork state.
-type ProjectAgentRequest struct{ ThreadID, Prompt, Title string }
+type ProjectAgentRequest struct {
+	ThreadID, Prompt, Title                       string
+	Backend, ProviderID, Model, Effort, Isolation string
+}
 type ProjectAgentResult struct{ ThreadID string }
+type ProjectLaunchOptionsRequest struct{ ThreadID, Backend, ProviderID string }
+type LaunchChoice struct{ ID, Name string }
+type LaunchModel struct {
+	ID, Name string
+	Efforts  []string
+}
+type ProjectLaunchOptions struct {
+	Harnesses, Providers, WorktreeModes []LaunchChoice
+	Models                              []LaunchModel
+	Default                             ProjectAgentRequest
+}
 type FileRequest struct{ ThreadID, Path string }
 type FileWriteRequest struct{ ThreadID, Path, Text, Revision string }
 
@@ -279,6 +295,14 @@ type FileContent struct {
 	Path     string `json:"path"`
 	Text     string `json:"text"`
 	Revision string `json:"revision"`
+}
+
+// ImageContent is an allowlisted worktree preview. It is kept separate from
+// FileContent so a browser never mistakes arbitrary binary data for editable
+// UTF-8 text.
+type ImageContent struct {
+	MediaType string
+	Data      []byte
 }
 
 // FileEntry is a direct child of a worktree directory. Paths are relative and

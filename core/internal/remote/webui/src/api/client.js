@@ -52,11 +52,16 @@ export const sendPrompt = (threadId, { text = '', attachments = [] } = {}, opts)
 export const forkAgent = (threadId, { title = '' } = {}, opts) => apiFetch(`/agents/${encodeURIComponent(threadId)}/fork`, {
 	...opts, method: 'POST', body: { title },
 })
-export const startProjectAgent = (threadId, { prompt, title = '' }, opts) => apiFetch(`/agents/${encodeURIComponent(threadId)}/new`, {
-  ...opts, method: 'POST', body: { prompt, title },
+export const startProjectAgent = (threadId, { prompt, title = '', backend = '', providerId = '', model = '', effort = '', isolation = '' }, opts) => apiFetch(`/agents/${encodeURIComponent(threadId)}/new`, {
+  ...opts, method: 'POST', body: { prompt, title, backend, providerId, model, effort, isolation },
 })
+export const getProjectLaunchOptions = (threadId, { backend, providerId } = {}, opts = {}) => apiFetch(`/agents/${encodeURIComponent(threadId)}/launch-options`, { ...opts, query: { backend, providerId } })
 export const listWorktreeFiles = (threadId, path = '', opts = {}) => apiFetch(`/agents/${encodeURIComponent(threadId)}/files`, { ...opts, query: { path } })
 export const readWorktreeFile = (threadId, path, opts = {}) => apiFetch(`/agents/${encodeURIComponent(threadId)}/file`, { ...opts, query: { path } })
+export const worktreeImageUrl = (threadId, path) => {
+  const query = new URLSearchParams({ path: String(path || '') })
+  return `${API_BASE}/agents/${encodeURIComponent(threadId)}/file/image?${query}`
+}
 export const writeWorktreeFile = (threadId, body, opts) => apiFetch(`/agents/${encodeURIComponent(threadId)}/file`, { ...opts, method: 'PUT', body })
 export const interruptAgent = (threadId, opts) => apiFetch(`/agents/${encodeURIComponent(threadId)}/interrupt`, { ...opts, method: 'POST', body: {} })
 export const stopAgent = (threadId, opts) => apiFetch(`/agents/${encodeURIComponent(threadId)}/stop`, { ...opts, method: 'POST', body: {} })

@@ -307,8 +307,62 @@ func (b *remoteBackend) StartProjectAgent(ctx context.Context, _ remote.Principa
 	if strings.TrimSpace(src.Project) == "" {
 		return remote.ProjectAgentResult{}, fmt.Errorf("this agent has no project")
 	}
-	h := b.d.harnessFor(req.ThreadID)
+	backendID := req.Backend
+	if backendID == "" {
+		backendID = b.d.harnessFor(req.ThreadID).Descriptor().ID
+	}
+	h, ok := b.d.harnesses.Get(backendID)
+	if !ok {
+		return remote.ProjectAgentResult{}, fmt.Errorf("unknown harness")
+	}
 	descriptor := h.Descriptor()
+	providerID := req.ProviderID
+	if providerID == "" {
+		providerID = src.ProviderID
+	}
+	provider, err := resolveProviderBinding(providerID)
+	if err != nil {
+		return remote.ProjectAgentResult{}, err
+	}
+	if provider != nil && !descriptor.Supports(harness.OperationProviderRouting) {
+		return remote.ProjectAgentResult{}, remote.ErrUnsupported
+	}
+	catalogue, err := h.Catalogue(ctx, harness.CatalogueScope{HarnessID: descriptor.ID, ProviderID: providerID})
+	if err != nil {
+		return remote.ProjectAgentResult{}, err
+	}
+	if err := harness.ValidateCatalogue(catalogue); err != nil {
+		return remote.ProjectAgentResult{}, err
+	}
+	model, effort := req.Model, req.Effort
+	if model != "" {
+		found := false
+		for _, option := range catalogue.Models {
+			if option.ID != model {
+				continue
+			}
+			found = true
+			if effort != "" && len(option.SupportedReasoningEfforts) > 0 && !containsString(option.SupportedReasoningEfforts, effort) {
+				return remote.ProjectAgentResult{}, fmt.Errorf("reasoning effort is not available for that model")
+			}
+			break
+		}
+		if !found {
+			return remote.ProjectAgentResult{}, fmt.Errorf("model is not available for that harness and provider")
+		}
+	} else {
+		model = src.Model
+	}
+	if effort == "" {
+		effort = src.Effort
+	}
+	isolation := req.Isolation
+	if isolation == "" {
+		isolation = "auto"
+	}
+	if isolation != "auto" && isolation != worktree.ModeWorkspace && isolation != worktree.ModeIsolated {
+		return remote.ProjectAgentResult{}, fmt.Errorf("invalid worktree mode")
+	}
 	threadID := agent.NewThreadID()
 	sessionID := ""
 	if descriptor.Supports(harness.OperationMintSessionID) {
@@ -316,8 +370,8 @@ func (b *remoteBackend) StartProjectAgent(ctx context.Context, _ remote.Principa
 	}
 	p := agentStartParams{
 		WorkspacePath: src.Project, Prompt: req.Prompt, PermissionMode: src.PermissionMode,
-		SandboxMode: src.EffectiveSettings.SandboxMode, Effort: src.Effort, Model: src.Model,
-		Backend: descriptor.ID, Isolation: "", CoworkEnabled: false, Provider: providerFromRecord(src),
+		SandboxMode: src.EffectiveSettings.SandboxMode, Effort: effort, Model: model,
+		Backend: descriptor.ID, Isolation: isolation, CoworkEnabled: false, Provider: provider,
 		SystemPrompt: src.SystemPrompt, Agents: src.Agents, Env: src.Env,
 		FallbackModels: src.FallbackModels, DisallowedTools: src.DisallowedTools, AddDirs: src.AddDirs,
 		StrictMCPConfig: src.StrictMCPConfig, MaxBudgetUSD: src.MaxBudgetUSD,
@@ -338,6 +392,61 @@ func (b *remoteBackend) StartProjectAgent(ctx context.Context, _ remote.Principa
 		_, _, _ = launchThread(b.d, h, threadID, sessionID, p, launchMeta{Title: req.Title})
 	})
 	return remote.ProjectAgentResult{ThreadID: threadID}, nil
+}
+
+func (b *remoteBackend) ProjectLaunchOptions(ctx context.Context, req remote.ProjectLaunchOptionsRequest) (remote.ProjectLaunchOptions, error) {
+	if err := ctx.Err(); err != nil {
+		return remote.ProjectLaunchOptions{}, err
+	}
+	if err := b.requireThread(req.ThreadID); err != nil {
+		return remote.ProjectLaunchOptions{}, err
+	}
+	src, _ := b.d.sessions.Get(req.ThreadID)
+	backendID := req.Backend
+	if backendID == "" {
+		backendID = b.d.harnessFor(req.ThreadID).Descriptor().ID
+	}
+	h, ok := b.d.harnesses.Get(backendID)
+	if !ok {
+		return remote.ProjectLaunchOptions{}, fmt.Errorf("unknown harness")
+	}
+	providerID := req.ProviderID
+	if providerID == "" {
+		providerID = src.ProviderID
+	}
+	if _, err := resolveProviderBinding(providerID); err != nil {
+		return remote.ProjectLaunchOptions{}, err
+	}
+	catalogue, err := h.Catalogue(ctx, harness.CatalogueScope{HarnessID: backendID, ProviderID: providerID})
+	if err != nil {
+		return remote.ProjectLaunchOptions{}, err
+	}
+	if err := harness.ValidateCatalogue(catalogue); err != nil {
+		return remote.ProjectLaunchOptions{}, err
+	}
+	result := remote.ProjectLaunchOptions{WorktreeModes: []remote.LaunchChoice{{ID: "auto", Name: "Automatic"}, {ID: worktree.ModeIsolated, Name: "Isolated worktree"}, {ID: worktree.ModeWorkspace, Name: "Project workspace"}}}
+	for _, item := range b.d.harnesses.All() {
+		descriptor := item.Descriptor()
+		result.Harnesses = append(result.Harnesses, remote.LaunchChoice{ID: descriptor.ID, Name: descriptor.DisplayName})
+	}
+	result.Providers = remoteProviderChoices(src)
+	for _, item := range catalogue.Models {
+		result.Models = append(result.Models, remote.LaunchModel{ID: item.ID, Name: item.DisplayName, Efforts: item.SupportedReasoningEfforts})
+	}
+	result.Default = remote.ProjectAgentRequest{ThreadID: req.ThreadID, Backend: backendID, ProviderID: providerID, Model: src.Model, Effort: src.Effort, Isolation: "auto"}
+	if result.Default.Model == "" && len(result.Models) > 0 {
+		result.Default.Model = result.Models[0].ID
+	}
+	return result, nil
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *remoteBackend) remoteFile(req remote.FileRequest) (string, error) {
@@ -452,6 +561,54 @@ func (b *remoteBackend) ReadFile(ctx context.Context, req remote.FileRequest) (r
 		return remote.FileContent{}, fmt.Errorf("file is not readable UTF-8 text")
 	}
 	return remote.FileContent{Path: filepath.ToSlash(filepath.Clean(req.Path)), Text: string(data), Revision: remoteRevision(data)}, nil
+}
+
+const maxRemoteWorktreeImageBytes = 8 * 1024 * 1024
+
+// ReadImage returns a small, explicitly supported raster file for the paired
+// browser's worktree inspector. It never becomes a general binary-file proxy:
+// remoteFile supplies the server-resolved worktree guard, and the signature
+// check prevents an HTML/script payload being labelled as an image.
+func (b *remoteBackend) ReadImage(ctx context.Context, req remote.FileRequest) (remote.ImageContent, error) {
+	if err := ctx.Err(); err != nil {
+		return remote.ImageContent{}, err
+	}
+	path, err := b.remoteFile(req)
+	if err != nil {
+		return remote.ImageContent{}, err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return remote.ImageContent{}, err
+	}
+	if info.Size() <= 0 || info.Size() > maxRemoteWorktreeImageBytes {
+		return remote.ImageContent{}, fmt.Errorf("image preview is limited to 8 MiB")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return remote.ImageContent{}, err
+	}
+	mediaType := remoteImageMediaType(req.Path, data)
+	if mediaType == "" {
+		return remote.ImageContent{}, fmt.Errorf("that file is not a supported image preview")
+	}
+	return remote.ImageContent{MediaType: mediaType, Data: data}, nil
+}
+
+func remoteImageMediaType(path string, data []byte) string {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch {
+	case (ext == ".png") && len(data) >= 8 && string(data[:8]) == "\x89PNG\r\n\x1a\n":
+		return "image/png"
+	case (ext == ".jpg" || ext == ".jpeg") && len(data) >= 3 && data[0] == 0xff && data[1] == 0xd8 && data[2] == 0xff:
+		return "image/jpeg"
+	case (ext == ".gif") && len(data) >= 6 && (string(data[:6]) == "GIF87a" || string(data[:6]) == "GIF89a"):
+		return "image/gif"
+	case (ext == ".webp") && len(data) >= 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WEBP":
+		return "image/webp"
+	default:
+		return ""
+	}
 }
 func (b *remoteBackend) WriteFile(ctx context.Context, _ remote.Principal, req remote.FileWriteRequest) (remote.FileContent, error) {
 	if err := ctx.Err(); err != nil {

@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"agentkate/internal/agent"
+	"agentkate/internal/remote"
+	"agentkate/internal/session"
 )
 
 // providerProfileFile is the key-free profile mirror written by the desktop
@@ -85,4 +87,39 @@ func resolveProviderBinding(id string) (*agent.Provider, error) {
 		}
 	}
 	return nil, fmt.Errorf("provider profile %q is not available to the core", id)
+}
+
+// remoteProviderChoices exports only opaque identifiers and labels. The launch
+// path still resolves the id locally, so endpoints and credentials never reach
+// a paired device.
+func remoteProviderChoices(current session.Record) []remote.LaunchChoice {
+	choices := []remote.LaunchChoice{{ID: "direct", Name: "Direct"}}
+	seen := map[string]bool{"direct": true}
+	appendChoice := func(id, name string) {
+		if id == "" || seen[id] {
+			return
+		}
+		if name == "" {
+			name = id
+		}
+		choices = append(choices, remote.LaunchChoice{ID: id, Name: name})
+		seen[id] = true
+	}
+	appendChoice("fireworks", "Fireworks (Fire Pass)")
+	appendChoice("openrouter", "OpenRouter")
+	for _, path := range providerProfilePaths() {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var profiles providerProfileFile
+		if json.Unmarshal(raw, &profiles) != nil {
+			continue
+		}
+		for _, profile := range profiles.Profiles {
+			appendChoice(profile.ID, profile.Name)
+		}
+	}
+	appendChoice(current.ProviderID, current.ProviderName)
+	return choices
 }

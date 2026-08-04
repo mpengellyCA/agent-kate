@@ -82,14 +82,15 @@ type Device struct {
 type Capability string
 
 const (
-	CapAgentManage  Capability = "agent_manage"
-	CapWorktreeView Capability = "worktree_view"
-	CapWorktreeEdit Capability = "worktree_edit"
+	CapAgentManage    Capability = "agent_manage"
+	CapAgentConfigure Capability = "agent_configure"
+	CapWorktreeView   Capability = "worktree_view"
+	CapWorktreeEdit   Capability = "worktree_edit"
 )
 
 func (c Capability) Valid() bool {
 	switch c {
-	case CapAgentManage, CapWorktreeView, CapWorktreeEdit:
+	case CapAgentManage, CapAgentConfigure, CapWorktreeView, CapWorktreeEdit:
 		return true
 	default:
 		return false
@@ -198,7 +199,7 @@ func (s *DeviceStore) SetCapabilities(id string, caps []Capability) (Device, boo
 		unique[cap] = struct{}{}
 	}
 	next := make([]Capability, 0, len(unique))
-	for _, cap := range []Capability{CapAgentManage, CapWorktreeView, CapWorktreeEdit} {
+	for _, cap := range []Capability{CapAgentManage, CapAgentConfigure, CapWorktreeView, CapWorktreeEdit} {
 		if _, ok := unique[cap]; ok {
 			next = append(next, cap)
 		}

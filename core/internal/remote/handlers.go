@@ -473,8 +473,13 @@ func (s *Server) handleProjectAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Prompt string `json:"prompt"`
-		Title  string `json:"title"`
+		Prompt     string `json:"prompt"`
+		Title      string `json:"title"`
+		Backend    string `json:"backend"`
+		ProviderID string `json:"providerId"`
+		Model      string `json:"model"`
+		Effort     string `json:"effort"`
+		Isolation  string `json:"isolation"`
 	}
 	if !decodeJSON(w, r, &body) {
 		return
@@ -487,16 +492,35 @@ func (s *Server) handleProjectAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusRequestEntityTooLarge, "prompt-too-large", "The agent instruction is too large.")
 		return
 	}
+	if body.Backend != "" || body.ProviderID != "" || body.Model != "" || body.Effort != "" || body.Isolation != "" {
+		if !s.requireCapability(w, r, CapAgentConfigure) {
+			return
+		}
+	}
 	threadID := r.PathValue("threadId")
 	ctx, cancel := context.WithTimeout(r.Context(), backendTimeout)
 	defer cancel()
-	result, err := s.backend.StartProjectAgent(ctx, principalOf(r), ProjectAgentRequest{ThreadID: threadID, Prompt: strings.TrimSpace(body.Prompt), Title: strings.TrimSpace(body.Title)})
+	result, err := s.backend.StartProjectAgent(ctx, principalOf(r), ProjectAgentRequest{ThreadID: threadID, Prompt: strings.TrimSpace(body.Prompt), Title: strings.TrimSpace(body.Title), Backend: strings.TrimSpace(body.Backend), ProviderID: strings.TrimSpace(body.ProviderID), Model: strings.TrimSpace(body.Model), Effort: strings.TrimSpace(body.Effort), Isolation: strings.TrimSpace(body.Isolation)})
 	s.auditAction(sessionOf(r.Context()), AuditProjectAgent, threadID, "", "new="+result.ThreadID, err)
 	if err != nil {
 		writeBackendError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "threadId": result.ThreadID})
+}
+
+func (s *Server) handleProjectLaunchOptions(w http.ResponseWriter, r *http.Request) {
+	if !s.requireCapability(w, r, CapAgentManage) || !s.requireCapability(w, r, CapAgentConfigure) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), backendTimeout)
+	defer cancel()
+	options, err := s.backend.ProjectLaunchOptions(ctx, ProjectLaunchOptionsRequest{ThreadID: r.PathValue("threadId"), Backend: strings.TrimSpace(r.URL.Query().Get("backend")), ProviderID: strings.TrimSpace(r.URL.Query().Get("providerId"))})
+	if err != nil {
+		writeBackendError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, options)
 }
 
 func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request) {
@@ -525,6 +549,28 @@ func (s *Server) handleFileRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+// handleImageRead serves only a verified, bounded raster preview from the
+// server-resolved worktree. The browser cannot supply a desktop path, and the
+// backend validates both the extension and the file signature before bytes are
+// emitted with an image content type.
+func (s *Server) handleImageRead(w http.ResponseWriter, r *http.Request) {
+	if !s.requireCapability(w, r, CapWorktreeView) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), backendTimeout)
+	defer cancel()
+	image, err := s.backend.ReadImage(ctx, FileRequest{ThreadID: r.PathValue("threadId"), Path: r.URL.Query().Get("path")})
+	if err != nil {
+		writeBackendError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", image.MediaType)
+	w.Header().Set("Content-Length", strconv.Itoa(len(image.Data)))
+	w.Header().Set("Cache-Control", "no-store, private")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(image.Data)
 }
 func (s *Server) handleFileWrite(w http.ResponseWriter, r *http.Request) {
 	if !s.requireCapability(w, r, CapWorktreeEdit) {

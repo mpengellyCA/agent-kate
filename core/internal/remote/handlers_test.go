@@ -3,6 +3,7 @@ package remote
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -178,6 +179,21 @@ func TestRemoteProjectAgentAndFilesNeedExplicitDeveloperCapabilities(t *testing.
 	if _, _, err := env.srv.SetDeviceCapabilities(env.device.ID, []Capability{CapAgentManage, CapWorktreeView}); err != nil {
 		t.Fatal(err)
 	}
+	code, body = env.authJSON("GET", "/api/v1/agents/t-1/launch-options", "")
+	if code != http.StatusForbidden || body["error"] != "capability-required" {
+		t.Fatalf("ungranted launch options = %d / %#v", code, body)
+	}
+	code, body = env.authJSON("POST", "/api/v1/agents/t-1/new", `{"prompt":"review the project","backend":"fake"}`)
+	if code != http.StatusForbidden || body["error"] != "capability-required" {
+		t.Fatalf("ungranted launch configuration = %d / %#v", code, body)
+	}
+	if _, _, err := env.srv.SetDeviceCapabilities(env.device.ID, []Capability{CapAgentManage, CapAgentConfigure, CapWorktreeView}); err != nil {
+		t.Fatal(err)
+	}
+	code, body = env.authJSON("GET", "/api/v1/agents/t-1/launch-options", "")
+	if code != http.StatusOK {
+		t.Fatalf("launch options = %d / %#v", code, body)
+	}
 	code, body = env.authJSON("POST", "/api/v1/agents/t-1/new", `{"prompt":"review the project"}`)
 	if code != http.StatusAccepted || body["threadId"] != "new-t-1" {
 		t.Fatalf("project start = %d / %#v", code, body)
@@ -189,6 +205,12 @@ func TestRemoteProjectAgentAndFilesNeedExplicitDeveloperCapabilities(t *testing.
 	code, body = env.authJSON("GET", "/api/v1/agents/t-1/file?path=README.md", "")
 	if code != http.StatusOK || body["path"] != "README.md" || body["text"] != "remote file body" || body["revision"] != "test" {
 		t.Fatalf("file read must use the lowercase browser contract: %d / %#v", code, body)
+	}
+	resp := env.auth("GET", "/api/v1/agents/t-1/file/image?path=diagram.png", "")
+	defer resp.Body.Close()
+	image, err := io.ReadAll(resp.Body)
+	if err != nil || resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != "image/png" || string(image) != "fake-png" {
+		t.Fatalf("image preview = status %d type %q body %q err %v", resp.StatusCode, resp.Header.Get("Content-Type"), image, err)
 	}
 }
 

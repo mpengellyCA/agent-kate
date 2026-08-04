@@ -86,11 +86,17 @@ func (f *fakeBackend) StartProjectAgent(_ context.Context, _ Principal, req Proj
 	}
 	return ProjectAgentResult{ThreadID: "new-" + req.ThreadID}, nil
 }
+func (f *fakeBackend) ProjectLaunchOptions(_ context.Context, req ProjectLaunchOptionsRequest) (ProjectLaunchOptions, error) {
+	return ProjectLaunchOptions{Harnesses: []LaunchChoice{{ID: "fake", Name: "Fake"}}, Providers: []LaunchChoice{{ID: "direct", Name: "Direct"}}, Models: []LaunchModel{{ID: "test", Name: "Test", Efforts: []string{"low", "high"}}}, WorktreeModes: []LaunchChoice{{ID: "auto", Name: "Automatic"}}, Default: ProjectAgentRequest{ThreadID: req.ThreadID, Backend: "fake", ProviderID: "direct", Model: "test", Effort: "high", Isolation: "auto"}}, nil
+}
 func (f *fakeBackend) ListFiles(_ context.Context, _ FileRequest) ([]FileEntry, error) {
 	return []FileEntry{{Path: "README.md", Name: "README.md"}}, nil
 }
 func (f *fakeBackend) ReadFile(_ context.Context, req FileRequest) (FileContent, error) {
 	return FileContent{Path: req.Path, Text: "remote file body", Revision: "test"}, nil
+}
+func (f *fakeBackend) ReadImage(_ context.Context, _ FileRequest) (ImageContent, error) {
+	return ImageContent{MediaType: "image/png", Data: []byte("fake-png")}, nil
 }
 func (f *fakeBackend) WriteFile(_ context.Context, _ Principal, req FileWriteRequest) (FileContent, error) {
 	return FileContent{Path: req.Path, Text: req.Text, Revision: "test"}, nil
