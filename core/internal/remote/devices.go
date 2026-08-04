@@ -41,7 +41,7 @@ const sessionTTL = 30 * 24 * time.Hour
 // deviceStoreSchemaVersion guards against loading a file written by a newer
 // core. Following cowork.LoadStore, a newer schema refuses to load rather than
 // silently inheriting state it does not understand.
-const deviceStoreSchemaVersion = 1
+const deviceStoreSchemaVersion = 2
 
 // cookieName is the session cookie. It is set Secure; HttpOnly; SameSite=Strict;
 // Path=/ — see setSessionCookie.
@@ -71,6 +71,29 @@ type Device struct {
 	RevokedAt    *time.Time `json:"revokedAt,omitempty"`
 	RevokeReason string     `json:"revokeReason,omitempty"`
 	Epoch        int        `json:"epoch"`
+	// Capabilities are explicit opt-ins for a trusted developer device.  A
+	// normal paired phone has none.  Keeping them on the device rather than in
+	// a browser claim means the desktop can revoke a privilege centrally.
+	Capabilities []Capability `json:"capabilities,omitempty"`
+}
+
+// Capability is one separately granted remote-developer power.  These are not
+// Cowork capabilities: none grant desktop capture, input, or UI authority.
+type Capability string
+
+const (
+	CapAgentManage  Capability = "agent_manage"
+	CapWorktreeView Capability = "worktree_view"
+	CapWorktreeEdit Capability = "worktree_edit"
+)
+
+func (c Capability) Valid() bool {
+	switch c {
+	case CapAgentManage, CapWorktreeView, CapWorktreeEdit:
+		return true
+	default:
+		return false
+	}
 }
 
 // Active reports whether the device may still authenticate.
@@ -78,11 +101,24 @@ func (d *Device) Active() bool { return d != nil && d.RevokedAt == nil }
 
 func (d *Device) clone() *Device {
 	c := *d
+	c.Capabilities = append([]Capability(nil), d.Capabilities...)
 	if d.RevokedAt != nil {
 		t := *d.RevokedAt
 		c.RevokedAt = &t
 	}
 	return &c
+}
+
+func (d *Device) Allows(cap Capability) bool {
+	if d == nil || !d.Active() || !cap.Valid() {
+		return false
+	}
+	for _, current := range d.Capabilities {
+		if current == cap {
+			return true
+		}
+	}
+	return false
 }
 
 type deviceFile struct {
@@ -148,6 +184,57 @@ func LoadDeviceStore(path string, now func() time.Time) (*DeviceStore, error) {
 	}
 	s.secret = secret
 	return s, nil
+}
+
+// SetCapabilities replaces one device's trusted-developer grants.  The
+// desktop is the only caller.  Unknown values are rejected rather than stored
+// for a future route to accidentally honour.
+func (s *DeviceStore) SetCapabilities(id string, caps []Capability) (Device, bool, error) {
+	unique := make(map[Capability]struct{}, len(caps))
+	for _, cap := range caps {
+		if !cap.Valid() {
+			return Device{}, false, fmt.Errorf("remote: unknown capability %q", cap)
+		}
+		unique[cap] = struct{}{}
+	}
+	next := make([]Capability, 0, len(unique))
+	for _, cap := range []Capability{CapAgentManage, CapWorktreeView, CapWorktreeEdit} {
+		if _, ok := unique[cap]; ok {
+			next = append(next, cap)
+		}
+	}
+	s.mu.Lock()
+	d, ok := s.devices[id]
+	if !ok || !d.Active() {
+		s.mu.Unlock()
+		return Device{}, false, nil
+	}
+	changed := !sameCapabilities(d.Capabilities, next)
+	if changed {
+		d.Capabilities = next
+		if err := s.saveLocked(); err != nil {
+			s.mu.Unlock()
+			return Device{}, false, err
+		}
+	}
+	out := *d.clone()
+	s.mu.Unlock()
+	if changed {
+		s.fireOnChange()
+	}
+	return out, changed, nil
+}
+
+func sameCapabilities(a, b []Capability) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *DeviceStore) ensureSecretLocked() error {

@@ -45,6 +45,7 @@ const (
 	AuditPermission AuditKind = "permission" // a permission prompt was answered
 	AuditInterrupt  AuditKind = "interrupt"  // a turn was interrupted
 	AuditStop       AuditKind = "stop"       // an agent was stopped
+	AuditCapability AuditKind = "capability" // desktop changed a device's developer powers
 	AuditTamper     AuditKind = "tamper"     // chain verification failed on load
 	AuditRotate     AuditKind = "rotate"     // bounded-retention chain genesis
 )

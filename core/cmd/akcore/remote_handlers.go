@@ -47,9 +47,13 @@ func registerRemoteHandlers(d handlerDeps) {
 		devices := srv.Devices()
 		rows := make([]map[string]any, 0, len(devices))
 		for _, dev := range devices {
+			caps := make([]string, len(dev.Capabilities))
+			for i, cap := range dev.Capabilities {
+				caps[i] = string(cap)
+			}
 			row := map[string]any{
 				"id": dev.ID, "name": dev.Name, "pairedAt": remoteTime(dev.PairedAt),
-				"lastSeen": remoteTime(dev.LastSeen), "revoked": dev.RevokedAt != nil,
+				"lastSeen": remoteTime(dev.LastSeen), "revoked": dev.RevokedAt != nil, "capabilities": caps,
 			}
 			if dev.RevokedAt != nil {
 				row["revokedAt"] = remoteTime(*dev.RevokedAt)
@@ -62,6 +66,30 @@ func registerRemoteHandlers(d handlerDeps) {
 			"killSwitch": srv.KillSwitch(), "auditTampered": srv.AuditTampered(),
 			"devices": rows, "webuiBuild": remoteWebUIBuild(),
 		}, nil
+	})
+
+	d.srv.Handle("remote.setDeviceCapabilities", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
+		var p struct {
+			DeviceID     string              `json:"deviceId"`
+			Capabilities []remote.Capability `json:"capabilities"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		if d.remote == nil || d.remote.server() == nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "remote access is unavailable in this core")
+		}
+		dev, changed, err := d.remote.server().SetDeviceCapabilities(p.DeviceID, p.Capabilities)
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		if dev.ID == "" {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown or revoked device")
+		}
+		return map[string]any{"ok": true, "changed": changed, "capabilities": dev.Capabilities}, nil
 	})
 
 	d.srv.Handle("remote.pairDevice", func(ctx context.Context, raw json.RawMessage) (any, error) {

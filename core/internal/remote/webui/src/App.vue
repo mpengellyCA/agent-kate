@@ -1,5 +1,6 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import MarkdownBlock from './components/MarkdownBlock.vue'
 import { bootstrapAuth } from './api/auth.js'
 import {
@@ -32,6 +33,8 @@ const attachments = ref([])
 const attachmentPicker = ref(null)
 const sending = ref(false)
 const conversation = ref(null)
+const route = useRoute()
+const router = useRouter()
 let stream = null
 
 const selected = computed(() => agents.value.find((agent) => agent.threadId === selectedID.value) ?? null)
@@ -69,6 +72,9 @@ const attachmentBytes = computed(() => attachments.value.reduce((total, attachme
 
 boot()
 onBeforeUnmount(closeStream)
+watch(() => route.fullPath, () => {
+  if (phase.value === 'ready') syncRoute().catch(reportRouteError)
+})
 watch(() => prompt.value?.requestId, async (requestID) => {
   detail.value = null
   answers.value = {}
@@ -95,7 +101,7 @@ async function boot() {
     meta.value = await getMeta()
     await refresh()
     phase.value = 'ready'
-    connectRoster()
+    await syncRoute()
   } catch (err) {
     phase.value = err?.isAuth ? 'unauthenticated' : 'offline'
     message.value = err?.message || 'Cannot reach Agent Kate.'
@@ -120,14 +126,14 @@ function connect(scope) {
   stream.addEventListener('agentGone', (event) => {
     const body = parse(event)
     agents.value = agents.value.filter((agent) => agent.threadId !== body?.threadId)
-    if (body?.threadId === selectedID.value) back()
+    if (body?.threadId === selectedID.value) replaceProjectRoute(selectedProject.value)
   })
   stream.addEventListener('agentEvent', (event) => {
     const body = parse(event)
     rememberEventID(event)
     if (body?.threadId === selectedID.value && Array.isArray(body.events)) transcript.value.push(...body.events)
   })
-  stream.addEventListener('gap', () => { if (selectedID.value) open(selectedID.value); else refresh().catch(() => {}) })
+  stream.addEventListener('gap', () => { if (selectedID.value) loadThread(selectedID.value); else refresh().catch(() => {}) })
   stream.addEventListener('revoked', (event) => {
     message.value = parse(event)?.reason || 'This device has been unpaired.'
     phase.value = 'revoked'
@@ -149,7 +155,7 @@ function applyTurnState(event) {
   if ('awaitingPermission' in state) row.awaitingPermission = state.awaitingPermission
 }
 
-async function open(threadId) {
+async function loadThread(threadId) {
   const agent = agents.value.find((row) => row.threadId === threadId)
   if (agent) selectedProject.value = projectName(agent)
   selectedID.value = threadId
@@ -165,29 +171,49 @@ async function open(threadId) {
     scrollConversation()
   } catch (err) { actionError.value = err?.message || 'Could not load this conversation.' }
 }
-function back() {
+function clearThread() {
   selectedID.value = ''
   transcript.value = []
   detail.value = null
   composer.value = ''
   attachments.value = []
-  connectRoster()
 }
 function openProject(name) {
-  selectedID.value = ''
-  transcript.value = []
-  detail.value = null
-  selectedProject.value = name
-  drawerOpen.value = false
-  connectRoster()
+  router.push({ name: 'project', params: { project: name } })
 }
 function showProjects() {
-  selectedID.value = ''
-  transcript.value = []
-  detail.value = null
-  selectedProject.value = ''
-  projectFilter.value = ''
+  router.push({ name: 'projects' })
+}
+function open(threadId) {
+  router.push({ name: 'agent', params: { threadId } })
+}
+function back() {
+  if (selectedProject.value) openProject(selectedProject.value)
+  else showProjects()
+}
+function replaceProjectRoute(project) {
+  const destination = project
+    ? { name: 'project', params: { project } }
+    : { name: 'projects' }
+  router.replace(destination)
+}
+async function syncRoute() {
+  const threadId = typeof route.params.threadId === 'string' ? route.params.threadId : ''
+  const project = typeof route.params.project === 'string' ? route.params.project : ''
+
+  drawerOpen.value = false
+  if (threadId) {
+    if (selectedID.value !== threadId) await loadThread(threadId)
+    return
+  }
+
+  clearThread()
+  selectedProject.value = project
+  if (!project) projectFilter.value = ''
   connectRoster()
+}
+function reportRouteError(err) {
+  actionError.value = err?.message || 'Could not open that remote view.'
 }
 function scrollConversation() {
   nextTick(() => {

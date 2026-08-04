@@ -14,6 +14,8 @@
 #include <KSharedConfig>
 
 #include <QAbstractSocket>
+#include <QAction>
+#include <QCheckBox>
 #include <QClipboard>
 #include <QComboBox>
 #include <QDateTime>
@@ -30,6 +32,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QLocale>
+#include <QMenu>
 #include <QNetworkInterface>
 #include <QPalette>
 #include <QPixmap>
@@ -1445,6 +1448,69 @@ void RemotePanel::renderDevices(const QJsonArray &devices)
         sentence->setText(i18n("<b>%1</b> — paired %2",
                                name.toHtmlEscaped(), when.toHtmlEscaped()));
         rowLayout->addWidget(sentence, 1);
+
+        // A paired device remains read-only by default. These are deliberately
+        // separate toggles rather than one broad "developer" switch: file
+        // reads and writes have materially different consequences, and neither
+        // grants Cowork or desktop-control authority.
+        const QJsonArray caps = dev.value(QStringLiteral("capabilities")).toArray();
+        auto hasCap = [&caps](const QString &cap) {
+            for (const QJsonValue &v : caps) {
+                if (v.toString() == cap) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        auto *developer = new QToolButton(row);
+        developer->setText(i18n("Developer"));
+        developer->setIcon(QIcon::fromTheme(QStringLiteral("code-context")));
+        developer->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+        developer->setPopupMode(QToolButton::InstantPopup);
+        developer->setToolTip(i18n("Choose the extra development powers for this device."));
+        auto *menu = new QMenu(developer);
+        struct CapabilityAction { QString key; QAction *action; };
+        const QList<CapabilityAction> actions{
+            {QStringLiteral("agent_manage"), menu->addAction(i18n("Start and fork agents"))},
+            {QStringLiteral("worktree_view"), menu->addAction(i18n("View worktree files"))},
+            {QStringLiteral("worktree_edit"), menu->addAction(i18n("Edit and autosave files"))},
+        };
+        for (const CapabilityAction &item : actions) {
+            item.action->setCheckable(true);
+            item.action->setChecked(hasCap(item.key));
+        }
+        developer->setMenu(menu);
+        connect(menu, &QMenu::triggered, this,
+                [this, id, name, actions](QAction *) {
+                    if (!m_core) {
+                        return;
+                    }
+                    QJsonArray next;
+                    for (const CapabilityAction &item : actions) {
+                        if (item.action->isChecked()) {
+                            next.append(item.key);
+                        }
+                    }
+                    QPointer<RemotePanel> self(this);
+                    m_core->call(QStringLiteral("remote.setDeviceCapabilities"),
+                                 {{QStringLiteral("deviceId"), id},
+                                  {QStringLiteral("capabilities"), next}},
+                                 [this, self, name](const QJsonObject &, const QJsonObject &err) {
+                                     if (!self) {
+                                         return;
+                                     }
+                                     if (!err.isEmpty()) {
+                                         setNotice(i18n("Could not update developer access for “%1”: %2", name,
+                                                        err.value(QStringLiteral("message")).toString()),
+                                                   int(KMessageWidget::Error));
+                                         return;
+                                     }
+                                     setNotice(i18n("Developer access updated for “%1”.", name),
+                                               int(KMessageWidget::Positive));
+                                     refresh();
+                                 }, this);
+                });
+        rowLayout->addWidget(developer, 0, Qt::AlignTop);
 
         auto *revoke = new QToolButton(row);
         revoke->setText(i18n("Revoke"));

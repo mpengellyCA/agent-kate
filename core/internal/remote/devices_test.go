@@ -422,3 +422,36 @@ func TestCorruptStoreFailsClosedWithoutReplacingIt(t *testing.T) {
 		t.Fatalf("the corrupt store was changed during read: %q / %v", raw, statErr)
 	}
 }
+
+func TestDeviceCapabilitiesAreOptInAndPersisted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "devices.json")
+	store, err := LoadDeviceStore(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, dev, err := store.Mint("developer phone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dev.Allows(CapAgentManage) || dev.Allows(CapWorktreeView) {
+		t.Fatal("a newly paired device unexpectedly has developer powers")
+	}
+	updated, changed, err := store.SetCapabilities(dev.ID, []Capability{CapWorktreeView, CapAgentManage, CapWorktreeView})
+	if err != nil || !changed {
+		t.Fatalf("SetCapabilities = %#v, %v, %v", updated, changed, err)
+	}
+	if !updated.Allows(CapAgentManage) || !updated.Allows(CapWorktreeView) || updated.Allows(CapWorktreeEdit) {
+		t.Fatalf("capabilities = %#v", updated.Capabilities)
+	}
+	reloaded, err := LoadDeviceStore(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := reloaded.Get(dev.ID)
+	if !ok || !got.Allows(CapAgentManage) || !got.Allows(CapWorktreeView) {
+		t.Fatalf("persisted device = %#v, present=%v", got, ok)
+	}
+	if _, _, err := reloaded.SetCapabilities(dev.ID, []Capability{"not-a-capability"}); err == nil {
+		t.Fatal("unknown capability was accepted")
+	}
+}

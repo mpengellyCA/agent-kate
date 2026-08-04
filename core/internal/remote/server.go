@@ -212,6 +212,35 @@ func (s *Server) Devices() []Device {
 	return s.devices.List()
 }
 
+// SetDeviceCapabilities is desktop-control-plane only. A paired browser can
+// consume a capability but cannot grant itself one.
+func (s *Server) SetDeviceCapabilities(id string, caps []Capability) (Device, bool, error) {
+	if s == nil {
+		return Device{}, false, errors.New("remote: server is not configured")
+	}
+	dev, changed, err := s.devices.SetCapabilities(id, caps)
+	if err != nil || !changed {
+		return dev, changed, err
+	}
+	labels := make([]string, len(dev.Capabilities))
+	for i, cap := range dev.Capabilities {
+		labels[i] = string(cap)
+	}
+	_ = s.audit.Append(AuditEntry{Kind: AuditCapability, DeviceID: dev.ID, DeviceName: dev.Name,
+		Detail: "capabilities=" + strings.Join(labels, ",")})
+	return dev, true, nil
+}
+
+// DeviceAllows is intentionally a live store read instead of a browser claim:
+// revoking a desktop toggle takes effect on the next privileged request.
+func (s *Server) DeviceAllows(id string, cap Capability) bool {
+	if s == nil {
+		return false
+	}
+	dev, ok := s.devices.Get(id)
+	return ok && dev.Allows(cap)
+}
+
 // SetOnDevicesChanged registers a callback fired after the device table moves,
 // so the panel can refresh without polling.
 func (s *Server) SetOnDevicesChanged(fn func()) {
