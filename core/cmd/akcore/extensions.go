@@ -45,6 +45,7 @@ func registerExtensionHandlers(d handlerDeps) {
 	if plugins == nil {
 		plugins = extensions.NewClaudePlugins("claude")
 	}
+	codexPlugins := d.codexPlugins
 
 	// call confines each CLI invocation to a safe goroutine and a deadline. A
 	// bad marketplace or a wedged CLI becomes a named source error in a reply;
@@ -69,15 +70,24 @@ func registerExtensionHandlers(d handlerDeps) {
 				catalog = extensions.FromSkills(list)
 			}
 		}
-		var installed, available []extensions.Extension
-		var installedErr, availableErr string
+		var installed, available, codexInstalled []extensions.Extension
+		var installedErr, availableErr, codexErr string
 		var wg sync.WaitGroup
-		wg.Add(2)
+		wg.Add(3)
 		safe.Go("extensions.listInstalled", func() { defer wg.Done(); installed, installedErr = call("listInstalled", plugins.ListInstalled) })
 		safe.Go("extensions.listAvailable", func() { defer wg.Done(); available, availableErr = call("listAvailable", plugins.ListAvailable) })
+		safe.Go("extensions.listCodexInstalled", func() {
+			defer wg.Done()
+			if codexPlugins == nil {
+				codexErr = "Codex plugin registry is unavailable"
+				return
+			}
+			codexInstalled, codexErr = call("listCodexInstalled", codexPlugins.ListInstalled)
+		})
 		wg.Wait()
 		return map[string]any{"catalog": catalog, "installed": installed, "available": available,
-			"errors": map[string]string{"installed": installedErr, "available": availableErr}}, nil
+			"native": map[string][]extensions.Extension{"codex": codexInstalled, "claude": installed},
+			"errors": map[string]string{"installed": installedErr, "available": availableErr, "codex": codexErr}}, nil
 	})
 
 	d.srv.Handle("extensions.components", func(ctx context.Context, raw json.RawMessage) (any, error) {
@@ -97,8 +107,41 @@ func registerExtensionHandlers(d handlerDeps) {
 		return e, nil
 	})
 
+	// extensions.convertPreview never installs anything. It is the experimental
+	// conversion surface: callers get component-level truth before choosing to
+	// export any portable subset into another harness.
+	d.srv.Handle("extensions.convertPreview", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
+		var p struct {
+			Name          string `json:"name"`
+			SourceHarness string `json:"sourceHarness"`
+			TargetHarness string `json:"targetHarness"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		if p.SourceHarness == "" {
+			p.SourceHarness = "claude"
+		}
+		if p.TargetHarness == "" || p.TargetHarness == p.SourceHarness {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "choose a different target harness")
+		}
+		if p.SourceHarness != "claude" {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "component details are not available for the native "+p.SourceHarness+" registry yet")
+		}
+		e, err := extensionCall(context.Background(), "conversionDetails", func(callCtx context.Context) (extensions.Extension, error) { return plugins.Details(callCtx, p.Name) })
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		e.Harness = p.SourceHarness
+		return extensions.PreviewConversion(e, p.TargetHarness), nil
+	})
+
 	type nameParams struct {
-		Name string `json:"name"`
+		Name    string `json:"name"`
+		Harness string `json:"harness"`
 	}
 	mutate := func(method string, fn func(context.Context, string) error) {
 		d.srv.Handle(method, func(ctx context.Context, raw json.RawMessage) (any, error) {
@@ -109,7 +152,23 @@ func registerExtensionHandlers(d handlerDeps) {
 			if err := json.Unmarshal(raw, &p); err != nil {
 				return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 			}
-			_, err := extensionCall(context.Background(), method, func(callCtx context.Context) (struct{}, error) { return struct{}{}, fn(callCtx, p.Name) })
+			operation := fn
+			if p.Harness == "codex" {
+				if codexPlugins == nil {
+					return nil, ipc.Errorf(ipc.CodeInvalidParams, "Codex plugin registry is unavailable")
+				}
+				switch method {
+				case "extensions.install":
+					operation = codexPlugins.Install
+				case "extensions.uninstall":
+					operation = codexPlugins.Uninstall
+				default:
+					return nil, ipc.Errorf(ipc.CodeInvalidParams, "Codex plugin enable/disable is managed by its native registry")
+				}
+			} else if p.Harness != "" && p.Harness != "claude" {
+				return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown plugin harness "+p.Harness)
+			}
+			_, err := extensionCall(context.Background(), method, func(callCtx context.Context) (struct{}, error) { return struct{}{}, operation(callCtx, p.Name) })
 			if err != nil {
 				return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
 			}

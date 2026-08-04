@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 
 	"agentkate/internal/agent"
 	"agentkate/internal/codex"
 	"agentkate/internal/harness"
+	"agentkate/internal/skills"
 )
 
 // codexHarness adapts the Codex CLI app-server supervisor to the neutral
@@ -15,11 +17,20 @@ import (
 // app-server has a large protocol surface, but a feature is not exposed to
 // Agent Kate until the supervisor translates and tests its complete lifecycle.
 type codexHarness struct {
-	sup *codex.Supervisor
+	sup        *codex.Supervisor
+	exePath    string
+	socketPath string
 }
 
-func newCodexHarness(sup *codex.Supervisor) *codexHarness {
-	return &codexHarness{sup: sup}
+func newCodexHarness(sup *codex.Supervisor, bridge ...string) *codexHarness {
+	h := &codexHarness{sup: sup}
+	if len(bridge) > 0 {
+		h.exePath = bridge[0]
+	}
+	if len(bridge) > 1 {
+		h.socketPath = bridge[1]
+	}
+	return h
 }
 
 func (h *codexHarness) Descriptor() harness.HarnessDescriptor {
@@ -29,18 +40,18 @@ func (h *codexHarness) Descriptor() harness.HarnessDescriptor {
 		DisplayName:     "Codex CLI",
 		Badge:           "Codex",
 		Health:          harness.HealthUnknown,
-		// The app-server owns persistent threads and exposes thread/fork. The
-		// child supervisor reports the newly-minted id back from that request.
-		Operations: harness.Operations(harness.OperationFork),
 		// Codex has a run-time model catalogue. The first implementation keeps
 		// its option vocabulary discovered rather than freezing model or effort
 		// tokens in Agent Kate. Efforts are part of each model/list entry, and
 		// a change is queued into the next turn/start request, which makes the
 		// running picker truthful without relying on the removed
 		// thread/settings/update endpoint.
-		// Cowork, persona injection, provider routing, transcript preview and
-		// every advanced launch option remain off until they have an end-to-end
-		// app-server probe. Do not emulate a missing capability here.
+		// Agent Kate's two MCP bridges are layered into Codex's native config at
+		// process launch. Cowork re-attaches a live thread when its tool list
+		// changes, matching the conservative Kimi path until Codex's re-list
+		// notification is probed end-to-end.
+		Operations: harness.Operations(harness.OperationFork,
+			harness.OperationCowork, harness.OperationSystemPrompt),
 	}
 }
 
@@ -119,30 +130,85 @@ func (h *codexHarness) Launch(launch harness.AgentLaunch, runtime harness.StartS
 	spec.Cowork = launch.Cowork
 	spec.Title = launch.Title
 	th, err := h.sup.Start(codex.StartOptions{
-		ID:             spec.ThreadID,
-		WorkDir:        spec.WorkDir,
-		Prompt:         spec.Prompt,
-		Attachments:    spec.Attachments,
-		SessionID:      spec.SessionID,
-		Resume:         spec.Resume,
-		ForkSession:    spec.ForkSession,
-		Model:          spec.Model,
-		Effort:         spec.Effort,
-		ApprovalPolicy: spec.PermissionMode,
-		Sandbox:        firstNonEmpty(spec.SandboxMode, "workspace-write"),
-		Env:            spec.Env,
+		ID:                    spec.ThreadID,
+		WorkDir:               spec.WorkDir,
+		Prompt:                spec.Prompt,
+		Attachments:           spec.Attachments,
+		SessionID:             spec.SessionID,
+		Resume:                spec.Resume,
+		ForkSession:           spec.ForkSession,
+		Model:                 spec.Model,
+		Effort:                spec.Effort,
+		ApprovalPolicy:        spec.PermissionMode,
+		Sandbox:               firstNonEmpty(spec.SandboxMode, "workspace-write"),
+		DeveloperInstructions: codexDeveloperInstructions(spec.SystemPrompt),
+		SkillRoots:            codexSkillRoots(),
+		MCPServers:            h.mcpServers(spec),
+		Env:                   h.launchEnv(spec),
 	})
 	if err != nil {
 		return harness.Launched{}, err
 	}
 	return harness.Launched{
-		SessionID:        th.SessionID(),
-		Model:            th.Model(),
-		Effort:           th.Effort(),
-		PermissionMode:   th.ApprovalPolicy(),
-		Agents:           harness.UnappliedAgents(spec.Agents, codexNoCustomSubagents),
-		UnappliedOptions: codexUnappliedOptions(spec),
+		SessionID:           th.SessionID(),
+		Model:               th.Model(),
+		Effort:              th.Effort(),
+		PermissionMode:      th.ApprovalPolicy(),
+		SystemPromptApplied: spec.SystemPrompt != "",
+		Agents:              harness.UnappliedAgents(spec.Agents, codexNoCustomSubagents),
+		UnappliedOptions:    codexUnappliedOptions(spec),
 	}, nil
+}
+
+const (
+	codexCooperationSecretEnv = "AGENTKATE_CODEX_COOPERATION_SECRET"
+	codexCoworkSecretEnv      = "AGENTKATE_CODEX_COWORK_SECRET"
+)
+
+// codexDeveloperInstructions is deliberately additive: it identifies Agent
+// Kate's host facilities without restating or replacing Codex's own base
+// instructions, global config, plugins, skills, or project AGENTS.md files.
+func codexDeveloperInstructions(user string) string {
+	base := "You are running inside Agent Kate. Preserve Codex's native tools, skills, plugins, and project guidance. " +
+		"When available, use the Agent Kate Cooperation MCP tools to coordinate with other Agent Kate agents; Cowork tools are opt-in desktop controls and remain subject to user approval."
+	if user == "" {
+		return base
+	}
+	return base + "\n\nAdditional instructions from the Agent Kate session:\n" + user
+}
+
+func codexSkillRoots() []string {
+	root := skills.DefaultDir()
+	if info, err := os.Stat(root); err == nil && info.IsDir() {
+		return []string{root}
+	}
+	return nil
+}
+
+func (h *codexHarness) mcpServers(spec harness.StartSpec) []codex.MCPServer {
+	if h.exePath == "" || h.socketPath == "" {
+		return nil // unit assembly with no running core has no bridge to attach
+	}
+	return []codex.MCPServer{
+		{Name: "agentkate-cooperation", Command: h.exePath,
+			Args:    append(mcpBridgeArgs(h.socketPath, spec.ThreadID, spec.WorkDir, false, true), "--secret-env", codexCooperationSecretEnv),
+			EnvVars: []string{codexCooperationSecretEnv}},
+		{Name: "agentkate-cowork", Command: h.exePath,
+			Args:    append(mcpBridgeArgs(h.socketPath, spec.ThreadID, spec.WorkDir, true, true), "--secret-env", codexCoworkSecretEnv),
+			EnvVars: []string{codexCoworkSecretEnv}},
+	}
+}
+
+func (h *codexHarness) launchEnv(spec harness.StartSpec) map[string]string {
+	env := make(map[string]string, len(spec.Env)+2)
+	for key, value := range spec.Env {
+		env[key] = value
+	}
+	if h.exePath != "" && h.socketPath != "" {
+		env[codexCooperationSecretEnv] = spec.BridgeSecret
+		env[codexCoworkSecretEnv] = spec.CoworkBridgeSecret
+	}
+	return env
 }
 
 func (h *codexHarness) Send(threadID, text string, atts []agent.Attachment) error {

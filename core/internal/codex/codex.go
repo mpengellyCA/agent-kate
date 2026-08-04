@@ -55,7 +55,26 @@ type StartOptions struct {
 	Sandbox               string // read-only, workspace-write, danger-full-access
 	DeveloperInstructions string
 	Config                map[string]any
-	Env                   map[string]string
+	// SkillRoots are additional, host-owned skill catalogues.  They are sent
+	// over the app-server's native skills/extraRoots/set endpoint after the
+	// handshake, rather than copied into the worktree or substituted for the
+	// user's own Codex skill/plugin configuration.
+	SkillRoots []string
+	// MCPServers augments the user's normal Codex configuration.  Each server
+	// is expressed as CLI config overrides so ~/.codex/config.toml remains in
+	// force; secret values travel only through the Codex child environment and
+	// are referenced by name through EnvVars, never placed in argv.
+	MCPServers []MCPServer
+	Env        map[string]string
+}
+
+// MCPServer is one Agent Kate-owned stdio MCP server layered on top of the
+// user's Codex configuration. Name must be a TOML key segment.
+type MCPServer struct {
+	Name    string
+	Command string
+	Args    []string
+	EnvVars []string
 }
 
 // Model is one app-server model/list entry relevant to a picker.
@@ -63,6 +82,19 @@ type Model struct {
 	ID      string
 	Name    string
 	Efforts []string
+}
+
+// Plugin is the safe, registry-level subset of an app-server plugin.  Its
+// package contents stay owned by Codex; Agent Kate never treats a native
+// plugin bundle as portable just because its metadata can be listed.
+type Plugin struct {
+	ID          string
+	Name        string
+	Version     string
+	Marketplace string
+	Description string
+	Installed   bool
+	Enabled     bool
 }
 
 // Thread is one app-server process containing one active Codex thread.
@@ -198,7 +230,11 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 	if id == "" {
 		id = agent.NewThreadID()
 	}
-	cmd := exec.Command(s.codexBin, "app-server", "--stdio")
+	args, err := appServerArgs(opts)
+	if err != nil {
+		return nil, err
+	}
+	cmd := exec.Command(s.codexBin, args...)
 	cmd.Dir = opts.WorkDir
 	cmd.Env = agent.ApplyEnvOverlay(os.Environ(), opts.Env)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -262,6 +298,12 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 		s.discardFailedStart(t)
 		return nil, fmt.Errorf("codex initialized: %w", err)
 	}
+	if len(opts.SkillRoots) > 0 {
+		if err := t.rpc.call(ctx, "skills/extraRoots/set", map[string]any{"extraRoots": opts.SkillRoots}, nil); err != nil {
+			s.discardFailedStart(t)
+			return nil, fmt.Errorf("codex skills/extraRoots/set: %w", err)
+		}
+	}
 
 	params := startParams(opts)
 	method := "thread/start"
@@ -321,6 +363,53 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 		}
 	}
 	return t, nil
+}
+
+// appServerArgs keeps Agent Kate's MCP additions additive.  `-c` is applied
+// after config.toml, so a user's existing MCP servers, plugins and feature
+// choices remain available.  EnvVars refers to variables inherited by the
+// Codex child; it avoids putting a bridge secret in the process command line.
+func appServerArgs(opts StartOptions) ([]string, error) {
+	args := []string{"app-server", "--stdio"}
+	for _, server := range opts.MCPServers {
+		if !validMCPServerName(server.Name) {
+			return nil, fmt.Errorf("codex MCP server name %q is invalid", server.Name)
+		}
+		if strings.TrimSpace(server.Command) == "" {
+			return nil, fmt.Errorf("codex MCP server %q has no command", server.Name)
+		}
+		command, err := json.Marshal(server.Command)
+		if err != nil {
+			return nil, err
+		}
+		serverArgs, err := json.Marshal(server.Args)
+		if err != nil {
+			return nil, err
+		}
+		envVars, err := json.Marshal(server.EnvVars)
+		if err != nil {
+			return nil, err
+		}
+		prefix := "mcp_servers." + server.Name
+		args = append(args,
+			"-c", prefix+".command="+string(command),
+			"-c", prefix+".args="+string(serverArgs),
+			"-c", prefix+".env_vars="+string(envVars),
+		)
+	}
+	return args, nil
+}
+
+func validMCPServerName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 func startParams(opts StartOptions) map[string]any {
@@ -664,6 +753,111 @@ func (s *Supervisor) DiscoverModels(ctx context.Context) ([]Model, error) {
 		cursor = result.NextCursor
 	}
 	return out, nil
+}
+
+// DiscoverInstalledPlugins reads Codex's own plugin registry through the
+// app-server. It creates no thread and does not mutate Codex configuration.
+func (s *Supervisor) DiscoverInstalledPlugins(ctx context.Context) ([]Plugin, error) {
+	cmd := exec.Command(s.codexBin, "app-server", "--stdio")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	cmd.Stderr = io.Discard
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	rpc := newRPCClient(stdin, s.log)
+	go rpc.readLoop(stdout)
+	defer func() { _ = stdin.Close(); _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+	if err := rpc.call(ctx, "initialize", map[string]any{
+		"clientInfo": map[string]string{"name": "Agent Kate", "version": "1"}, "capabilities": map[string]any{},
+	}, nil); err != nil {
+		return nil, fmt.Errorf("codex initialize: %w", err)
+	}
+	if err := rpc.notify("initialized", map[string]any{}); err != nil {
+		return nil, fmt.Errorf("codex initialized: %w", err)
+	}
+	var result struct {
+		Marketplaces []struct {
+			Name    string `json:"name"`
+			Plugins []struct {
+				ID           string `json:"id"`
+				Name         string `json:"name"`
+				Version      string `json:"version"`
+				LocalVersion string `json:"localVersion"`
+				Installed    bool   `json:"installed"`
+				Enabled      bool   `json:"enabled"`
+				Interface    struct {
+					ShortDescription string `json:"shortDescription"`
+					LongDescription  string `json:"longDescription"`
+				} `json:"interface"`
+			} `json:"plugins"`
+		} `json:"marketplaces"`
+	}
+	if err := rpc.call(ctx, "plugin/installed", map[string]any{}, &result); err != nil {
+		return nil, fmt.Errorf("codex plugin/installed: %w", err)
+	}
+	out := make([]Plugin, 0)
+	for _, marketplace := range result.Marketplaces {
+		for _, plugin := range marketplace.Plugins {
+			if plugin.Name == "" {
+				continue
+			}
+			out = append(out, Plugin{ID: first(plugin.ID, plugin.Name), Name: plugin.Name,
+				Version: first(plugin.LocalVersion, plugin.Version), Marketplace: marketplace.Name,
+				Description: first(plugin.Interface.ShortDescription, plugin.Interface.LongDescription),
+				Installed:   plugin.Installed, Enabled: plugin.Enabled})
+		}
+	}
+	return out, nil
+}
+
+// InstallPlugin and UninstallPlugin delegate the native package operation to
+// Codex. They deliberately accept only a plugin name here: marketplace and
+// authentication selection remain Codex's configured registry policy.
+func (s *Supervisor) InstallPlugin(ctx context.Context, name string) error {
+	return s.pluginMutation(ctx, "plugin/install", name)
+}
+
+func (s *Supervisor) UninstallPlugin(ctx context.Context, name string) error {
+	return s.pluginMutation(ctx, "plugin/uninstall", name)
+}
+
+func (s *Supervisor) pluginMutation(ctx context.Context, method, name string) error {
+	if strings.TrimSpace(name) == "" {
+		return errors.New("Codex plugin name is required")
+	}
+	cmd := exec.Command(s.codexBin, "app-server", "--stdio")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	cmd.Stderr = io.Discard
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	rpc := newRPCClient(stdin, s.log)
+	go rpc.readLoop(stdout)
+	defer func() { _ = stdin.Close(); _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+	if err := rpc.call(ctx, "initialize", map[string]any{"clientInfo": map[string]string{"name": "Agent Kate", "version": "1"}, "capabilities": map[string]any{}}, nil); err != nil {
+		return fmt.Errorf("codex initialize: %w", err)
+	}
+	if err := rpc.notify("initialized", map[string]any{}); err != nil {
+		return fmt.Errorf("codex initialized: %w", err)
+	}
+	if err := rpc.call(ctx, method, map[string]any{"pluginName": name}, nil); err != nil {
+		return fmt.Errorf("codex %s: %w", method, err)
+	}
+	return nil
 }
 
 func (s *Supervisor) thread(id string) (*Thread, error) {

@@ -118,6 +118,7 @@ var uiOnlyHandlers = map[string]map[string]any{
 	// Claude configuration, so the extension catalogue is UI-only too.
 	"extensions.list":           {},
 	"extensions.components":     {"name": ""},
+	"extensions.convertPreview": {"name": "", "sourceHarness": "claude", "targetHarness": "codex"},
 	"extensions.install":        {"name": ""},
 	"extensions.uninstall":      {"name": ""},
 	"extensions.enable":         {"name": ""},

@@ -9,13 +9,11 @@
 // the central copy propagate without re-installing.
 //
 // One catalog, every engine: the same skill is linked into BOTH
-// <target>/.claude/skills/ (Claude Code) and <target>/.agents/skills/ (the
-// cross-tool convention kimi reads). Verified against kimi 0.30.0 — a skill
-// dropped in .agents/skills/ shows up in an ACP session's command list as
-// `skill:<name>` and the agent lists it when asked. That check mattered: the
-// sibling .agents/agents/ subagent catalogue is v2-engine-only and invisible
-// over ACP (plan 16 P3), so "kimi documents this directory" was not evidence
-// enough on its own.
+// <target>/.claude/skills/ (Claude Code), <target>/.agents/skills/ (the
+// cross-tool convention kimi reads), and <target>/.codex/skills/ (Codex's
+// project-visible skill location). Codex threads also receive the central
+// catalogue through its native skills/extraRoots/set request, which makes the
+// links useful both to a terminal-launched Codex and an isolated worktree.
 package skills
 
 import (
@@ -34,6 +32,7 @@ import (
 var skillDirs = []string{
 	filepath.Join(".claude", "skills"), // Claude Code
 	filepath.Join(".agents", "skills"), // kimi (and other .agents-aware tools)
+	filepath.Join(".codex", "skills"),  // Codex project skills
 }
 
 // Skill is one entry in the central catalog.

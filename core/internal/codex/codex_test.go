@@ -73,11 +73,45 @@ func TestFakeAppServer(t *testing.T) {
 			response(map[string]any{})
 		case "model/list":
 			response(map[string]any{"data": []map[string]any{{"id": "gpt-test", "displayName": "Test model", "supportedReasoningEfforts": []map[string]string{{"reasoningEffort": "low"}, {"reasoningEffort": "medium"}}}}, "nextCursor": nil})
+		case "plugin/installed":
+			response(map[string]any{"marketplaces": []map[string]any{{"name": "test-market", "plugins": []map[string]any{{"id": "p-1", "name": "test-plugin", "localVersion": "1.2.3", "installed": true, "enabled": true, "interface": map[string]any{"shortDescription": "A test plugin"}}, {"id": "p-2", "name": "not-installed", "installed": false, "enabled": false}}}}})
 		default:
 			response(map[string]any{})
 		}
 	}
 	os.Exit(0)
+}
+
+func TestDiscoverInstalledPluginsUsesNativeRegistry(t *testing.T) {
+	var c collected
+	s := fakeSupervisor(t, &c)
+	plugins, err := s.DiscoverInstalledPlugins(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plugins) != 2 || plugins[0].Name != "test-plugin" || plugins[0].Version != "1.2.3" || !plugins[0].Enabled || plugins[0].Marketplace != "test-market" {
+		t.Fatalf("plugins = %#v", plugins)
+	}
+}
+
+func TestPluginMutationsUseNativeAppServerMethods(t *testing.T) {
+	var c collected
+	logPath := filepath.Join(t.TempDir(), "rpc.jsonl")
+	t.Setenv("AK_CODEX_FAKE_LOG", logPath)
+	s := fakeSupervisor(t, &c)
+	if err := s.InstallPlugin(context.Background(), "test-plugin"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UninstallPlugin(context.Background(), "test-plugin"); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"method":"plugin/install"`) || !strings.Contains(string(raw), `"method":"plugin/uninstall"`) {
+		t.Fatalf("native plugin mutations were not sent: %s", raw)
+	}
 }
 
 type collected struct {
@@ -186,6 +220,51 @@ func TestSupervisorStartsTurnsAndTranslatesEvents(t *testing.T) {
 	if !sawInitialized || !sawInitialEffort {
 		t.Fatalf("app-server handshake/turn settings missing: initialized=%v effort=%v",
 			sawInitialized, sawInitialEffort)
+	}
+}
+
+func TestStartAttachesAdditionalSkillRoots(t *testing.T) {
+	var c collected
+	logPath := filepath.Join(t.TempDir(), "rpc.jsonl")
+	t.Setenv("AK_CODEX_FAKE_LOG", logPath)
+	s := fakeSupervisor(t, &c)
+	thread, err := s.Start(StartOptions{ID: "ak-skills", WorkDir: t.TempDir(), SkillRoots: []string{"/catalog/one", "/catalog/two"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Stop(thread.ID)
+	for _, frame := range recordedRequests(t, logPath) {
+		if frame["method"] != "skills/extraRoots/set" {
+			continue
+		}
+		params, _ := frame["params"].(map[string]any)
+		roots, _ := params["extraRoots"].([]any)
+		if len(roots) == 2 && roots[0] == "/catalog/one" && roots[1] == "/catalog/two" {
+			return
+		}
+	}
+	t.Fatal("Codex start did not attach the configured skill roots")
+}
+
+func TestAppServerArgsLayerMCPWithoutSecretValues(t *testing.T) {
+	args, err := appServerArgs(StartOptions{MCPServers: []MCPServer{{
+		Name: "agentkate-cooperation", Command: "/usr/bin/akcore", Args: []string{"mcp", "--socket", "/run/ak.sock"}, EnvVars: []string{"AGENTKATE_CODEX_COOPERATION_SECRET"},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	for _, want := range []string{
+		"mcp_servers.agentkate-cooperation.command=\"/usr/bin/akcore\"",
+		"mcp_servers.agentkate-cooperation.args=[\"mcp\",\"--socket\",\"/run/ak.sock\"]",
+		"mcp_servers.agentkate-cooperation.env_vars=[\"AGENTKATE_CODEX_COOPERATION_SECRET\"]",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("app-server args missing %q: %q", want, joined)
+		}
+	}
+	if _, err := appServerArgs(StartOptions{MCPServers: []MCPServer{{Name: "bad.name", Command: "x"}}}); err == nil {
+		t.Fatal("accepted an MCP name that escapes its TOML key segment")
 	}
 }
 

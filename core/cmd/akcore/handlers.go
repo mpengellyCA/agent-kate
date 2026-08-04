@@ -166,8 +166,11 @@ type handlerDeps struct {
 	// separate from VSIX extensions prevents two unrelated extension systems
 	// from sharing an install path or authority boundary.
 	claudePlugins *extensions.ClaudePlugins
-	gitCache      *gitstatus.Cache
-	cowork        *cowork.Service // nil if KDE/consent init failed; handlers guard
+	// codexPlugins is the app-server-backed native Codex plugin registry. It
+	// deliberately has no relationship to a Claude plugin bundle.
+	codexPlugins *extensions.CodexPlugins
+	gitCache     *gitstatus.Cache
+	cowork       *cowork.Service // nil if KDE/consent init failed; handlers guard
 	// remote is an authenticated HTTPS human surface, not an IPC UI role.
 	remote     *remoteControl
 	humanQueue *humanSendQueue

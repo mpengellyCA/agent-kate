@@ -51,6 +51,8 @@ func runMCPBridge(args []string) {
 	coworkMode := fs.Bool("cowork", false, "serve the opt-in KDE Cowork desktop tools instead of Cooperation")
 	noPermTool := fs.Bool("no-permission-tool", false,
 		"hide the request_permission tool (for harnesses whose permissions don't flow over MCP)")
+	secretEnv := fs.String("secret-env", bridgeSecretEnvVar,
+		"environment variable holding this bridge's one-time identity secret")
 	_ = fs.Parse(args)
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -68,8 +70,8 @@ func runMCPBridge(args []string) {
 	// the environment akcore spawned us with — never from argv, which any local
 	// process can read — and is dropped from our own environment immediately so
 	// that anything we ever exec cannot inherit it.
-	secret := os.Getenv(bridgeSecretEnvVar)
-	_ = os.Unsetenv(bridgeSecretEnvVar)
+	secret := os.Getenv(*secretEnv)
+	_ = os.Unsetenv(*secretEnv)
 	if err := client.Call("bridge.identify",
 		map[string]any{"threadId": *thread, "secret": secret}, nil); err != nil {
 		// Fatal, deliberately: a bridge the core will not recognise can serve no

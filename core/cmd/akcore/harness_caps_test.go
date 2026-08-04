@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 
 	"agentkate/internal/harness"
@@ -39,7 +40,8 @@ func TestHarnessDescriptors(t *testing.T) {
 		}
 	}
 	codex := newCodexHarness(nil).Descriptor()
-	if !codex.Supports(harness.OperationFork) || codex.Supports(harness.OperationCompaction) {
+	if !codex.Supports(harness.OperationFork) || !codex.Supports(harness.OperationCowork) ||
+		!codex.Supports(harness.OperationSystemPrompt) || codex.Supports(harness.OperationCompaction) {
 		t.Error("Codex operation descriptor is not conservative")
 	}
 }
@@ -65,5 +67,28 @@ func TestHarnessRegistryWiring(t *testing.T) {
 	if len(all) != 3 || all[0].Descriptor().ID != "claude" || all[2].Descriptor().ID != "codex" {
 		t.Fatalf("engine order wrong: %d entries, first %q",
 			len(all), all[0].Descriptor().ID)
+	}
+}
+
+func TestCodexBridgeLayerUsesDistinctEnvironmentSecrets(t *testing.T) {
+	h := newCodexHarness(nil, "/usr/bin/akcore", "/run/agentkate.sock")
+	spec := harness.StartSpec{ThreadID: "thread-1", WorkDir: "/workspace", BridgeSecret: "coop", CoworkBridgeSecret: "cowork"}
+	servers := h.mcpServers(spec)
+	if len(servers) != 2 {
+		t.Fatalf("MCP servers = %d, want cooperation and cowork", len(servers))
+	}
+	if servers[0].Name != "agentkate-cooperation" || servers[1].Name != "agentkate-cowork" {
+		t.Fatalf("server names = %#v", servers)
+	}
+	if len(servers[0].EnvVars) != 1 || servers[0].EnvVars[0] != codexCooperationSecretEnv ||
+		len(servers[1].EnvVars) != 1 || servers[1].EnvVars[0] != codexCoworkSecretEnv {
+		t.Fatalf("server secret environment routing = %#v", servers)
+	}
+	env := h.launchEnv(spec)
+	if env[codexCooperationSecretEnv] != "coop" || env[codexCoworkSecretEnv] != "cowork" {
+		t.Fatalf("Codex child did not inherit distinct bridge secrets: %#v", env)
+	}
+	if got := codexDeveloperInstructions("Keep commits small."); !strings.Contains(got, "Agent Kate") || !strings.Contains(got, "Keep commits small.") {
+		t.Fatalf("developer instructions = %q", got)
 	}
 }

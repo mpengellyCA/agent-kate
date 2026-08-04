@@ -432,7 +432,7 @@ func runCore() {
 	harnesses = harness.NewRegistry("claude")
 	harnesses.Register(newClaudeHarness(sup, exePath, *socket))
 	harnesses.Register(newKimiHarness(ksup, exePath, *socket))
-	harnesses.Register(newCodexHarness(csup))
+	harnesses.Register(newCodexHarness(csup, exePath, *socket))
 	// The cold-exit tracker is created above (the relay closes over it) but can
 	// only route through the registry once it exists — a compaction can't fire
 	// before a thread has run, which is well after this point.
@@ -502,6 +502,7 @@ func runCore() {
 		modes:         ensembles,
 		skills:        skillCatalog,
 		claudePlugins: extcatalog.NewClaudePlugins("claude"),
+		codexPlugins:  extcatalog.NewCodexPlugins(csup),
 		gitCache:      gitCache,
 		cowork:        coworkSvc,
 		remote:        remoteCtl,
