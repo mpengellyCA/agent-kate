@@ -197,6 +197,11 @@ func launchThread(d handlerDeps, h harness.Harness, threadID, sessionID string,
 	applyProviderToRecord(&rec, p.Provider)
 	if err := d.sessions.Put(rec); err != nil {
 		d.log.Warn("could not persist thread record", "thread", threadID, "err", err)
+	} else {
+		// A thread can be created by the paired remote surface as well as this
+		// desktop window. Tell every desktop UI to reconcile the authoritative
+		// store so the project roster never becomes a per-surface view.
+		notifySessionChanged(d, rec)
 	}
 
 	mode := "directly in the workspace"
@@ -457,6 +462,8 @@ func forkAgentThread(d handlerDeps, h harness.Harness, src session.Record, newTh
 	applyProviderToRecord(&rec, providerFromRecord(src))
 	if err := d.sessions.Put(rec); err != nil {
 		d.log.Warn("could not persist fork record", "thread", newThreadID, "err", err)
+	} else {
+		notifySessionChanged(d, rec)
 	}
 
 	d.log.Info("agent thread forked",
@@ -464,6 +471,20 @@ func forkAgentThread(d handlerDeps, h harness.Harness, src session.Record, newTh
 		"model", launched.Model, "effort", launched.Effort)
 	emitLifecycle(d, newThreadID, "started",
 		"forked from #"+strconv.Itoa(src.Worktree.Number)+" on "+wt.Branch, &wt)
+}
+
+// notifySessionChanged is deliberately a UI-only notification. A session
+// record contains project and worktree metadata, so a bridge must never learn
+// about it merely because another surface created an agent. The desktop uses
+// this small invalidation to refresh an already-open project's shared roster.
+func notifySessionChanged(d handlerDeps, rec session.Record) {
+	if d.srv == nil {
+		return
+	}
+	d.srv.NotifyUI("session.changed", map[string]any{
+		"threadId": rec.ThreadID,
+		"project":  rec.Project,
+	})
 }
 
 // promoteAgentThread upgrades a non-isolated thread to an isolated worktree: it

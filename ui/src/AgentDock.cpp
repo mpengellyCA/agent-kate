@@ -172,6 +172,16 @@ AgentDock::AgentDock(CoreClient *core, QWidget *parent)
             [this](const QString &method, const QJsonObject &params) {
                 if (method == QLatin1String("git.invalidated")) {
                     refreshAgentNumbers();
+                } else if (method == QLatin1String("session.changed")) {
+                    // Remote and desktop creation both persist through the
+                    // same core session store. Reconcile an open project when
+                    // either surface adds a thread; otherwise the desktop
+                    // roster stays frozen until the project is reopened.
+                    const QString project =
+                        params.value(QStringLiteral("project")).toString();
+                    if (!project.isEmpty() && m_projects.contains(project)) {
+                        restoreThreads(project);
+                    }
                 } else if (method == QLatin1String("mcp.activity")) {
                     // An agent launching, closing or discarding another changes
                     // the roster tree — and a launched worker has no other way
@@ -1287,9 +1297,19 @@ void AgentDock::restoreThreads(const QString &project)
                          const QString backend =
                              rec.value(QStringLiteral("backend")).toString();
                          AgentPanel *panel = addDormantAgent(
-                             project, threadId,
-                             rec.value(QStringLiteral("title")).toString(), isolated,
-                             backend);
+                            project, threadId,
+                            rec.value(QStringLiteral("title")).toString(), isolated,
+                            backend);
+                         if (rec.value(QStringLiteral("status")).toString()
+                            == QLatin1String("running")) {
+                            // This thread may have been launched from a paired
+                            // phone while the desktop was already open. It is
+                            // live, so it must not be shown as resumable.
+                            panel->adoptStartedThread(
+                                threadId,
+                                i18n("started from another Agent Kate surface."),
+                                isolated, backend);
+                         }
                          // Seed the roster card's tag chips from the persisted set.
                          QStringList tags;
                          const QJsonArray tagArr =

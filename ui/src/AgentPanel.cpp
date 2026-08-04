@@ -2561,8 +2561,11 @@ void AgentPanel::adoptStartedThread(const QString &threadId, const QString &note
                                     bool isolated, const QString &backend)
 {
     bindStartedThread(threadId, isolated, backend);
-    // No transcript to replay: this thread was born with its opening message,
-    // which streams in live like any other first turn.
+    // A thread created from another surface may already have sent its opening
+    // prompt before this panel received the roster invalidation. Replay the
+    // persisted transcript as well as listening for the live stream, so the
+    // desktop does not begin halfway through a mobile-created agent's turn.
+    loadTranscript();
     if (!note.isEmpty()) {
         addNote(note.toHtmlEscaped(), QStringLiteral("sys"));
     }
