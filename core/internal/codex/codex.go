@@ -38,6 +38,12 @@ type EventFunc func(threadID string, events []json.RawMessage)
 // the safe default when no UI is available.
 type PermissionFunc func(threadID, toolName string, input json.RawMessage) bool
 
+// QuestionFunc routes Codex's native request_user_input tool through Agent
+// Kate's existing typed human-input surface. updatedInput is the exact
+// AskUserQuestion-shaped answer returned by that surface; it is converted
+// back to Codex's id-keyed response before it reaches the app server.
+type QuestionFunc func(threadID, toolName string, input json.RawMessage) (allow bool, updatedInput json.RawMessage)
+
 // StartOptions describes one Codex thread.  Config is passed verbatim to the
 // app-server's thread/start (or resume/fork) config field, for the adapter to
 // use for Codex-specific configuration without growing this neutral package.
@@ -121,10 +127,26 @@ type Thread struct {
 	// resurrecting a completed turn as permanently busy.
 	completedTurns map[string]bool
 	interrupted    bool
-	logFile        *os.File
-	text           map[string]*strings.Builder // item id -> streaming text
-	stdoutDrained  chan struct{}
-	stderrDrained  chan struct{}
+	compacting     bool
+	// compactUncertain is latched after a compaction request times out or its
+	// RPC call fails. The protocol's completion notification carries no request
+	// id, so accepting another compaction on that live thread could let the old
+	// notification complete the new request. A fresh process is the safe reset.
+	compactUncertain bool
+	compactDone      chan struct{}
+	logFile          *os.File
+	text             map[string]*strings.Builder // item id -> streaming text
+	// started records item lifecycles that have already produced an opening
+	// canonical event.  The app-server sends item/started before the terminal
+	// item/completed frame; preserving that boundary lets the UI show a command
+	// while it is running without duplicating its tool card on completion.
+	started       map[string]string
+	commandOutput map[string]*strings.Builder // item id -> streamed stdout/stderr
+	reasoning     map[string]*strings.Builder // item id -> safe summary text
+	streamIndex   map[string]int              // item id -> canonical stream block
+	nextStream    int
+	stdoutDrained chan struct{}
+	stderrDrained chan struct{}
 }
 
 func (t *Thread) SessionID() string { t.mu.Lock(); defer t.mu.Unlock(); return t.sessionID }
@@ -145,6 +167,7 @@ type Supervisor struct {
 	emit       EventFunc
 	eventDir   string
 	permission PermissionFunc
+	question   QuestionFunc
 
 	// Kept test-overridable, matching the other resident supervisors: an
 	// interrupt is only useful if a child that stopped reading stdin cannot
@@ -159,6 +182,11 @@ type Supervisor struct {
 // SetPermissionFunc wires this harness into the core's one human approval
 // broker. It is set at startup, before any threads can be launched.
 func (s *Supervisor) SetPermissionFunc(f PermissionFunc) { s.permission = f }
+
+// SetQuestionFunc wires Codex request_user_input into the same question
+// broker and UI used by the other harnesses. It is deliberately separate from
+// PermissionFunc: a question returns structured data, not an approval bit.
+func (s *Supervisor) SetQuestionFunc(f QuestionFunc) { s.question = f }
 
 // NewSupervisor constructs a supervisor.  Empty codexBin resolves to codex on
 // PATH; its translated event log is kept privately beneath XDG_DATA_HOME.
@@ -273,6 +301,8 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 
 	t := &Thread{ID: id, WorkDir: opts.WorkDir, cmd: cmd, stdin: stdin, alive: true,
 		text: make(map[string]*strings.Builder), completedTurns: make(map[string]bool),
+		started: make(map[string]string), commandOutput: make(map[string]*strings.Builder),
+		reasoning: make(map[string]*strings.Builder), streamIndex: make(map[string]int),
 		stdoutDrained: make(chan struct{}), stderrDrained: make(chan struct{})}
 	t.rpc = newRPCClient(stdin, s.log)
 	t.rpc.onNotification = func(method string, params json.RawMessage) { s.onNotification(t, method, params) }
@@ -289,7 +319,7 @@ func (s *Supervisor) Start(opts StartOptions) (*Thread, error) {
 	var init map[string]any
 	if err := t.rpc.call(ctx, "initialize", map[string]any{
 		"clientInfo":   map[string]string{"name": "Agent Kate", "version": "1"},
-		"capabilities": map[string]any{},
+		"capabilities": map[string]any{"experimentalApi": true},
 	}, &init); err != nil {
 		s.discardFailedStart(t)
 		return nil, fmt.Errorf("codex initialize: %w", err)
@@ -506,6 +536,58 @@ func (s *Supervisor) Send(id, text string, atts []agent.Attachment) error {
 	}
 	t.mu.Unlock()
 	return nil
+}
+
+// Compact starts Codex's native, in-place context compaction and waits for the
+// authoritative thread/compacted notification.  It deliberately does not
+// create a synthetic summary: Codex owns the rewritten context and a later
+// resume uses the same native session.
+func (s *Supervisor) Compact(ctx context.Context, id string) error {
+	t, err := s.thread(id)
+	if err != nil {
+		return err
+	}
+	t.mu.Lock()
+	if t.stopping || !t.alive {
+		t.mu.Unlock()
+		return fmt.Errorf("codex thread %q is not running", id)
+	}
+	if t.activeTurnID != "" {
+		t.mu.Unlock()
+		return fmt.Errorf("Codex compaction requires an idle thread")
+	}
+	if t.compacting {
+		t.mu.Unlock()
+		return fmt.Errorf("Codex compaction is already in progress")
+	}
+	if t.compactUncertain {
+		t.mu.Unlock()
+		return fmt.Errorf("Codex compaction status is uncertain; resume the thread before compacting again")
+	}
+	done := make(chan struct{})
+	t.compacting, t.compactDone = true, done
+	sessionID := t.sessionID
+	t.mu.Unlock()
+
+	if err := t.rpc.call(ctx, "thread/compact/start", map[string]any{"threadId": sessionID}, nil); err != nil {
+		t.mu.Lock()
+		if t.compactDone == done {
+			t.compacting, t.compactDone, t.compactUncertain = false, nil, true
+		}
+		t.mu.Unlock()
+		return fmt.Errorf("codex thread/compact/start: %w", err)
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		t.mu.Lock()
+		if t.compactDone == done {
+			t.compacting, t.compactDone, t.compactUncertain = false, nil, true
+		}
+		t.mu.Unlock()
+		return ctx.Err()
+	}
 }
 
 func (s *Supervisor) Interrupt(id string) error {
@@ -1145,7 +1227,12 @@ func (s *Supervisor) onNotification(t *Thread, method string, raw json.RawMessag
 			Tool             string          `json:"tool"`
 			Server           string          `json:"server"`
 			Arguments        json.RawMessage `json:"arguments"`
+			Summary          []string        `json:"summary"`
 		} `json:"item"`
+		Plan []struct {
+			Step   string `json:"step"`
+			Status string `json:"status"`
+		} `json:"plan"`
 		Turn struct {
 			ID     string          `json:"id"`
 			Status string          `json:"status"`
@@ -1160,6 +1247,20 @@ func (s *Supervisor) onNotification(t *Thread, method string, raw json.RawMessag
 	if json.Unmarshal(raw, &p) != nil {
 		return
 	}
+	t.mu.Lock()
+	if t.text == nil {
+		t.text = make(map[string]*strings.Builder)
+	}
+	if t.started == nil {
+		t.started = make(map[string]string)
+	}
+	if t.commandOutput == nil {
+		t.commandOutput = make(map[string]*strings.Builder)
+	}
+	if t.reasoning == nil {
+		t.reasoning = make(map[string]*strings.Builder)
+	}
+	t.mu.Unlock()
 	switch method {
 	case "item/agentMessage/delta":
 		t.mu.Lock()
@@ -1170,7 +1271,54 @@ func (s *Supervisor) onNotification(t *Thread, method string, raw json.RawMessag
 			t.text[itemID] = b
 		}
 		b.WriteString(p.Delta)
+		index, opened := s.startStreamLocked(t, itemID)
 		t.mu.Unlock()
+		if opened {
+			s.emitStreamStart(t, index, "text")
+		}
+		s.emitStreamDelta(t, index, "text_delta", p.Delta)
+	case "item/reasoning/summaryTextDelta":
+		// Summary deltas are user-visible progress. Do not map raw reasoning
+		// text: Codex exposes that separately and it is not a stable display
+		// contract for clients.
+		t.mu.Lock()
+		itemID := first(p.ItemID, p.Item.ID)
+		b := t.reasoning[itemID]
+		if b == nil {
+			b = &strings.Builder{}
+			t.reasoning[itemID] = b
+		}
+		b.WriteString(p.Delta)
+		index, opened := s.startStreamLocked(t, itemID)
+		t.mu.Unlock()
+		if opened {
+			s.emitStreamStart(t, index, "thinking")
+		}
+		s.emitStreamDelta(t, index, "thinking_delta", p.Delta)
+	case "item/commandExecution/outputDelta":
+		t.mu.Lock()
+		itemID := first(p.ItemID, p.Item.ID)
+		b := t.commandOutput[itemID]
+		if b == nil {
+			b = &strings.Builder{}
+			t.commandOutput[itemID] = b
+		}
+		b.WriteString(p.Delta)
+		t.mu.Unlock()
+	case "item/started":
+		s.handleItemStarted(t, p.Item)
+	case "turn/plan/updated":
+		if len(p.Plan) > 0 {
+			todos := make([]map[string]string, 0, len(p.Plan))
+			for _, step := range p.Plan {
+				status := step.Status
+				if status == "inProgress" {
+					status = "in_progress"
+				}
+				todos = append(todos, map[string]string{"content": step.Step, "status": status})
+			}
+			s.emitEvent(t, event(map[string]any{"type": "assistant", "message": map[string]any{"role": "assistant", "content": []map[string]any{{"type": "tool_use", "id": "codex-plan", "name": "TodoWrite", "input": map[string]any{"todos": todos}}}}}))
+		}
 	case "item/completed":
 		s.handleItemCompleted(t, p.Item)
 	case "turn/completed":
@@ -1194,6 +1342,7 @@ func (s *Supervisor) onNotification(t *Thread, method string, raw json.RawMessag
 		if p.Turn.Status != "" && p.Turn.Status != "completed" {
 			result["subtype"] = "error"
 			result["error"] = p.Turn.Status
+			result["is_error"] = true
 		}
 		s.emitEvent(t, event(result))
 	case "thread/tokenUsage/updated":
@@ -1201,17 +1350,37 @@ func (s *Supervisor) onNotification(t *Thread, method string, raw json.RawMessag
 			s.emitEvent(t, event(map[string]any{"type": "_context", "usedTokens": p.TokenUsage.Total}))
 		}
 	case "thread/compacted":
-		s.emitEvent(t, event(map[string]any{"type": "_notice", "text": "Codex compacted this thread."}))
+		t.mu.Lock()
+		owned := t.compacting && t.compactDone != nil
+		if owned {
+			close(t.compactDone)
+			t.compacting, t.compactDone = false, nil
+		}
+		sessionID := t.sessionID
+		t.mu.Unlock()
+		if !owned {
+			// Ignore unsolicited or late completions. They must never manufacture
+			// a terminal turn event, which would otherwise release a later turn.
+			return
+		}
+		// A native compaction is not a user turn, but the core's shared turn
+		// tracker brackets it while the synchronous command is pending. Emit the
+		// same terminal event it observes for other in-place compactors so the
+		// panel and wait_agent release their busy state exactly once.
+		s.emitEvent(t, event(map[string]any{"type": "system", "subtype": "compact_boundary", "session_id": sessionID}))
+		s.emitEvent(t, event(map[string]any{"type": "result", "subtype": "native_compaction", "session_id": sessionID}))
 	}
 }
 
-// onRequest maps the two approval shapes that can execute or modify files to
-// the same human broker used by the Claude and Kimi harnesses. The other
-// app-server request families (permission-profile expansion, questions and
-// dynamic client tools) are not capabilities Agent Kate offers yet; replying
-// with a JSON-RPC error makes that refusal explicit instead of deadlocking the
-// turn or silently granting it.
+// onRequest maps app-server client requests to only the matching, implemented
+// Agent Kate surface. Unsupported request families receive a JSON-RPC error;
+// that explicit refusal is safer than either deadlocking a turn or inventing a
+// client-side tool implementation.
 func (s *Supervisor) onRequest(t *Thread, id json.RawMessage, method string, input json.RawMessage) {
+	if method == "item/tool/requestUserInput" {
+		s.answerUserInputRequest(t, id, input)
+		return
+	}
 	tool, approval := "", false
 	switch method {
 	case "item/commandExecution/requestApproval":
@@ -1241,6 +1410,199 @@ func (s *Supervisor) onRequest(t *Thread, id json.RawMessage, method string, inp
 	_ = t.rpc.respond(id, map[string]any{"decision": map[string]any{"denied": map[string]any{"rejection": "Denied by Agent Kate"}}})
 }
 
+// answerUserInputRequest adapts Codex's complete question surface to the
+// shared AskUserQuestion form. Codex identifies answers by stable question
+// ids, while Agent Kate's neutral form keys them by visible question text, so
+// duplicate text is rejected rather than attaching an answer to the wrong id.
+func (s *Supervisor) answerUserInputRequest(t *Thread, id json.RawMessage, input json.RawMessage) {
+	var request struct {
+		Questions []struct {
+			ID       string `json:"id"`
+			Question string `json:"question"`
+			IsOther  bool   `json:"isOther"`
+			IsSecret bool   `json:"isSecret"`
+			Options  []struct {
+				Label       string `json:"label"`
+				Description string `json:"description"`
+			} `json:"options"`
+		} `json:"questions"`
+	}
+	if err := json.Unmarshal(input, &request); err != nil || len(request.Questions) == 0 {
+		_ = t.rpc.respondError(id, -32602, "invalid Codex request_user_input request")
+		return
+	}
+
+	questions := make([]map[string]any, 0, len(request.Questions))
+	byText := make(map[string]struct {
+		id        string
+		options   map[string]bool
+		allowText bool
+	}, len(request.Questions))
+	usedIDs := make(map[string]bool, len(request.Questions))
+	for _, question := range request.Questions {
+		if question.ID == "" || question.Question == "" {
+			_ = t.rpc.respondError(id, -32602, "Codex user-input questions require an id and text")
+			return
+		}
+		if _, duplicate := byText[question.Question]; duplicate {
+			_ = t.rpc.respondError(id, -32601, "Codex user-input questions must have distinct text")
+			return
+		}
+		if usedIDs[question.ID] {
+			_ = t.rpc.respondError(id, -32602, "Codex user-input questions must have distinct ids")
+			return
+		}
+		usedIDs[question.ID] = true
+		options := make([]map[string]string, 0, len(question.Options))
+		allowed := make(map[string]bool, len(question.Options))
+		for _, option := range question.Options {
+			if option.Label == "" || allowed[option.Label] {
+				_ = t.rpc.respondError(id, -32602, "Codex user-input options must have distinct labels")
+				return
+			}
+			allowed[option.Label] = true
+			options = append(options, map[string]string{"label": option.Label, "description": option.Description})
+		}
+		byText[question.Question] = struct {
+			id        string
+			options   map[string]bool
+			allowText bool
+		}{id: question.ID, options: allowed, allowText: question.IsOther || len(question.Options) == 0}
+		questions = append(questions, map[string]any{"question": question.Question, "options": options, "multiSelect": false, "allowOther": question.IsOther, "secret": question.IsSecret})
+	}
+
+	neutralInput, _ := json.Marshal(map[string]any{"questions": questions})
+	if s.question == nil {
+		_ = t.rpc.respond(id, map[string]any{"answers": map[string]any{}})
+		return
+	}
+	allow, updated := s.question(t.ID, "AskUserQuestion", neutralInput)
+	if !allow {
+		_ = t.rpc.respond(id, map[string]any{"answers": map[string]any{}})
+		return
+	}
+	var reply struct {
+		Answers map[string]json.RawMessage `json:"answers"`
+	}
+	if err := json.Unmarshal(updated, &reply); err != nil {
+		_ = t.rpc.respondError(id, -32602, "Agent Kate received an invalid user-input answer")
+		return
+	}
+	answers := make(map[string]any, len(byText))
+	for text, question := range byText {
+		raw, ok := reply.Answers[text]
+		if !ok {
+			_ = t.rpc.respondError(id, -32602, "Agent Kate received an incomplete user-input answer")
+			return
+		}
+		var selected string
+		if err := json.Unmarshal(raw, &selected); err != nil {
+			_ = t.rpc.respondError(id, -32602, "Agent Kate received an invalid user-input selection")
+			return
+		}
+		// An explicit option must still round-trip exactly. Free-text requests
+		// and the protocol's `isOther` mode are represented by arbitrary text.
+		if !question.options[selected] && (!question.allowText || selected == "") {
+			_ = t.rpc.respondError(id, -32602, "Agent Kate received an empty user-input answer")
+			return
+		}
+		answers[question.id] = map[string]any{"answers": []string{selected}}
+	}
+	_ = t.rpc.respond(id, map[string]any{"answers": answers})
+}
+
+// startStreamLocked opens one Claude-shaped stream block per Codex item. The
+// desktop renderer already knows this stable dialect, while app-server item IDs
+// remain opaque strings, so the small per-thread index map is the bridge.
+func (s *Supervisor) startStreamLocked(t *Thread, itemID string) (int, bool) {
+	if t.streamIndex == nil {
+		t.streamIndex = make(map[string]int)
+	}
+	if index, ok := t.streamIndex[itemID]; ok {
+		return index, false
+	}
+	index := t.nextStream
+	t.nextStream++
+	t.streamIndex[itemID] = index
+	return index, true
+}
+
+func (s *Supervisor) emitStreamStart(t *Thread, index int, kind string) {
+	s.emitEvent(t, event(map[string]any{"type": "stream_event", "event": map[string]any{
+		"type": "content_block_start", "index": index,
+		"content_block": map[string]any{"type": kind},
+	}}))
+}
+
+func (s *Supervisor) emitStreamDelta(t *Thread, index int, kind, delta string) {
+	if delta == "" {
+		return
+	}
+	field := "text"
+	if kind == "thinking_delta" {
+		field = "thinking"
+	}
+	s.emitEvent(t, event(map[string]any{"type": "stream_event", "event": map[string]any{
+		"type": "content_block_delta", "index": index,
+		"delta": map[string]any{"type": kind, field: delta},
+	}}))
+}
+
+func (s *Supervisor) closeStream(t *Thread, itemID string) {
+	t.mu.Lock()
+	index, ok := t.streamIndex[itemID]
+	if ok {
+		delete(t.streamIndex, itemID)
+	}
+	t.mu.Unlock()
+	if ok {
+		s.emitEvent(t, event(map[string]any{"type": "stream_event", "event": map[string]any{
+			"type": "content_block_stop", "index": index,
+		}}))
+	}
+}
+
+func (s *Supervisor) handleItemStarted(t *Thread, item struct {
+	ID               string          `json:"id"`
+	Type             string          `json:"type"`
+	Text             string          `json:"text"`
+	Command          string          `json:"command"`
+	Status           string          `json:"status"`
+	AggregatedOutput string          `json:"aggregatedOutput"`
+	Tool             string          `json:"tool"`
+	Server           string          `json:"server"`
+	Arguments        json.RawMessage `json:"arguments"`
+	Summary          []string        `json:"summary"`
+}) {
+	if item.ID == "" {
+		return
+	}
+	t.mu.Lock()
+	if t.commandOutput == nil {
+		t.commandOutput = make(map[string]*strings.Builder)
+	}
+	if t.reasoning == nil {
+		t.reasoning = make(map[string]*strings.Builder)
+	}
+	if _, duplicate := t.started[item.ID]; duplicate {
+		t.mu.Unlock()
+		return
+	}
+	t.started[item.ID] = item.Type
+	index, opened := -1, false
+	if item.Type == "reasoning" {
+		index, opened = s.startStreamLocked(t, item.ID)
+	}
+	t.mu.Unlock()
+	if opened {
+		s.emitStreamStart(t, index, "thinking")
+	}
+	if item.Type == "commandExecution" {
+		input, _ := json.Marshal(map[string]any{"command": item.Command})
+		s.emitEvent(t, event(map[string]any{"type": "assistant", "message": map[string]any{"role": "assistant", "content": []map[string]any{{"type": "tool_use", "id": item.ID, "name": "Bash", "input": json.RawMessage(input)}}}}))
+	}
+}
+
 func (s *Supervisor) handleItemCompleted(t *Thread, item struct {
 	ID               string          `json:"id"`
 	Type             string          `json:"type"`
@@ -1251,9 +1613,25 @@ func (s *Supervisor) handleItemCompleted(t *Thread, item struct {
 	Tool             string          `json:"tool"`
 	Server           string          `json:"server"`
 	Arguments        json.RawMessage `json:"arguments"`
+	Summary          []string        `json:"summary"`
 }) {
+	t.mu.Lock()
+	_, wasStarted := t.started[item.ID]
+	delete(t.started, item.ID)
+	streamedOutput := ""
+	if b := t.commandOutput[item.ID]; b != nil {
+		streamedOutput = b.String()
+		delete(t.commandOutput, item.ID)
+	}
+	streamedReasoning := ""
+	if b := t.reasoning[item.ID]; b != nil {
+		streamedReasoning = b.String()
+		delete(t.reasoning, item.ID)
+	}
+	t.mu.Unlock()
 	switch item.Type {
 	case "agentMessage":
+		s.closeStream(t, item.ID)
 		t.mu.Lock()
 		b := t.text[item.ID]
 		delete(t.text, item.ID)
@@ -1266,10 +1644,27 @@ func (s *Supervisor) handleItemCompleted(t *Thread, item struct {
 			s.emitEvent(t, event(map[string]any{"type": "assistant", "message": map[string]any{"role": "assistant", "content": []map[string]any{{"type": "text", "text": text}}}}))
 		}
 	case "commandExecution":
-		input, _ := json.Marshal(map[string]any{"command": item.Command})
-		s.emitEvent(t, event(map[string]any{"type": "assistant", "message": map[string]any{"role": "assistant", "content": []map[string]any{{"type": "tool_use", "id": item.ID, "name": "Bash", "input": json.RawMessage(input)}}}}))
-		if item.AggregatedOutput != "" {
-			s.emitEvent(t, event(map[string]any{"type": "user", "message": map[string]any{"role": "user", "content": []map[string]any{{"type": "tool_result", "tool_use_id": item.ID, "content": item.AggregatedOutput}}}}))
+		if !wasStarted {
+			input, _ := json.Marshal(map[string]any{"command": item.Command})
+			s.emitEvent(t, event(map[string]any{"type": "assistant", "message": map[string]any{"role": "assistant", "content": []map[string]any{{"type": "tool_use", "id": item.ID, "name": "Bash", "input": json.RawMessage(input)}}}}))
+		}
+		output := first(item.AggregatedOutput, streamedOutput)
+		failed := item.Status == "failed" || item.Status == "declined"
+		if output != "" || failed {
+			result := map[string]any{"type": "tool_result", "tool_use_id": item.ID, "content": output}
+			if failed {
+				result["is_error"] = true
+			}
+			s.emitEvent(t, event(map[string]any{"type": "user", "message": map[string]any{"role": "user", "content": []map[string]any{result}}}))
+		}
+	case "reasoning":
+		s.closeStream(t, item.ID)
+		text := strings.Join(item.Summary, "\n")
+		if text == "" {
+			text = streamedReasoning
+		}
+		if text != "" {
+			s.emitEvent(t, event(map[string]any{"type": "assistant", "message": map[string]any{"role": "assistant", "content": []map[string]any{{"type": "thinking", "thinking": text}}}}))
 		}
 	case "mcpToolCall", "dynamicToolCall":
 		name := item.Tool

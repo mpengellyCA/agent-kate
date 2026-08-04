@@ -1201,9 +1201,17 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
             .writeEntry("compactStrip", on);
         pushCompactStrategy();
     });
+    m_continueUntilDone = new QCheckBox(
+        QStringLiteral("Keep working until complete (up to 8 turns)"), this);
+    m_continueUntilDone->setToolTip(QStringLiteral(
+        "After each successful turn, Agent Kate sends one bounded follow-up to the "
+        "same agent. It never acts on an agent's wording, and stops after eight "
+        "automatic turns or when you turn this off."));
+    connect(m_continueUntilDone, &QCheckBox::toggled, this,
+            [this] { pushContinuationPolicy(); });
 
     // "Compact now ▾" — one-shot compaction with any backend, independent of
-    // the scheduled strategy above. Hot Opus needs a live thread; the other
+    // the scheduled strategy above. Native live compaction needs a live thread; the other
     // backends just need the recorded Claude Code session id.
     m_compactNowBtn = new QToolButton(this);
     m_compactNowBtn->setText(QStringLiteral("Compact now"));
@@ -1212,7 +1220,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
     m_compactNowBtn->setCursor(Qt::PointingHandCursor);
     m_compactNowBtn->setToolTip(QStringLiteral(
         "Compact this thread now with the backend of your choice.\n"
-        "Hot Opus runs inline on the live thread and needs it running.\n"
+        "Native live compaction runs inside the current thread and needs it running.\n"
         "Cold backends (Opus/Sonnet/Haiku) re-read the saved transcript.\n"
         "Local is free and behaviourally-lossless."));
     {
@@ -1222,7 +1230,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
             connect(a, &QAction::triggered, this, [this, token] { runCompactNow(token); });
             return a;
         };
-        add(QStringLiteral("Hot Opus (live thread)"), QStringLiteral("hot"));
+        add(QStringLiteral("Native live compaction"), QStringLiteral("hot"));
         menu->addSeparator();
         add(QStringLiteral("Cold Opus"), QStringLiteral("opus"));
         add(QStringLiteral("Cold Sonnet"), QStringLiteral("sonnet"));
@@ -1360,6 +1368,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
         form->setContentsMargins(10, 8, 10, 8);
         form->addRow(QStringLiteral("When to summarize"), m_compactCombo);
         form->addRow(QString(), m_compactStrip);
+        form->addRow(QString(), m_continueUntilDone);
         auto *panelAction = new QWidgetAction(menu);
         panelAction->setDefaultWidget(panel);
         menu->addAction(panelAction);
@@ -1371,7 +1380,7 @@ AgentPanel::AgentPanel(CoreClient *core, QWidget *parent)
             connect(a, &QAction::triggered, this, [this, token] { runCompactNow(token); });
             return a;
         };
-        add(QStringLiteral("Best quality, on the live agent"), QStringLiteral("hot"));
+        add(QStringLiteral("Native live compaction"), QStringLiteral("hot"));
         nowMenu->addSeparator();
         add(QStringLiteral("High quality (Opus)"), QStringLiteral("opus"));
         add(QStringLiteral("Balanced (Sonnet)"), QStringLiteral("sonnet"));
@@ -2516,6 +2525,12 @@ void AgentPanel::setDormant(const QString &threadId, const QString &title, bool 
                          QSignalBlocker blocker(m_compactStrip);
                          m_compactStrip->setChecked(
                              result.value(QStringLiteral("strip")).toBool(false));
+					 if (m_continueUntilDone) {
+						 QSignalBlocker continuationBlocker(m_continueUntilDone);
+						 m_continueUntilDone->setChecked(
+							 result.value(QStringLiteral("continuation")).toObject()
+								 .value(QStringLiteral("enabled")).toBool(false));
+					 }
                      },
                      this);
     }
@@ -2570,6 +2585,10 @@ void AgentPanel::bindStartedThread(const QString &threadId, bool isolated,
     m_idle = true; // live, waiting for its first turn to stream in
     m_isolated = isolated;
     m_backend = backend;
+	if (m_continueUntilDone) {
+		QSignalBlocker blocker(m_continueUntilDone);
+		m_continueUntilDone->setChecked(false);
+	}
     m_sessionCostUsd = 0.0;
     m_sessionInTokens = 0;
     m_sessionOutTokens = 0;
@@ -2666,6 +2685,20 @@ void AgentPanel::pushCompactStrategy()
                  nullptr, this);
 }
 
+void AgentPanel::pushContinuationPolicy()
+{
+    if (!currentTraits().continuation || m_threadId.isEmpty() || !m_core
+        || !m_core->isConnected()) {
+        return;
+    }
+    const QJsonObject policy{{QStringLiteral("enabled"), m_continueUntilDone->isChecked()},
+                             {QStringLiteral("maxTurns"), 8}};
+    m_core->call(QStringLiteral("agent.setContinuation"),
+                 QJsonObject{{QStringLiteral("threadId"), m_threadId},
+                             {QStringLiteral("policy"), policy}},
+                 nullptr, this);
+}
+
 void AgentPanel::runCompactNow(const QString &model)
 {
     const HarnessTraits t = currentTraits();
@@ -2681,7 +2714,7 @@ void AgentPanel::runCompactNow(const QString &model)
         return;
     }
     if (model == QLatin1String("hot") && m_dormant) {
-        addNote(QStringLiteral("Hot Opus needs a running thread. Resume first, "
+        addNote(QStringLiteral("Native live compaction needs a running thread. Resume first, "
                                "or pick a cold backend."),
                 QStringLiteral("err"));
         return;
@@ -2893,14 +2926,14 @@ void AgentPanel::refresh()
                 : i18n("Forking is not supported for %1 agents.", traits.displayName));
     }
     // Compact-now needs a thread on disk (running or dormant) and a harness
-    // with compaction support. The Hot Opus menu item is the only one that
+    // with compaction support. The native live-compaction menu item is the only one that
     // further needs the thread to be live.
     if (m_compactNowBtn) {
         m_compactNowBtn->setEnabled(!m_threadId.isEmpty() && traits.compaction);
         if (auto *menu = m_compactNowBtn->menu()) {
             const auto actions = menu->actions();
             if (!actions.isEmpty()) {
-                actions.first()->setEnabled(running); // "Hot Opus (live thread)"
+                actions.first()->setEnabled(running); // native live compaction
             }
         }
     }
@@ -2908,7 +2941,7 @@ void AgentPanel::refresh()
         m_compactNowMenu->setEnabled(!m_threadId.isEmpty() && traits.compaction);
         const auto actions = m_compactNowMenu->actions();
         if (!actions.isEmpty()) {
-            actions.first()->setEnabled(running); // "Hot Opus (live thread)"
+            actions.first()->setEnabled(running); // native live compaction
         }
     }
     // Engine and isolation are baked into the agent's launch — frozen once a
@@ -2919,6 +2952,10 @@ void AgentPanel::refresh()
     // harness); thinking effort is live only where the harness says so.
     m_compactCombo->setEnabled(traits.compaction);
     m_compactStrip->setEnabled(traits.compaction);
+    if (m_continueUntilDone) {
+        m_continueUntilDone->setEnabled(!m_threadId.isEmpty() && traits.continuation);
+        m_continueUntilDone->setVisible(traits.continuation);
+    }
     m_engineCombo->setEnabled(m_threadId.isEmpty());
     m_modeCombo->setEnabled(m_threadId.isEmpty() || running);
     m_isolationCombo->setEnabled(m_threadId.isEmpty());
@@ -5609,6 +5646,21 @@ void AgentPanel::buildQuestionForm(const QJsonObject &req)
             first = false;
         }
 
+        // Codex can ask for a free-text/secret value or permit an "Other"
+        // value alongside its fixed choices. Preserve those shapes in the
+        // neutral form instead of falsely narrowing the harness capability.
+        if (options.isEmpty() || q.value(QStringLiteral("allowOther")).toBool()) {
+            auto *text = new QLineEdit(container);
+            text->setPlaceholderText(options.isEmpty()
+                                         ? QStringLiteral("Enter your answer")
+                                         : QStringLiteral("Other (optional)"));
+            if (q.value(QStringLiteral("secret")).toBool()) {
+                text->setEchoMode(QLineEdit::Password);
+            }
+            qLayout->addWidget(text);
+            field.textInput = text;
+        }
+
         m_questionLayout->addWidget(container);
         m_questionFields.append(field);
     }
@@ -5625,6 +5677,11 @@ void AgentPanel::onQuestionSubmit()
 {
     QJsonObject answers;
     for (const QuestionField &field : m_questionFields) {
+
+		if (field.textInput && !field.textInput->text().isEmpty()) {
+			answers[field.question] = field.textInput->text();
+			continue;
+		}
         if (field.multiSelect) {
             QJsonArray picked;
             for (const auto &opt : field.options) {

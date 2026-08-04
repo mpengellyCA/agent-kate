@@ -304,6 +304,7 @@ private:
         QString question;
         bool multiSelect = false;
         QList<QPair<QString, QAbstractButton *>> options; // label -> button
+        QLineEdit *textInput = nullptr; // free-text, secret, or "Other"
     };
 
     void onSendClicked();
@@ -436,6 +437,7 @@ private:
     // thread. No-op when no thread exists yet — the choice is then sticky
     // local-only until a thread is created.
     void pushCompactStrategy();
+    void pushContinuationPolicy();
     // Dispatch an on-demand compaction with the given model token
     // ("hot", "opus", "sonnet", "haiku", "local"). Reports progress and
     // result in the feed; does not change the thread's scheduled strategy.
@@ -877,6 +879,7 @@ private:
     // is condensed to keep resume cost down. Both are sticky to last used.
     QComboBox *m_compactCombo = nullptr;
     QCheckBox *m_compactStrip = nullptr;
+    QCheckBox *m_continueUntilDone = nullptr;
     // On-demand compactor: pick any backend (Hot Opus on the live thread, or
     // cold Opus/Sonnet/Haiku/Local) without changing the scheduled strategy.
     QToolButton *m_compactNowBtn = nullptr;

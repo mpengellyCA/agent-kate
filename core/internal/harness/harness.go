@@ -23,7 +23,7 @@ import (
 // ContractVersion changes only when the JSON DTO semantics change.  It is
 // deliberately in each response, rather than negotiated through an SDK: the
 // core and UI are released together but fixtures can still reject a drift.
-const ContractVersion = 1
+const ContractVersion = 2
 
 // OperationKind is a named end-to-end action.  A descriptor contains an entry
 // only when the adapter has implemented and tested that action; absence is the
@@ -52,7 +52,94 @@ const (
 	OperationCostBudget          OperationKind = "costBudget"
 	OperationSubagentTranscripts OperationKind = "subagentTranscripts"
 	OperationSkillReload         OperationKind = "skillReload"
+	// OperationCommands means the harness supplies a native command catalogue
+	// for the composer's command completion.  It is intentionally separate from
+	// the ability to *send* a slash-prefixed prompt: a client must not advertise
+	// a made-up command list merely because raw text happens to work.
+	OperationCommands OperationKind = "commands"
 )
+
+// InteropSupport is the availability of a user-visible harness feature.  The
+// matrix deliberately says nothing about a native protocol feature that the
+// adapter has not wired end-to-end: Unsupported is the safe default.
+type InteropSupport string
+
+const (
+	InteropUnsupported InteropSupport = "unsupported"
+	InteropNative      InteropSupport = "native"
+	// InteropManaged is implemented by Agent Kate rather than by the harness,
+	// but is still available consistently to a user of that harness.  It is
+	// useful for bounded continuation, whose control loop is host-owned.
+	InteropManaged InteropSupport = "managed"
+)
+
+// CompactionInterop distinguishes a live in-place native compact operation
+// from a cold (dormant-session) compaction pass.  They have materially
+// different preconditions and must never be collapsed into one boolean.
+type CompactionInterop struct {
+	InPlace InteropSupport `json:"inPlace"`
+	Cold    InteropSupport `json:"cold"`
+}
+
+// InteroperabilityMatrix is the feature-parity DTO.  It is intentionally
+// capability-specific rather than a harness-name switch: UI and orchestration
+// code can present an equivalent workflow where it exists and an honest
+// unsupported state where it does not.
+//
+// Plans, Tasks and Subagents mean their complete native lifecycle is surfaced,
+// not merely that transcript text happens to mention them.  SubagentTranscripts
+// separately captures the useful narrower case supported by existing adapters.
+type InteroperabilityMatrix struct {
+	Commands            InteropSupport    `json:"commands"`
+	Compaction          CompactionInterop `json:"compaction"`
+	Continuation        InteropSupport    `json:"continuation"`
+	Plans               InteropSupport    `json:"plans"`
+	Tasks               InteropSupport    `json:"tasks"`
+	Subagents           InteropSupport    `json:"subagents"`
+	SubagentTranscripts InteropSupport    `json:"subagentTranscripts"`
+	Questions           InteropSupport    `json:"questions"`
+	DynamicTools        InteropSupport    `json:"dynamicTools"`
+}
+
+// InteropFromOperations provides the conservative baseline for adapters that
+// already declare the older operation DTO.  New dimensions remain unsupported
+// until a harness explicitly advertises and tests them.
+func InteropFromOperations(operations []OperationDescriptor) InteroperabilityMatrix {
+	matrix := InteroperabilityMatrix{
+		Commands: InteropUnsupported, Continuation: InteropUnsupported,
+		Plans: InteropUnsupported, Tasks: InteropUnsupported,
+		Subagents: InteropUnsupported, SubagentTranscripts: InteropUnsupported,
+		Questions: InteropUnsupported, DynamicTools: InteropUnsupported,
+		Compaction: CompactionInterop{InPlace: InteropUnsupported, Cold: InteropUnsupported},
+	}
+	for _, operation := range operations {
+		switch operation.Kind {
+		case OperationCommands:
+			matrix.Commands = InteropNative
+		case OperationCompaction:
+			matrix.Compaction.InPlace = InteropNative
+		case OperationColdCompaction:
+			matrix.Compaction.Cold = InteropNative
+		case OperationSubagentTranscripts:
+			matrix.SubagentTranscripts = InteropNative
+		}
+	}
+	return matrix
+}
+
+func normaliseInteropSupport(value InteropSupport) InteropSupport {
+	if value == "" {
+		return InteropUnsupported
+	}
+	return value
+}
+
+// Available reports whether a matrix value represents an implemented feature.
+// Callers that need to distinguish native from Agent-Kate-managed functionality
+// can compare the value directly.
+func (s InteropSupport) Available() bool {
+	return s == InteropNative || s == InteropManaged
+}
 
 // ApplicationTiming says when a requested setting takes effect. It is part of
 // the setting descriptor and of every application result, so a client never
@@ -83,6 +170,44 @@ type HarnessDescriptor struct {
 	ProtocolVersion  string                `json:"protocolVersion,omitempty"`
 	Health           string                `json:"health"`
 	Operations       []OperationDescriptor `json:"operations"`
+	// Interop is a complete parity matrix.  Descriptors created by pre-matrix
+	// adapters are serialised with the conservative operation-derived baseline;
+	// adapters add new dimensions only after end-to-end coverage exists.
+	Interop InteroperabilityMatrix `json:"interop"`
+}
+
+// Interoperability returns a complete, safe matrix.  The legacy operation
+// bridge makes the DTO immediately useful without inventing any of the new
+// protocol features.
+func (d HarnessDescriptor) Interoperability() InteroperabilityMatrix {
+	baseline := InteropFromOperations(d.Operations)
+	configured := d.Interop
+	merge := func(base, override InteropSupport) InteropSupport {
+		if override != "" {
+			return normaliseInteropSupport(override)
+		}
+		return base
+	}
+	baseline.Commands = merge(baseline.Commands, configured.Commands)
+	baseline.Compaction.InPlace = merge(baseline.Compaction.InPlace, configured.Compaction.InPlace)
+	baseline.Compaction.Cold = merge(baseline.Compaction.Cold, configured.Compaction.Cold)
+	baseline.Continuation = merge(baseline.Continuation, configured.Continuation)
+	baseline.Plans = merge(baseline.Plans, configured.Plans)
+	baseline.Tasks = merge(baseline.Tasks, configured.Tasks)
+	baseline.Subagents = merge(baseline.Subagents, configured.Subagents)
+	baseline.SubagentTranscripts = merge(baseline.SubagentTranscripts, configured.SubagentTranscripts)
+	baseline.Questions = merge(baseline.Questions, configured.Questions)
+	baseline.DynamicTools = merge(baseline.DynamicTools, configured.DynamicTools)
+	return baseline
+}
+
+// MarshalJSON keeps the wire DTO complete while retaining source compatibility
+// for adapters that have not yet needed any new matrix dimension.
+func (d HarnessDescriptor) MarshalJSON() ([]byte, error) {
+	type descriptorAlias HarnessDescriptor
+	copy := descriptorAlias(d)
+	copy.Interop = d.Interoperability()
+	return json.Marshal(copy)
 }
 
 // Supports is the one operation gate used by core and UI mappers.
@@ -138,8 +263,12 @@ type SettingDescriptor struct {
 }
 
 type ModelDescriptor struct {
-	ID                        string            `json:"id"`
-	DisplayName               string            `json:"displayName"`
+	ID          string `json:"id"`
+	DisplayName string `json:"displayName"`
+	// Role is an optional, deliberately small product-facing grouping.  It
+	// never substitutes for ID or DisplayName: adapters set it only when the
+	// live native catalogue itself identifies a known role family.
+	Role                      ModelRole         `json:"role,omitempty"`
 	SupportedReasoningEfforts []string          `json:"supportedReasoningEfforts,omitempty"`
 	Metadata                  map[string]string `json:"metadata,omitempty"`
 }
@@ -194,6 +323,35 @@ func ValidateDescriptor(descriptor HarnessDescriptor) error {
 		}
 		seen[operation.Kind] = true
 	}
+	derived := InteropFromOperations(descriptor.Operations)
+	// The older operation gates are still used by existing core paths.  Do not
+	// permit the parity DTO to contradict one of those gates, or different UI
+	// surfaces could make opposite claims about the same native behavior.
+	for name, declared := range map[string]struct {
+		operation InteropSupport
+		matrix    InteropSupport
+	}{
+		"commands":            {derived.Commands, descriptor.Interop.Commands},
+		"compaction.inPlace":  {derived.Compaction.InPlace, descriptor.Interop.Compaction.InPlace},
+		"compaction.cold":     {derived.Compaction.Cold, descriptor.Interop.Compaction.Cold},
+		"subagentTranscripts": {derived.SubagentTranscripts, descriptor.Interop.SubagentTranscripts},
+	} {
+		if declared.operation == InteropNative && declared.matrix != "" && declared.matrix != InteropNative {
+			return fmt.Errorf("harness descriptor interop %s contradicts its operation gate", name)
+		}
+	}
+	matrix := descriptor.Interoperability()
+	for name, support := range map[string]InteropSupport{
+		"commands": matrix.Commands, "compaction.inPlace": matrix.Compaction.InPlace,
+		"compaction.cold": matrix.Compaction.Cold, "continuation": matrix.Continuation,
+		"plans": matrix.Plans, "tasks": matrix.Tasks, "subagents": matrix.Subagents,
+		"subagentTranscripts": matrix.SubagentTranscripts, "questions": matrix.Questions,
+		"dynamicTools": matrix.DynamicTools,
+	} {
+		if support != InteropUnsupported && support != InteropNative && support != InteropManaged {
+			return fmt.Errorf("harness descriptor has invalid interop support %q for %s", support, name)
+		}
+	}
 	return nil
 }
 
@@ -205,6 +363,9 @@ func ValidateCatalogue(snapshot CatalogueSnapshot) error {
 	for _, model := range snapshot.Models {
 		if model.ID == "" || model.DisplayName == "" || models[model.ID] {
 			return fmt.Errorf("catalogue has an invalid or duplicate model")
+		}
+		if model.Role != "" && !model.Role.Valid() {
+			return fmt.Errorf("catalogue has invalid model role %q", model.Role)
 		}
 		models[model.ID] = true
 	}

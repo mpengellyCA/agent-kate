@@ -6,8 +6,10 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -15,8 +17,10 @@ import (
 
 	"agentkate/internal/agent"
 	"agentkate/internal/gitstatus"
+	"agentkate/internal/harness"
 	"agentkate/internal/permission"
 	"agentkate/internal/remote"
+	"agentkate/internal/safe"
 	"agentkate/internal/worktree"
 )
 
@@ -180,6 +184,96 @@ func (b *remoteBackend) Send(ctx context.Context, principal remote.Principal, re
 		return remote.SendResult{}, fmt.Errorf("remote send: %w", err)
 	}
 	return remote.SendResult{Queued: result.Queued, Position: result.Position, Resuming: result.Resuming}, nil
+}
+
+// Fork starts a server-resolved continuation. The remote request never chooses
+// a worktree, model, provider, or Cowork state. Cowork is intentionally not
+// inherited: developer remote authority must not bootstrap desktop control.
+func (b *remoteBackend) Fork(ctx context.Context, _ remote.Principal, req remote.ForkRequest) (remote.ForkResult, error) {
+	if err := ctx.Err(); err != nil {
+		return remote.ForkResult{}, err
+	}
+	if err := b.requireThread(req.ThreadID); err != nil {
+		return remote.ForkResult{}, err
+	}
+	src, _ := b.d.sessions.Get(req.ThreadID)
+	h := b.d.harnessFor(req.ThreadID)
+	if !h.Descriptor().Supports(harness.OperationFork) {
+		return remote.ForkResult{}, remote.ErrUnsupported
+	}
+	if src.SessionID == "" {
+		return remote.ForkResult{}, fmt.Errorf("this agent has no conversation yet to fork")
+	}
+	src.CoworkEnabled = false
+	threadID := agent.NewThreadID()
+	safe.Go("remote.forkThread", func() { forkAgentThread(b.d, h, src, threadID, "", "", req.Title) })
+	return remote.ForkResult{ThreadID: threadID}, nil
+}
+
+func (b *remoteBackend) remoteFile(req remote.FileRequest) (string, error) {
+	if err := b.requireThread(req.ThreadID); err != nil {
+		return "", err
+	}
+	rec, _ := b.d.sessions.Get(req.ThreadID)
+	clean := filepath.Clean(req.Path)
+	if req.Path == "" || filepath.IsAbs(clean) || clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("invalid worktree path")
+	}
+	parts := strings.Split(filepath.ToSlash(clean), "/")
+	if parts[0] == ".git" || parts[0] == ".agentkate" {
+		return "", fmt.Errorf("that worktree path is protected")
+	}
+	path := filepath.Join(rec.Worktree.Path, clean)
+	root, err := filepath.EvalSymlinks(rec.Worktree.Path)
+	if err != nil {
+		return "", err
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(path))
+	if err != nil {
+		return "", err
+	}
+	if rel, err := filepath.Rel(root, parent); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("path escapes the worktree")
+	}
+	return path, nil
+}
+func remoteRevision(b []byte) string { sum := sha256.Sum256(b); return fmt.Sprintf("%x", sum[:]) }
+func (b *remoteBackend) ReadFile(ctx context.Context, req remote.FileRequest) (remote.FileContent, error) {
+	if err := ctx.Err(); err != nil {
+		return remote.FileContent{}, err
+	}
+	path, err := b.remoteFile(req)
+	if err != nil {
+		return remote.FileContent{}, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return remote.FileContent{}, err
+	}
+	if len(data) > 512*1024 || !utf8.Valid(data) {
+		return remote.FileContent{}, fmt.Errorf("file is not readable UTF-8 text")
+	}
+	return remote.FileContent{Path: filepath.ToSlash(filepath.Clean(req.Path)), Text: string(data), Revision: remoteRevision(data)}, nil
+}
+func (b *remoteBackend) WriteFile(ctx context.Context, _ remote.Principal, req remote.FileWriteRequest) (remote.FileContent, error) {
+	if err := ctx.Err(); err != nil {
+		return remote.FileContent{}, err
+	}
+	path, err := b.remoteFile(remote.FileRequest{ThreadID: req.ThreadID, Path: req.Path})
+	if err != nil {
+		return remote.FileContent{}, err
+	}
+	old, err := os.ReadFile(path)
+	if err != nil {
+		return remote.FileContent{}, err
+	}
+	if req.Revision == "" || req.Revision != remoteRevision(old) {
+		return remote.FileContent{}, fmt.Errorf("file changed since it was opened")
+	}
+	if err := os.WriteFile(path, []byte(req.Text), 0o600); err != nil {
+		return remote.FileContent{}, err
+	}
+	return b.ReadFile(ctx, remote.FileRequest{ThreadID: req.ThreadID, Path: req.Path})
 }
 
 func (b *remoteBackend) PermissionDetail(ctx context.Context, requestID string) (remote.PermissionDetail, error) {

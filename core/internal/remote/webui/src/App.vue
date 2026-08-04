@@ -5,7 +5,7 @@ import MarkdownBlock from './components/MarkdownBlock.vue'
 import { bootstrapAuth } from './api/auth.js'
 import {
   API_VERSION, eventsUrl, getAgents, getMeta, getPermission, getTranscript,
-  interruptAgent, logout, respondPermission, sendPrompt, stopAgent,
+  forkAgent, interruptAgent, logout, respondPermission, sendPrompt, stopAgent,
 } from './api/client.js'
 
 const MAX_ATTACHMENTS = 4
@@ -32,6 +32,7 @@ const composer = ref('')
 const attachments = ref([])
 const attachmentPicker = ref(null)
 const sending = ref(false)
+const forking = ref(false)
 const conversation = ref(null)
 const route = useRoute()
 const router = useRouter()
@@ -69,6 +70,7 @@ const currentProject = computed(() => projectGroups.value.find((group) => group.
 const canSend = computed(() => !!selected.value && !sending.value &&
   (!!composer.value.trim() || attachments.value.length > 0) && selected.value.status !== 'archived')
 const attachmentBytes = computed(() => attachments.value.reduce((total, attachment) => total + attachment.bytes, 0))
+const canManageAgents = computed(() => Array.isArray(meta.value?.capabilities) && meta.value.capabilities.includes('agent_manage'))
 
 boot()
 onBeforeUnmount(closeStream)
@@ -229,6 +231,19 @@ async function control(op) {
     await (op === 'interrupt' ? interruptAgent(selected.value.threadId) : stopAgent(selected.value.threadId))
     await refresh()
   } catch (err) { actionError.value = err?.message || `Could not ${op} this agent.` }
+}
+async function forkSelected() {
+  if (!selected.value || !canManageAgents.value || forking.value) return
+  forking.value = true
+  actionError.value = ''
+  try {
+    const result = await forkAgent(selected.value.threadId)
+    await refresh()
+    sendFeedback.value = result?.threadId
+      ? 'Fork is starting and will appear in this project shortly.'
+      : 'Fork is starting.'
+  } catch (err) { actionError.value = err?.message || 'Could not fork this agent.' }
+  finally { forking.value = false }
 }
 
 function openAttachmentPicker() { attachmentPicker.value?.click() }
@@ -416,7 +431,7 @@ function relativeActivity(value) {
       </section>
 
       <section v-else class="flex min-h-0 flex-1 flex-col overflow-hidden">
-        <header class="flex flex-none items-center gap-2 border-b border-ak-border bg-base-200 px-3 py-2"><button type="button" class="btn btn-ghost btn-sm hidden lg:inline-flex" @click="back">← {{ selectedProject }}</button><div class="min-w-0"><h2 class="truncate text-sm font-semibold">{{ selected.title || selected.threadId }}</h2><p class="truncate text-xs text-ak-muted">{{ selected.engineName || selected.backend }} · {{ selected.busy ? 'Working' : selected.status === 'dormant' ? 'Dormant' : 'Ready' }}</p></div><span class="flex-1" /><button v-if="selected.busy" type="button" class="btn btn-warning btn-sm" @click="control('interrupt')">Interrupt</button><button type="button" class="btn btn-outline btn-error btn-sm" @click="control('stop')">Stop</button></header>
+        <header class="flex flex-none items-center gap-2 border-b border-ak-border bg-base-200 px-3 py-2"><button type="button" class="btn btn-ghost btn-sm hidden lg:inline-flex" @click="back">← {{ selectedProject }}</button><div class="min-w-0"><h2 class="truncate text-sm font-semibold">{{ selected.title || selected.threadId }}</h2><p class="truncate text-xs text-ak-muted">{{ selected.engineName || selected.backend }} · {{ selected.busy ? 'Working' : selected.status === 'dormant' ? 'Dormant' : 'Ready' }}</p></div><span class="flex-1" /><button v-if="canManageAgents" type="button" class="btn btn-ghost btn-sm" :disabled="forking" @click="forkSelected"><span v-if="forking" class="loading loading-spinner loading-xs" />Fork</button><button v-if="selected.busy" type="button" class="btn btn-warning btn-sm" @click="control('interrupt')">Interrupt</button><button type="button" class="btn btn-outline btn-error btn-sm" @click="control('stop')">Stop</button></header>
         <p v-if="transcriptTruncated" class="mx-3 mt-3 flex-none rounded-box bg-warning/10 px-3 py-2 text-xs text-warning">Some conversation content was clipped for this phone.</p>
         <div ref="conversation" class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-safe">
           <div class="mx-auto flex max-w-4xl flex-col gap-3 p-3 sm:p-5">

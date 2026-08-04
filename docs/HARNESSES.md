@@ -8,7 +8,13 @@ credentials, bridge secrets, or raw configuration in a JSON DTO.
 ## Onboarding contract
 
 1. Implement `Descriptor() HarnessDescriptor`. Declare only tested
-   `OperationDescriptor` entries; an absent operation is unsupported.
+   `OperationDescriptor` entries; an absent operation is unsupported. The
+   descriptor also serializes an `interop` parity matrix for commands,
+   in-place/cold compaction, continuation, plans, tasks, subagents and their
+   transcripts, questions, and dynamic tools. Existing operations seed only
+   their exact proven matrix cells (commands, compaction, subagent transcripts);
+   every other cell is `unsupported` until the adapter explicitly wires and
+   tests it.
 2. Implement `Catalogue(ctx, scope) CatalogueSnapshot`. It returns models and
    typed setting descriptors with dependencies, defaults, and `launch`,
    `nextTurn`, or `live` application timing. The scope contains a harness and
@@ -34,6 +40,14 @@ catalogue rather than carrying a harness-name fallback.
   keys at this boundary.
 - Do not emulate missing native behavior. Declare support only once an
   end-to-end fixture proves it.
+- `interop` values are `native`, `managed`, or `unsupported`. `managed` is
+  reserved for a verified Agent Kate workflow (for example a bounded host
+  continuation loop); it must not be used to disguise an absent native
+  harness feature. A readable subagent transcript is not a native subagent
+  lifecycle, and must be declared in `subagentTranscripts`, not `subagents`.
+- The `interop.compaction` cells are separate: `inPlace` requires a live
+  thread, while `cold` may run against a dormant session. A UI must gate each
+  path independently.
 - Codex model/effort/approval changes become effective on the next
   `turn/start`; report `nextTurn`. Kimi ACP configuration updates report the
   actual live values returned by ACP. Claude reports its control-channel

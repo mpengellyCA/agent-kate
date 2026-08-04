@@ -49,6 +49,11 @@ export const getTranscript = (threadId, opts = {}) => apiFetch(`/agents/${encode
 export const sendPrompt = (threadId, { text = '', attachments = [] } = {}, opts) => apiFetch(`/agents/${encodeURIComponent(threadId)}/send`, {
   ...opts, method: 'POST', body: { text, attachments, mode: 'queue' },
 })
+export const forkAgent = (threadId, { title = '' } = {}, opts) => apiFetch(`/agents/${encodeURIComponent(threadId)}/fork`, {
+  ...opts, method: 'POST', body: { title },
+})
+export const readWorktreeFile = (threadId, path, opts = {}) => apiFetch(`/agents/${encodeURIComponent(threadId)}/file`, { ...opts, query: { path } })
+export const writeWorktreeFile = (threadId, body, opts) => apiFetch(`/agents/${encodeURIComponent(threadId)}/file`, { ...opts, method: 'PUT', body })
 export const interruptAgent = (threadId, opts) => apiFetch(`/agents/${encodeURIComponent(threadId)}/interrupt`, { ...opts, method: 'POST', body: {} })
 export const stopAgent = (threadId, opts) => apiFetch(`/agents/${encodeURIComponent(threadId)}/stop`, { ...opts, method: 'POST', body: {} })
 export const getDiff = (threadId, opts = {}) => apiFetch(`/agents/${encodeURIComponent(threadId)}/diff`, { ...opts, query: { maxBytes: opts.maxBytes, maxLines: opts.maxLines } })

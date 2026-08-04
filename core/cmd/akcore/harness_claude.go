@@ -67,6 +67,7 @@ func (h *claudeHarness) Descriptor() harness.HarnessDescriptor {
 			harness.OperationMintSessionID,
 			// subagents/agent-<id>.jsonl beside the session transcript.
 			harness.OperationSubagentTranscripts,
+			harness.OperationCommands,
 			// The reload_skills control request, sent on the live session's stdin
 			// (ReloadSkills below).
 			harness.OperationSkillReload,
@@ -85,6 +86,13 @@ func (h *claudeHarness) Descriptor() harness.HarnessDescriptor {
 			harness.OperationStrictMCPConfig,
 			harness.OperationCostBudget,
 		),
+		Interop: harness.InteroperabilityMatrix{
+			Continuation: harness.InteropManaged,
+			Plans:        harness.InteropNative,
+			Tasks:        harness.InteropNative,
+			Subagents:    harness.InteropNative,
+			Questions:    harness.InteropNative,
+		},
 	}
 }
 
@@ -106,6 +114,7 @@ func (h *claudeHarness) Catalogue(ctx context.Context, scope harness.CatalogueSc
 		for _, model := range found {
 			models = append(models, harness.ModelDescriptor{
 				ID: model.Value, DisplayName: model.Name,
+				Role:                      harness.DeriveModelRole(model.Value, model.Name),
 				SupportedReasoningEfforts: model.Efforts,
 			})
 		}

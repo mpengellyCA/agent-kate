@@ -74,6 +74,11 @@ struct HarnessTraits {
     // and only a restart changes that, which the core says out loud in the
     // thread's own transcript when a reload skips it (audit F50).
     bool skillReload = false;
+    // commands: this harness can supply its native command catalogue for the
+    // composer's slash-command completion. Raw slash-prefixed text is not a
+    // substitute for a catalogue.
+    bool commands = false;
+    bool continuation = false; // host-owned, bounded continuation loop
 
     // Values mapped from the current catalogue. Empty means the catalogue has
     // not declared that setting, never that the UI should invent a fallback.

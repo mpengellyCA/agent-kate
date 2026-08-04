@@ -13,9 +13,8 @@ import (
 )
 
 // codexHarness adapts the Codex CLI app-server supervisor to the neutral
-// harness contract. Its deliberately modest capability set is important: the
-// app-server has a large protocol surface, but a feature is not exposed to
-// Agent Kate until the supervisor translates and tests its complete lifecycle.
+// harness contract. A feature is not exposed to Agent Kate until the
+// supervisor translates and tests its complete lifecycle.
 type codexHarness struct {
 	sup        *codex.Supervisor
 	exePath    string
@@ -40,7 +39,7 @@ func (h *codexHarness) Descriptor() harness.HarnessDescriptor {
 		DisplayName:     "Codex CLI",
 		Badge:           "Codex",
 		Health:          harness.HealthUnknown,
-		// Codex has a run-time model catalogue. The first implementation keeps
+		// Codex has a run-time model catalogue. The implementation keeps
 		// its option vocabulary discovered rather than freezing model or effort
 		// tokens in Agent Kate. Efforts are part of each model/list entry, and
 		// a change is queued into the next turn/start request, which makes the
@@ -50,8 +49,22 @@ func (h *codexHarness) Descriptor() harness.HarnessDescriptor {
 		// process launch. Cowork re-attaches a live thread when its tool list
 		// changes, matching the conservative Kimi path until Codex's re-list
 		// notification is probed end-to-end.
+		// `thread/compact/start` is Codex's native, in-place compaction; unlike
+		// Claude's cold summary pass it needs the live thread and returns no
+		// summary body. Compact translates its completion into the shared
+		// success-without-summary path.
+		//
+		// The current app-server schema does not expose a slash-command catalogue.
+		// Do not declare OperationCommands until it does: the composer may always
+		// send text, but showing an invented command list would be misleading.
 		Operations: harness.Operations(harness.OperationFork,
-			harness.OperationCowork, harness.OperationSystemPrompt),
+			harness.OperationCompaction, harness.OperationCowork,
+			harness.OperationSystemPrompt),
+		Interop: harness.InteroperabilityMatrix{
+			Continuation: harness.InteropManaged,
+			Plans:        harness.InteropNative,
+			Questions:    harness.InteropNative,
+		},
 	}
 }
 
@@ -69,6 +82,7 @@ func (h *codexHarness) Catalogue(ctx context.Context, scope harness.CatalogueSco
 	models := make([]harness.ModelDescriptor, 0, len(found))
 	for _, model := range found {
 		models = append(models, harness.ModelDescriptor{ID: model.ID, DisplayName: model.Name,
+			Role:                      harness.DeriveModelRole(model.ID, model.Name),
 			SupportedReasoningEfforts: model.Efforts})
 	}
 	snapshot := harness.CatalogueSnapshot{ContractVersion: harness.ContractVersion,
@@ -272,6 +286,17 @@ func (h *codexHarness) BrowseSessions() ([]harness.BrowsableSession, error) {
 	return nil, nil
 }
 
-func (h *codexHarness) Compact(_ context.Context, _ harness.CompactSpec) (string, error) {
-	return "", harness.Unsupported("Compaction", h.Descriptor())
+func (h *codexHarness) Compact(ctx context.Context, spec harness.CompactSpec) (string, error) {
+	if !spec.Hot {
+		return "", fmt.Errorf("Codex compacts only inside a live session; resume the thread and compact it natively")
+	}
+	if spec.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, spec.Timeout)
+		defer cancel()
+	}
+	if err := h.sup.Compact(ctx, spec.ThreadID); err != nil {
+		return "", err
+	}
+	return "", ErrCompactedInPlace
 }

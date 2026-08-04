@@ -78,6 +78,13 @@ type Record struct {
 	SummaryUpdatedAt time.Time `json:"summaryUpdatedAt,omitempty"`
 	LastTurnAt       time.Time `json:"lastTurnAt,omitempty"`
 
+	// Continuation is an explicit host-owned run policy.  It never infers
+	// intent from an assistant's prose: when enabled the core sends a fixed,
+	// visible follow-up after each successfully completed turn, until MaxTurns
+	// is reached.  TurnsUsed is persisted so a core restart cannot accidentally
+	// turn a bounded run into an unbounded one.
+	Continuation ContinuationPolicy `json:"continuation,omitempty"`
+
 	// Orchestration linkage (plan 16). A worker launched by another agent via
 	// the Cooperation bridge's launch_agent carries its launcher's thread id in
 	// ParentThreadID; Role marks the thread's place in that tree ("controller"
@@ -134,6 +141,15 @@ type Record struct {
 	ProviderBaseURL string            `json:"-"` // legacy runtime projection
 	ProviderEnvVar  string            `json:"-"` // legacy runtime projection
 	ProviderModels  map[string]string `json:"-"` // legacy runtime projection
+}
+
+// ContinuationPolicy bounds an opt-in "continue until complete" run.  A zero
+// value is disabled.  MaxTurns counts automatic follow-ups, not the human's
+// opening prompt, and is deliberately required whenever Enabled is true.
+type ContinuationPolicy struct {
+	Enabled   bool `json:"enabled,omitempty"`
+	MaxTurns  int  `json:"maxTurns,omitempty"`
+	TurnsUsed int  `json:"turnsUsed,omitempty"`
 }
 
 // Store is the on-disk set of thread records, mirrored in memory.

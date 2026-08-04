@@ -74,6 +74,19 @@ func (f *fakeBackend) Send(_ context.Context, principal Principal, req SendReque
 	return f.sendResult, f.sendErr
 }
 
+func (f *fakeBackend) Fork(_ context.Context, _ Principal, req ForkRequest) (ForkResult, error) {
+	if req.ThreadID == "" {
+		return ForkResult{}, ErrUnknownThread
+	}
+	return ForkResult{ThreadID: "fork-" + req.ThreadID}, nil
+}
+func (f *fakeBackend) ReadFile(_ context.Context, req FileRequest) (FileContent, error) {
+	return FileContent{Path: req.Path, Text: "", Revision: "test"}, nil
+}
+func (f *fakeBackend) WriteFile(_ context.Context, _ Principal, req FileWriteRequest) (FileContent, error) {
+	return FileContent{Path: req.Path, Text: req.Text, Revision: "test"}, nil
+}
+
 func (f *fakeBackend) PermissionDetail(context.Context, string) (PermissionDetail, error) {
 	f.record("PermissionDetail")
 	f.mu.Lock()

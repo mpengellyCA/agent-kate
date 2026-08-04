@@ -93,6 +93,14 @@ func sessionOf(ctx context.Context) Session {
 	return s
 }
 
+func (s *Server) requireCapability(w http.ResponseWriter, r *http.Request, cap Capability) bool {
+	if s.DeviceAllows(sessionOf(r.Context()).DeviceID, cap) {
+		return true
+	}
+	writeError(w, http.StatusForbidden, "capability-required", "This action is not enabled for this paired device.")
+	return false
+}
+
 // --- auth -------------------------------------------------------------------
 
 func (s *Server) handleAuthExchange(w http.ResponseWriter, r *http.Request) {
@@ -196,12 +204,20 @@ func clientIP(r *http.Request) string {
 
 // --- meta -------------------------------------------------------------------
 
-func (s *Server) handleMeta(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
+	sess := sessionOf(r.Context())
+	caps := []string{}
+	if dev, ok := s.devices.Get(sess.DeviceID); ok {
+		for _, cap := range dev.Capabilities {
+			caps = append(caps, string(cap))
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"apiVersion":  APIVersion,
-		"coreVersion": s.cfg.CoreVersion,
-		"webuiBuild":  s.cfg.WebUIBuild,
-		"serverTime":  s.nowRFC3339(),
+		"apiVersion":   APIVersion,
+		"coreVersion":  s.cfg.CoreVersion,
+		"webuiBuild":   s.cfg.WebUIBuild,
+		"serverTime":   s.nowRFC3339(),
+		"capabilities": caps,
 	})
 }
 
@@ -424,6 +440,68 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		// says "queued", which is still true.
 		"resuming": res.Resuming,
 	})
+}
+
+func (s *Server) handleFork(w http.ResponseWriter, r *http.Request) {
+	if !s.requireCapability(w, r, CapAgentManage) {
+		return
+	}
+	var body struct {
+		Title string `json:"title"`
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	if len(body.Title) > maxSendTextBytes || !utf8.ValidString(body.Title) {
+		writeError(w, http.StatusRequestEntityTooLarge, "title-too-large", "That fork title is too large.")
+		return
+	}
+	threadID := r.PathValue("threadId")
+	ctx, cancel := context.WithTimeout(r.Context(), backendTimeout)
+	defer cancel()
+	result, err := s.backend.Fork(ctx, principalOf(r), ForkRequest{ThreadID: threadID, Title: strings.TrimSpace(body.Title)})
+	s.auditAction(sessionOf(r.Context()), AuditFork, threadID, "", "fork="+result.ThreadID, err)
+	if err != nil {
+		writeBackendError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "threadId": result.ThreadID})
+}
+
+func (s *Server) handleFileRead(w http.ResponseWriter, r *http.Request) {
+	if !s.requireCapability(w, r, CapWorktreeView) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), backendTimeout)
+	defer cancel()
+	result, err := s.backend.ReadFile(ctx, FileRequest{ThreadID: r.PathValue("threadId"), Path: r.URL.Query().Get("path")})
+	if err != nil {
+		writeBackendError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+func (s *Server) handleFileWrite(w http.ResponseWriter, r *http.Request) {
+	if !s.requireCapability(w, r, CapWorktreeEdit) {
+		return
+	}
+	var body struct{ Path, Text, Revision string }
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	if len(body.Text) > 512*1024 || !utf8.ValidString(body.Text) {
+		writeError(w, http.StatusRequestEntityTooLarge, "file-too-large", "Files are limited to 512 KiB of UTF-8 text.")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), backendTimeout)
+	defer cancel()
+	result, err := s.backend.WriteFile(ctx, principalOf(r), FileWriteRequest{ThreadID: r.PathValue("threadId"), Path: body.Path, Text: body.Text, Revision: body.Revision})
+	s.auditAction(sessionOf(r.Context()), AuditFileWrite, r.PathValue("threadId"), "", "path="+body.Path, err)
+	if err != nil {
+		writeBackendError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 func validateRemoteAttachments(in []Attachment) ([]Attachment, error) {

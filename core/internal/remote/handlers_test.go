@@ -150,6 +150,21 @@ func TestRemoteSendUsesTypedQueueContract(t *testing.T) {
 	}
 }
 
+func TestRemoteForkNeedsExplicitDeveloperCapability(t *testing.T) {
+	env := newTestEnv(t)
+	code, body := env.authJSON("POST", "/api/v1/agents/t-1/fork", `{"title":"mobile continuation"}`)
+	if code != http.StatusForbidden || body["error"] != "capability-required" {
+		t.Fatalf("ungranted fork = %d / %#v", code, body)
+	}
+	if _, changed, err := env.srv.SetDeviceCapabilities(env.device.ID, []Capability{CapAgentManage}); err != nil || !changed {
+		t.Fatalf("grant = changed=%v err=%v", changed, err)
+	}
+	code, body = env.authJSON("POST", "/api/v1/agents/t-1/fork", `{"title":"mobile continuation"}`)
+	if code != http.StatusAccepted || body["threadId"] != "fork-t-1" {
+		t.Fatalf("granted fork = %d / %#v", code, body)
+	}
+}
+
 func TestRemoteSendRejectsUnsafeAttachmentAndImmediateMode(t *testing.T) {
 	for name, body := range map[string]string{
 		"path":      `{"text":"x","attachments":[{"kind":"text","name":"../secret","mediaType":"text/plain","text":"x"}]}`,

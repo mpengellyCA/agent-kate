@@ -71,8 +71,8 @@ func TestAppServerAgentMessageBecomesAssistantAndResult(t *testing.T) {
 	s.onNotification(thread, "item/completed", json.RawMessage(`{"item":{"id":"message-1","type":"agentMessage"}}`))
 	s.onNotification(thread, "turn/completed", json.RawMessage(`{"turnId":"turn-1","turn":{"status":"completed"}}`))
 
-	if len(got) != 2 {
-		t.Fatalf("emitted %d events, want assistant and result", len(got))
+	if len(got) != 6 {
+		t.Fatalf("emitted %d events, want stream start/deltas/stop plus assistant and result", len(got))
 	}
 	var assistant struct {
 		Type    string `json:"type"`
@@ -82,21 +82,21 @@ func TestAppServerAgentMessageBecomesAssistantAndResult(t *testing.T) {
 			} `json:"content"`
 		} `json:"message"`
 	}
-	if err := json.Unmarshal(got[0], &assistant); err != nil {
+	if err := json.Unmarshal(got[4], &assistant); err != nil {
 		t.Fatalf("decode assistant event: %v", err)
 	}
 	if assistant.Type != "assistant" || len(assistant.Message.Content) != 1 || assistant.Message.Content[0].Text != "Hello, Kate" {
-		t.Fatalf("assistant event = %s", got[0])
+		t.Fatalf("assistant event = %s", got[4])
 	}
 	var result struct {
 		Type      string `json:"type"`
 		SessionID string `json:"session_id"`
 	}
-	if err := json.Unmarshal(got[1], &result); err != nil {
+	if err := json.Unmarshal(got[5], &result); err != nil {
 		t.Fatalf("decode result event: %v", err)
 	}
 	if result.Type != "result" || result.SessionID != "codex-thread" {
-		t.Fatalf("result event = %s", got[1])
+		t.Fatalf("result event = %s", got[5])
 	}
 }
 
@@ -140,6 +140,129 @@ func TestCommandApprovalIsBrokeredAndAnswered(t *testing.T) {
 	}
 	if response.ID != 17 || response.Result.Decision != "accept" {
 		t.Fatalf("approval response = %s", line)
+	}
+}
+
+func TestUserInputQuestionIsBrokeredAndMappedBackToCodexIDs(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	var gotInput struct {
+		Questions []struct {
+			Question string `json:"question"`
+			Options  []struct {
+				Label string `json:"label"`
+			} `json:"options"`
+		} `json:"questions"`
+	}
+	s := NewSupervisor("codex", nil, nil)
+	s.SetQuestionFunc(func(threadID, toolName string, input json.RawMessage) (bool, json.RawMessage) {
+		if threadID != "agent-kate-thread" || toolName != "AskUserQuestion" {
+			t.Fatalf("question route = %q/%q", threadID, toolName)
+		}
+		if err := json.Unmarshal(input, &gotInput); err != nil {
+			t.Fatalf("neutral question input: %v", err)
+		}
+		return true, json.RawMessage(`{"answers":{"Deploy?":"Staging"}}`)
+	})
+	thread := &Thread{ID: "agent-kate-thread", rpc: newRPCClient(clientConn, nil)}
+	done := make(chan struct{})
+	go func() {
+		s.onRequest(thread, json.RawMessage("18"), "item/tool/requestUserInput", json.RawMessage(`{"questions":[{"id":"deploy-target","question":"Deploy?","options":[{"label":"Staging","description":"Safe"},{"label":"Production","description":"Live"}]}]}`))
+		close(done)
+	}()
+
+	line, err := bufio.NewReader(serverConn).ReadBytes('\n')
+	if err != nil {
+		t.Fatalf("read user-input response: %v", err)
+	}
+	<-done
+	if len(gotInput.Questions) != 1 || gotInput.Questions[0].Question != "Deploy?" || len(gotInput.Questions[0].Options) != 2 {
+		t.Fatalf("neutral question = %#v", gotInput)
+	}
+	var response struct {
+		ID     int `json:"id"`
+		Result struct {
+			Answers map[string]struct {
+				Answers []string `json:"answers"`
+			} `json:"answers"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(line, &response); err != nil {
+		t.Fatalf("decode user-input response: %v", err)
+	}
+	answer, ok := response.Result.Answers["deploy-target"]
+	if response.ID != 18 || !ok || len(answer.Answers) != 1 || answer.Answers[0] != "Staging" {
+		t.Fatalf("user-input response = %s", line)
+	}
+}
+
+func TestUserInputQuestionBridgesFreeTextShape(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	s := NewSupervisor("codex", nil, nil)
+	s.SetQuestionFunc(func(_ string, _ string, input json.RawMessage) (bool, json.RawMessage) {
+		if !strings.Contains(string(input), `"allowOther":true`) {
+			t.Fatalf("free-text capability was dropped: %s", input)
+		}
+		return true, json.RawMessage(`{"answers":{"Why?":"A custom reason"}}`)
+	})
+	thread := &Thread{ID: "agent-kate-thread", rpc: newRPCClient(clientConn, nil)}
+	done := make(chan struct{})
+	go func() {
+		s.onRequest(thread, json.RawMessage("19"), "item/tool/requestUserInput", json.RawMessage(`{"questions":[{"id":"reason","question":"Why?","isOther":true,"options":[{"label":"A","description":""}]}]}`))
+		close(done)
+	}()
+
+	line, err := bufio.NewReader(serverConn).ReadBytes('\n')
+	if err != nil {
+		t.Fatalf("read user-input response: %v", err)
+	}
+	<-done
+	if strings.Contains(string(line), `"error"`) || !strings.Contains(string(line), "A custom reason") {
+		t.Fatalf("free-text response = %s", line)
+	}
+}
+
+func TestCompactionNotificationOnlyCompletesOwnedCompaction(t *testing.T) {
+	var got []json.RawMessage
+	s := NewSupervisor("codex", nil, func(_ string, events []json.RawMessage) { got = append(got, events...) })
+	thread := &Thread{ID: "agent-kate-thread", sessionID: "codex-thread"}
+
+	// A delayed notification after a cancelled call, or an unsolicited server
+	// notification, is not a terminal user turn.
+	s.onNotification(thread, "thread/compacted", json.RawMessage(`{"threadId":"codex-thread"}`))
+	if len(got) != 0 {
+		t.Fatalf("unowned compaction emitted events: %s", got)
+	}
+
+	done := make(chan struct{})
+	thread.compacting, thread.compactDone = true, done
+	s.onNotification(thread, "thread/compacted", json.RawMessage(`{"threadId":"codex-thread"}`))
+	select {
+	case <-done:
+	default:
+		t.Fatal("owned compaction did not complete")
+	}
+	if len(got) != 2 {
+		t.Fatalf("owned compaction emitted %d events, want boundary and result", len(got))
+	}
+	s.onNotification(thread, "thread/compacted", json.RawMessage(`{"threadId":"codex-thread"}`))
+	if len(got) != 2 {
+		t.Fatalf("duplicate compaction emitted events: %d", len(got))
+	}
+}
+
+func TestFailedCommandWithoutOutputStillFinalizesToolCard(t *testing.T) {
+	var got []json.RawMessage
+	s := NewSupervisor("codex", nil, func(_ string, events []json.RawMessage) { got = append(got, events...) })
+	thread := &Thread{ID: "agent-kate-thread", started: map[string]string{"cmd-1": "commandExecution"}}
+	s.onNotification(thread, "item/completed", json.RawMessage(`{"item":{"id":"cmd-1","type":"commandExecution","command":"false","status":"failed"}}`))
+	if len(got) != 1 || !strings.Contains(string(got[0]), `"is_error":true`) {
+		t.Fatalf("failed command result = %s", got)
 	}
 }
 

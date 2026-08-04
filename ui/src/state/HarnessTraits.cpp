@@ -65,6 +65,11 @@ HarnessTraits fromJson(const QJsonObject &o)
     t.costBudget = has("costBudget");
     t.subagentTranscripts = has("subagentTranscripts");
     t.skillReload = has("skillReload");
+    t.commands = has("commands");
+    t.continuation = o.value(QStringLiteral("interop"))
+                         .toObject()
+                         .value(QStringLiteral("continuation"))
+                         .toString() == QLatin1String("managed");
     return t;
 }
 
@@ -224,12 +229,34 @@ HarnessRegistry::modelChoices(const QString &harnessId, const QString &providerI
     ModelChoices out;
     const QString provider = providerId.isEmpty() ? ProviderStore::directId() : providerId;
     const QJsonObject catalogue = m_catalogues.value(harnessId + QLatin1Char('@') + provider);
+    // One native model per semantic role makes the short picker group useful
+    // without hiding the rest of a harness catalogue. The role arrives from
+    // the core only when the harness-provided model id/name explicitly named
+    // a verified family; an untyped entry stays in the full native list.
+    QSet<QString> recommendedRoles;
     for (const QJsonValue &value : catalogue.value(QStringLiteral("models")).toArray()) {
         const QJsonObject model = value.toObject();
         const QString id = model.value(QStringLiteral("id")).toString();
         if (!id.isEmpty()) {
             const QString name = model.value(QStringLiteral("displayName")).toString();
-            out.all << id + QLatin1Char('|') + (name.isEmpty() ? id : name);
+            const QString label = name.isEmpty() ? id : name;
+            out.all << id + QLatin1Char('|') + label;
+            const QString role = model.value(QStringLiteral("role")).toString();
+            if (!recommendedRoles.contains(role)) {
+                QString roleLabel;
+                if (role == QLatin1String("balanced")) {
+                    roleLabel = i18n("Balanced");
+                } else if (role == QLatin1String("deep")) {
+                    roleLabel = i18n("Deep reasoning");
+                } else if (role == QLatin1String("fast")) {
+                    roleLabel = i18n("Fast");
+                }
+                if (!roleLabel.isEmpty()) {
+                    recommendedRoles.insert(role);
+                    out.recommended << id + QLatin1Char('|')
+                                    + i18n("%1 — %2", label, roleLabel);
+                }
+            }
         }
     }
     return out;

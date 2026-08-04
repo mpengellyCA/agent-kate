@@ -35,6 +35,12 @@ type Backend interface {
 	// to desktop and remote transcripts. Its principal is session-derived.
 	Send(ctx context.Context, principal Principal, req SendRequest) (SendResult, error)
 
+	// Fork creates a fresh, isolated continuation of an existing thread. The
+	// HTTPS handler admits it only for devices with CapAgentManage.
+	Fork(ctx context.Context, principal Principal, req ForkRequest) (ForkResult, error)
+	ReadFile(ctx context.Context, req FileRequest) (FileContent, error)
+	WriteFile(ctx context.Context, principal Principal, req FileWriteRequest) (FileContent, error)
+
 	// PermissionDetail returns the renderable content of ONE parked prompt.
 	//
 	// It exists because permissionRequested deliberately carries no `input`,
@@ -236,6 +242,16 @@ type SendResult struct {
 	// starting up" deserve different words on screen.
 	Resuming bool
 }
+
+type ForkRequest struct {
+	ThreadID string
+	Title    string
+}
+
+type ForkResult struct{ ThreadID string }
+type FileRequest struct{ ThreadID, Path string }
+type FileWriteRequest struct{ ThreadID, Path, Text, Revision string }
+type FileContent struct{ Path, Text, Revision string }
 
 // PermissionAnswer is a human decision arriving from a phone.
 type PermissionAnswer struct {

@@ -1642,6 +1642,44 @@ func registerHandlers(d handlerDeps) {
 		return map[string]any{"ok": true}, nil
 	})
 
+	// agent.setContinuation configures the host-owned, bounded "continue until
+	// complete" loop. It is UI-only because it spends turns (and therefore
+	// money) on a named thread. The loop itself is harness-neutral; the matrix
+	// advertises it as managed only once a harness has been verified through
+	// this shared delivery path.
+	d.srv.Handle("agent.setContinuation", func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if err := requireUIWindow(d.srv, ctx); err != nil {
+			return nil, err
+		}
+		var p struct {
+			ThreadID string                     `json:"threadId"`
+			Policy   session.ContinuationPolicy `json:"policy"`
+		}
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		if p.ThreadID == "" {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "threadId is required")
+		}
+		rec, ok := d.sessions.Get(p.ThreadID)
+		if !ok {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, "unknown thread "+p.ThreadID)
+		}
+		if !d.descriptorFor(p.ThreadID).Interoperability().Continuation.Available() {
+			return nil, unsupported("Bounded continuation", d.descriptorFor(p.ThreadID))
+		}
+		policy, err := normaliseContinuation(p.Policy)
+		if err != nil {
+			return nil, ipc.Errorf(ipc.CodeInvalidParams, err.Error())
+		}
+		if err := d.sessions.Update(rec.ThreadID, func(r *session.Record) {
+			r.Continuation = policy
+		}); err != nil {
+			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
+		}
+		return policy, nil
+	})
+
 	// agent.summaryStatus reports whether a thread has a current compacted
 	// summary on disk, used by the UI to drive the recovery dialog on resume.
 	//
@@ -1673,11 +1711,12 @@ func registerHandlers(d handlerDeps) {
 			return nil, ipc.Errorf(ipc.CodeInternalError, err.Error())
 		}
 		out := map[string]any{
-			"hasSummary": sum != nil,
-			"strategy":   rec.CompactStrategy,
-			"strip":      rec.CompactStrip,
-			"lastTurnAt": rec.LastTurnAt,
-			"updatedAt":  rec.SummaryUpdatedAt,
+			"hasSummary":   sum != nil,
+			"strategy":     rec.CompactStrategy,
+			"strip":        rec.CompactStrip,
+			"continuation": rec.Continuation,
+			"lastTurnAt":   rec.LastTurnAt,
+			"updatedAt":    rec.SummaryUpdatedAt,
 		}
 		if sum != nil {
 			out["summaryTurns"] = sum.Turns

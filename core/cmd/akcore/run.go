@@ -293,17 +293,28 @@ func runCore() {
 		// explicit typed projection below; no bridge ever sees this raw batch.
 		remoteCtl.publishRawEvents(threadID, events)
 		for _, event := range events {
-			turns.Observe(threadID, event)
 			var probe struct {
 				Type      string `json:"type"`
 				Phase     string `json:"phase"`
 				SessionID string `json:"session_id"`
+				IsError   bool   `json:"is_error"`
+				Subtype   string `json:"subtype"`
 				// The account's usage window, carried on every turn by every
 				// engine. Plan 28 §Phase 2 turns it from a readout into a
 				// resume: the machine already knows when it may continue.
 				RateLimitInfo json.RawMessage `json:"rate_limit_info"`
 			}
-			if json.Unmarshal(event, &probe) != nil {
+			parsed := json.Unmarshal(event, &probe) == nil
+			// Queue an eligible continuation before the terminal event reaches the
+			// turn tracker. Observe's busy->idle callback drains one pending entry;
+			// queuing afterwards would leave it stranded until a later idle edge.
+			// FIFO ordering also lets an already-authorised human follow-up win.
+			if parsed && probe.Type == "result" && probe.Subtype != "native_compaction" &&
+				!probe.IsError && probe.Subtype != "error" {
+				deps.continueAfterResult(threadID)
+			}
+			turns.Observe(threadID, event)
+			if !parsed {
 				continue
 			}
 			if probe.Type == "rate_limit_event" {
@@ -339,7 +350,7 @@ func runCore() {
 			// Bump LastTurnAt on each turn completion. This is the staleness
 			// signal for the compaction layer — if the summary is older than the
 			// last turn, it needs to be refreshed before resume.
-			if probe.Type == "result" {
+			if probe.Type == "result" && probe.Subtype != "native_compaction" {
 				now := time.Now()
 				lastTurnMu.Lock()
 				due := now.Sub(lastTurnPersisted[threadID]) >= lastTurnPersistInterval
@@ -423,6 +434,15 @@ func runCore() {
 			return false
 		}
 		return dec.Allow
+	})
+	csup.SetQuestionFunc(func(threadID, toolName string, input json.RawMessage) (bool, json.RawMessage) {
+		dec, ok := askHumanPermissionForSurfaces(srv, remoteCtl, broker, threadID, toolName, input, questionSide)
+		if !ok {
+			log.Warn("codex user-input request denied without a human answer",
+				"thread", threadID, "uiConnected", srv.HasUI())
+			return false, nil
+		}
+		return dec.Allow, dec.UpdatedInput
 	})
 
 	// The harness registry: each supervisor wrapped in its adapter, in the

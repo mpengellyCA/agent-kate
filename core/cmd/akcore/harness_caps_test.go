@@ -41,8 +41,12 @@ func TestHarnessDescriptors(t *testing.T) {
 	}
 	codex := newCodexHarness(nil).Descriptor()
 	if !codex.Supports(harness.OperationFork) || !codex.Supports(harness.OperationCowork) ||
-		!codex.Supports(harness.OperationSystemPrompt) || codex.Supports(harness.OperationCompaction) {
-		t.Error("Codex operation descriptor is not conservative")
+		!codex.Supports(harness.OperationSystemPrompt) || !codex.Supports(harness.OperationCompaction) ||
+		codex.Supports(harness.OperationColdCompaction) || codex.Supports(harness.OperationCommands) {
+		t.Error("Codex operation descriptor does not reflect its native compact-only surface")
+	}
+	if !claude.Supports(harness.OperationCommands) || !kimi.Supports(harness.OperationCommands) {
+		t.Error("harnesses with native command catalogues must declare commands")
 	}
 }
 

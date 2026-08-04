@@ -88,9 +88,16 @@ func (h *kimiHarness) Descriptor() harness.HarnessDescriptor {
 			harness.OperationSessionBrowse,
 			harness.OperationSubagentTranscripts,
 			harness.OperationCompaction,
+			harness.OperationCommands,
 			harness.OperationCowork,
 			harness.OperationProviderRegistry,
 		),
+		Interop: harness.InteroperabilityMatrix{
+			Continuation: harness.InteropManaged,
+			Plans:        harness.InteropNative,
+			Subagents:    harness.InteropNative,
+			Questions:    harness.InteropNative,
+		},
 	}
 }
 
@@ -111,7 +118,8 @@ func (h *kimiHarness) Catalogue(_ context.Context, scope harness.CatalogueScope)
 		switch option.ID {
 		case "model":
 			for _, choice := range option.Options {
-				snapshot.Models = append(snapshot.Models, harness.ModelDescriptor{ID: choice.Value, DisplayName: choice.Name})
+				snapshot.Models = append(snapshot.Models, harness.ModelDescriptor{ID: choice.Value, DisplayName: choice.Name,
+					Role: harness.DeriveModelRole(choice.Value, choice.Name)})
 			}
 			snapshot.Settings = append(snapshot.Settings, harness.SettingDescriptor{
 				Key: harness.SettingModel, DisplayName: firstNonEmpty(option.Name, "Model"),

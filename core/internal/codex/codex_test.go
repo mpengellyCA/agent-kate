@@ -65,12 +65,22 @@ func TestFakeAppServer(t *testing.T) {
 			turnID := fmt.Sprintf("turn-%d", turns)
 			notifyID := fmt.Sprintf("msg-%d", turns)
 			response(map[string]any{"turn": map[string]any{"id": turnID}})
+			notify("turn/plan/updated", map[string]any{"threadId": "codex-thread-1", "turnId": turnID, "plan": []map[string]string{{"step": "Inspect", "status": "completed"}, {"step": "Implement", "status": "inProgress"}}})
+			notify("item/started", map[string]any{"threadId": "codex-thread-1", "turnId": turnID, "startedAtMs": 1, "item": map[string]any{"id": "cmd-" + turnID, "type": "commandExecution", "command": "go test ./...", "status": "inProgress"}})
+			notify("item/commandExecution/outputDelta", map[string]any{"threadId": "codex-thread-1", "turnId": turnID, "itemId": "cmd-" + turnID, "delta": "ok\tpackage\n"})
+			notify("item/completed", map[string]any{"threadId": "codex-thread-1", "turnId": turnID, "completedAtMs": 2, "item": map[string]any{"id": "cmd-" + turnID, "type": "commandExecution", "command": "go test ./...", "status": "completed"}})
+			notify("item/started", map[string]any{"threadId": "codex-thread-1", "turnId": turnID, "startedAtMs": 3, "item": map[string]any{"id": "reason-" + turnID, "type": "reasoning"}})
+			notify("item/reasoning/summaryTextDelta", map[string]any{"threadId": "codex-thread-1", "turnId": turnID, "itemId": "reason-" + turnID, "summaryIndex": 0, "delta": "Checking tests"})
+			notify("item/completed", map[string]any{"threadId": "codex-thread-1", "turnId": turnID, "completedAtMs": 4, "item": map[string]any{"id": "reason-" + turnID, "type": "reasoning", "summary": []string{"Checking tests"}}})
 			notify("item/agentMessage/delta", map[string]any{"threadId": "codex-thread-1", "turnId": turnID, "itemId": notifyID, "delta": "hello "})
 			notify("item/agentMessage/delta", map[string]any{"threadId": "codex-thread-1", "turnId": turnID, "itemId": notifyID, "delta": "world"})
 			notify("item/completed", map[string]any{"threadId": "codex-thread-1", "turnId": turnID, "completedAtMs": 1, "item": map[string]any{"id": notifyID, "type": "agentMessage", "text": "hello world"}})
 			notify("turn/completed", map[string]any{"threadId": "codex-thread-1", "turn": map[string]any{"id": turnID, "status": "completed"}})
 		case "turn/interrupt":
 			response(map[string]any{})
+		case "thread/compact/start":
+			response(map[string]any{})
+			notify("thread/compacted", map[string]any{"threadId": "codex-thread-1"})
 		case "model/list":
 			response(map[string]any{"data": []map[string]any{{"id": "gpt-test", "displayName": "Test model", "supportedReasoningEfforts": []map[string]string{{"reasoningEffort": "low"}, {"reasoningEffort": "medium"}}}}, "nextCursor": nil})
 		case "plugin/installed":
@@ -221,6 +231,108 @@ func TestSupervisorStartsTurnsAndTranslatesEvents(t *testing.T) {
 		t.Fatalf("app-server handshake/turn settings missing: initialized=%v effort=%v",
 			sawInitialized, sawInitialEffort)
 	}
+}
+
+func TestLiveItemEventsTranslateWithoutDuplicatingToolCards(t *testing.T) {
+	var c collected
+	s := fakeSupervisor(t, &c)
+	thread, err := s.Start(StartOptions{ID: "ak-live", WorkDir: t.TempDir(), Prompt: "exercise live events"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Stop(thread.ID)
+	if !c.contains(t, func(v map[string]any) bool {
+		if v["type"] != "assistant" {
+			return false
+		}
+		m, _ := v["message"].(map[string]any)
+		content, _ := m["content"].([]any)
+		if len(content) != 1 {
+			return false
+		}
+		b, _ := content[0].(map[string]any)
+		return b["type"] == "tool_use" && b["name"] == "TodoWrite"
+	}) {
+		t.Error("missing canonical TodoWrite plan update")
+	}
+	if !c.contains(t, func(v map[string]any) bool {
+		if v["type"] != "user" {
+			return false
+		}
+		m, _ := v["message"].(map[string]any)
+		content, _ := m["content"].([]any)
+		if len(content) != 1 {
+			return false
+		}
+		b, _ := content[0].(map[string]any)
+		return b["type"] == "tool_result" && b["tool_use_id"] == "cmd-turn-1" && b["content"] == "ok\tpackage\n"
+	}) {
+		t.Error("command output delta was not retained for final tool result")
+	}
+	if !c.contains(t, func(v map[string]any) bool {
+		if v["type"] != "stream_event" {
+			return false
+		}
+		e, _ := v["event"].(map[string]any)
+		return e["type"] == "content_block_delta" && e["delta"].(map[string]any)["type"] == "thinking_delta"
+	}) {
+		t.Error("missing safe reasoning-summary stream delta")
+	}
+	var commandStarts int
+	c.mu.Lock()
+	values := append([]json.RawMessage(nil), c.values...)
+	c.mu.Unlock()
+	for _, raw := range values {
+		var v map[string]any
+		_ = json.Unmarshal(raw, &v)
+		m, _ := v["message"].(map[string]any)
+		content, _ := m["content"].([]any)
+		if v["type"] == "assistant" && len(content) == 1 {
+			if b, _ := content[0].(map[string]any); b["type"] == "tool_use" && b["id"] == "cmd-turn-1" {
+				commandStarts++
+			}
+		}
+	}
+	if commandStarts != 1 {
+		t.Errorf("command tool cards = %d, want 1", commandStarts)
+	}
+}
+
+func TestNativeCompactionUsesAppServerAndCompletesInPlace(t *testing.T) {
+	var c collected
+	logPath := filepath.Join(t.TempDir(), "rpc.jsonl")
+	t.Setenv("AK_CODEX_FAKE_LOG", logPath)
+	s := fakeSupervisor(t, &c)
+	thread, err := s.Start(StartOptions{ID: "ak-compact", WorkDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Stop(thread.ID)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := s.Compact(ctx, thread.ID); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	if !c.contains(t, func(v map[string]any) bool {
+		return v["type"] == "system" && v["subtype"] == "compact_boundary"
+	}) {
+		t.Error("native compaction did not publish a compact boundary")
+	}
+	if !c.contains(t, func(v map[string]any) bool {
+		return v["type"] == "result" && v["session_id"] == "codex-thread-1"
+	}) {
+		t.Error("native compaction did not release the shared turn lifecycle")
+	}
+	for _, frame := range recordedRequests(t, logPath) {
+		if frame["method"] != "thread/compact/start" {
+			continue
+		}
+		params, _ := frame["params"].(map[string]any)
+		if params["threadId"] == "codex-thread-1" {
+			return
+		}
+	}
+	t.Fatal("native compaction request was not sent with the Codex session id")
 }
 
 func TestStartAttachesAdditionalSkillRoots(t *testing.T) {
