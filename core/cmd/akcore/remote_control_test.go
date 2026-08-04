@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -68,5 +69,33 @@ func TestHumanEchoStoreMatchesQueuedDuplicatesOneForOne(t *testing.T) {
 	}
 	if got := store.merge("thread-1", nil); len(got) != 1 || got[0].Text != "same follow-up" {
 		t.Fatalf("second identical queued echo was consumed too: %#v", got)
+	}
+}
+
+func TestHumanEchoMergePreservesCanonicalOrderWithLegacyUntimestampedEvents(t *testing.T) {
+	var store humanEchoStore
+	at := time.Now().UTC().Truncate(time.Millisecond)
+	store.add("thread-1", remote.TranscriptEvent{Kind: "user", Text: "queued follow-up", At: at})
+
+	// Codex logs written before timestamp normalization contain assistant and
+	// tool rows without At. A reload may merge one pending user echo into this
+	// page; the merge must not reorder the persisted conversation around it.
+	canonical := []remote.TranscriptEvent{
+		{Kind: "user", Text: "opening prompt", At: at.Add(-2 * time.Minute)},
+		{Kind: "assistant", Text: "first answer"},
+		{Kind: "tool", ToolName: "Bash", Summary: "Approve a shell command"},
+		{Kind: "assistant", Text: "second answer"},
+	}
+	got := store.merge("thread-1", canonical)
+	if len(got) != len(canonical)+1 {
+		t.Fatalf("merged transcript = %#v", got)
+	}
+	for i, event := range canonical {
+		if !reflect.DeepEqual(got[i], event) {
+			t.Fatalf("canonical event %d moved: got %#v, want %#v", i, got[i], event)
+		}
+	}
+	if got[len(got)-1].Kind != "user" || got[len(got)-1].Text != "queued follow-up" {
+		t.Fatalf("pending echo not kept at its safe tail position: %#v", got)
 	}
 }

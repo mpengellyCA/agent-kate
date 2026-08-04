@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -298,10 +297,35 @@ func (s *humanEchoStore) merge(threadID string, events []remote.TranscriptEvent)
 	} else {
 		s.byThread[threadID] = remaining
 	}
+	// The harness transcript is the canonical sequence. Do not sort it here:
+	// older Codex event logs did not timestamp assistant/tool rows while user
+	// rows were timestamped, so sorting a mixed page put every user message at
+	// the end on a mobile reload. Insert only the as-yet-unpersisted echo around
+	// timestamped neighbours, leaving every canonical event in log order.
 	out := append([]remote.TranscriptEvent(nil), events...)
-	out = append(out, remaining...)
-	sort.SliceStable(out, func(i, j int) bool { return out[i].At.Before(out[j].At) })
+	for _, echo := range remaining {
+		out = insertHumanEcho(out, echo)
+	}
 	return out
+}
+
+func insertHumanEcho(events []remote.TranscriptEvent, echo remote.TranscriptEvent) []remote.TranscriptEvent {
+	insertAt := len(events)
+	if !echo.At.IsZero() {
+		for i, event := range events {
+			// A zero timestamp says only that this historical entry was recorded
+			// before timestamps were available. It is not evidence that the entry
+			// happened before the echo, so never move it around the new event.
+			if !event.At.IsZero() && !event.At.Before(echo.At) {
+				insertAt = i
+				break
+			}
+		}
+	}
+	events = append(events, remote.TranscriptEvent{})
+	copy(events[insertAt+1:], events[insertAt:])
+	events[insertAt] = echo
+	return events
 }
 
 func pruneHumanEchoes(items []remote.TranscriptEvent, now time.Time) []remote.TranscriptEvent {

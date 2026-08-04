@@ -1717,4 +1717,17 @@ func (s *Supervisor) handleItemCompleted(t *Thread, item struct {
 	}
 }
 
-func event(v any) json.RawMessage { b, _ := json.Marshal(v); return b }
+func event(v any) json.RawMessage {
+	// The normalized event log is the canonical replay ordering for the remote
+	// DTO as well as the desktop. Every new event needs a timestamp: a mobile
+	// reload can temporarily merge a just-accepted user echo, and ordering that
+	// echo against timestamp-less assistant events used to push user messages to
+	// the bottom of the transcript.
+	if fields, ok := v.(map[string]any); ok {
+		if _, present := fields["timestamp"]; !present {
+			fields["timestamp"] = time.Now().UTC()
+		}
+	}
+	b, _ := json.Marshal(v)
+	return b
+}
