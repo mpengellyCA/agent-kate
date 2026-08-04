@@ -195,6 +195,19 @@ func TestRemoteProjectAgentAndFilesNeedExplicitDeveloperCapabilities(t *testing.
 	if code != http.StatusOK || !ok || len(options) != 1 || options[0].(map[string]any)["id"] != "fake" || body["default"].(map[string]any)["providerId"] != "direct" {
 		t.Fatalf("launch options = %d / %#v", code, body)
 	}
+	// These field names are bound directly by the mobile launch form. Do not
+	// rely on Go's default exported-field encoding here: it emits capitalized
+	// names and makes the controls look empty without an HTTP error.
+	for _, key := range []string{"harnesses", "providers", "worktreeModes", "models", "default"} {
+		if _, present := body[key]; !present {
+			t.Errorf("launch options missing browser field %q: %#v", key, body)
+		}
+	}
+	for _, key := range []string{"Harnesses", "Providers", "WorktreeModes", "Models", "Default"} {
+		if _, present := body[key]; present {
+			t.Errorf("launch options leaked Go field %q; use lower/camel-case JSON tags", key)
+		}
+	}
 	code, body = env.authJSON("POST", "/api/v1/agents/t-1/new", `{"prompt":"review the project"}`)
 	if code != http.StatusAccepted || body["threadId"] != "new-t-1" {
 		t.Fatalf("project start = %d / %#v", code, body)

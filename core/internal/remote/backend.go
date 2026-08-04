@@ -290,6 +290,13 @@ type LaunchModel struct {
 	Name    string   `json:"name"`
 	Efforts []string `json:"efforts"`
 }
+
+// ProjectLaunchOptions is consumed directly by the remote agent-launch form.
+//
+// Browser-facing DTOs must always declare their exact JSON names. Go's default
+// exported-field encoding (for example, "Harnesses") silently leaves a client
+// that expects `harnesses` with empty controls. This has regressed twice; keep
+// the exact-wire-shape test in handlers_test.go when changing this type.
 type ProjectLaunchOptions struct {
 	Harnesses     []LaunchChoice      `json:"harnesses"`
 	Providers     []LaunchChoice      `json:"providers"`
@@ -301,8 +308,8 @@ type FileRequest struct{ ThreadID, Path string }
 type FileWriteRequest struct{ ThreadID, Path, Text, Revision string }
 
 // FileContent is the text editor payload. These JSON names are part of the
-// browser contract; Go's default exported-field names ("Text") silently left
-// the WebUI looking for an absent lowercase `text` field.
+// browser contract; see ProjectLaunchOptions for the regression note on never
+// relying on Go's default exported-field names for browser-facing DTOs.
 type FileContent struct {
 	Path     string `json:"path"`
 	Text     string `json:"text"`
