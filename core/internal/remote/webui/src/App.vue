@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import MarkdownBlock from './components/MarkdownBlock.vue'
+import { displayTranscript } from './lib/transcript.js'
 import { bootstrapAuth } from './api/auth.js'
 import {
   API_VERSION, eventsUrl, getAgents, getMeta, getPermission, getTranscript,
@@ -66,6 +67,7 @@ let autosaveTimer = null
 
 const selected = computed(() => agents.value.find((agent) => agent.threadId === selectedID.value) ?? null)
 const prompt = computed(() => selected.value?.awaitingPermission ?? null)
+const displayedTranscript = computed(() => displayTranscript(transcript.value))
 const versionSkew = computed(() => Number(meta.value?.apiVersion) !== API_VERSION)
 const activeAgents = computed(() => agents.value.filter((agent) => agent.status !== 'archived'))
 const projectGroups = computed(() => {
@@ -622,14 +624,13 @@ function relativeActivity(value) {
         <p v-if="transcriptTruncated" class="mx-3 mt-3 flex-none rounded-box bg-warning/10 px-3 py-2 text-xs text-warning">Some conversation content was clipped for this phone.</p>
         <div ref="conversation" class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-safe">
           <div class="mx-auto flex max-w-4xl flex-col gap-3 p-3 sm:p-5">
-            <div v-if="!transcript.length" class="py-16 text-center text-sm text-ak-muted">No remote-safe conversation events yet.</div>
-            <article v-for="(event, index) in transcript" :key="`${index}-${event.at || ''}`" class="rounded-box border border-ak-border px-3 py-2 text-sm shadow-sm" :class="event.kind === 'user' ? 'ml-7 bg-primary/15 sm:ml-20' : event.kind === 'assistant' ? 'mr-3 bg-base-200 sm:mr-16' : 'bg-base-300 text-xs'">
+            <div v-if="!displayedTranscript.length" class="py-16 text-center text-sm text-ak-muted">No remote-safe conversation events yet.</div>
+            <article v-for="(event, index) in displayedTranscript" :key="`${index}-${event.at || ''}`" class="rounded-box border border-ak-border px-3 py-2 text-sm shadow-sm" :class="event.kind === 'user' ? 'ml-7 bg-primary/15 sm:ml-20' : event.kind === 'assistant' ? 'mr-3 bg-base-200 sm:mr-16' : 'bg-base-300 text-xs'">
               <MarkdownBlock v-if="event.kind === 'user' || event.kind === 'assistant'" :source="event.text" />
               <div v-if="event.kind === 'user' && event.attachments?.length" class="mt-2 flex flex-wrap gap-1.5" aria-label="Message attachments">
                 <span v-for="(attachment, attachmentIndex) in event.attachments" :key="`${attachment.kind}-${attachmentIndex}`" class="inline-flex items-center gap-1 rounded-full border border-primary/25 bg-base-100/50 px-2.5 py-1 text-xs font-medium text-base-content"><span class="text-primary" aria-hidden="true">{{ attachment.kind === 'image' ? '▧' : '▤' }}</span>{{ attachmentLabel(attachment) }}</span>
               </div>
               <template v-else-if="event.kind === 'tool'"><p class="font-semibold">{{ event.toolName || 'Tool activity' }}</p><p class="mt-1 text-ak-muted">{{ event.summary || 'The agent is using a tool.' }}</p></template>
-              <template v-else><p class="font-semibold">Agent status</p><p class="mt-1 text-ak-muted">{{ event.text }}</p></template>
             </article>
           </div>
         </div>
