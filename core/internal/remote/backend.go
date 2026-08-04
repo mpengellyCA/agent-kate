@@ -271,7 +271,15 @@ type ProjectAgentRequest struct{ ThreadID, Prompt, Title string }
 type ProjectAgentResult struct{ ThreadID string }
 type FileRequest struct{ ThreadID, Path string }
 type FileWriteRequest struct{ ThreadID, Path, Text, Revision string }
-type FileContent struct{ Path, Text, Revision string }
+
+// FileContent is the text editor payload. These JSON names are part of the
+// browser contract; Go's default exported-field names ("Text") silently left
+// the WebUI looking for an absent lowercase `text` field.
+type FileContent struct {
+	Path     string `json:"path"`
+	Text     string `json:"text"`
+	Revision string `json:"revision"`
+}
 
 // FileEntry is a direct child of a worktree directory. Paths are relative and
 // never include Agent Kate's own metadata directories.

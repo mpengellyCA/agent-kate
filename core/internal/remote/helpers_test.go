@@ -90,7 +90,7 @@ func (f *fakeBackend) ListFiles(_ context.Context, _ FileRequest) ([]FileEntry, 
 	return []FileEntry{{Path: "README.md", Name: "README.md"}}, nil
 }
 func (f *fakeBackend) ReadFile(_ context.Context, req FileRequest) (FileContent, error) {
-	return FileContent{Path: req.Path, Text: "", Revision: "test"}, nil
+	return FileContent{Path: req.Path, Text: "remote file body", Revision: "test"}, nil
 }
 func (f *fakeBackend) WriteFile(_ context.Context, _ Principal, req FileWriteRequest) (FileContent, error) {
 	return FileContent{Path: req.Path, Text: req.Text, Revision: "test"}, nil

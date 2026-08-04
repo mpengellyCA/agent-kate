@@ -186,6 +186,10 @@ func TestRemoteProjectAgentAndFilesNeedExplicitDeveloperCapabilities(t *testing.
 	if code != http.StatusOK {
 		t.Fatalf("files = %d / %#v", code, body)
 	}
+	code, body = env.authJSON("GET", "/api/v1/agents/t-1/file?path=README.md", "")
+	if code != http.StatusOK || body["path"] != "README.md" || body["text"] != "remote file body" || body["revision"] != "test" {
+		t.Fatalf("file read must use the lowercase browser contract: %d / %#v", code, body)
+	}
 }
 
 func TestRemoteSendRejectsUnsafeAttachmentAndImmediateMode(t *testing.T) {
