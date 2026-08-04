@@ -191,7 +191,8 @@ func TestRemoteProjectAgentAndFilesNeedExplicitDeveloperCapabilities(t *testing.
 		t.Fatal(err)
 	}
 	code, body = env.authJSON("GET", "/api/v1/agents/t-1/launch-options", "")
-	if code != http.StatusOK {
+	options, ok := body["harnesses"].([]any)
+	if code != http.StatusOK || !ok || len(options) != 1 || options[0].(map[string]any)["id"] != "fake" || body["default"].(map[string]any)["providerId"] != "direct" {
 		t.Fatalf("launch options = %d / %#v", code, body)
 	}
 	code, body = env.authJSON("POST", "/api/v1/agents/t-1/new", `{"prompt":"review the project"}`)

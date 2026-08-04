@@ -270,20 +270,32 @@ type ForkResult struct{ ThreadID string }
 // ProjectAgentRequest is seeded from an existing project member. The paired
 // browser cannot supply a workspace, provider, environment, or Cowork state.
 type ProjectAgentRequest struct {
-	ThreadID, Prompt, Title                       string
-	Backend, ProviderID, Model, Effort, Isolation string
+	ThreadID   string `json:"threadId,omitempty"`
+	Prompt     string `json:"prompt,omitempty"`
+	Title      string `json:"title,omitempty"`
+	Backend    string `json:"backend,omitempty"`
+	ProviderID string `json:"providerId,omitempty"`
+	Model      string `json:"model,omitempty"`
+	Effort     string `json:"effort,omitempty"`
+	Isolation  string `json:"isolation,omitempty"`
 }
 type ProjectAgentResult struct{ ThreadID string }
 type ProjectLaunchOptionsRequest struct{ ThreadID, Backend, ProviderID string }
-type LaunchChoice struct{ ID, Name string }
+type LaunchChoice struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
 type LaunchModel struct {
-	ID, Name string
-	Efforts  []string
+	ID      string   `json:"id"`
+	Name    string   `json:"name"`
+	Efforts []string `json:"efforts"`
 }
 type ProjectLaunchOptions struct {
-	Harnesses, Providers, WorktreeModes []LaunchChoice
-	Models                              []LaunchModel
-	Default                             ProjectAgentRequest
+	Harnesses     []LaunchChoice      `json:"harnesses"`
+	Providers     []LaunchChoice      `json:"providers"`
+	WorktreeModes []LaunchChoice      `json:"worktreeModes"`
+	Models        []LaunchModel       `json:"models"`
+	Default       ProjectAgentRequest `json:"default"`
 }
 type FileRequest struct{ ThreadID, Path string }
 type FileWriteRequest struct{ ThreadID, Path, Text, Revision string }
