@@ -14,10 +14,10 @@ import (
 // right shape anyway: the frozen /api/v1/ contract is deliberately NOT a mirror
 // of the internal IPC vocabulary (the socket churns freely, a phone's cached
 // PWA cannot), and this interface is the seam where the two vocabularies meet.
-// Keeping it this narrow is also a security property — a capability the phone
-// must never reach is one that simply has no method here. There is no Cowork
-// verb, no agent creation, and nothing that takes a filesystem path: every
-// method keys on threadId and lets the core resolve the worktree itself.
+// Keeping it narrow is a security property: there is no Cowork verb and no
+// caller-supplied filesystem root. The developer methods below remain behind
+// per-device, default-deny capabilities and key their worktree to a thread the
+// core resolves itself.
 //
 // Implementations must be safe for concurrent use and must respect ctx: an HTTP
 // handler cancels it when the phone walks out of Wi-Fi range, and a backend that
@@ -38,6 +38,8 @@ type Backend interface {
 	// Fork creates a fresh, isolated continuation of an existing thread. The
 	// HTTPS handler admits it only for devices with CapAgentManage.
 	Fork(ctx context.Context, principal Principal, req ForkRequest) (ForkResult, error)
+	StartProjectAgent(ctx context.Context, principal Principal, req ProjectAgentRequest) (ProjectAgentResult, error)
+	ListFiles(ctx context.Context, req FileRequest) ([]FileEntry, error)
 	ReadFile(ctx context.Context, req FileRequest) (FileContent, error)
 	WriteFile(ctx context.Context, principal Principal, req FileWriteRequest) (FileContent, error)
 
@@ -106,6 +108,8 @@ var (
 	// pairing URL is only meaningful with a listener behind it; minting one
 	// anyway produces a QR code pointing at whatever else holds that port.
 	ErrNotListening = errors.New("remote: remote access is not switched on")
+	// ErrConflict means a revisioned resource changed after the caller read it.
+	ErrConflict = errors.New("remote: revision conflict")
 )
 
 // Agent is one roster row, in Go types. The wire form is built in handlers.go so
@@ -249,9 +253,23 @@ type ForkRequest struct {
 }
 
 type ForkResult struct{ ThreadID string }
+
+// ProjectAgentRequest is seeded from an existing project member. The paired
+// browser cannot supply a workspace, provider, environment, or Cowork state.
+type ProjectAgentRequest struct{ ThreadID, Prompt, Title string }
+type ProjectAgentResult struct{ ThreadID string }
 type FileRequest struct{ ThreadID, Path string }
 type FileWriteRequest struct{ ThreadID, Path, Text, Revision string }
 type FileContent struct{ Path, Text, Revision string }
+
+// FileEntry is a direct child of a worktree directory. Paths are relative and
+// never include Agent Kate's own metadata directories.
+type FileEntry struct {
+	Path      string `json:"path"`
+	Name      string `json:"name"`
+	Directory bool   `json:"directory"`
+	Size      int64  `json:"size,omitempty"`
+}
 
 // PermissionAnswer is a human decision arriving from a phone.
 type PermissionAnswer struct {

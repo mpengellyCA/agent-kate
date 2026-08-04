@@ -50,8 +50,12 @@ export const sendPrompt = (threadId, { text = '', attachments = [] } = {}, opts)
   ...opts, method: 'POST', body: { text, attachments, mode: 'queue' },
 })
 export const forkAgent = (threadId, { title = '' } = {}, opts) => apiFetch(`/agents/${encodeURIComponent(threadId)}/fork`, {
-  ...opts, method: 'POST', body: { title },
+	...opts, method: 'POST', body: { title },
 })
+export const startProjectAgent = (threadId, { prompt, title = '' }, opts) => apiFetch(`/agents/${encodeURIComponent(threadId)}/new`, {
+  ...opts, method: 'POST', body: { prompt, title },
+})
+export const listWorktreeFiles = (threadId, path = '', opts = {}) => apiFetch(`/agents/${encodeURIComponent(threadId)}/files`, { ...opts, query: { path } })
 export const readWorktreeFile = (threadId, path, opts = {}) => apiFetch(`/agents/${encodeURIComponent(threadId)}/file`, { ...opts, query: { path } })
 export const writeWorktreeFile = (threadId, body, opts) => apiFetch(`/agents/${encodeURIComponent(threadId)}/file`, { ...opts, method: 'PUT', body })
 export const interruptAgent = (threadId, opts) => apiFetch(`/agents/${encodeURIComponent(threadId)}/interrupt`, { ...opts, method: 'POST', body: {} })

@@ -165,6 +165,29 @@ func TestRemoteForkNeedsExplicitDeveloperCapability(t *testing.T) {
 	}
 }
 
+func TestRemoteProjectAgentAndFilesNeedExplicitDeveloperCapabilities(t *testing.T) {
+	env := newTestEnv(t)
+	code, body := env.authJSON("POST", "/api/v1/agents/t-1/new", `{"prompt":"review the project"}`)
+	if code != http.StatusForbidden || body["error"] != "capability-required" {
+		t.Fatalf("ungranted project start = %d / %#v", code, body)
+	}
+	code, body = env.authJSON("GET", "/api/v1/agents/t-1/files", "")
+	if code != http.StatusForbidden || body["error"] != "capability-required" {
+		t.Fatalf("ungranted files = %d / %#v", code, body)
+	}
+	if _, _, err := env.srv.SetDeviceCapabilities(env.device.ID, []Capability{CapAgentManage, CapWorktreeView}); err != nil {
+		t.Fatal(err)
+	}
+	code, body = env.authJSON("POST", "/api/v1/agents/t-1/new", `{"prompt":"review the project"}`)
+	if code != http.StatusAccepted || body["threadId"] != "new-t-1" {
+		t.Fatalf("project start = %d / %#v", code, body)
+	}
+	code, body = env.authJSON("GET", "/api/v1/agents/t-1/files", "")
+	if code != http.StatusOK {
+		t.Fatalf("files = %d / %#v", code, body)
+	}
+}
+
 func TestRemoteSendRejectsUnsafeAttachmentAndImmediateMode(t *testing.T) {
 	for name, body := range map[string]string{
 		"path":      `{"text":"x","attachments":[{"kind":"text","name":"../secret","mediaType":"text/plain","text":"x"}]}`,

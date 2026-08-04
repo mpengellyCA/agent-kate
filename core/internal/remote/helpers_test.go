@@ -80,6 +80,15 @@ func (f *fakeBackend) Fork(_ context.Context, _ Principal, req ForkRequest) (For
 	}
 	return ForkResult{ThreadID: "fork-" + req.ThreadID}, nil
 }
+func (f *fakeBackend) StartProjectAgent(_ context.Context, _ Principal, req ProjectAgentRequest) (ProjectAgentResult, error) {
+	if req.ThreadID == "" {
+		return ProjectAgentResult{}, ErrUnknownThread
+	}
+	return ProjectAgentResult{ThreadID: "new-" + req.ThreadID}, nil
+}
+func (f *fakeBackend) ListFiles(_ context.Context, _ FileRequest) ([]FileEntry, error) {
+	return []FileEntry{{Path: "README.md", Name: "README.md"}}, nil
+}
 func (f *fakeBackend) ReadFile(_ context.Context, req FileRequest) (FileContent, error) {
 	return FileContent{Path: req.Path, Text: "", Revision: "test"}, nil
 }

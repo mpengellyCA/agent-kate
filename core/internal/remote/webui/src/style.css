@@ -107,6 +107,28 @@
     -webkit-line-clamp: 2;
     line-height: 1.35;
   }
+  .file-workspace {
+    border: 1px solid var(--color-ak-border);
+    background: var(--color-base-100);
+  }
+  .file-entry {
+    display: flex;
+    width: 100%;
+    align-items: center;
+    gap: .45rem;
+    border-radius: .45rem;
+    padding: .48rem .55rem;
+    text-align: left;
+  }
+  .file-entry:hover,
+  .file-entry:focus-visible,
+  .file-entry-active {
+    background: color-mix(in oklab, var(--color-primary) 16%, var(--color-base-300));
+  }
+  .file-editor {
+    tab-size: 2;
+    color: color-mix(in oklab, var(--color-base-content) 94%, var(--color-primary));
+  }
 }
 
 @media (max-width: 639px) {

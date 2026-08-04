@@ -21,6 +21,7 @@ import (
 	"agentkate/internal/permission"
 	"agentkate/internal/remote"
 	"agentkate/internal/safe"
+	"agentkate/internal/session"
 	"agentkate/internal/worktree"
 )
 
@@ -210,6 +211,55 @@ func (b *remoteBackend) Fork(ctx context.Context, _ remote.Principal, req remote
 	return remote.ForkResult{ThreadID: threadID}, nil
 }
 
+// StartProjectAgent is intentionally a much narrower cousin of the desktop's
+// agent.start. A paired device can name an existing project member and provide
+// its first instruction, but it cannot choose a path, credentials, an
+// environment overlay, or Cowork. Those trusted settings are copied only from
+// the server-resolved seed record, with Cowork force-disabled.
+func (b *remoteBackend) StartProjectAgent(ctx context.Context, _ remote.Principal, req remote.ProjectAgentRequest) (remote.ProjectAgentResult, error) {
+	if err := ctx.Err(); err != nil {
+		return remote.ProjectAgentResult{}, err
+	}
+	if err := b.requireThread(req.ThreadID); err != nil {
+		return remote.ProjectAgentResult{}, err
+	}
+	src, _ := b.d.sessions.Get(req.ThreadID)
+	if strings.TrimSpace(src.Project) == "" {
+		return remote.ProjectAgentResult{}, fmt.Errorf("this agent has no project")
+	}
+	h := b.d.harnessFor(req.ThreadID)
+	descriptor := h.Descriptor()
+	threadID := agent.NewThreadID()
+	sessionID := ""
+	if descriptor.Supports(harness.OperationMintSessionID) {
+		sessionID = session.NewID()
+	}
+	p := agentStartParams{
+		WorkspacePath: src.Project, Prompt: req.Prompt, PermissionMode: src.PermissionMode,
+		SandboxMode: src.EffectiveSettings.SandboxMode, Effort: src.Effort, Model: src.Model,
+		Backend: descriptor.ID, Isolation: "", CoworkEnabled: false, Provider: providerFromRecord(src),
+		SystemPrompt: src.SystemPrompt, Agents: src.Agents, Env: src.Env,
+		FallbackModels: src.FallbackModels, DisallowedTools: src.DisallowedTools, AddDirs: src.AddDirs,
+		StrictMCPConfig: src.StrictMCPConfig, MaxBudgetUSD: src.MaxBudgetUSD,
+	}
+	if p.PermissionMode == "" {
+		p.PermissionMode = src.EffectiveSettings.PermissionMode
+	}
+	if p.Effort == "" {
+		p.Effort = src.EffectiveSettings.ReasoningEffort
+	}
+	if p.Model == "" {
+		p.Model = src.EffectiveSettings.Model
+	}
+	if b.d.turns != nil {
+		b.d.turns.TurnQueued(threadID)
+	}
+	safe.Go("remote.startProjectAgent", func() {
+		_, _, _ = launchThread(b.d, h, threadID, sessionID, p, launchMeta{Title: req.Title})
+	})
+	return remote.ProjectAgentResult{ThreadID: threadID}, nil
+}
+
 func (b *remoteBackend) remoteFile(req remote.FileRequest) (string, error) {
 	if err := b.requireThread(req.ThreadID); err != nil {
 		return "", err
@@ -228,14 +278,82 @@ func (b *remoteBackend) remoteFile(req remote.FileRequest) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	parent, err := filepath.EvalSymlinks(filepath.Dir(path))
+	resolved, err := filepath.EvalSymlinks(path)
 	if err != nil {
 		return "", err
 	}
-	if rel, err := filepath.Rel(root, parent); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	if rel, err := filepath.Rel(root, resolved); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("path escapes the worktree")
+	}
+	return resolved, nil
+}
+
+func (b *remoteBackend) remoteDirectory(req remote.FileRequest) (string, error) {
+	if err := b.requireThread(req.ThreadID); err != nil {
+		return "", err
+	}
+	rec, _ := b.d.sessions.Get(req.ThreadID)
+	clean := filepath.Clean(req.Path)
+	if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("invalid worktree path")
+	}
+	if req.Path == "" || clean == "." {
+		clean = "."
+	}
+	if clean != "." {
+		parts := strings.Split(filepath.ToSlash(clean), "/")
+		if parts[0] == ".git" || parts[0] == ".agentkate" {
+			return "", fmt.Errorf("that worktree path is protected")
+		}
+	}
+	root, err := filepath.EvalSymlinks(rec.Worktree.Path)
+	if err != nil {
+		return "", err
+	}
+	path, err := filepath.EvalSymlinks(filepath.Join(root, clean))
+	if err != nil {
+		return "", err
+	}
+	if rel, err := filepath.Rel(root, path); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("path escapes the worktree")
 	}
 	return path, nil
+}
+
+func (b *remoteBackend) ListFiles(ctx context.Context, req remote.FileRequest) ([]remote.FileEntry, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	path, err := b.remoteDirectory(req)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]remote.FileEntry, 0, len(entries))
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if entry.Name() == ".git" || entry.Name() == ".agentkate" || entry.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		rel := entry.Name()
+		if req.Path != "" && filepath.Clean(req.Path) != "." {
+			rel = filepath.Join(req.Path, entry.Name())
+		}
+		out = append(out, remote.FileEntry{Path: filepath.ToSlash(rel), Name: entry.Name(), Directory: info.IsDir(), Size: info.Size()})
+		if len(out) == 256 {
+			break
+		}
+	}
+	return out, nil
 }
 func remoteRevision(b []byte) string { sum := sha256.Sum256(b); return fmt.Sprintf("%x", sum[:]) }
 func (b *remoteBackend) ReadFile(ctx context.Context, req remote.FileRequest) (remote.FileContent, error) {
@@ -268,7 +386,7 @@ func (b *remoteBackend) WriteFile(ctx context.Context, _ remote.Principal, req r
 		return remote.FileContent{}, err
 	}
 	if req.Revision == "" || req.Revision != remoteRevision(old) {
-		return remote.FileContent{}, fmt.Errorf("file changed since it was opened")
+		return remote.FileContent{}, remote.ErrConflict
 	}
 	if err := os.WriteFile(path, []byte(req.Text), 0o600); err != nil {
 		return remote.FileContent{}, err

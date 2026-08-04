@@ -468,6 +468,51 @@ func (s *Server) handleFork(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "threadId": result.ThreadID})
 }
 
+func (s *Server) handleProjectAgent(w http.ResponseWriter, r *http.Request) {
+	if !s.requireCapability(w, r, CapAgentManage) {
+		return
+	}
+	var body struct {
+		Prompt string `json:"prompt"`
+		Title  string `json:"title"`
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	if strings.TrimSpace(body.Prompt) == "" {
+		writeError(w, http.StatusBadRequest, "prompt-required", "A first instruction is required.")
+		return
+	}
+	if len(body.Prompt) > maxSendTextBytes || len(body.Title) > maxSendTextBytes || !utf8.ValidString(body.Prompt) || !utf8.ValidString(body.Title) {
+		writeError(w, http.StatusRequestEntityTooLarge, "prompt-too-large", "The agent instruction is too large.")
+		return
+	}
+	threadID := r.PathValue("threadId")
+	ctx, cancel := context.WithTimeout(r.Context(), backendTimeout)
+	defer cancel()
+	result, err := s.backend.StartProjectAgent(ctx, principalOf(r), ProjectAgentRequest{ThreadID: threadID, Prompt: strings.TrimSpace(body.Prompt), Title: strings.TrimSpace(body.Title)})
+	s.auditAction(sessionOf(r.Context()), AuditProjectAgent, threadID, "", "new="+result.ThreadID, err)
+	if err != nil {
+		writeBackendError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "threadId": result.ThreadID})
+}
+
+func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request) {
+	if !s.requireCapability(w, r, CapWorktreeView) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), backendTimeout)
+	defer cancel()
+	entries, err := s.backend.ListFiles(ctx, FileRequest{ThreadID: r.PathValue("threadId"), Path: r.URL.Query().Get("path")})
+	if err != nil {
+		writeBackendError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"entries": entries})
+}
+
 func (s *Server) handleFileRead(w http.ResponseWriter, r *http.Request) {
 	if !s.requireCapability(w, r, CapWorktreeView) {
 		return
@@ -767,6 +812,8 @@ func writeBackendError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "busy", "That agent is mid-turn.")
 	case errors.Is(err, ErrUnsupported):
 		writeError(w, http.StatusNotImplemented, "unsupported", "That agent's harness cannot do this.")
+	case errors.Is(err, ErrConflict):
+		writeError(w, http.StatusConflict, "revision-conflict", "That file changed since you opened it. Reload before saving.")
 	case errors.Is(err, context.DeadlineExceeded):
 		writeError(w, http.StatusGatewayTimeout, "timeout", "The core did not answer in time.")
 	default:

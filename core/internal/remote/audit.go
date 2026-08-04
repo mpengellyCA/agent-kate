@@ -35,21 +35,22 @@ const auditTailWindow = 64 * 1024
 type AuditKind string
 
 const (
-	AuditPair       AuditKind = "pair"       // a device was paired
-	AuditAuth       AuditKind = "auth"       // a token was exchanged for a session
-	AuditLogout     AuditKind = "logout"     // a device ended its session
-	AuditRevoke     AuditKind = "revoke"     // a device was revoked
-	AuditKill       AuditKind = "kill"       // global kill-switch engaged
-	AuditRearm      AuditKind = "rearm"      // global kill-switch re-armed
-	AuditSend       AuditKind = "send"       // a prompt was sent or queued
-	AuditPermission AuditKind = "permission" // a permission prompt was answered
-	AuditInterrupt  AuditKind = "interrupt"  // a turn was interrupted
-	AuditStop       AuditKind = "stop"       // an agent was stopped
-	AuditFork       AuditKind = "fork"       // an agent continuation was created
-	AuditFileWrite  AuditKind = "file_write" // a worktree file was saved
-	AuditCapability AuditKind = "capability" // desktop changed a device's developer powers
-	AuditTamper     AuditKind = "tamper"     // chain verification failed on load
-	AuditRotate     AuditKind = "rotate"     // bounded-retention chain genesis
+	AuditPair         AuditKind = "pair"          // a device was paired
+	AuditAuth         AuditKind = "auth"          // a token was exchanged for a session
+	AuditLogout       AuditKind = "logout"        // a device ended its session
+	AuditRevoke       AuditKind = "revoke"        // a device was revoked
+	AuditKill         AuditKind = "kill"          // global kill-switch engaged
+	AuditRearm        AuditKind = "rearm"         // global kill-switch re-armed
+	AuditSend         AuditKind = "send"          // a prompt was sent or queued
+	AuditPermission   AuditKind = "permission"    // a permission prompt was answered
+	AuditInterrupt    AuditKind = "interrupt"     // a turn was interrupted
+	AuditStop         AuditKind = "stop"          // an agent was stopped
+	AuditFork         AuditKind = "fork"          // an agent continuation was created
+	AuditProjectAgent AuditKind = "project_agent" // a new project agent was started
+	AuditFileWrite    AuditKind = "file_write"    // a worktree file was saved
+	AuditCapability   AuditKind = "capability"    // desktop changed a device's developer powers
+	AuditTamper       AuditKind = "tamper"        // chain verification failed on load
+	AuditRotate       AuditKind = "rotate"        // bounded-retention chain genesis
 )
 
 // Keep the live segment and at most one previous segment. Rotation restarts a

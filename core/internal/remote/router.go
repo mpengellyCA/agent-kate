@@ -46,8 +46,8 @@ type route struct {
 // hand an agent screen capture and input injection, which inverts the consent
 // model the entire Cowork design rests on. There is no agent creation (it needs
 // project/worktree/model/provider selection and KWallet key resolution, all
-// UI-resident), nothing that takes a filesystem path, and nothing destructive
-// beyond a graceful stop.
+// UI-resident). Developer methods are default-deny per-device capabilities:
+// their project/worktree is server-resolved from a thread, never a local path.
 func (s *Server) routes() []route {
 	return []route{
 		{Pattern: "POST /api/v1/auth/exchange", Auth: false, Handler: s.handleAuthExchange},
@@ -58,6 +58,8 @@ func (s *Server) routes() []route {
 		{Pattern: "GET /api/v1/agents/{threadId}/transcript", Auth: true, Handler: s.handleTranscript},
 		{Pattern: "POST /api/v1/agents/{threadId}/send", Auth: true, Handler: s.handleSend},
 		{Pattern: "POST /api/v1/agents/{threadId}/fork", Auth: true, Handler: s.handleFork},
+		{Pattern: "POST /api/v1/agents/{threadId}/new", Auth: true, Handler: s.handleProjectAgent},
+		{Pattern: "GET /api/v1/agents/{threadId}/files", Auth: true, Handler: s.handleFiles},
 		{Pattern: "GET /api/v1/agents/{threadId}/file", Auth: true, Handler: s.handleFileRead},
 		{Pattern: "PUT /api/v1/agents/{threadId}/file", Auth: true, Handler: s.handleFileWrite},
 		{Pattern: "POST /api/v1/agents/{threadId}/interrupt", Auth: true, Handler: s.handleInterrupt},
@@ -127,6 +129,13 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 		bodyLimit := int64(maxRequestBytes)
 		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/send") {
 			bodyLimit = maxSendRequestBytes
+		}
+		// A revisioned worktree save is capped again in handleFileWrite at
+		// 512 KiB of UTF-8 text. Leave modest JSON framing headroom here so
+		// that documented limit is actually reachable without widening every
+		// other API body's 64 KiB ceiling.
+		if r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/file") {
+			bodyLimit = 576 * 1024
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, bodyLimit)
 
