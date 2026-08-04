@@ -215,9 +215,12 @@ private:
     void seedEngineChoices();
     AgentPanel *addAgent(const QString &projectPath, const QString &model = QString(),
                          const QString &backend = QString());
-    AgentPanel *addDormantAgent(const QString &project, const QString &threadId,
-                                const QString &title, bool isolated,
-                                const QString &backend = QString());
+    // Hydrate a panel from the canonical core session record. The same path is
+    // used for threads created from desktop, mobile, or another agent.
+    AgentPanel *addPersistedAgent(const QString &project, const QString &threadId,
+                                  const QString &title, bool isolated,
+                                  const QString &backend = QString(), bool running = false,
+                                  const QString &runningNote = QString());
     void renameAgent(int agentId);
     // Fork an agent: show the Fork dialog prefilled from the source, call
     // agent.fork, then adopt the newly-started thread into its own roster panel.

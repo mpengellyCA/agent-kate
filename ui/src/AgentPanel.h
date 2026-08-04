@@ -101,10 +101,9 @@ public:
                             const QString &title, bool isolated,
                             const QString &backend = QString());
 
-    // Bind this fresh panel to a thread the core has already started that has
-    // NO prior conversation to inherit — an ensemble controller (mode.apply
-    // launched it with its briefing as the opening message). Same live
-    // adoption, minus the transcript replay; note is shown as a system line.
+    // Bind this fresh panel to a running canonical thread record. Its
+    // transcript is replayed so a panel opened after another surface started
+    // the thread catches up before rendering the live stream.
     void adoptStartedThread(const QString &threadId, const QString &note, bool isolated,
                             const QString &backend = QString());
 

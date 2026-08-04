@@ -825,7 +825,7 @@ void AgentDock::attachSession(const QString &project, const QString &threadId,
     }
     ensureProject(project);
     // An attached external session resumes in its own directory, non-isolated.
-    AgentPanel *panel = addDormantAgent(project, threadId, title, /*isolated=*/false);
+    AgentPanel *panel = addPersistedAgent(project, threadId, title, /*isolated=*/false);
     if (!m_agents.isEmpty()) {
         m_roster->setCurrentAgent(m_agents.constLast().id); // focus the new agent
     }
@@ -1000,11 +1000,14 @@ AgentPanel *AgentDock::addAgent(const QString &projectPath, const QString &model
     return panel;
 }
 
-// addDormantAgent restores a persisted, not-running thread into the roster
-// without stealing focus from the active agent.
-AgentPanel *AgentDock::addDormantAgent(const QString &project, const QString &threadId,
-                                       const QString &title, bool isolated,
-                                       const QString &backend)
+// addPersistedAgent renders the status the shared core record actually holds,
+// without stealing focus from the active agent. It must not infer origin from
+// the transport that caused the refresh: desktop and remote are peers of the
+// same session store, not separate agent lifecycles.
+AgentPanel *AgentDock::addPersistedAgent(const QString &project, const QString &threadId,
+                                         const QString &title, bool isolated,
+                                         const QString &backend, bool running,
+                                         const QString &runningNote)
 {
     const int id = ++m_counter;
     auto *panel = new AgentPanel(m_core, m_stack);
@@ -1020,7 +1023,11 @@ AgentPanel *AgentDock::addDormantAgent(const QString &project, const QString &th
         m_roster->setAgentTitlePinned(id, title);
     }
     wireAgentPanel(id, panel);
-    panel->setDormant(threadId, label, isolated, backend); // emits dormantChanged
+    if (running) {
+        panel->adoptStartedThread(threadId, runningNote, isolated, backend);
+    } else {
+        panel->setDormant(threadId, label, isolated, backend); // emits dormantChanged
+    }
     return panel;
 }
 
@@ -1069,17 +1076,10 @@ void AgentDock::refreshOrchestrationLinks()
                 const bool running =
                     rec.value(QStringLiteral("status")).toString()
                     == QLatin1String("running");
-                AgentPanel *panel =
-                    self->addDormantAgent(project, threadId, title, isolated, backend);
-                if (running) {
-                    // A live worker is not resumable — it is already working.
-                    // Bind the panel to the running thread and replay what it
-                    // has said so far (it started before we knew about it).
-                    panel->adoptStartedThread(
-                        threadId,
-                        i18n("launched by another agent — its conversation continues here."),
-                        isolated, backend);
-                }
+                self->addPersistedAgent(
+                    project, threadId, title, isolated, backend, running,
+                    running ? i18n("launched by another agent — its conversation continues here.")
+                            : QString());
             }
             // Pass 2: nest and badge. Done after every adoption so a controller
             // and its worker that arrive in the same sweep still link up.
@@ -1296,20 +1296,13 @@ void AgentDock::restoreThreads(const QString &project)
                          // compaction) on the restored panel.
                          const QString backend =
                              rec.value(QStringLiteral("backend")).toString();
-                         AgentPanel *panel = addDormantAgent(
+                         const bool running =
+                             rec.value(QStringLiteral("status")).toString()
+                             == QLatin1String("running");
+                         AgentPanel *panel = addPersistedAgent(
                             project, threadId,
                             rec.value(QStringLiteral("title")).toString(), isolated,
-                            backend);
-                         if (rec.value(QStringLiteral("status")).toString()
-                            == QLatin1String("running")) {
-                            // This thread may have been launched from a paired
-                            // phone while the desktop was already open. It is
-                            // live, so it must not be shown as resumable.
-                            panel->adoptStartedThread(
-                                threadId,
-                                i18n("started from another Agent Kate surface."),
-                                isolated, backend);
-                         }
+                            backend, running);
                          // Seed the roster card's tag chips from the persisted set.
                          QStringList tags;
                          const QJsonArray tagArr =
