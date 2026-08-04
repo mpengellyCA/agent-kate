@@ -64,6 +64,7 @@ appstream-util validate-relax --nonet %{buildroot}%{_datadir}/metainfo/org.kde.a
 %{_bindir}/akcore
 %{_datadir}/applications/org.kde.agentkate.desktop
 %{_datadir}/metainfo/org.kde.agentkate.metainfo.xml
+%{_datadir}/knotifications6/agentkate.notifyrc
 %{_datadir}/icons/hicolor/*/apps/agentkate.*
 
 %changelog
