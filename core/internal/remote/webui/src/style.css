@@ -65,12 +65,53 @@
     min-width: 320px;
     margin: 0;
     background: var(--color-base-100);
+    overflow-x: hidden;
     overscroll-behavior-y: none;
     -webkit-tap-highlight-color: transparent;
   }
   button, input, textarea { font: inherit; }
   button, [role='button'] { touch-action: manipulation; }
   :focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+}
+
+@layer components {
+  /* Project cards keep the roster readable on a narrow phone: a project is the
+   * primary navigation unit, and individual threads only appear after it is
+   * chosen.  This also means long prompts never dictate the height of a row. */
+  .project-card,
+  .agent-row {
+    min-width: 0;
+    overflow: hidden;
+  }
+  .project-card {
+    min-height: 8.5rem;
+    background-image: linear-gradient(135deg, color-mix(in oklab, var(--color-primary) 10%, transparent), transparent 46%);
+  }
+  .project-card:hover,
+  .project-card:focus-visible,
+  .agent-row:hover,
+  .agent-row:focus-visible {
+    border-color: color-mix(in oklab, var(--color-primary) 72%, var(--color-ak-border));
+    background-color: var(--color-base-300);
+  }
+  .project-preview {
+    min-width: 0;
+    border-inline-start: 2px solid color-mix(in oklab, var(--color-primary) 45%, transparent);
+    padding-inline-start: .65rem;
+    color: color-mix(in oklab, var(--color-base-content) 85%, var(--color-ak-muted));
+  }
+  .agent-title {
+    display: -webkit-box;
+    overflow: hidden;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-height: 1.35;
+  }
+}
+
+@media (max-width: 639px) {
+  .project-card { min-height: 7.5rem; }
+  .agent-row .badge { max-width: 5.6rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 }
 
 /* Only DOMPurify's MarkdownBlock output uses this selector. */
