@@ -7,6 +7,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"unicode/utf8"
 
 	"agentkate/internal/agent"
+	"agentkate/internal/fsperm"
 	"agentkate/internal/gitstatus"
 	"agentkate/internal/harness"
 	"agentkate/internal/permission"
@@ -25,7 +27,10 @@ import (
 	"agentkate/internal/worktree"
 )
 
-type remoteBackend struct{ d handlerDeps }
+type remoteBackend struct {
+	d             handlerDeps
+	attachmentDir string // test override; production uses a private session sibling.
+}
 
 var _ remote.Backend = (*remoteBackend)(nil)
 
@@ -176,15 +181,90 @@ func (b *remoteBackend) Send(ctx context.Context, principal remote.Principal, re
 	}
 	atts := make([]agent.Attachment, 0, len(req.Attachments))
 	for _, att := range req.Attachments {
-		atts = append(atts, agent.Attachment{
+		converted := agent.Attachment{
 			Kind: att.Kind, Name: att.Name, MediaType: att.MediaType, Text: att.Text, DataB64: att.DataB64,
-		})
+		}
+		// Image bytes were supplied by the paired device, not by a desktop path.
+		// Keep one owner-private copy so the trusted desktop can render the same
+		// thumbnail after the live event or a restart. This cache path is carried
+		// only in desktop events/sidecars; remote projections get generic markers.
+		if att.Kind == "image" {
+			converted.CachePath = b.cacheRemoteImage(att)
+		}
+		atts = append(atts, converted)
 	}
 	result, err := b.d.humanSend(humanPrincipal{Surface: remoteSurface, Device: principal.DeviceName}, req.ThreadID, req.Text, atts)
 	if err != nil {
 		return remote.SendResult{}, fmt.Errorf("remote send: %w", err)
 	}
 	return remote.SendResult{Queued: result.Queued, Position: result.Position, Resuming: result.Resuming}, nil
+}
+
+func remoteAttachmentMarkers(atts []agent.Attachment) []remote.TranscriptAttachment {
+	if len(atts) == 0 {
+		return nil
+	}
+	markers := make([]remote.TranscriptAttachment, 0, len(atts))
+	for _, att := range atts {
+		if att.Kind == "image" || att.Kind == "text" {
+			markers = append(markers, remote.TranscriptAttachment{Kind: att.Kind})
+		}
+	}
+	return markers
+}
+
+func (b *remoteBackend) cacheRemoteImage(att remote.Attachment) string {
+	if att.Kind != "image" {
+		return ""
+	}
+	data, err := base64.StdEncoding.DecodeString(att.DataB64)
+	if err != nil || len(data) == 0 {
+		return ""
+	}
+	ext := map[string]string{
+		"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp",
+	}[att.MediaType]
+	if ext == "" {
+		return ""
+	}
+	dir := b.attachmentDir
+	if dir == "" {
+		dir = filepath.Join(filepath.Dir(session.DefaultPath()), "remote-attachments")
+	}
+	if err := fsperm.MkdirAll(dir); err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	path := filepath.Join(dir, fmt.Sprintf("%x.%s", sum[:], ext))
+	// O_EXCL prevents following a pre-existing symlink. When another request
+	// already published this content-addressed image, HardenFile confirms it is
+	// a regular owner-private file before it is re-used.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, fsperm.FileMode)
+	if err == nil {
+		if _, err = f.Write(data); err == nil {
+			err = f.Close()
+		} else {
+			_ = f.Close()
+		}
+		if err == nil {
+			if _, err = fsperm.HardenFile(path); err == nil {
+				return path
+			}
+		}
+		_ = os.Remove(path)
+		return ""
+	}
+	if !os.IsExist(err) {
+		return ""
+	}
+	info, statErr := os.Lstat(path)
+	if statErr != nil || !info.Mode().IsRegular() {
+		return ""
+	}
+	if _, err = fsperm.HardenFile(path); err != nil {
+		return ""
+	}
+	return path
 }
 
 // Fork starts a server-resolved continuation. The remote request never chooses
@@ -603,8 +683,8 @@ func projectRemoteTranscript(raw []json.RawMessage, limit, maxBytes int) ([]remo
 		_ = json.Unmarshal(event.Message, &message)
 		switch event.Type {
 		case "user":
-			if text := remoteUserText(message.Content); text != "" {
-				if !appendEvent(remote.TranscriptEvent{Kind: "user", Text: text, At: event.Timestamp}) {
+			if text, attachments := remoteUserProjection(message.Content); text != "" {
+				if !appendEvent(remote.TranscriptEvent{Kind: "user", Text: text, Attachments: attachments, At: event.Timestamp}) {
 					return result, true
 				}
 			}
@@ -638,34 +718,44 @@ func projectRemoteTranscript(raw []json.RawMessage, limit, maxBytes int) ([]remo
 }
 
 func remoteUserText(content json.RawMessage) string {
+	text, _ := remoteUserProjection(content)
+	return text
+}
+
+func remoteUserProjection(content json.RawMessage) (string, []remote.TranscriptAttachment) {
 	var text string
 	if json.Unmarshal(content, &text) == nil {
-		return text
+		return text, nil
 	}
 	var blocks []remoteWireBlock
 	if json.Unmarshal(content, &blocks) != nil || len(blocks) == 0 {
-		return ""
+		return "", nil
 	}
 	// buildUserContent always puts the human's text first and attachment bodies
 	// after it. Deliberately read one block only: later text blocks can contain
 	// a full attached file and must never reach a paired device.
 	if blocks[0].Type == "text" && !strings.HasPrefix(blocks[0].Text, "Attached file `") {
-		return blocks[0].Text
+		text = blocks[0].Text
 	}
-	// An attachment-only prompt has no safe prose block at all. Preserve the
-	// conversation shape with the same bounded label the canonical acceptance
-	// echo uses, but never project the file body (or image data) from a harness
-	// transcript back to a paired device.
-	attachments := 0
+	// Inspect only block types. Names and bodies have no route to this DTO.
+	attachments := make([]remote.TranscriptAttachment, 0, len(blocks))
 	for _, block := range blocks {
-		if block.Type == "image" || (block.Type == "text" && strings.HasPrefix(block.Text, "Attached file `")) {
-			attachments++
+		switch {
+		case block.Type == "image":
+			attachments = append(attachments, remote.TranscriptAttachment{Kind: "image"})
+		case block.Type == "text" && strings.HasPrefix(block.Text, "Attached file `"):
+			attachments = append(attachments, remote.TranscriptAttachment{Kind: "text"})
 		}
 	}
-	if attachments == 0 {
-		return ""
+	if text != "" {
+		return text, attachments
 	}
-	return fmt.Sprintf("Attached %d file(s)", attachments)
+	if len(attachments) == 0 {
+		return "", nil
+	}
+	// An attachment-only prompt has no safe prose block. Preserve the shape
+	// without projecting a filename, attachment body, or image data.
+	return fmt.Sprintf("Attached %d file(s)", len(attachments)), attachments
 }
 
 func remoteLifecyclePhase(phase string) bool {

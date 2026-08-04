@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"agentkate/internal/agent"
 	"agentkate/internal/permission"
 	"agentkate/internal/remote"
 	"agentkate/internal/remote/webui"
@@ -190,10 +191,11 @@ func (c *remoteControl) publishRawEvents(threadID string, raw []json.RawMessage)
 // created this user turn itself. It is already a remote-safe typed DTO; routing
 // it through the raw projector would couple the remote surface to a desktop
 // event shape and invite attachment data to drift across the boundary.
-func (c *remoteControl) publishAcceptedHumanSend(threadID, text string, at time.Time) {
-	c.echoes.add(threadID, remote.TranscriptEvent{Kind: "user", Text: text, At: at})
+func (c *remoteControl) publishAcceptedHumanSend(threadID, text string, at time.Time, atts []agent.Attachment) {
+	event := remote.TranscriptEvent{Kind: "user", Text: text, Attachments: remoteAttachmentMarkers(atts), At: at}
+	c.echoes.add(threadID, event)
 	if srv := c.server(); srv != nil {
-		srv.PublishTranscript(threadID, []remote.TranscriptEvent{{Kind: "user", Text: text, At: at}})
+		srv.PublishTranscript(threadID, []remote.TranscriptEvent{event})
 	}
 }
 

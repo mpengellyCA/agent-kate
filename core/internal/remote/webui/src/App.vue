@@ -465,6 +465,9 @@ function agentState(agent) {
   return 'Ready'
 }
 function shortBytes(bytes) { return bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} MiB` : `${Math.ceil(bytes / 1024)} KiB` }
+function attachmentLabel(attachment) {
+  return attachment?.kind === 'image' ? 'Image attached' : 'Text file attached'
+}
 function projectName(agent) { return String(agent?.project || '').trim() || 'Unassigned project' }
 function activityTime(agent) { const value = Date.parse(agent?.lastActivityAt || ''); return Number.isFinite(value) ? value : 0 }
 function projectMark(name) { return name.trim().slice(0, 1).toLocaleUpperCase() || '•' }
@@ -552,6 +555,9 @@ function relativeActivity(value) {
             <div v-if="!transcript.length" class="py-16 text-center text-sm text-ak-muted">No remote-safe conversation events yet.</div>
             <article v-for="(event, index) in transcript" :key="`${index}-${event.at || ''}`" class="rounded-box border border-ak-border px-3 py-2 text-sm shadow-sm" :class="event.kind === 'user' ? 'ml-7 bg-primary/15 sm:ml-20' : event.kind === 'assistant' ? 'mr-3 bg-base-200 sm:mr-16' : 'bg-base-300 text-xs'">
               <MarkdownBlock v-if="event.kind === 'user' || event.kind === 'assistant'" :source="event.text" />
+              <div v-if="event.kind === 'user' && event.attachments?.length" class="mt-2 flex flex-wrap gap-1.5" aria-label="Message attachments">
+                <span v-for="(attachment, attachmentIndex) in event.attachments" :key="`${attachment.kind}-${attachmentIndex}`" class="inline-flex items-center gap-1 rounded-full border border-primary/25 bg-base-100/50 px-2.5 py-1 text-xs font-medium text-base-content"><span class="text-primary" aria-hidden="true">{{ attachment.kind === 'image' ? '▧' : '▤' }}</span>{{ attachmentLabel(attachment) }}</span>
+              </div>
               <template v-else-if="event.kind === 'tool'"><p class="font-semibold">{{ event.toolName || 'Tool activity' }}</p><p class="mt-1 text-ak-muted">{{ event.summary || 'The agent is using a tool.' }}</p></template>
               <template v-else><p class="font-semibold">Agent status</p><p class="mt-1 text-ak-muted">{{ event.text }}</p></template>
             </article>

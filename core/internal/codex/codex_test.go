@@ -214,6 +214,29 @@ func TestSupervisorStartsTurnsAndTranslatesEvents(t *testing.T) {
 	if err != nil || len(got) < 3 {
 		t.Fatalf("ReadTranscript = %d events, %v", len(got), err)
 	}
+	// Codex's app-server does not replay its outbound user input. Agent Kate
+	// records an accepted normalized copy so desktop and remote attachment chips
+	// survive a reopen instead of only existing in the live echo.
+	foundUser := false
+	for _, raw := range got {
+		var event struct {
+			Type    string `json:"type"`
+			Message struct {
+				Content []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"message"`
+		}
+		if json.Unmarshal(raw, &event) == nil && event.Type == "user" && len(event.Message.Content) == 1 &&
+			event.Message.Content[0].Type == "text" && event.Message.Content[0].Text == "say hello" {
+			foundUser = true
+			break
+		}
+	}
+	if !foundUser {
+		t.Fatalf("durable user turn missing from transcript: %#v", got)
+	}
 	// App-server requires initialize to be acknowledged with a notification,
 	// and effort is a turn/start setting rather than a thread/start field.
 	var sawInitialized, sawInitialEffort bool

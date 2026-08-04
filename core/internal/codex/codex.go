@@ -472,8 +472,10 @@ func first(v ...string) string {
 }
 
 // Send sends a normal user turn. Text attachments are inlined; Codex's
-// app-server image input needs a local path/URL, so data-only image attachments
-// are described textually instead of pretending they were attached.
+// app-server image input needs a local path/URL, so a remote upload uses the
+// adapter's private cache copy. On success we also append a normalized user
+// event to the durable local transcript. The app-server does not echo outbound
+// user input itself, which otherwise makes a sent attachment vanish on replay.
 func (s *Supervisor) Send(id, text string, atts []agent.Attachment) error {
 	t, err := s.thread(id)
 	if err != nil {
@@ -493,8 +495,11 @@ func (s *Supervisor) Send(id, text string, atts []agent.Attachment) error {
 		case "text":
 			input = append(input, map[string]any{"type": "text", "text": fmt.Sprintf("Attached file %q:\n%s", a.Name, a.Text)})
 		case "image":
-			if a.Path != "" {
-				input = append(input, map[string]any{"type": "localImage", "path": a.Path})
+			// Remote uploads have no human-supplied desktop path. The remote
+			// adapter stores an owner-private cache copy and places it in CachePath,
+			// which is just as suitable for the app-server's local image input.
+			if path := first(a.Path, a.CachePath); path != "" {
+				input = append(input, map[string]any{"type": "localImage", "path": path})
 			} else {
 				input = append(input, map[string]any{"type": "text", "text": fmt.Sprintf("An image attachment named %q was supplied.", a.Name)})
 			}
@@ -528,6 +533,13 @@ func (s *Supervisor) Send(id, text string, atts []agent.Attachment) error {
 	if err := t.rpc.call(ctx, "turn/start", params, &out); err != nil {
 		return fmt.Errorf("codex turn/start: %w", err)
 	}
+	// This is intentionally log-only: the canonical human-surface echo is the
+	// live event for both desktop and remote clients. Broadcasting this durable
+	// copy as well would render the same turn twice.
+	s.recordEvent(t, event(map[string]any{
+		"type": "user", "timestamp": time.Now().UTC(),
+		"message": map[string]any{"role": "user", "content": codexUserContent(text, atts)},
+	}))
 	t.mu.Lock()
 	if t.completedTurns != nil && t.completedTurns[out.Turn.ID] {
 		delete(t.completedTurns, out.Turn.ID)
@@ -536,6 +548,29 @@ func (s *Supervisor) Send(id, text string, atts []agent.Attachment) error {
 	}
 	t.mu.Unlock()
 	return nil
+}
+
+func codexUserContent(text string, atts []agent.Attachment) []map[string]any {
+	content := make([]map[string]any, 0, 1+len(atts))
+	if text != "" {
+		content = append(content, map[string]any{"type": "text", "text": text})
+	}
+	for _, a := range atts {
+		switch a.Kind {
+		case "text":
+			content = append(content, map[string]any{"type": "text", "text": fmt.Sprintf("Attached file `%s`:\n```\n%s\n```", a.Name, a.Text)})
+		case "image":
+			// The private log needs only enough normalized structure for a replay.
+			// Its remote projection examines the type but never the source/body.
+			content = append(content, map[string]any{"type": "image", "source": map[string]any{
+				"type": "base64", "media_type": a.MediaType, "data": a.DataB64,
+			}})
+		}
+	}
+	if len(content) == 0 {
+		content = append(content, map[string]any{"type": "text", "text": ""})
+	}
+	return content
 }
 
 // Compact starts Codex's native, in-place context compaction and waits for the
@@ -1044,6 +1079,16 @@ func (s *Supervisor) openLog(t *Thread, appendLog bool) error {
 }
 
 func (s *Supervisor) emitEvent(t *Thread, raw json.RawMessage) {
+	s.recordEvent(t, raw)
+	if s.emit != nil {
+		s.emit(t.ID, []json.RawMessage{raw})
+	}
+}
+
+// recordEvent adds a normalized event to the private replay log without
+// pushing it to a live client. Used for accepted outbound user turns, whose
+// live fan-out is already owned by the human surface.
+func (s *Supervisor) recordEvent(t *Thread, raw json.RawMessage) {
 	if len(raw) == 0 {
 		return
 	}
@@ -1052,9 +1097,6 @@ func (s *Supervisor) emitEvent(t *Thread, raw json.RawMessage) {
 		_, _ = t.logFile.Write(append(raw, '\n'))
 	}
 	t.mu.Unlock()
-	if s.emit != nil {
-		s.emit(t.ID, []json.RawMessage{raw})
-	}
 }
 func (s *Supervisor) logf(msg string, args ...any) {
 	if s.log != nil {

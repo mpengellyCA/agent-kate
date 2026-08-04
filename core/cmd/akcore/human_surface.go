@@ -209,7 +209,7 @@ func (d handlerDeps) publishAcceptedHumanSend(threadID, text string, atts []agen
 		d.srv.NotifyUI("agent.event", agentEventParams{ThreadID: threadID, Events: []json.RawMessage{raw}})
 	}
 	if d.remote != nil {
-		d.remote.publishAcceptedHumanSend(threadID, remoteText, at)
+		d.remote.publishAcceptedHumanSend(threadID, remoteText, at, atts)
 	}
 }
 

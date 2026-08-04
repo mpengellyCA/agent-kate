@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -76,6 +78,72 @@ func TestProjectRemoteTranscriptLabelsAttachmentOnlyUserTurn(t *testing.T) {
 	encoded, _ := json.Marshal(got)
 	if strings.Contains(string(encoded), secret) || strings.Contains(string(encoded), "private.md") {
 		t.Fatalf("attachment-only projection leaked file details: %s", encoded)
+	}
+}
+
+func TestProjectRemoteTranscriptKeepsOnlyGenericAttachmentMarkers(t *testing.T) {
+	secret := "image-bytes-and-filename-must-stay-private"
+	raw := []json.RawMessage{json.RawMessage(fmt.Sprintf(`{"type":"user","message":{"content":[{"type":"text","text":"please inspect"},{"type":"image","source":{"data":%q}},{"type":"text","text":%q}]}}`, secret, "Attached file `private-notes.md`:\n```\n"+secret+"\n```"))}
+	got, truncated := projectRemoteTranscript(raw, 20, 4096)
+	if truncated || len(got) != 1 || got[0].Text != "please inspect" || len(got[0].Attachments) != 2 {
+		t.Fatalf("projection = %#v, truncated=%v", got, truncated)
+	}
+	if got[0].Attachments[0].Kind != "image" || got[0].Attachments[1].Kind != "text" {
+		t.Fatalf("attachment markers = %#v", got[0].Attachments)
+	}
+	encoded, _ := json.Marshal(got)
+	if strings.Contains(string(encoded), secret) || strings.Contains(string(encoded), "private-notes.md") || strings.Contains(string(encoded), "source") {
+		t.Fatalf("attachment marker leaked private detail: %s", encoded)
+	}
+}
+
+func TestRemoteImageUploadCachesPrivateDesktopPreviewAndUsesGenericRemoteMarker(t *testing.T) {
+	store, err := session.NewStore(filepath.Join(t.TempDir(), "threads.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put(session.Record{ThreadID: "t-1", SessionID: "s-1", AgentRef: harness.AgentRef{ThreadID: "t-1", HarnessID: "fake"}}); err != nil {
+		t.Fatal(err)
+	}
+	h := &humanSendHarness{fakeHarness: &fakeHarness{}}
+	registry := harness.NewRegistry("fake")
+	registry.Register(h)
+	side := session.NewAttachmentStore(filepath.Join(t.TempDir(), "sidecars"))
+	control := newRemoteControl(t.Context(), nil)
+	backend := remoteBackend{
+		d:             handlerDeps{sessions: store, harnesses: registry, turns: agent.NewTurnTracker(), attachSide: side, remote: control},
+		attachmentDir: filepath.Join(t.TempDir(), "remote-images"),
+	}
+	image := []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 0x00}
+	_, err = backend.Send(context.Background(), remote.Principal{DeviceName: "Pixel"}, remote.SendRequest{
+		ThreadID: "t-1", Text: "look", Attachments: []remote.Attachment{{
+			Kind: "image", Name: "Screenshot_20260804_071914_Firefox.jpg", MediaType: "image/png", DataB64: base64.StdEncoding.EncodeToString(image),
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(h.sent) != 1 || len(h.sent[0]) != 1 || h.sent[0][0].CachePath == "" {
+		t.Fatalf("desktop attachment was not given a durable preview cache: %#v", h.sent)
+	}
+	cache := h.sent[0][0].CachePath
+	if got, err := os.ReadFile(cache); err != nil || string(got) != string(image) {
+		t.Fatalf("cache data = %q, %v", got, err)
+	}
+	if info, err := os.Stat(cache); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("cache mode = %v, %v; want 0600", info.Mode(), err)
+	}
+	turns, err := side.Load("t-1")
+	if err != nil || len(turns) != 1 || turns[0].Attachments[0].CachePath != cache {
+		t.Fatalf("desktop replay sidecar = %#v, %v", turns, err)
+	}
+	got := control.mergeHumanEchoes("t-1", nil)
+	if len(got) != 1 || len(got[0].Attachments) != 1 || got[0].Attachments[0].Kind != "image" {
+		t.Fatalf("remote echo = %#v", got)
+	}
+	encoded, _ := json.Marshal(got)
+	if strings.Contains(string(encoded), "Screenshot_") || strings.Contains(string(encoded), "dataB64") || strings.Contains(string(encoded), cache) {
+		t.Fatalf("remote echo leaked image detail: %s", encoded)
 	}
 }
 

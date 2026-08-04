@@ -187,11 +187,22 @@ type TranscriptRequest struct {
 // TranscriptEvent is the allowlisted remote projection of one transcript row.
 // Tool arguments and raw permission input have no field here by design.
 type TranscriptEvent struct {
-	Kind     string    `json:"kind"` // user | assistant | tool | lifecycle
-	Text     string    `json:"text,omitempty"`
-	ToolName string    `json:"toolName,omitempty"`
-	Summary  string    `json:"summary,omitempty"`
-	At       time.Time `json:"at,omitempty"`
+	Kind     string `json:"kind"` // user | assistant | tool | lifecycle
+	Text     string `json:"text,omitempty"`
+	ToolName string `json:"toolName,omitempty"`
+	Summary  string `json:"summary,omitempty"`
+	// Attachments is a deliberately generic, body-free marker for a human turn.
+	// A paired device may learn that an image or text file was attached, but not
+	// its filename, path, contents, or a browser URL capable of retrieving it.
+	Attachments []TranscriptAttachment `json:"attachments,omitempty"`
+	At          time.Time              `json:"at,omitempty"`
+}
+
+// TranscriptAttachment is the remote-safe representation of an attachment.
+// Keep this separate from the upload DTO: it must stay incapable of carrying
+// the filename or bytes back through transcript or SSE delivery.
+type TranscriptAttachment struct {
+	Kind string `json:"kind"` // "image" or "text"
 }
 
 // Transcript is one page of a thread's remote-safe conversation projection.
